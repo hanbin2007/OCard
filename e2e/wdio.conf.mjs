@@ -29,7 +29,8 @@ export const config = {
   maxInstances: 1,
   capabilities: [
     {
-      browserName: "wry",
+      // 不设 browserName:WebKitWebDriver 只认 tauri-driver 注入的能力集
+      maxInstances: 1,
       "tauri:options": { application },
     },
   ],
