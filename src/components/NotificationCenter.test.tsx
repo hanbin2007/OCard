@@ -10,6 +10,7 @@ import App from "../App";
 import * as api from "../api";
 import { mockProjects, mockWorkstation } from "../api/mock";
 import type { NoticeDto } from "../api/types";
+import { formatTimestamp } from "../lib/format";
 
 let emit: ((notice: NoticeDto) => void) | null = null;
 let subSpy: ReturnType<typeof vi.spyOn>;
@@ -413,6 +414,62 @@ describe("通知中心", () => {
     expect(items).toHaveLength(1);
     expect(within(items[0]).queryByTestId("notice-count")).toBeNull();
     expect(screen.queryByText("×2")).toBeNull();
+
+    listSpy.mockRestore();
+  });
+
+  it("回放较旧的同 code 告警不会让时间/消息倒流", async () => {
+    // ready 手动控制，确保「实时 T2 先入、回放 T1 后到」这个顺序
+    let markReady: (() => void) | null = null;
+    subSpy.mockImplementation((onNotice: (n: NoticeDto) => void) => {
+      emit = onNotice;
+      return {
+        dispose: () => {},
+        ready: new Promise<void>((resolve) => {
+          markReady = resolve;
+        }),
+      };
+    });
+
+    const older = notice({
+      code: "audit-outbox",
+      message: "旧的那条（T1）",
+      occurredAt: "2026-08-24T09:00:00+08:00",
+    });
+    const listSpy = vi.spyOn(api, "listNotices").mockResolvedValue([older]);
+
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    // 先落地较新的实时通知 T2
+    send(
+      notice({
+        code: "audit-outbox",
+        message: "新的那条（T2）",
+        occurredAt: "2026-08-24T11:30:00+08:00",
+      }),
+    );
+
+    // 再让回放把较旧的 T1 送进来
+    await act(async () => {
+      markReady?.();
+    });
+    await waitFor(() => expect(listSpy).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByTestId("notice-bell"));
+    const item = screen.getByTestId("notice-item");
+
+    // 折叠成一条并计数，但展示的仍是较新的 T2
+    expect(within(item).getByTestId("notice-count").textContent).toBe("×2");
+    expect(item.textContent).toContain("新的那条（T2）");
+    expect(item.textContent).not.toContain("旧的那条（T1）");
+    // lastAt 仍是 T2，没有被回退成 T1（按本地时区渲染，故从格式化函数取期望值）
+    expect(item.textContent).toContain(
+      formatTimestamp("2026-08-24T11:30:00+08:00"),
+    );
+    expect(item.textContent).not.toContain(
+      formatTimestamp("2026-08-24T09:00:00+08:00"),
+    );
 
     listSpy.mockRestore();
   });

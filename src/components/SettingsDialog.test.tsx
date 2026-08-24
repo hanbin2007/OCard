@@ -183,7 +183,7 @@ describe("关于与更新", () => {
     await user.click(screen.getByTestId("settings-check-update"));
     await waitFor(() =>
       expect(screen.getByTestId("settings-update-result").textContent).toBe(
-        "已下载，点击重启并更新安装",
+        "已下载，点击安装更新完成安装",
       ),
     );
 
@@ -283,7 +283,11 @@ describe("关于与更新", () => {
     await act(async () => {
       finish?.();
     });
-    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    // 安装成功后按钮收起：后端 pending 已清空，再点只会得到「没有已下载的更新」
+    await waitFor(() =>
+      expect(screen.queryByTestId("settings-install-update")).toBeNull(),
+    );
+    expect(screen.getByTestId("settings-install-done")).toBeDefined();
 
     checkSpy.mockRestore();
     installSpy.mockRestore();
@@ -323,6 +327,8 @@ describe("关于与更新", () => {
       ),
     );
     expect(screen.queryByTestId("settings-install-error")).toBeNull();
+    // 安装成功后不该还留着可再点的按钮
+    expect(screen.queryByTestId("settings-install-update")).toBeNull();
 
     checkSpy.mockRestore();
     installSpy.mockRestore();

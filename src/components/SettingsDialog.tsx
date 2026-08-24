@@ -17,7 +17,7 @@ const UPDATE_RESULT_TEXT: Record<UpdateCheckResult, string> = {
   uptodate: "已是最新",
   busy: "后台正在检查或下载，请稍候再试",
   // "ready" 现在的含义是「已下载待安装」，不是「重启就会自动装上」
-  ready: "已下载，点击重启并更新安装",
+  ready: "已下载，点击安装更新完成安装",
   failed: "更新失败，详见通知",
   "check-failed": "检查失败，详见通知",
   unsupported: "当前安装方式不支持自动更新",
@@ -209,7 +209,7 @@ export function SettingsDialog() {
               >
                 {checking ? "检查中…" : "检查更新"}
               </button>
-              {updateReady ? (
+              {updateReady && !installed ? (
                 <button
                   type="button"
                   className="btn btn--primary btn--sm"

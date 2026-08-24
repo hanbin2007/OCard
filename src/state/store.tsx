@@ -211,6 +211,14 @@ interface NoticeBucket {
  * - **不同时刻的重复告警**（同 code、不同 occurredAt）：折叠成一条并计数 ×N，
  *   避免刷屏。
  */
+/** ISO 时间戳比较：优先按时刻，解析不了再退回字符串序 */
+function isNewerThan(a: string, b: string): boolean {
+  const ta = Date.parse(a);
+  const tb = Date.parse(b);
+  if (Number.isNaN(ta) || Number.isNaN(tb)) return a > b;
+  return ta > tb;
+}
+
 function ingestNotice(
   bucket: NoticeBucket,
   notice: NoticeDto,
@@ -223,11 +231,17 @@ function ingestNotice(
   const keys: Record<string, true> = { ...bucket.noticeKeys, [key]: true };
   const head = bucket.notices[0];
   if (head && head.code === notice.code && head.level === notice.level) {
+    // 回放拿到的是**更旧**的同 code 告警时，只加计数、把窗口向前延伸，
+    // 绝不能把 lastAt/message 回写成旧值（那等于让界面时间倒流）
+    const newer = isNewerThan(notice.occurredAt, head.lastAt);
     const merged: NoticeEntry = {
       ...head,
       count: head.count + 1,
-      lastAt: notice.occurredAt,
-      message: notice.message,
+      firstAt: isNewerThan(head.firstAt, notice.occurredAt)
+        ? notice.occurredAt
+        : head.firstAt,
+      lastAt: newer ? notice.occurredAt : head.lastAt,
+      message: newer ? notice.message : head.message,
       read: false,
       live: options.live || head.live,
     };
