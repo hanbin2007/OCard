@@ -26,6 +26,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
+sysinfo = "0.33"
 
 [dev-dependencies]
 tempfile = "3"

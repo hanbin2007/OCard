@@ -5,5 +5,6 @@ pub mod journal;
 pub mod manifest;
 pub mod naming;
 pub mod project;
+pub mod volumes;
 
 pub use error::{CoreError, Result};
