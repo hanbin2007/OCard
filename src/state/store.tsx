@@ -73,6 +73,8 @@ export interface AppState {
   noticesOpen: boolean;
   /** 生成稳定 id 用，保持 reducer 纯函数 */
   noticeSeq: number;
+  /** 已摄入通知的 `code@occurredAt`，供启动回放去重 */
+  noticeKeys: Record<string, true>;
 }
 
 type BootstrapPayload = Pick<
@@ -99,6 +101,8 @@ export type AppAction =
   | { type: "workstationUpdated"; workstation: WorkstationInfo }
   | { type: "taskSnapshot"; task: CopyTask }
   | { type: "noticeReceived"; notice: NoticeDto }
+  | { type: "noticesReplayed"; notices: NoticeDto[] }
+  | { type: "noticeAcknowledged"; id: string }
   | { type: "noticeToastDismissed"; id: string }
   | { type: "noticeDismissed"; id: string }
   | { type: "noticesCleared" }
@@ -125,6 +129,7 @@ export const initialState: AppState = {
   notices: [],
   noticesOpen: false,
   noticeSeq: 0,
+  noticeKeys: {},
 };
 
 /** 把增量事件合并进文件列表；未在事件里出现的文件保持原样 */
@@ -187,6 +192,61 @@ function mergeSnapshot(local: CopyTask | undefined, snapshot: CopyTask): CopyTas
     files: local.files.length > 0 ? local.files : snapshot.files,
     destinations:
       local.destinations.length > 0 ? local.destinations : snapshot.destinations,
+  };
+}
+
+interface NoticeBucket {
+  notices: NoticeEntry[];
+  noticeSeq: number;
+  noticeKeys: Record<string, true>;
+}
+
+/**
+ * 摄入一条通知：同 code 连续重复折叠计数，否则新建条目。
+ * `dedupe` 只在启动回放时开启——回放里可能混着已经实时收到过的那几条；
+ * 实时事件不去重，否则同一毫秒的真实重复会被吃掉。
+ */
+function ingestNotice(
+  bucket: NoticeBucket,
+  notice: NoticeDto,
+  options: { live: boolean; dedupe: boolean },
+): NoticeBucket {
+  const key = `${notice.code}@${notice.occurredAt}`;
+  if (options.dedupe && bucket.noticeKeys[key]) return bucket;
+
+  const keys: Record<string, true> = { ...bucket.noticeKeys, [key]: true };
+  const head = bucket.notices[0];
+  if (head && head.code === notice.code && head.level === notice.level) {
+    const merged: NoticeEntry = {
+      ...head,
+      count: head.count + 1,
+      lastAt: notice.occurredAt,
+      message: notice.message,
+      read: false,
+      live: options.live || head.live,
+    };
+    return {
+      notices: [merged, ...bucket.notices.slice(1)],
+      noticeSeq: bucket.noticeSeq,
+      noticeKeys: keys,
+    };
+  }
+
+  const entry: NoticeEntry = {
+    id: `notice-${bucket.noticeSeq + 1}`,
+    level: notice.level,
+    code: notice.code,
+    message: notice.message,
+    firstAt: notice.occurredAt,
+    lastAt: notice.occurredAt,
+    count: 1,
+    read: false,
+    live: options.live,
+  };
+  return {
+    notices: [entry, ...bucket.notices],
+    noticeSeq: bucket.noticeSeq + 1,
+    noticeKeys: keys,
   };
 }
 
@@ -299,38 +359,37 @@ export function reducer(state: AppState, action: AppAction): AppState {
       };
     }
 
-    case "noticeReceived": {
-      const notice = action.notice;
-      const head = state.notices[0];
-      // 同 code 连续重复折叠为一条并计数，不刷屏
-      if (head && head.code === notice.code && head.level === notice.level) {
-        const merged: NoticeEntry = {
-          ...head,
-          count: head.count + 1,
-          lastAt: notice.occurredAt,
-          message: notice.message,
-          read: false,
-          live: true,
-        };
-        return { ...state, notices: [merged, ...state.notices.slice(1)] };
-      }
-      const entry: NoticeEntry = {
-        id: `notice-${state.noticeSeq + 1}`,
-        level: notice.level,
-        code: notice.code,
-        message: notice.message,
-        firstAt: notice.occurredAt,
-        lastAt: notice.occurredAt,
-        count: 1,
-        read: false,
-        live: true,
-      };
+    case "noticeReceived":
       return {
         ...state,
-        notices: [entry, ...state.notices],
-        noticeSeq: state.noticeSeq + 1,
+        ...ingestNotice(state, action.notice, { live: true, dedupe: false }),
+      };
+
+    case "noticesReplayed": {
+      // 按时间升序摄入，最后统一按最新时间倒序排列
+      const ordered = [...action.notices].sort((a, b) =>
+        a.occurredAt.localeCompare(b.occurredAt),
+      );
+      let bucket: NoticeBucket = state;
+      for (const notice of ordered) {
+        // 回放不弹 toast，直接进铃铛
+        bucket = ingestNotice(bucket, notice, { live: false, dedupe: true });
+      }
+      return {
+        ...state,
+        ...bucket,
+        notices: [...bucket.notices].sort((a, b) => b.lastAt.localeCompare(a.lastAt)),
       };
     }
+
+    case "noticeAcknowledged":
+      // 逐条确认：error 只有被确认过才算已读
+      return {
+        ...state,
+        notices: state.notices.map((n) =>
+          n.id === action.id ? { ...n, read: true, live: false } : n,
+        ),
+      };
 
     case "noticeToastDismissed":
       return {
@@ -351,9 +410,11 @@ export function reducer(state: AppState, action: AppAction): AppState {
       return {
         ...state,
         noticesOpen: open,
-        // 打开即视为已读，并把即时呈现区收起来
+        // 打开只把 warning/info 置已读；error 必须逐条确认，否则可能从未被独立看到
         notices: open
-          ? state.notices.map((n) => ({ ...n, read: true, live: false }))
+          ? state.notices.map((n) =>
+              n.level === "error" ? n : { ...n, read: true, live: false },
+            )
           : state.notices,
       };
     }
@@ -403,6 +464,63 @@ export function StoreProvider({
   const skipBootstrap = preloaded !== undefined;
   const [reloadToken, setReloadToken] = useState(0);
   const reload = useCallback(() => setReloadToken((n) => n + 1), []);
+
+  /**
+   * 后端通知（降级/失败）常驻订阅 + 启动回放。
+   *
+   * 时序要点：这块**不等 bootstrap**。订阅越早建立，漏掉的推送越少；
+   * 订阅建立后再拉一次 list_notices，把订阅建立之前后端已经发出的通知补回来，
+   * 否则启动早期的降级提示会静默丢失。回放的通知直接进铃铛、不再弹 toast，
+   * 但 error 仍需逐条确认。
+   */
+  useEffect(() => {
+    const dispose = api.subscribeNotices(
+      (notice) => dispatch({ type: "noticeReceived", notice }),
+      (err) =>
+        dispatch({
+          type: "noticeReceived",
+          notice: {
+            level: "error",
+            code: "notice-listen-failed",
+            message:
+              err instanceof Error
+                ? `通知通道未能建立：${err.message}。后端的降级提示可能无法送达，请重启应用。`
+                : "通知通道未能建立，后端的降级提示可能无法送达，请重启应用。",
+            occurredAt: new Date().toISOString(),
+          },
+        }),
+    );
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const backlog = await api.listNotices();
+        if (!cancelled && backlog.length > 0) {
+          dispatch({ type: "noticesReplayed", notices: backlog });
+        }
+      } catch (err) {
+        if (cancelled) return;
+        dispatch({
+          type: "noticeReceived",
+          notice: {
+            level: "error",
+            code: "notice-replay-failed",
+            message:
+              err instanceof Error
+                ? `启动通知回放失败：${err.message}。可能漏掉了启动期间的降级提示。`
+                : "启动通知回放失败，可能漏掉了启动期间的降级提示。",
+            occurredAt: new Date().toISOString(),
+          },
+        });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      dispose();
+    };
+  }, []);
+
 
   useEffect(() => {
     if (skipBootstrap) return;
@@ -457,29 +575,6 @@ export function StoreProvider({
               err instanceof Error
                 ? `进度监听未能建立：${err.message}。拷卡进度不会自动刷新，请重启应用；已在进行的拷贝不受影响。`
                 : "进度监听未能建立，拷卡进度不会自动刷新，请重启应用；已在进行的拷贝不受影响。",
-            occurredAt: new Date().toISOString(),
-          },
-        }),
-    );
-  }, []);
-
-  /**
-   * 后端通知（降级/失败）常驻订阅。
-   * 连通知通道本身建不起来也要说出来——否则后续所有降级都会静默。
-   */
-  useEffect(() => {
-    return api.subscribeNotices(
-      (notice) => dispatch({ type: "noticeReceived", notice }),
-      (err) =>
-        dispatch({
-          type: "noticeReceived",
-          notice: {
-            level: "error",
-            code: "notice-listen-failed",
-            message:
-              err instanceof Error
-                ? `通知通道未能建立：${err.message}。后端的降级提示可能无法送达，请重启应用。`
-                : "通知通道未能建立，后端的降级提示可能无法送达，请重启应用。",
             occurredAt: new Date().toISOString(),
           },
         }),

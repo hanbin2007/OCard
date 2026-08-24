@@ -286,7 +286,7 @@ export interface WorkstationInfo {
  * 通知（tauri 事件 `app://notice`）
  * ------------------------------------------------------------------ */
 
-export type NoticeLevel = "warning" | "error";
+export type NoticeLevel = "info" | "warning" | "error";
 
 /**
  * 后端推送的降级/失败通知。
@@ -301,3 +301,18 @@ export interface NoticeDto {
   message: string;
   occurredAt: string;
 }
+
+/**
+ * `check_for_update` 的结果。
+ * - ready：已在后台下载完成，重启生效
+ * - uptodate：已是最新
+ * - failed：下载/安装失败（详情走 app://notice）
+ * - check-failed：检查本身失败（网络等）
+ * - unsupported：当前安装方式不支持自动更新（如包管理器安装）
+ */
+export type UpdateCheckResult =
+  | "ready"
+  | "uptodate"
+  | "failed"
+  | "check-failed"
+  | "unsupported";

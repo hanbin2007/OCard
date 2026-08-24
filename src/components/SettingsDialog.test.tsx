@@ -1,9 +1,10 @@
 /** 工作站设置对话框：首跑引导、校验、保存回写。 */
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
+import * as api from "../api";
 import { mockProjects, mockWorkstation } from "../api/mock";
 
 // mock 回退会就地改写 mockWorkstation，测完还原，避免同文件内互相污染
@@ -124,6 +125,90 @@ describe("工作站设置", () => {
 
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+});
+
+describe("关于与更新", () => {
+  async function openSettings() {
+    const user = userEvent.setup();
+    render(<App preloaded={configured} />);
+    await user.click(screen.getByTestId("settings-open"));
+    return user;
+  }
+
+  it("显示当前版本号", async () => {
+    await openSettings();
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-version").textContent).toBe("v0.1.0"),
+    );
+  });
+
+  it("检查更新期间按钮禁用并显示 loading", async () => {
+    let resolveCheck: ((r: "uptodate") => void) | null = null;
+    const spy = vi
+      .spyOn(api, "checkForUpdate")
+      .mockImplementation(() => new Promise((r) => (resolveCheck = r)));
+
+    const user = await openSettings();
+    const button = screen.getByTestId("settings-check-update");
+    await user.click(button);
+
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    expect(button.textContent).toContain("检查中");
+
+    await act(async () => {
+      resolveCheck?.("uptodate");
+    });
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+
+    spy.mockRestore();
+  });
+
+  it("「已是最新」内联反馈", async () => {
+    const spy = vi.spyOn(api, "checkForUpdate").mockResolvedValue("uptodate");
+    const user = await openSettings();
+
+    await user.click(screen.getByTestId("settings-check-update"));
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-update-result").textContent).toBe("已是最新"),
+    );
+    spy.mockRestore();
+  });
+
+  it("「更新已就绪」与「不支持自动更新」各自的文案", async () => {
+    const spy = vi.spyOn(api, "checkForUpdate").mockResolvedValue("ready");
+    const user = await openSettings();
+
+    await user.click(screen.getByTestId("settings-check-update"));
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-update-result").textContent).toBe(
+        "更新已就绪，重启生效",
+      ),
+    );
+
+    spy.mockResolvedValue("unsupported");
+    await user.click(screen.getByTestId("settings-check-update"));
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-update-result").textContent).toBe(
+        "当前安装方式不支持自动更新",
+      ),
+    );
+    spy.mockRestore();
+  });
+
+  it("检查失败时引导去通知中心，不静默", async () => {
+    const spy = vi
+      .spyOn(api, "checkForUpdate")
+      .mockRejectedValue(new Error("network down"));
+    const user = await openSettings();
+
+    await user.click(screen.getByTestId("settings-check-update"));
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-update-result").textContent).toBe(
+        "检查失败，详见通知",
+      ),
+    );
+    spy.mockRestore();
   });
 });
 

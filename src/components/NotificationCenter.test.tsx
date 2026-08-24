@@ -210,6 +210,149 @@ describe("通知中心", () => {
     expect(screen.getByTestId("notice-item")).toBeDefined();
   });
 
+  it("info 级别：蓝点、行为同 warning（自动收起、aria-live polite）", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(<App preloaded={preloaded} />);
+
+    send(
+      notice({
+        level: "info",
+        code: "update-ready",
+        message: "已在后台更新到 v0.2.0，重启生效",
+      }),
+    );
+
+    const toast = await screen.findByTestId("notice-toast-info");
+    expect(toast.getAttribute("aria-live")).toBe("polite");
+    expect(toast.getAttribute("role")).toBe("status");
+    expect(toast.textContent).toContain("更新已就绪");
+
+    // 与 warning 一致：数秒后自动收起，历史仍在铃铛
+    await act(async () => {
+      vi.advanceTimersByTime(7000);
+    });
+    expect(screen.queryByTestId("notice-toast-info")).toBeNull();
+  });
+
+  it("打开面板不会替 error 代为确认，徽标继续红", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    send(notice({ level: "warning", code: "audit-outbox" }));
+    send(notice({ level: "error", code: "audit-lost", message: "审计链存在缺口" }));
+    await waitFor(() => expect(screen.getByTestId("notice-unread")).toBeDefined());
+
+    await user.click(screen.getByTestId("notice-bell"));
+
+    // warning 被置已读，error 仍未确认 → 徽标还在，且是红的
+    const badge = screen.getByTestId("notice-unread");
+    expect(badge.textContent).toBe("1");
+    expect(badge.className).toContain("notice-bell__badge--error");
+    // error 条目上有独立的「确认」按钮
+    expect(screen.getByTestId("notice-ack")).toBeDefined();
+  });
+
+  it("逐条确认 error 后徽标恢复", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    send(notice({ level: "error", code: "audit-lost", message: "审计链存在缺口" }));
+    await waitFor(() => expect(screen.getByTestId("notice-unread")).toBeDefined());
+
+    await user.click(screen.getByTestId("notice-bell"));
+    await user.click(screen.getByTestId("notice-ack"));
+
+    expect(screen.queryByTestId("notice-unread")).toBeNull();
+    // 确认后按钮消失，历史条目仍在
+    expect(screen.queryByTestId("notice-ack")).toBeNull();
+    expect(screen.getByTestId("notice-item")).toBeDefined();
+  });
+
+  it("多条 error 必须各自确认，确认一条不影响另一条", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    send(notice({ level: "error", code: "audit-lost", message: "审计链缺口" }));
+    send(notice({ level: "error", code: "project-meta-corrupt", message: "元数据损坏" }));
+
+    await user.click(screen.getByTestId("notice-bell"));
+    expect(screen.getAllByTestId("notice-ack")).toHaveLength(2);
+
+    await user.click(screen.getAllByTestId("notice-ack")[0]);
+    expect(screen.getAllByTestId("notice-ack")).toHaveLength(1);
+    expect(screen.getByTestId("notice-unread").textContent).toBe("1");
+  });
+
+  it("启动回放：订阅前积压的通知补进铃铛，不弹 toast，error 仍需确认", async () => {
+    const listSpy = vi.spyOn(api, "listNotices").mockResolvedValue([
+      notice({
+        level: "warning",
+        code: "rebuild-scan-failed",
+        message: "启动重建扫描降级",
+        occurredAt: "2026-08-24T09:00:00+08:00",
+      }),
+      notice({
+        level: "error",
+        code: "audit-lost",
+        message: "审计链存在缺口",
+        occurredAt: "2026-08-24T09:00:01+08:00",
+      }),
+    ]);
+
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    await waitFor(() => expect(screen.getByTestId("notice-unread")).toBeDefined());
+    // 回放不弹即时横幅
+    expect(screen.queryByTestId("notice-toasts")).toBeNull();
+
+    await user.click(screen.getByTestId("notice-bell"));
+    const items = screen.getAllByTestId("notice-item");
+    expect(items).toHaveLength(2);
+    // 时间倒序
+    expect(items[0].getAttribute("data-code")).toBe("audit-lost");
+    // 回放来的 error 同样要逐条确认
+    expect(screen.getByTestId("notice-ack")).toBeDefined();
+
+    listSpy.mockRestore();
+  });
+
+  it("回放与实时重复的同一条（code + occurredAt 相同）只保留一条", async () => {
+    const dup = notice({
+      code: "audit-outbox",
+      occurredAt: "2026-08-24T09:30:00+08:00",
+    });
+    const listSpy = vi.spyOn(api, "listNotices").mockResolvedValue([dup]);
+
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    // 实时先收到同一条
+    send(dup);
+    await waitFor(() => expect(screen.getByTestId("notice-unread")).toBeDefined());
+
+    await user.click(screen.getByTestId("notice-bell"));
+    const items = screen.getAllByTestId("notice-item");
+    expect(items).toHaveLength(1);
+    expect(within(items[0]).queryByTestId("notice-count")).toBeNull();
+
+    listSpy.mockRestore();
+  });
+
+  it("回放本身失败也要说出来", async () => {
+    const listSpy = vi
+      .spyOn(api, "listNotices")
+      .mockRejectedValue(new Error("backlog unavailable"));
+
+    render(<App preloaded={preloaded} />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.getAttribute("data-code")).toBe("notice-replay-failed");
+    expect(alert.textContent).toContain("backlog unavailable");
+
+    listSpy.mockRestore();
+  });
+
   it("通知通道本身建不起来也要说出来", async () => {
     subSpy.mockImplementation(
       (_onNotice: (n: NoticeDto) => void, onError?: (e: unknown) => void) => {

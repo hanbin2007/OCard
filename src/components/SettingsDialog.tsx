@@ -6,10 +6,20 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import type { UpdateCheckResult } from "../api/types";
 import * as api from "../api";
 import { validateWorkstation } from "../lib/validation";
 import { useStore } from "../state/store";
 import { Field } from "./ui";
+
+/** 检查更新的结果文案；失败一律引导去通知中心看详情，不静默 */
+const UPDATE_RESULT_TEXT: Record<UpdateCheckResult, string> = {
+  uptodate: "已是最新",
+  ready: "更新已就绪，重启生效",
+  failed: "更新失败，详见通知",
+  "check-failed": "检查失败，详见通知",
+  unsupported: "当前安装方式不支持自动更新",
+};
 
 export function SettingsDialog() {
   const { state, dispatch } = useStore();
@@ -22,6 +32,10 @@ export function SettingsDialog() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const operatorRef = useRef<HTMLInputElement>(null);
 
+  const [version, setVersion] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
+
   // 每次打开都以当前配置为准重置表单
   useEffect(() => {
     if (!settingsOpen) return;
@@ -31,6 +45,38 @@ export function SettingsDialog() {
     setSaveError(null);
     operatorRef.current?.focus();
   }, [settingsOpen, workstation]);
+
+  // 打开时取一次版本号
+  useEffect(() => {
+    if (!settingsOpen) return;
+    let cancelled = false;
+    setUpdateResult(null);
+    void (async () => {
+      try {
+        const v = await api.getAppVersion();
+        if (!cancelled) setVersion(v);
+      } catch {
+        if (!cancelled) setVersion(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [settingsOpen]);
+
+  async function checkUpdate() {
+    if (checking) return;
+    setChecking(true);
+    setUpdateResult(null);
+    try {
+      setUpdateResult(await api.checkForUpdate());
+    } catch {
+      // 具体原因由后端经 app://notice 推送到通知中心
+      setUpdateResult("check-failed");
+    } finally {
+      setChecking(false);
+    }
+  }
 
   useEffect(() => {
     if (!settingsOpen) return;
@@ -117,6 +163,35 @@ export function SettingsDialog() {
               onChange={(e) => setNasRoot(e.currentTarget.value)}
             />
           </Field>
+
+          <div className="settings-about">
+            <div className="settings-about__head">
+              <span className="field__label">关于与更新</span>
+              <span className="settings-about__version" data-testid="settings-version">
+                {version ? `v${version}` : "版本获取中…"}
+              </span>
+            </div>
+            <div className="row-inline">
+              <button
+                type="button"
+                className="btn btn--sm"
+                data-testid="settings-check-update"
+                disabled={checking}
+                onClick={checkUpdate}
+              >
+                {checking ? "检查中…" : "检查更新"}
+              </button>
+              {updateResult ? (
+                <span
+                  className="text-xs muted"
+                  data-testid="settings-update-result"
+                  role="status"
+                >
+                  {UPDATE_RESULT_TEXT[updateResult]}
+                </span>
+              ) : null}
+            </div>
+          </div>
 
           {saveError ? (
             <span className="field__error" role="alert">

@@ -31,6 +31,7 @@ import type {
   CopyTaskPreview,
   FolderNode,
   NoticeDto,
+  UpdateCheckResult,
   NewCameraInput,
   NewProjectInput,
   NewStorageCardInput,
@@ -45,6 +46,7 @@ import type {
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 
 /** 运行在 Tauri 里时走真实 IPC;浏览器/vitest 环境回退 mock */
 const IS_TAURI =
@@ -451,4 +453,29 @@ export function subscribeNotices(
   }
   // 浏览器/测试环境没有后端推送；测试通过 spy 注入通知
   return () => {};
+}
+
+/**
+ * 拉取后端积压的通知（启动早期发出的那些，订阅建立前就已产生）。
+ * 不这样回放一次就会丢信——而丢信正是「静默 fail-open」的一种。
+ */
+export function listNotices(): Promise<NoticeDto[]> {
+  if (IS_TAURI) return ipc("list_notices");
+  return reply([]);
+}
+
+/* ------------------------------------------------------------------ *
+ * 关于与更新
+ * ------------------------------------------------------------------ */
+
+/** 当前应用版本 */
+export function getAppVersion(): Promise<string> {
+  if (IS_TAURI) return getVersion();
+  return reply("0.1.0");
+}
+
+/** 手动检查更新；失败详情由后端经 app://notice 推送 */
+export function checkForUpdate(): Promise<UpdateCheckResult> {
+  if (IS_TAURI) return ipc("check_for_update");
+  return reply("uptodate");
 }

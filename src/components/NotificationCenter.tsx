@@ -2,8 +2,8 @@
  * 通知中心。
  *
  * 硬性原则：任何 fail-open（降级、跳过、兜底）都必须让用户看见。
- * - error：立刻以非侵入横幅呈现，**不自动消失**，必须手动确认；role="alert"
- * - warning：同样即时可见，数秒后自动收进铃铛；aria-live="polite"
+ * - error：立刻以非侵入横幅呈现，**不自动消失**，必须逐条手动确认；role="alert"
+ * - warning / info：同样即时可见，数秒后自动收进铃铛；aria-live="polite"
  * - 同 code 连续重复折叠成一条并计数（×N），不刷屏
  * - 对**未知 code 通用呈现**：后端随时会加新 code，前端不做白名单
  */
@@ -11,10 +11,11 @@
 import { useEffect, useRef } from "react";
 import { IconBell, IconClose } from "./Icon";
 import { formatTimestamp } from "../lib/format";
+import type { NoticeLevel } from "../api/types";
 import { useStore, type NoticeEntry } from "../state/store";
 
-/** warning 在即时呈现区停留多久后自动收进铃铛 */
-const WARNING_AUTO_HIDE_MS = 6000;
+/** warning / info 在即时呈现区停留多久后自动收进铃铛（error 永不自动收起） */
+const AUTO_HIDE_MS = 6000;
 
 /** 已知 code 的中文抬头；未知 code 一律回落到通用抬头 */
 const NOTICE_TITLES: Record<string, string> = {
@@ -26,11 +27,19 @@ const NOTICE_TITLES: Record<string, string> = {
   "rebuild-manifest-unreadable": "部分任务清单不可读",
   "progress-listen-failed": "进度监听未能建立",
   "notice-listen-failed": "通知通道未能建立",
+  "notice-replay-failed": "启动通知回放失败",
+  "update-ready": "更新已就绪",
 };
 
 /** 未知 code 也要有体面的抬头，不能露出空白 */
+const FALLBACK_TITLES: Record<NoticeLevel, string> = {
+  error: "发生错误",
+  warning: "降级提示",
+  info: "提示",
+};
+
 function noticeTitle(entry: NoticeEntry): string {
-  return NOTICE_TITLES[entry.code] ?? (entry.level === "error" ? "发生错误" : "降级提示");
+  return NOTICE_TITLES[entry.code] ?? FALLBACK_TITLES[entry.level];
 }
 
 /* ------------------------------------------------------------------ *
@@ -42,11 +51,11 @@ function NoticeBanner({ entry }: { entry: NoticeEntry }) {
   const isError = entry.level === "error";
 
   useEffect(() => {
-    // error 不自动消失：必须由用户确认，避免降级被一晃而过地忽略
+    // error 不自动消失：必须由用户逐条确认，避免降级被一晃而过地忽略
     if (isError) return;
     const timer = setTimeout(
       () => dispatch({ type: "noticeToastDismissed", id: entry.id }),
-      WARNING_AUTO_HIDE_MS,
+      AUTO_HIDE_MS,
     );
     return () => clearTimeout(timer);
   }, [isError, entry.id, entry.count, dispatch]);
@@ -75,8 +84,14 @@ function NoticeBanner({ entry }: { entry: NoticeEntry }) {
         type="button"
         className="btn btn--ghost btn--icon btn--sm"
         data-testid="notice-toast-ack"
-        aria-label={isError ? "我知道了" : "收起提示"}
-        onClick={() => dispatch({ type: "noticeToastDismissed", id: entry.id })}
+        aria-label={isError ? `确认 ${entry.code}` : "收起提示"}
+        onClick={() =>
+          dispatch(
+            isError
+              ? { type: "noticeAcknowledged", id: entry.id }
+              : { type: "noticeToastDismissed", id: entry.id },
+          )
+        }
       >
         <IconClose />
       </button>
@@ -106,7 +121,8 @@ export function NoticeBell() {
   const { state, dispatch } = useStore();
   const { notices, noticesOpen } = state;
   const unread = notices.filter((n) => !n.read).length;
-  const hasError = notices.some((n) => n.level === "error");
+  // 只有尚未确认的 error 才让徽标转红
+  const hasError = notices.some((n) => n.level === "error" && !n.read);
   const wrapRef = useRef<HTMLDivElement>(null);
 
   // 点外部/Esc 关闭
@@ -194,6 +210,19 @@ export function NoticeBell() {
                     <p className="notice-item__message">{entry.message}</p>
                     <code className="notice-item__code">{entry.code}</code>
                   </div>
+                  <div className="notice-item__actions">
+                  {entry.level === "error" && !entry.read ? (
+                    <button
+                      type="button"
+                      className="btn btn--sm"
+                      data-testid="notice-ack"
+                      onClick={() =>
+                        dispatch({ type: "noticeAcknowledged", id: entry.id })
+                      }
+                    >
+                      确认
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     className="btn btn--ghost btn--icon btn--sm"
@@ -203,6 +232,7 @@ export function NoticeBell() {
                   >
                     <IconClose />
                   </button>
+                  </div>
                 </div>
               ))
             )}
