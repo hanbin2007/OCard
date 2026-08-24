@@ -101,7 +101,8 @@ jobs:
       # CI 只验证打包链路;updater 工件需签名私钥,仅在 Release 工作流生成,
       # 私钥不进普通 CI(暴露面最小化)
       - name: Build Tauri bundles
-        run: pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        # 用文件而非内联 JSON:Windows pwsh 会吞内联引号
+        run: pnpm tauri build --config src-tauri/ci-no-updater.conf.json
 
       - name: Upload bundles
         uses: actions/upload-artifact@v7
