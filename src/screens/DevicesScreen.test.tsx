@@ -21,7 +21,7 @@ const preloaded = {
 };
 
 function codePreview() {
-  return screen.getByTestId("camera-code-preview").textContent;
+  return screen.getByTestId("dev-code-preview").textContent;
 }
 
 describe("设备登记", () => {

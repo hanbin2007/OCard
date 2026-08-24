@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { NewProjectInput } from "../api/types";
 import {
+  isAbsoluteNasRoot,
   validateNewCamera,
   validateNewProject,
   validateStartCopy,
+  validateWorkstation,
 } from "./validation";
 
 function project(overrides: Partial<NewProjectInput> = {}): NewProjectInput {
@@ -179,5 +181,59 @@ describe("validateStartCopy", () => {
     const result = validateStartCopy({ ...base, volumeId: "", cameraId: "" });
     expect(result.errors.volumeId).toBeTruthy();
     expect(result.errors.cameraId).toBeTruthy();
+  });
+});
+
+describe("isAbsoluteNasRoot", () => {
+  it("认 macOS / Linux 挂载点", () => {
+    expect(isAbsoluteNasRoot("/Volumes/DIT-NAS")).toBe(true);
+    expect(isAbsoluteNasRoot("/mnt/nas/projects")).toBe(true);
+  });
+
+  it("认 Windows 盘符与 UNC", () => {
+    expect(isAbsoluteNasRoot("Z:\\Projects")).toBe(true);
+    expect(isAbsoluteNasRoot("Z:/Projects")).toBe(true);
+    expect(isAbsoluteNasRoot("\\\\nas\\projects")).toBe(true);
+  });
+
+  it("拒绝相对路径与空值", () => {
+    expect(isAbsoluteNasRoot("Projects/校运会")).toBe(false);
+    expect(isAbsoluteNasRoot("./nas")).toBe(false);
+    expect(isAbsoluteNasRoot("   ")).toBe(false);
+    expect(isAbsoluteNasRoot("Z:")).toBe(false);
+  });
+});
+
+describe("validateWorkstation", () => {
+  it("操作人 + 绝对路径齐全时通过", () => {
+    const result = validateWorkstation({
+      operator: "张涵斌",
+      nasRoot: "/Volumes/DIT-NAS/Projects",
+    });
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual({});
+  });
+
+  it("操作人为空被拦下（审计日志要按操作人留痕）", () => {
+    const result = validateWorkstation({ operator: "  ", nasRoot: "/Volumes/NAS" });
+    expect(result.valid).toBe(false);
+    expect(result.errors.operator).toContain("操作人");
+  });
+
+  it("操作人超长被拦下", () => {
+    const result = validateWorkstation({
+      operator: "名".repeat(21),
+      nasRoot: "/Volumes/NAS",
+    });
+    expect(result.errors.operator).toContain("20");
+  });
+
+  it("NAS 根路径为空或非绝对路径被拦下", () => {
+    expect(
+      validateWorkstation({ operator: "张三", nasRoot: "" }).errors.nasRoot,
+    ).toBeTruthy();
+    expect(
+      validateWorkstation({ operator: "张三", nasRoot: "nas/projects" }).errors.nasRoot,
+    ).toContain("绝对路径");
   });
 });

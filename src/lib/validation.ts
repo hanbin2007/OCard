@@ -146,6 +146,51 @@ export function validateNewCamera(
   return { valid: Object.keys(errors).length === 0, errors };
 }
 
+export const OPERATOR_NAME_MAX = 20;
+
+export interface WorkstationErrors {
+  operator?: string;
+  nasRoot?: string;
+}
+
+/**
+ * NAS 根路径是否是一个绝对路径。三平台形式都要认（PRD §6.5）：
+ * - macOS / Linux 挂载点：`/Volumes/DIT-NAS`、`/mnt/nas`
+ * - Windows 盘符：`Z:\Projects`、`Z:/Projects`
+ * - Windows UNC：`\\nas\projects`
+ */
+export function isAbsoluteNasRoot(path: string): boolean {
+  const p = path.trim();
+  if (!p) return false;
+  if (p.startsWith("//") || p.startsWith("\\\\")) return true; // UNC
+  if (p.startsWith("/")) return true; // POSIX
+  return /^[A-Za-z]:[\\/]/.test(p); // 盘符
+}
+
+/** 工作站设置校验：操作人 + NAS 根路径 */
+export function validateWorkstation(input: {
+  operator: string;
+  nasRoot: string;
+}): ValidationResult<WorkstationErrors> {
+  const errors: WorkstationErrors = {};
+
+  const operator = input.operator.trim();
+  if (!operator) {
+    errors.operator = "请填写操作人（DIT 名），审计日志按此留痕";
+  } else if (operator.length > OPERATOR_NAME_MAX) {
+    errors.operator = `操作人不超过 ${OPERATOR_NAME_MAX} 个字符`;
+  }
+
+  const nasRoot = input.nasRoot.trim();
+  if (!nasRoot) {
+    errors.nasRoot = "请填写 NAS 根路径";
+  } else if (!isAbsoluteNasRoot(nasRoot)) {
+    errors.nasRoot = "请填写绝对路径，如 /Volumes/DIT-NAS 或 Z:\\Projects";
+  }
+
+  return { valid: Object.keys(errors).length === 0, errors };
+}
+
 /** 拷卡任务发起前的双确认校验（PRD §5.3） */
 export interface StartCopyErrors {
   volumeId?: string;

@@ -256,7 +256,11 @@ export function CopyTaskScreen() {
                         <span className="field__label" id="volume-group-label">
                           源卷
                         </span>
-                        <div role="radiogroup" aria-labelledby="volume-group-label">
+                        <div
+                          role="radiogroup"
+                          data-testid="copy-volume-select"
+                          aria-labelledby="volume-group-label"
+                        >
                           {volumes.map((v) => {
                             const matched = state.cards.find(
                               (c) => c.id === v.matchedCardId,
@@ -265,6 +269,7 @@ export function CopyTaskScreen() {
                               <button
                                 key={v.id}
                                 type="button"
+                                data-testid="copy-volume-option"
                                 className="volume-row"
                                 role="radio"
                                 aria-label={`选择源卷 ${v.name}`}
@@ -307,6 +312,7 @@ export function CopyTaskScreen() {
                       >
                         <select
                           id="copy-camera"
+                          data-testid="copy-camera-select"
                           className="select"
                           value={cameraId}
                           onChange={(e) => setCameraId(e.currentTarget.value)}
@@ -366,6 +372,7 @@ export function CopyTaskScreen() {
                       >
                         <textarea
                           id="copy-note"
+                          data-testid="copy-note"
                           className="textarea"
                           value={note}
                           placeholder="如：上午田赛，含 4×100 决赛全程"
@@ -443,7 +450,11 @@ export function CopyTaskScreen() {
                         </div>
                       </div>
 
-                      <button type="submit" className="btn btn--primary">
+                      <button
+                        type="submit"
+                        data-testid="copy-start"
+                        className="btn btn--primary"
+                      >
                         开始拷卡
                       </button>
                     </form>

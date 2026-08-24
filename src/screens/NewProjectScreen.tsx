@@ -118,6 +118,7 @@ export function NewProjectScreen() {
             <button
               type="submit"
               form={FORM_ID}
+              data-testid="np-submit"
               className="btn btn--primary btn--pill"
               disabled={busy}
             >
@@ -152,6 +153,7 @@ export function NewProjectScreen() {
                     >
                       <input
                         id="project-date"
+                        data-testid="np-date"
                         className={`input input--mono${showErrors && errors.date ? " input--invalid" : ""}`}
                         type="date"
                         value={isoDate}
@@ -167,6 +169,7 @@ export function NewProjectScreen() {
                     >
                       <input
                         id="project-name"
+                        data-testid="np-name"
                         className={`input${showErrors && errors.name ? " input--invalid" : ""}`}
                         type="text"
                         value={name}
@@ -196,6 +199,7 @@ export function NewProjectScreen() {
                       <button
                         key={value}
                         type="button"
+                        data-testid={`np-scenario-${value.toLowerCase()}`}
                         className="choice"
                         role="radio"
                         aria-checked={scenario === value}
@@ -241,6 +245,7 @@ export function NewProjectScreen() {
                               <span className="category-row__index">{displayIndex}.</span>
                               <input
                                 id={category.id}
+                                data-testid="np-category-input"
                                 className={`input${itemError ? " input--invalid" : ""}`}
                                 type="text"
                                 value={category.value}

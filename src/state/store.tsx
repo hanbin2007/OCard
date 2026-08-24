@@ -42,6 +42,8 @@ export interface AppState {
   tasks: CopyTask[];
   selectedProjectId: string | null;
   selectedTaskId: string | null;
+  /** 工作站设置对话框是否打开 */
+  settingsOpen: boolean;
 }
 
 type BootstrapPayload = Pick<
@@ -62,7 +64,10 @@ export type AppAction =
   | { type: "cardCreated"; card: StorageCard }
   | { type: "cardRemoved"; cardId: string }
   | { type: "taskStarted"; task: CopyTask }
-  | { type: "taskProgress"; event: CopyProgressEvent };
+  | { type: "taskProgress"; event: CopyProgressEvent }
+  | { type: "settingsOpened" }
+  | { type: "settingsClosed" }
+  | { type: "workstationUpdated"; workstation: WorkstationInfo };
 
 export const initialState: AppState = {
   route: "projects",
@@ -76,6 +81,7 @@ export const initialState: AppState = {
   tasks: [],
   selectedProjectId: null,
   selectedTaskId: null,
+  settingsOpen: false,
 };
 
 /** 把增量事件合并进文件列表；未在事件里出现的文件保持原样 */
@@ -189,6 +195,15 @@ export function reducer(state: AppState, action: AppAction): AppState {
         }),
       };
     }
+
+    case "settingsOpened":
+      return { ...state, settingsOpen: true };
+
+    case "settingsClosed":
+      return { ...state, settingsOpen: false };
+
+    case "workstationUpdated":
+      return { ...state, workstation: action.workstation, settingsOpen: false };
 
     default:
       return state;

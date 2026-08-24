@@ -127,6 +127,7 @@ export function DevicesScreen() {
                     >
                       <input
                         id="cam-model"
+                        data-testid="dev-model"
                         className="input"
                         type="text"
                         value={model}
@@ -145,6 +146,7 @@ export function DevicesScreen() {
                       >
                         <input
                           id="cam-position"
+                          data-testid="dev-position"
                           className="input input--mono"
                           type="text"
                           maxLength={1}
@@ -167,6 +169,7 @@ export function DevicesScreen() {
                       >
                         <input
                           id="cam-alias"
+                          data-testid="dev-alias"
                           className="input input--mono"
                           type="text"
                           maxLength={4}
@@ -192,7 +195,7 @@ export function DevicesScreen() {
                       <span className="code-preview__label">规范编码预览</span>
                       <span
                         className={`code-preview__value${code ? "" : " code-preview__value--empty"}`}
-                        data-testid="camera-code-preview"
+                        data-testid="dev-code-preview"
                       >
                         {code || "型号_机位_代称"}
                       </span>
@@ -204,7 +207,11 @@ export function DevicesScreen() {
                       </p>
                     ) : null}
 
-                    <button type="submit" className="btn btn--primary">
+                    <button
+                      type="submit"
+                      data-testid="dev-submit"
+                      className="btn btn--primary"
+                    >
                       登记相机
                     </button>
                   </form>
@@ -319,7 +326,11 @@ export function DevicesScreen() {
                     <span />
                   </div>
                   {cameras.map((camera) => (
-                    <div className="list__row cameras__row" key={camera.id}>
+                    <div
+                      className="list__row cameras__row"
+                      data-testid="camera-row"
+                      key={camera.id}
+                    >
                       <span className="projects__name truncate">
                         {camera.model}
                         <span className="projects__folder">{camera.code}</span>

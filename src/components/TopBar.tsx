@@ -1,6 +1,8 @@
-/** 主区顶部极简标题栏：标题 + 次要信息 + 右侧动作。 */
+/** 主区顶部极简标题栏：标题 + 次要信息 + 右侧动作 + 设置入口。 */
 
 import type { ReactNode } from "react";
+import { IconSettings } from "./Icon";
+import { useStore } from "../state/store";
 
 export function TopBar({
   title,
@@ -14,13 +16,28 @@ export function TopBar({
   subtitleMono?: boolean;
   actions?: ReactNode;
 }) {
+  const { dispatch } = useStore();
+
   return (
     <div className="topbar">
       <h1 className="topbar__title">{title}</h1>
       {subtitle ? (
         <span className={`topbar__sub${subtitleMono ? " mono" : ""}`}>{subtitle}</span>
       ) : null}
-      {actions ? <div className="topbar__actions">{actions}</div> : null}
+      <div className="topbar__actions">
+        {actions}
+        {/* 设置入口常驻：首跑没配 NAS 时也要够得着 */}
+        <button
+          type="button"
+          data-testid="settings-open"
+          className="btn btn--ghost btn--icon"
+          aria-label="工作站设置"
+          title="工作站设置"
+          onClick={() => dispatch({ type: "settingsOpened" })}
+        >
+          <IconSettings />
+        </button>
+      </div>
     </div>
   );
 }

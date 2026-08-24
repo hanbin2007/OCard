@@ -659,6 +659,14 @@
   margin-top: var(--space-5);
 }
 
+.dialog__form {
+  margin-top: var(--space-5);
+}
+
+.dialog__form .dialog__actions {
+  margin-top: var(--space-1);
+}
+
 .btn--danger-solid {
   background: var(--danger);
   border-color: var(--danger);

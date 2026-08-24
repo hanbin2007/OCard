@@ -79,6 +79,7 @@ export function Sidebar() {
               <li key={route}>
                 <button
                   type="button"
+                  data-testid={`nav-${route}`}
                   className="nav-item"
                   aria-current={state.route === route ? "page" : undefined}
                   onClick={() => dispatch({ type: "navigate", route })}

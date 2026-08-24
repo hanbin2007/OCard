@@ -72,6 +72,7 @@ export function ProjectsScreen() {
                     <div
                       key={project.id}
                       className="list__row projects__row"
+                      data-testid="project-row"
                       {...nav.getItemProps(project.id)}
                     >
                       <span className="projects__name truncate" title={project.name}>

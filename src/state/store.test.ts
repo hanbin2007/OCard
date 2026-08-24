@@ -198,6 +198,25 @@ describe("reducer", () => {
     expect(next.tasks[0].destinations[0].state).toBe("done");
   });
 
+  it("设置对话框开合，保存后写回工作站并自动关闭", () => {
+    const opened = reducer(initialState, { type: "settingsOpened" });
+    expect(opened.settingsOpen).toBe(true);
+
+    const closed = reducer(opened, { type: "settingsClosed" });
+    expect(closed.settingsOpen).toBe(false);
+
+    const saved = reducer(opened, {
+      type: "workstationUpdated",
+      workstation: {
+        machineId: "WS-1",
+        operator: "李默",
+        nasRoot: "/Volumes/NAS2",
+      },
+    });
+    expect(saved.workstation?.operator).toBe("李默");
+    expect(saved.settingsOpen).toBe(false);
+  });
+
   it("bootstrap 失败落到错误态，重新加载时清掉错误", () => {
     const failed = reducer(initialState, { type: "loadFailed", error: "NAS 未挂载" });
     expect(failed.loading).toBe(false);

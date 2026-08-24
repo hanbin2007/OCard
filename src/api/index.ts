@@ -72,6 +72,24 @@ export function getWorkstationInfo(): Promise<WorkstationInfo> {
   return reply(mockWorkstation);
 }
 
+/**
+ * 保存本机的操作人与 NAS 根路径。
+ * 操作人会随每条审计事件落盘（PRD §5.10），NAS 根路径是本机私有配置
+ * （项目状态内只存相对路径，各机路径形式不同不影响互通，PRD §6.3）。
+ */
+export function setWorkstationInfo(
+  operator: string,
+  nasRoot: string,
+): Promise<WorkstationInfo> {
+  if (IS_TAURI) return ipc("set_workstation_info", { operator, nasRoot });
+  // mock 回退：就地更新，后续 getWorkstationInfo 能读到同一份
+  Object.assign(mockWorkstation, {
+    operator: operator.trim(),
+    nasRoot: nasRoot.trim(),
+  });
+  return reply({ ...mockWorkstation });
+}
+
 /* ------------------------------------------------------------------ *
  * 项目
  * ------------------------------------------------------------------ */
