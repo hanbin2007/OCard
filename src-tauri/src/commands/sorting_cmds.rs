@@ -84,7 +84,7 @@ impl Drop for DeliveryGuard<'_> {
 }
 
 /// fsx 最后回退(检查+改名)被使用过:发一次性告警(零静默,复验轮二 P1)。
-pub(crate) fn notify_if_unsafe_fallback(app: &AppHandle) {
+pub(crate) fn notify_if_unsafe_fallback<R: tauri::Runtime>(app: &AppHandle<R>) {
     if crate::core::fsx::take_unsafe_fallback_flag() {
         notify::warn(
             app,
@@ -221,7 +221,7 @@ fn inbox_fingerprint(files: &[InboxFile]) -> u64 {
 #[derive(Default)]
 pub struct IndexManager(pub Mutex<HashMap<String, IndexState>>);
 
-fn emit_index_progress(app: &AppHandle, project_id: &str, st: &IndexState) {
+fn emit_index_progress<R: tauri::Runtime>(app: &AppHandle<R>, project_id: &str, st: &IndexState) {
     let _ = app.emit(
         INDEX_EVENT,
         &IndexProgressEventDto {
@@ -240,7 +240,12 @@ fn emit_index_progress(app: &AppHandle, project_id: &str, st: &IndexState) {
 }
 
 /// 需要时启动该项目的后台索引线程(幂等:已在跑则不重复)。
-fn ensure_indexing(app: &AppHandle, project_id: &str, project_root: &Path, files: &[InboxFile]) {
+fn ensure_indexing<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    project_id: &str,
+    project_root: &Path,
+    files: &[InboxFile],
+) {
     // 空清单不 spawn 线程:没活可干还发 0/0 事件纯属浪费(复验 P2)
     if files.is_empty() {
         return;
@@ -420,8 +425,8 @@ fn asset_dto(project_root: &Path, rel: &str, size: u64, mtime: u128) -> SortingA
 }
 
 #[tauri::command]
-pub fn list_pending_assets(
-    app: AppHandle,
+pub fn list_pending_assets<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     project_id: String,
     offset: usize,
@@ -442,8 +447,8 @@ pub fn list_pending_assets(
 }
 
 #[tauri::command]
-pub fn list_categories(
-    app: AppHandle,
+pub fn list_categories<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     project_id: String,
 ) -> CmdResult<Vec<SortingCategoryDto>> {
@@ -483,8 +488,8 @@ fn bulk(outcomes: Vec<sorting::ItemOutcome>) -> BulkResultDto {
 
 /// 批量操作的审计事件(汇总一条,失败逐项列出)。
 #[allow(clippy::too_many_arguments)]
-fn audit_bulk(
-    app: &AppHandle,
+fn audit_bulk<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &State<AppState>,
     project_root: &Path,
     kind: &str,
@@ -510,8 +515,8 @@ fn audit_bulk(
 }
 
 #[tauri::command]
-pub fn move_assets(
-    app: AppHandle,
+pub fn move_assets<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     project_id: String,
     asset_ids: Vec<String>,
@@ -549,8 +554,8 @@ pub fn move_assets(
 }
 
 #[tauri::command]
-pub fn curate_assets(
-    app: AppHandle,
+pub fn curate_assets<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     project_id: String,
     asset_ids: Vec<String>,
@@ -572,8 +577,8 @@ pub fn curate_assets(
 }
 
 #[tauri::command]
-pub fn trash_assets(
-    app: AppHandle,
+pub fn trash_assets<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     project_id: String,
     asset_ids: Vec<String>,
@@ -616,8 +621,8 @@ pub fn trash_assets(
 }
 
 #[tauri::command]
-pub fn list_trash(
-    app: AppHandle,
+pub fn list_trash<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     project_id: String,
 ) -> CmdResult<Vec<TrashEntryDto>> {
@@ -660,8 +665,8 @@ pub fn list_trash(
 }
 
 #[tauri::command]
-pub fn restore_from_trash(
-    app: AppHandle,
+pub fn restore_from_trash<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     project_id: String,
     entry_ids: Vec<String>,
@@ -702,8 +707,8 @@ pub struct EmptyTrashResultDto {
 }
 
 #[tauri::command]
-pub fn empty_trash(
-    app: AppHandle,
+pub fn empty_trash<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     project_id: String,
 ) -> CmdResult<EmptyTrashResultDto> {
@@ -750,7 +755,10 @@ pub fn empty_trash(
 }
 
 #[tauri::command]
-pub fn indexing_status(app: AppHandle, project_id: String) -> IndexingStatusDto {
+pub fn indexing_status<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    project_id: String,
+) -> IndexingStatusDto {
     let mgr = app.state::<IndexManager>();
     let map = mgr.0.lock().unwrap();
     let st = map.get(&project_id).cloned().unwrap_or_default();
@@ -791,8 +799,8 @@ pub struct DeliverySummaryDto {
 /// 执行交付打包(PRD §5.7):半天分包、复制不动原件、清单落盘;
 /// 上传与发链接人工完成(既定边界)。重跑安全(零覆盖,已打包项报失败)。
 #[tauri::command]
-pub fn build_delivery(
-    app: AppHandle,
+pub fn build_delivery<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     project_id: String,
 ) -> CmdResult<DeliverySummaryDto> {
@@ -891,8 +899,8 @@ pub struct RemoteActivityDto {
 /// 其他工作站在本项目上进行中的拷卡(copy_started 无对应 copy_completed,24h 内)。
 /// 前端在拷卡屏轮询(约 10s),用于「避免重复拷同一张卡」。
 #[tauri::command]
-pub fn list_remote_activity(
-    app: AppHandle,
+pub fn list_remote_activity<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     project_id: String,
 ) -> CmdResult<Vec<RemoteActivityDto>> {

@@ -30,7 +30,7 @@ static LAST_CHECK_FAILED: AtomicBool = AtomicBool::new(false);
 pub struct PendingUpdate(pub Mutex<Option<(tauri_plugin_updater::Update, Vec<u8>)>>);
 
 /// 后台静默更新循环:启动即查一次,此后周期性检查。
-pub async fn silent_update_loop(app: AppHandle) {
+pub async fn silent_update_loop<R: tauri::Runtime>(app: AppHandle<R>) {
     loop {
         check_and_download(&app, false).await;
         tokio::time::sleep(CHECK_INTERVAL).await;
@@ -38,7 +38,7 @@ pub async fn silent_update_loop(app: AppHandle) {
 }
 
 /// 执行一次检查+静默下载(不安装)。`manual` 时无更新/失败也给反馈。
-pub async fn check_and_download(app: &AppHandle, manual: bool) -> String {
+pub async fn check_and_download<R: tauri::Runtime>(app: &AppHandle<R>, manual: bool) -> String {
     if IN_PROGRESS.swap(true, Ordering::SeqCst) {
         return "busy".into();
     }
@@ -47,7 +47,7 @@ pub async fn check_and_download(app: &AppHandle, manual: bool) -> String {
     result
 }
 
-async fn do_check_and_download(app: &AppHandle, manual: bool) -> String {
+async fn do_check_and_download<R: tauri::Runtime>(app: &AppHandle<R>, manual: bool) -> String {
     if let Some(pending) = app.try_state::<PendingUpdate>() {
         if pending.0.lock().unwrap().is_some() {
             return "ready".into();
@@ -107,14 +107,17 @@ async fn do_check_and_download(app: &AppHandle, manual: bool) -> String {
 
 /// 手动检查更新(设置界面「检查更新」按钮)。
 #[tauri::command]
-pub async fn check_for_update(app: AppHandle) -> Result<String, String> {
+pub async fn check_for_update<R: tauri::Runtime>(app: AppHandle<R>) -> Result<String, String> {
     Ok(check_and_download(&app, true).await)
 }
 
 /// 用户主动安装已下载的更新。有运行中拷卡任务时拒绝(安装会退出进程);
 /// 与检查/下载共用同一串行闸(codex 五轮:安装可与下载并发)。
 #[tauri::command]
-pub fn install_update(app: AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+pub fn install_update<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
     if IN_PROGRESS.swap(true, Ordering::SeqCst) {
         return Err("后台正在检查或下载更新,请稍候再试".into());
     }
@@ -123,7 +126,10 @@ pub fn install_update(app: AppHandle, state: tauri::State<AppState>) -> Result<(
     result
 }
 
-fn do_install(app: &AppHandle, state: &tauri::State<AppState>) -> Result<(), String> {
+fn do_install<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &tauri::State<AppState>,
+) -> Result<(), String> {
     if state.tasks.any_running() {
         return Err("有拷卡任务正在进行,安装更新会中断它们;请等任务完成或暂停后再更新".into());
     }

@@ -98,7 +98,7 @@ pub fn file_status_str(status: &copy::FileStatus) -> &'static str {
 }
 
 /// 启动(或续跑)一个任务的后台工作线程。
-pub fn spawn_worker(app: AppHandle, handle: Arc<TaskHandle>) {
+pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle>) {
     // 先清暂停标志再判 running:若旧 worker 还在跑且刚收到暂停请求,
     // 用户此刻点「继续」应让旧 worker 撤销暂停继续跑(评审 L19/P1-9)。
     handle.pause_requested.store(false, Ordering::SeqCst);
@@ -208,8 +208,8 @@ pub fn prepare_resume(
 
 /// journal 追加带重试;彻底失败时写本机 outbox 兜底,绝不静默丢审计(评审 P1-7)。
 /// 任何降级都向 UI 发用户可见通知(UX 原则:fail-open 不允许无提示)。
-pub fn append_audit(
-    app: &AppHandle,
+pub fn append_audit<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     project_root: &std::path::Path,
     outbox_dir: &std::path::Path,
     ev: &journal::Event,
@@ -254,7 +254,10 @@ pub fn append_audit(
     }
 }
 
-fn run_worker(app: &AppHandle, handle: &TaskHandle) -> crate::core::Result<()> {
+fn run_worker<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    handle: &TaskHandle,
+) -> crate::core::Result<()> {
     let mut m = manifest::load(&handle.project_root, &handle.manifest_id)?;
 
     let req = copy::CopyRequest {

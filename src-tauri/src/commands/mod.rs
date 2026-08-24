@@ -2,6 +2,8 @@
 //! 错误统一映射为字符串消息(前端 toast 展示)。
 
 pub mod dto;
+#[cfg(test)]
+mod integration_tests;
 pub mod notify;
 pub mod sorting_cmds;
 pub mod tasks;
@@ -33,7 +35,10 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 }
 
 /// 读配置并上报问题(零静默:业务路径的配置损坏/权限错误也必须可见,codex 五轮)。
-fn load_config(app: &AppHandle, state: &AppState) -> config::WorkstationConfig {
+fn load_config<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+) -> config::WorkstationConfig {
     let (cfg, problem) = config::load_checked(&state.config_dir);
     if let Some(msg) = problem {
         notify::warn(app, "workstation-config-degraded", msg);
@@ -41,13 +46,13 @@ fn load_config(app: &AppHandle, state: &AppState) -> config::WorkstationConfig {
     cfg
 }
 
-fn nas_root(app: &AppHandle, state: &AppState) -> CmdResult<PathBuf> {
+fn nas_root<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) -> CmdResult<PathBuf> {
     load_config(app, state)
         .nas_root
         .ok_or_else(|| "尚未配置 NAS 根路径,请先在设置中配置".to_string())
 }
 
-fn operator(app: &AppHandle, state: &AppState) -> String {
+fn operator<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) -> String {
     let op = load_config(app, state).operator;
     if op.is_empty() {
         "未登记DIT".to_string()
@@ -101,7 +106,10 @@ fn find_project(nas: &Path, project_id: &str) -> CmdResult<catalog::ProjectStats
 // ---------- 工作站 ----------
 
 #[tauri::command]
-pub fn get_workstation_info(app: AppHandle, state: State<AppState>) -> WorkstationInfoDto {
+pub fn get_workstation_info<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<AppState>,
+) -> WorkstationInfoDto {
     let (cfg, problem) = config::load_checked(&state.config_dir);
     if let Some(msg) = problem {
         notify::warn(&app, "workstation-config-degraded", msg);
@@ -117,8 +125,8 @@ pub fn get_workstation_info(app: AppHandle, state: State<AppState>) -> Workstati
 }
 
 #[tauri::command]
-pub fn set_workstation_info(
-    app: AppHandle,
+pub fn set_workstation_info<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     operator: String,
     nas_root: String,
@@ -138,7 +146,7 @@ pub fn set_workstation_info(
 // ---------- 项目 ----------
 
 /// 上报登记表 journal 健康度(UX 原则:容错跳过必须让用户看见)。
-fn notice_registry_health(app: &AppHandle, load: &registry::RegistryLoad) {
+fn notice_registry_health<R: tauri::Runtime>(app: &AppHandle<R>, load: &registry::RegistryLoad) {
     if load.skipped_lines > 0 || load.unreadable_files > 0 || load.skipped_payloads > 0 {
         notify::warn(
             app,
@@ -151,14 +159,17 @@ fn notice_registry_health(app: &AppHandle, load: &registry::RegistryLoad) {
     }
 }
 
-fn notice_catalog_warnings(app: &AppHandle, warnings: &[String]) {
+fn notice_catalog_warnings<R: tauri::Runtime>(app: &AppHandle<R>, warnings: &[String]) {
     for w in warnings {
         notify::warn(app, "project-meta-corrupt", w.clone());
     }
 }
 
 #[tauri::command]
-pub fn list_projects(app: AppHandle, state: State<AppState>) -> CmdResult<Vec<ProjectDto>> {
+pub fn list_projects<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<AppState>,
+) -> CmdResult<Vec<ProjectDto>> {
     let nas = nas_root(&app, &state)?;
     let running: Vec<String> = state
         .tasks
@@ -177,8 +188,8 @@ pub fn list_projects(app: AppHandle, state: State<AppState>) -> CmdResult<Vec<Pr
 }
 
 #[tauri::command]
-pub fn get_project(
-    app: AppHandle,
+pub fn get_project<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     project_id: String,
 ) -> CmdResult<Option<ProjectDto>> {
@@ -188,8 +199,8 @@ pub fn get_project(
 }
 
 #[tauri::command]
-pub fn create_project(
-    app: AppHandle,
+pub fn create_project<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     input: NewProjectInput,
 ) -> CmdResult<ProjectDto> {
@@ -255,15 +266,18 @@ pub fn preview_folder_tree(
 // ---------- 登记表 ----------
 
 #[tauri::command]
-pub fn list_cameras(app: AppHandle, state: State<AppState>) -> CmdResult<Vec<registry::CameraReg>> {
+pub fn list_cameras<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<AppState>,
+) -> CmdResult<Vec<registry::CameraReg>> {
     let load = registry::load(&nas_root(&app, &state)?).map_err(err)?;
     notice_registry_health(&app, &load);
     Ok(load.registry.cameras)
 }
 
 #[tauri::command]
-pub fn create_camera(
-    app: AppHandle,
+pub fn create_camera<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     input: NewCameraInput,
 ) -> CmdResult<registry::CameraReg> {
@@ -280,7 +294,11 @@ pub fn create_camera(
 }
 
 #[tauri::command]
-pub fn delete_camera(app: AppHandle, state: State<AppState>, camera_id: String) -> CmdResult<()> {
+pub fn delete_camera<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<AppState>,
+    camera_id: String,
+) -> CmdResult<()> {
     registry::delete_camera(
         &nas_root(&app, &state)?,
         &state.machine_id,
@@ -291,8 +309,8 @@ pub fn delete_camera(app: AppHandle, state: State<AppState>, camera_id: String) 
 }
 
 #[tauri::command]
-pub fn list_storage_cards(
-    app: AppHandle,
+pub fn list_storage_cards<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
 ) -> CmdResult<Vec<registry::StorageCard>> {
     let load = registry::load(&nas_root(&app, &state)?).map_err(err)?;
@@ -301,8 +319,8 @@ pub fn list_storage_cards(
 }
 
 #[tauri::command]
-pub fn create_storage_card(
-    app: AppHandle,
+pub fn create_storage_card<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     input: NewStorageCardInput,
 ) -> CmdResult<registry::StorageCard> {
@@ -319,8 +337,8 @@ pub fn create_storage_card(
 }
 
 #[tauri::command]
-pub fn delete_storage_card(
-    app: AppHandle,
+pub fn delete_storage_card<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     card_id: String,
 ) -> CmdResult<()> {
@@ -336,7 +354,10 @@ pub fn delete_storage_card(
 // ---------- 卷 ----------
 
 #[tauri::command]
-pub fn list_volumes(app: AppHandle, state: State<AppState>) -> Vec<VolumeDto> {
+pub fn list_volumes<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<AppState>,
+) -> Vec<VolumeDto> {
     // 卡匹配是增强信息:登记表读不到时降级为「不匹配」,但必须告知(零静默)
     let cards = match nas_root(&app, &state) {
         Err(_) => Vec::new(), // NAS 未配置:首跑正常态,引导页已在处理,不算降级
@@ -504,8 +525,8 @@ fn check_existing_target(dest_targets: &[PathBuf], confirmed: bool) -> CmdResult
 
 /// 解析一次拷卡任务的真实落盘目标(不落任何盘)。供前端双确认屏展示真值(评审 H6/P1-6)。
 #[tauri::command]
-pub fn preview_copy_task(
-    app: AppHandle,
+pub fn preview_copy_task<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     input: StartCopyInput,
 ) -> CmdResult<serde_json::Value> {
@@ -538,8 +559,8 @@ pub fn preview_copy_task(
 }
 
 #[tauri::command]
-pub fn start_copy_task(
-    app: AppHandle,
+pub fn start_copy_task<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     input: StartCopyInput,
 ) -> CmdResult<CopyTaskDto> {
@@ -680,7 +701,11 @@ pub fn pause_copy_task(state: State<AppState>, task_id: String) -> CmdResult<()>
 }
 
 #[tauri::command]
-pub fn resume_copy_task(app: AppHandle, state: State<AppState>, task_id: String) -> CmdResult<()> {
+pub fn resume_copy_task<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<AppState>,
+    task_id: String,
+) -> CmdResult<()> {
     let handle = state
         .tasks
         .get(&task_id)
@@ -754,7 +779,7 @@ pub fn resume_copy_task(app: AppHandle, state: State<AppState>, task_id: String)
 
 /// 启动时从各项目未完成的 manifest 重建 paused 任务(评审 H3/P0-3):
 /// 崩溃/重启后任务不再消失,可从任务列表续传。
-pub fn rebuild_tasks(app: &AppHandle, state: &AppState) {
+pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
     // 经统一入口:配置损坏/权限错误也要上报(codex 六轮:此处曾漏)
     let Some(nas) = load_config(app, state).nas_root else {
         return;
@@ -933,8 +958,8 @@ pub fn rebuild_tasks(app: &AppHandle, state: &AppState) {
 
 /// 单文件重试:失败文件在 manifest 中未验证,重跑任务即只补拷这些文件。
 #[tauri::command]
-pub fn retry_copy_file(
-    app: AppHandle,
+pub fn retry_copy_file<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<AppState>,
     task_id: String,
     _file_id: String,

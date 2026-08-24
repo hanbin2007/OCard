@@ -27,7 +27,12 @@ pub struct NoticeDto {
     pub repeats: Option<u32>,
 }
 
-pub fn emit_notice(app: &AppHandle, level: &'static str, code: &str, message: String) {
+pub fn emit_notice<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    level: &'static str,
+    code: &str,
+    message: String,
+) {
     eprintln!("[{level}] {code}: {message}");
     let mut dto = NoticeDto {
         level,
@@ -73,15 +78,15 @@ pub fn list_notices(state: tauri::State<super::AppState>) -> Vec<NoticeDto> {
     state.notices.lock().unwrap().clone()
 }
 
-pub fn warn(app: &AppHandle, code: &str, message: String) {
+pub fn warn<R: tauri::Runtime>(app: &AppHandle<R>, code: &str, message: String) {
     emit_notice(app, "warning", code, message);
 }
 
 #[allow(dead_code)]
-pub fn info(app: &AppHandle, code: &str, message: String) {
+pub fn info<R: tauri::Runtime>(app: &AppHandle<R>, code: &str, message: String) {
     emit_notice(app, "info", code, message);
 }
 
-pub fn error(app: &AppHandle, code: &str, message: String) {
+pub fn error<R: tauri::Runtime>(app: &AppHandle<R>, code: &str, message: String) {
     emit_notice(app, "error", code, message);
 }
