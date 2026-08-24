@@ -235,9 +235,9 @@ function ingestNotice(
   if (bucket.noticeKeys[key]) return bucket;
 
   const keys: Record<string, true> = { ...bucket.noticeKeys, [key]: true };
-  // 后端已在 30s 窗口内合并同 code，repeats 表示这一条代表了多少次；
-  // 缺省视为 1，避免把合并过的通知又数成一次
-  const occurrences = Math.max(1, notice.repeats ?? 1);
+  // repeats 是后端在 30s 窗口内的**累计值**（1→2→3），不是增量。
+  // 折叠时必须用它**替换**计数；当作增量累加会把 1,2,3 显示成 ×6。
+  const repeats = notice.repeats;
   const head = bucket.notices[0];
   if (head && head.code === notice.code && head.level === notice.level) {
     // 回放拿到的是**更旧**的同 code 告警时，只加计数、把窗口向前延伸，
@@ -245,7 +245,7 @@ function ingestNotice(
     const newer = isNewerThan(notice.occurredAt, head.lastAt);
     const merged: NoticeEntry = {
       ...head,
-      count: head.count + occurrences,
+      count: repeats !== undefined ? Math.max(1, repeats) : head.count + 1,
       firstAt: isNewerThan(head.firstAt, notice.occurredAt)
         ? notice.occurredAt
         : head.firstAt,
@@ -268,7 +268,7 @@ function ingestNotice(
     message: notice.message,
     firstAt: notice.occurredAt,
     lastAt: notice.occurredAt,
-    count: occurrences,
+    count: repeats !== undefined ? Math.max(1, repeats) : 1,
     read: false,
     live: options.live,
   };

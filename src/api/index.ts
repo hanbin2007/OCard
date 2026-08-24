@@ -524,11 +524,11 @@ export function checkForUpdate(): Promise<UpdateCheckResult> {
  * ------------------------------------------------------------------ */
 
 /** 后端对单页条数的硬上限；超出会被静默截断，所以客户端先夹住 */
-export const MAX_ASSET_PAGE_LIMIT = 500;
+export const MAX_ASSET_PAGE_LIMIT = 200;
 
 /**
  * 分页列出待分类素材（千张级，绝不一次全量过 IPC）。
- * limit 超过 500 时后端会截断，这里提前夹住——否则调用方会以为拿到了 600 条，
+ * limit 超过上限时后端会截断，这里提前夹住——否则调用方会以为拿到了更多，
  * 而按「已加载条数」推进的 offset 就会跳过中间那批。
  */
 export function listPendingAssets(
@@ -647,7 +647,8 @@ export function subscribeIndexProgress(
 
 /**
  * 按拍摄时间半天分包，**复制**出交付包并生成清单。
- * 零覆盖：重跑时已打包过的文件会出现在 failures 里，这是安全策略不是事故。
+ * 零覆盖：重跑时内容一致的文件计入 `alreadyDelivered`（verified-skip），
+ * 同名但内容不同的才作为 `name-collision` 进 failures（未交付，需人工核对）。
  * 上传网盘与发链接由人工完成，OCard 只负责打包与留痕。
  */
 export function buildDelivery(projectId: string): Promise<DeliverySummary> {

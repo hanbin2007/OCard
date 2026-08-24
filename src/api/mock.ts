@@ -451,7 +451,7 @@ export const mockIndexing: IndexingStatus = {
   missing: 2,
 };
 
-/** 交付打包 mock：两个半天包 + 一条「重跑已存在」的失败 */
+/** 交付打包 mock：两个半天包（fileCount/bytes 为包内实况总量）+ 一条同名冲突 */
 export const mockDelivery: DeliverySummary = {
   packages: [
     { name: "0824上午", fileCount: 412, bytes: 38 * 1024 ** 3 },

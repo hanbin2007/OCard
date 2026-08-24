@@ -142,6 +142,25 @@ describe("回收站", () => {
     list.mockRestore();
   });
 
+  it("#4 清空有失败时屏内明说「已保留可重试」，不只靠通知", async () => {
+    const user = userEvent.setup();
+    const empty = vi
+      .spyOn(api, "emptyTrash")
+      .mockResolvedValue({ removed: 1, failed: 2 });
+
+    render(<App preloaded={preloaded} />);
+    await screen.findAllByTestId("trash-row");
+
+    await user.click(screen.getByTestId("trash-empty"));
+    await user.click(screen.getByRole("button", { name: "永久删除" }));
+
+    const box = await screen.findByTestId("trash-empty-failed");
+    expect(box.getAttribute("role")).toBe("alert");
+    expect(box.textContent).toContain("2 个文件删除失败");
+    expect(box.textContent).toContain("已保留在回收站");
+    empty.mockRestore();
+  });
+
   it("回收站为空时禁用清空按钮", async () => {
     const spy = vi.spyOn(api, "listTrash").mockResolvedValue([]);
     render(<App preloaded={preloaded} />);

@@ -1,6 +1,13 @@
 /** 交付打包：确认流程、结果面板、重跑文案、部分失败的界面内可见性。 */
 
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
@@ -39,6 +46,78 @@ describe("交付打包", () => {
     expect(dialog.textContent).toContain("上传网盘与发送链接仍需人工完成");
     // 确认前绝不动手
     expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("#4 确认文案提醒打包期间勿分类", async () => {
+    const user = await openWorkbench();
+    await user.click(screen.getByTestId("delivery-open"));
+    expect(screen.getByRole("alertdialog").textContent).toContain(
+      "打包期间请勿在任何工作站进行分类操作",
+    );
+  });
+
+  it("#4 打包期间禁用分类操作并给出提示", async () => {
+    const user = await openWorkbench();
+    let finish: ((s: DeliverySummary) => void) | undefined;
+    const spy = vi
+      .spyOn(api, "buildDelivery")
+      .mockImplementation(
+        () =>
+          new Promise<DeliverySummary>((resolve) => {
+            finish = resolve;
+          }),
+      );
+
+    await user.click(screen.getByTestId("delivery-open"));
+    await user.click(screen.getByRole("button", { name: "开始打包" }));
+
+    await screen.findByTestId("sorting-delivery-lock");
+    const chip = screen
+      .getAllByTestId("sorting-category")
+      .find((c) => c.getAttribute("data-category") === "cat-1") as HTMLButtonElement;
+    expect(chip.disabled).toBe(true);
+
+    await act(async () => {
+      finish?.(mockDelivery);
+    });
+    await waitFor(() =>
+      expect(screen.queryByTestId("sorting-delivery-lock")).toBeNull(),
+    );
+    spy.mockRestore();
+  });
+
+  it("#4 表头说明包内为实况总量", async () => {
+    const user = await openWorkbench();
+    await user.click(screen.getByTestId("delivery-open"));
+    await user.click(screen.getByRole("button", { name: "开始打包" }));
+    await screen.findByTestId("delivery-result");
+
+    expect(screen.getByTestId("delivery-package-note").textContent).toContain(
+      "当前实况",
+    );
+    expect(screen.getByTestId("delivery-total").textContent).toContain("本次新交付");
+  });
+
+  it("#4 失败超过 8 条时指向交付总清单，而不是通知中心", async () => {
+    const user = await openWorkbench();
+    const spy = vi.spyOn(api, "buildDelivery").mockResolvedValue({
+      ...mockDelivery,
+      alreadyDelivered: 0,
+      failures: Array.from({ length: 12 }, (_, i) => ({
+        assetId: `5. 其他/DSC_${i}.JPG`,
+        message: "磁盘写满",
+        kind: "error" as const,
+      })),
+    });
+
+    await user.click(screen.getByTestId("delivery-open"));
+    await user.click(screen.getByRole("button", { name: "开始打包" }));
+    await screen.findByTestId("delivery-result");
+
+    const hint = screen.getByTestId("delivery-more-hint");
+    expect(hint.textContent).toContain("交付总清单.txt");
+    expect(hint.textContent).not.toContain("通知中心");
     spy.mockRestore();
   });
 

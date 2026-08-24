@@ -5,10 +5,10 @@ import { listPendingAssets, MAX_ASSET_PAGE_LIMIT } from "./index";
 import { mockPendingAssets } from "./mock";
 
 describe("listPendingAssets 分页", () => {
-  it("limit 超过后端上限 500 时被夹住，不会误以为拿到了更多", async () => {
+  it("limit 超过后端上限 200 时被夹住，不会误以为拿到了更多", async () => {
     const page = await listPendingAssets("p-1", 0, 600);
-    expect(MAX_ASSET_PAGE_LIMIT).toBe(500);
-    expect(page.items).toHaveLength(500);
+    expect(MAX_ASSET_PAGE_LIMIT).toBe(200);
+    expect(page.items).toHaveLength(200);
     expect(page.total).toBe(mockPendingAssets.length);
   });
 

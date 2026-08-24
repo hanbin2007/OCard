@@ -50,6 +50,8 @@ export function SortingScreen() {
   /** 初始加载失败：绝不能渲染成「没有素材」——那是把故障说成空目录 */
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
+  /** 翻页失败：保留已加载内容，单独显示错误 */
+  const [pageError, setPageError] = useState<string | null>(null);
   const [categories, setCategories] = useState<SortingCategory[]>([]);
   const [indexing, setIndexing] = useState<{
     indexed: number;
@@ -68,14 +70,24 @@ export function SortingScreen() {
   const [columns, setColumns] = useState(6);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [busy, setBusy] = useState(false);
+  /** 交付打包进行中：同一批文件不能一边打包一边被分类挪走 */
+  const [deliveryWorking, setDeliveryWorking] = useState(false);
   const gridWrapRef = useRef<HTMLDivElement>(null);
   const loadedCountRef = useRef(0);
   const lastRefreshRef = useRef(0);
-  const lastIndexedRef = useRef(0);
+  /** 上一条索引事件的快照，用于判定「增长 / 重启 / 完成」；随 projectId 重置 */
+  const lastEventRef = useRef<{ indexed: number; running: boolean } | null>(null);
+  /** 收尾对账只做一次，避免自我循环 */
+  const reconciledRef = useRef(false);
+  const assetsRef = useRef<SortingAsset[]>([]);
+  const notifyRef = useRef<
+    (level: "warning" | "error", code: string, message: string) => void
+  >(() => {});
 
   useEffect(() => {
     loadedCountRef.current = assets.length;
-  }, [assets.length]);
+    assetsRef.current = assets;
+  }, [assets]);
 
   const assetIds = useMemo(() => assets.map((a) => a.id), [assets]);
   const markedSet = useMemo(() => new Set(pendingDelete.marked), [pendingDelete.marked]);
@@ -143,18 +155,29 @@ export function SortingScreen() {
       }
       setAssets(collected);
       setTotal(latestTotal);
-    } catch {
-      // 刷新失败不打断分类：保留当前列表，下一次索引事件会再试
+    } catch (err) {
+      // 保留当前列表，但绝不静默：用户得知道看到的可能是旧状态
+      notifyRef.current(
+        "warning",
+        "sorting-refresh-failed",
+        `刷新素材列表失败：${
+          err instanceof Error ? err.message : String(err)
+        }。当前显示的可能不是最新状态，可稍后重试或重新进入本屏。`,
+      );
     }
   }, [projectId]);
 
   const loadMore = useCallback(async () => {
     if (!projectId || loading || assets.length >= total) return;
     setLoading(true);
+    setPageError(null);
     try {
       const page = await api.listPendingAssets(projectId, assets.length, PAGE_SIZE);
       setAssets((prev) => [...prev, ...page.items]);
       setTotal(page.total);
+    } catch (err) {
+      // 翻页失败不能吞：已加载的保留，错误显式可见并可重试
+      setPageError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
@@ -172,12 +195,35 @@ export function SortingScreen() {
     [dispatch],
   );
 
-  // 索引进度：索引中也能操作已索引部分，所以只更新进度条，不锁界面。
-  // indexed 增长时按 2s 节流重拉当前页——否则刚索引好的格子会一直停在「索引中」。
+  notifyRef.current = notify;
+
+  /**
+   * 索引进度订阅。
+   *
+   * 两个此前踩过的坑，这里都必须守住：
+   * ① 判定不能跨轮单调过滤。后端每轮重启索引都会把 indexed 归 0，
+   *    用「组件级 lastIndexed 永不重置 + indexed <= last 就丢弃」会导致
+   *    第一轮之后的所有事件被全部挡掉，缩略图永不出图。改为与**上一条事件**
+   *    比较：增长 / 归零重启 / running 由 true→false，任一即触发刷新。
+   * ② 必须等 sub.ready。list_pending_assets 会同步 spawn 索引线程，
+   *    小库存可能在 listen 注册完成前就索引完，唯一的收尾事件就此丢失。
+   *    所以 ready 之后再拉一次 indexingStatus 兜底对账。
+   */
   useEffect(() => {
     if (!projectId) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    lastEventRef.current = null;
+    reconciledRef.current = false;
+
+    const scheduleRefresh = () => {
+      if (timer) clearTimeout(timer);
+      const elapsed = Date.now() - lastRefreshRef.current;
+      timer = setTimeout(
+        () => void refreshLoadedAssets(),
+        Math.max(0, INDEX_REFRESH_MIN_MS - elapsed),
+      );
+    };
 
     const sub = api.subscribeIndexProgress(
       (event) => {
@@ -190,14 +236,16 @@ export function SortingScreen() {
           missing: event.missing,
         });
 
-        if (event.indexed <= lastIndexedRef.current) return;
-        lastIndexedRef.current = event.indexed;
-        if (timer) clearTimeout(timer);
-        const elapsed = Date.now() - lastRefreshRef.current;
-        timer = setTimeout(
-          () => void refreshLoadedAssets(),
-          Math.max(0, INDEX_REFRESH_MIN_MS - elapsed),
-        );
+        const prev = lastEventRef.current;
+        lastEventRef.current = { indexed: event.indexed, running: event.running };
+        if (!prev) {
+          scheduleRefresh();
+          return;
+        }
+        const grew = event.indexed > prev.indexed;
+        const restarted = event.indexed < prev.indexed; // 新一轮索引
+        const finished = prev.running && !event.running;
+        if (grew || restarted || finished) scheduleRefresh();
       },
       (err) => {
         if (cancelled) return;
@@ -211,12 +259,49 @@ export function SortingScreen() {
       },
     );
 
+    // 监听注册完成后兜底对账：注册期间可能已经把索引跑完了
+    void sub.ready
+      .catch(() => undefined)
+      .then(async () => {
+        if (cancelled) return;
+        try {
+          const status = await api.indexingStatus(projectId);
+          if (cancelled) return;
+          setIndexing(status);
+          lastEventRef.current = {
+            indexed: status.indexed,
+            running: status.running,
+          };
+        } catch (err) {
+          if (cancelled) return;
+          notify(
+            "warning",
+            "index-status-failed",
+            `读取索引状态失败：${
+              err instanceof Error ? err.message : String(err)
+            }。缩略图可能已生成但界面未刷新，可重新进入本屏。`,
+          );
+        }
+      });
+
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
       sub.dispose();
     };
   }, [projectId, refreshLoadedAssets, notify]);
+
+  /**
+   * 收尾对账：索引已停、但当前页仍有格子没有缩略图 → 补拉一次。
+   * 单次触发（reconciledRef），既救回「收尾事件丢失」的场景，又不会自我循环。
+   */
+  useEffect(() => {
+    if (!projectId || loading || reconciledRef.current) return;
+    if (!indexing || indexing.running) return;
+    if (!assetsRef.current.some((a) => !a.thumbnail)) return;
+    reconciledRef.current = true;
+    void refreshLoadedAssets();
+  }, [projectId, loading, indexing, refreshLoadedAssets]);
 
   /**
    * 批量操作的统一收尾：成功的移出列表，失败的**如实留下并恢复选中态**，
@@ -264,7 +349,7 @@ export function SortingScreen() {
   const runAssign = useCallback(
     async (categoryId: string) => {
       const targets = actionTargets(selection);
-      if (!projectId || targets.length === 0 || busy) return;
+      if (!projectId || targets.length === 0 || busy || deliveryWorking) return;
       // 精选永远是复制语义，move 到 curated 会让素材卡在没有流程的位置
       if (categories.find((c) => c.id === categoryId)?.kind === "curated") {
         await runCurateRef.current();
@@ -285,12 +370,21 @@ export function SortingScreen() {
         setBusy(false);
       }
     },
-    [projectId, selection, busy, categories, applyBulk, refreshCategories, notify],
+    [
+      projectId,
+      selection,
+      busy,
+      deliveryWorking,
+      categories,
+      applyBulk,
+      refreshCategories,
+      notify,
+    ],
   );
 
   const runCurate = useCallback(async () => {
     const targets = actionTargets(selection);
-    if (!projectId || targets.length === 0 || busy) return;
+    if (!projectId || targets.length === 0 || busy || deliveryWorking) return;
     setBusy(true);
     try {
       const result = await api.curateAssets(projectId, targets);
@@ -312,7 +406,7 @@ export function SortingScreen() {
     } finally {
       setBusy(false);
     }
-  }, [projectId, selection, busy, refreshCategories, notify]);
+  }, [projectId, selection, busy, deliveryWorking, refreshCategories, notify]);
 
   runCurateRef.current = runCurate;
 
@@ -470,7 +564,10 @@ export function SortingScreen() {
             <span className="text-xs dim" data-testid="sorting-remaining">
               待分类 {total}
             </span>
-            <DeliveryButton projectId={project.id} />
+            <DeliveryButton
+              projectId={project.id}
+              onWorkingChange={setDeliveryWorking}
+            />
             <button
               type="button"
               className="btn btn--sm"
@@ -494,7 +591,7 @@ export function SortingScreen() {
                 className="chip"
                 data-testid="sorting-category"
                 data-category={category.id}
-                disabled={category.kind === "inbox" || busy}
+                disabled={category.kind === "inbox" || busy || deliveryWorking}
                 /* 精选是「复制进精选/待修」，不是移动——点击路径必须与 P 键一致 */
                 onClick={() =>
                   category.kind === "curated"
@@ -515,6 +612,14 @@ export function SortingScreen() {
               </button>
             ))}
           </div>
+
+          {deliveryWorking ? (
+            <div className="sorting__indexing" role="status" data-testid="sorting-delivery-lock">
+              <span className="text-xs">
+                交付打包进行中，已暂时禁用分类操作，避免同一批文件边打包边被挪走。
+              </span>
+            </div>
+          ) : null}
 
           {/* 索引进度：索引中也能操作已索引部分 */}
           {indexing &&
@@ -622,6 +727,12 @@ export function SortingScreen() {
                 </span>
               ) : null}
             </div>
+
+            {pageError ? (
+              <span className="field__error" role="alert" data-testid="sorting-page-error">
+                加载更多失败：{pageError}
+              </span>
+            ) : null}
 
             {assets.length < total ? (
               <button

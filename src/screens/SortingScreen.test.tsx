@@ -472,6 +472,160 @@ describe("分类工作台", () => {
     subSpy.mockRestore();
   });
 
+  it("#13a 新一轮索引（indexed 归 0）的事件不会被跨轮单调过滤挡掉", async () => {
+    let emit: ((e: IndexProgressEvent) => void) | null = null;
+    const subSpy = vi
+      .spyOn(api, "subscribeIndexProgress")
+      .mockImplementation((onEvent: (e: IndexProgressEvent) => void) => {
+        emit = onEvent;
+        return { dispose: () => {}, ready: Promise.resolve() };
+      });
+
+    await renderSorting();
+    const listSpy = vi.spyOn(api, "listPendingAssets");
+
+    const ev = (indexed: number, running: boolean): IndexProgressEvent => ({
+      projectId: project.id,
+      indexed,
+      total: 1240,
+      running,
+      failed: 0,
+      missing: 0,
+      occurredAt: new Date().toISOString(),
+    });
+
+    // 第一轮索引跑完，水位到 1240
+    act(() => emit?.(ev(1240, false)));
+    await waitFor(() => expect(listSpy).toHaveBeenCalled(), { timeout: 4000 });
+    const afterFirstRound = listSpy.mock.calls.length;
+
+    // 后端重启索引：indexed 归 0。**只发这一条**——
+    // 若用「indexed 必须大于历史水位」过滤，这条会被吞掉，缩略图永不出图
+    act(() => emit?.(ev(0, true)));
+
+    await waitFor(
+      () => expect(listSpy.mock.calls.length).toBeGreaterThan(afterFirstRound),
+      { timeout: 4000 },
+    );
+
+    listSpy.mockRestore();
+    subSpy.mockRestore();
+  }, 15000);
+
+  it("#13b 订阅就绪前索引已跑完：ready 后兜底对账，不留永久「索引中」", async () => {
+    // ready 手动控制，模拟 listen 注册尚未完成
+    let markReady: (() => void) | undefined;
+    const subSpy = vi
+      .spyOn(api, "subscribeIndexProgress")
+      .mockImplementation(() => ({
+        dispose: () => {},
+        ready: new Promise<void>((resolve) => {
+          markReady = resolve;
+        }),
+      }));
+
+    // 打开页面时索引还在跑；等 listen 注册完成时它已经跑完，
+    // 收尾事件因此丢失——只能靠 ready 之后的兜底对账救回来
+    const statusSpy = vi
+      .spyOn(api, "indexingStatus")
+      .mockResolvedValueOnce({
+        projectId: project.id,
+        indexed: 900,
+        total: 1240,
+        running: true,
+        failed: 0,
+        missing: 0,
+      })
+      .mockResolvedValue({
+        projectId: project.id,
+        indexed: 1240,
+        total: 1240,
+        running: false,
+        failed: 0,
+        missing: 0,
+      });
+
+    await renderSorting();
+    const listSpy = vi.spyOn(api, "listPendingAssets");
+
+    await act(async () => {
+      markReady?.();
+    });
+
+    // ready 之后必须补拉状态并刷新当前页
+    await waitFor(() => expect(statusSpy.mock.calls.length).toBeGreaterThan(1));
+    await waitFor(() => expect(listSpy).toHaveBeenCalled(), { timeout: 4000 });
+
+    listSpy.mockRestore();
+    statusSpy.mockRestore();
+    subSpy.mockRestore();
+  }, 15000);
+
+  it("#3 翻页失败给可见错误并保留已加载内容", async () => {
+    const user = userEvent.setup();
+    await renderSorting();
+    const before = cells().length;
+
+    const spy = vi
+      .spyOn(api, "listPendingAssets")
+      .mockRejectedValueOnce(new Error("NAS 超时"));
+    await user.click(screen.getByTestId("sorting-load-more"));
+
+    const err = await screen.findByTestId("sorting-page-error");
+    expect(err.textContent).toContain("NAS 超时");
+    // 已加载的内容不能被清掉
+    expect(cells().length).toBe(before);
+    expect(screen.queryByTestId("sorting-load-error")).toBeNull();
+
+    // 重试可继续
+    spy.mockRestore();
+    await user.click(screen.getByTestId("sorting-load-more"));
+    await waitFor(() =>
+      expect(screen.getByTestId("sorting-remaining").textContent).toContain("1240"),
+    );
+  });
+
+  it("#3 索引驱动的刷新失败要发通知，不静默", async () => {
+    const user = userEvent.setup();
+    let emit: ((e: IndexProgressEvent) => void) | null = null;
+    const subSpy = vi
+      .spyOn(api, "subscribeIndexProgress")
+      .mockImplementation((onEvent: (e: IndexProgressEvent) => void) => {
+        emit = onEvent;
+        return { dispose: () => {}, ready: Promise.resolve() };
+      });
+
+    await renderSorting();
+    const listSpy = vi
+      .spyOn(api, "listPendingAssets")
+      .mockRejectedValue(new Error("NAS 断连"));
+
+    act(() =>
+      emit?.({
+        projectId: project.id,
+        indexed: 1240,
+        total: 1240,
+        running: false,
+        failed: 0,
+        missing: 0,
+        occurredAt: new Date().toISOString(),
+      }),
+    );
+
+    await waitFor(() => expect(listSpy).toHaveBeenCalled(), { timeout: 4000 });
+    await user.click(screen.getByTestId("notice-bell"));
+    await waitFor(() =>
+      expect(
+        screen
+          .getAllByTestId("notice-item")
+          .some((n) => n.getAttribute("data-code") === "sorting-refresh-failed"),
+      ).toBe(true),
+    );
+
+    listSpy.mockRestore();
+    subSpy.mockRestore();
+  }, 15000);
+
   it("可以继续加载下一页", async () => {
     const user = userEvent.setup();
     await renderSorting();
