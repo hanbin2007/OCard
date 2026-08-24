@@ -23,7 +23,7 @@ import {
   toggleSelection,
   type Selection,
 } from "../lib/sorting";
-import { useStore } from "../state/store";
+import { selectDeliveryWorking, useStore } from "../state/store";
 
 const PAGE_SIZE = 200;
 /** 索引事件驱动的重拉节流：索引中事件很密，不能每条都打一次 IPC */
@@ -43,8 +43,8 @@ const GRID_GAP = 8;
 export function SortingScreen() {
   const { state, dispatch } = useStore();
   const project = state.projects.find((p) => p.id === state.selectedProjectId) ?? null;
-  /** 交付打包进行中（全局态）：分类、删除链路、导航都要据此禁用 */
-  const deliveryWorking = state.deliveryWorking;
+  /** 交付作业进行中（由 job 状态派生）：分类、删除链路、导航都要据此禁用 */
+  const deliveryWorking = selectDeliveryWorking(state);
 
   const [assets, setAssets] = useState<SortingAsset[]>([]);
   const [total, setTotal] = useState(0);
@@ -603,12 +603,7 @@ export function SortingScreen() {
             <span className="text-xs dim" data-testid="sorting-remaining">
               待分类 {total}
             </span>
-            <DeliveryButton
-              projectId={project.id}
-              onWorkingChange={(working) =>
-                dispatch({ type: "deliveryWorkingChanged", working })
-              }
-            />
+            <DeliveryButton projectId={project.id} />
             <button
               type="button"
               className="btn btn--sm"

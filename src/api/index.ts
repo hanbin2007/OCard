@@ -7,10 +7,16 @@
  */
 
 import {
+  mockCancelJob,
+  mockGetJob,
+  mockListJobs,
+  mockStartDelivery,
+  mockSubscribeJobs,
+} from "./mockJobs";
+import {
   mockCameras,
   mockCopyTasks,
   mockCategories,
-  mockDelivery,
   mockIndexing,
   mockInspection,
   mockPendingAssets,
@@ -36,7 +42,7 @@ import type {
   AssetPage,
   BulkResult,
   CopyTaskPreview,
-  DeliverySummary,
+  JobSnapshot,
   RemoteActivity,
   FolderNode,
   IndexingStatus,
@@ -645,17 +651,6 @@ export function subscribeIndexProgress(
  * 交付打包（PRD §5.7）
  * ------------------------------------------------------------------ */
 
-/**
- * 按拍摄时间半天分包，**复制**出交付包并生成清单。
- * 零覆盖：重跑时内容一致的文件计入 `alreadyDelivered`（verified-skip），
- * 同名但内容不同的才作为 `name-collision` 进 failures（未交付，需人工核对）。
- * 上传网盘与发链接由人工完成，OCard 只负责打包与留痕。
- */
-export function buildDelivery(projectId: string): Promise<DeliverySummary> {
-  if (IS_TAURI) return ipc("build_delivery", { projectId });
-  return reply(mockDelivery);
-}
-
 /** 在 Finder / 资源管理器里定位到该路径 */
 export function revealPath(path: string): Promise<void> {
   if (IS_TAURI) return revealItemInDir(path);
@@ -676,4 +671,67 @@ export function listRemoteActivity(projectId: string): Promise<RemoteActivity[]>
   if (IS_TAURI) return ipc("list_remote_activity", { projectId });
   void projectId;
   return reply([]);
+}
+
+/* ------------------------------------------------------------------ *
+ * 后台作业（M3 W2）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 发起交付打包作业（立即返回快照，实际工作在后台）。
+ * 零覆盖与「取消也按实况写清单」由后端保证，前端只负责如实呈现。
+ */
+export function startDelivery(projectId: string): Promise<JobSnapshot> {
+  if (IS_TAURI) return ipc("start_delivery", { projectId });
+  return reply(mockStartDelivery(projectId));
+}
+
+export function listJobs(): Promise<JobSnapshot[]> {
+  if (IS_TAURI) return ipc("list_jobs");
+  return reply(mockListJobs());
+}
+
+export function getJob(jobId: string): Promise<JobSnapshot | null> {
+  if (IS_TAURI) return ipc("get_job", { jobId });
+  return reply(mockGetJob(jobId));
+}
+
+export function cancelJob(jobId: string): Promise<JobSnapshot> {
+  if (IS_TAURI) return ipc("cancel_job", { jobId });
+  return reply(mockCancelJob(jobId));
+}
+
+/**
+ * 订阅作业进度（`job://progress`，≥500ms 节流 + 终态必发）。
+ * 与通知/索引订阅同构：暴露 `ready`，调用方必须在 ready 之后用 listJobs 对账一次，
+ * 否则订阅注册前就跑完的作业会丢掉终态（M2 #13 的同型竞态）。
+ */
+export function subscribeJobProgress(
+  onEvent: (job: JobSnapshot) => void,
+  onError?: (error: unknown) => void,
+): EventSubscription {
+  if (IS_TAURI) {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    const ready = listen<JobSnapshot>("job://progress", (e) => {
+      if (!disposed) onEvent(e.payload);
+    })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => {
+        if (!disposed) onError?.(err);
+        throw err;
+      });
+    return {
+      dispose: () => {
+        disposed = true;
+        unlisten?.();
+      },
+      ready,
+    };
+  }
+  const dispose = mockSubscribeJobs(onEvent);
+  return { dispose, ready: Promise.resolve() };
 }

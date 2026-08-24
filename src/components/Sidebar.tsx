@@ -1,6 +1,6 @@
 /** 左侧窄边栏：导航 + 最近项目 + 操作人/主题。 */
 
-import { useStore } from "../state/store";
+import { selectDeliveryWorking, useStore } from "../state/store";
 import type { RouteName } from "../state/store";
 import { THEME_LABELS, useTheme } from "../state/theme";
 import { formatCompactDate } from "../lib/format";
@@ -63,6 +63,7 @@ function ThemeSwitch() {
 
 export function Sidebar() {
   const { state, dispatch } = useStore();
+  const deliveryWorking = selectDeliveryWorking(state);
   const counts: Partial<Record<RouteName, number>> = {
     projects: state.projects.length,
     devices: state.cameras.length,
@@ -87,9 +88,9 @@ export function Sidebar() {
                   className="nav-item"
                   aria-current={state.route === route ? "page" : undefined}
                   /* 打包期间锁住导航：离开会让结果面板（含未交付明细）静默蒸发 */
-                  disabled={state.deliveryWorking}
+                  disabled={deliveryWorking}
                   title={
-                    state.deliveryWorking
+                    deliveryWorking
                       ? "交付打包进行中，完成后才能切换页面"
                       : undefined
                   }
@@ -115,9 +116,9 @@ export function Sidebar() {
                 type="button"
                 className="sidebar__project"
                 aria-current={project.id === state.selectedProjectId}
-                disabled={state.deliveryWorking}
+                disabled={deliveryWorking}
                 title={
-                  state.deliveryWorking
+                  deliveryWorking
                     ? "交付打包进行中，完成后才能切换项目"
                     : undefined
                 }

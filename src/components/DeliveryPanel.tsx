@@ -5,55 +5,80 @@
  * 失败清单在界面内直接可见——不能只丢进铃铛让人自己去翻。
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import * as api from "../api";
-import type { DeliverySummary } from "../api/types";
+import type { DeliverySummary, JobSnapshot } from "../api/types";
 import { formatBytes } from "../lib/format";
 import { classifyFailures, deliveryHeadline } from "../lib/delivery";
-import { useStore } from "../state/store";
+import { selectLatestDeliveryJob, useStore } from "../state/store";
 import { ConfirmDialog, type ConfirmRequest } from "./ConfirmDialog";
-import { Badge } from "./ui";
-
-type Phase = "idle" | "working" | "done";
+import { Badge, ProgressBar } from "./ui";
 
 export function DeliveryButton({
   projectId,
   onWorkingChange,
 }: {
   projectId: string;
-  /** 打包期间通知上层禁用分类操作——同一批文件不能一边打包一边被挪走 */
+  /** 兼容旧调用点；互斥真相来源已是 store 里的 job 状态 */
   onWorkingChange?: (working: boolean) => void;
 }) {
-  const { dispatch } = useStore();
-  const [phase, setPhase] = useState<Phase>("idle");
-  const [summary, setSummary] = useState<DeliverySummary | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
+  const { state, dispatch } = useStore();
+  const job = selectLatestDeliveryJob(state, projectId);
+  const working =
+    job !== null && (job.state === "queued" || job.state === "running");
 
-  async function run() {
-    setPhase("working");
-    onWorkingChange?.(true);
-    setError(null);
+  const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
+  const [startError, setStartError] = useState<string | null>(null);
+  /** 已被用户关掉的终态作业 id：关掉后不再自动弹回来 */
+  const [dismissed, setDismissed] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+
+  useEffect(() => {
+    onWorkingChange?.(working);
+  }, [working, onWorkingChange]);
+
+  async function start() {
+    setStartError(null);
+    setDismissed(null);
     try {
-      const result = await api.buildDelivery(projectId);
-      setSummary(result);
+      const snapshot = await api.startDelivery(projectId);
+      // 立刻把快照并入，别等第一条事件——否则互斥会有一小段空窗
+      dispatch({ type: "jobProgress", job: snapshot });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      setError(message);
+      setStartError(message);
       dispatch({
         type: "noticeReceived",
         notice: {
           level: "error",
           code: "delivery-failed",
-          message: `交付打包失败：${message}`,
+          message: `交付打包未能启动：${message}`,
+          occurredAt: new Date().toISOString(),
+        },
+      });
+    }
+  }
+
+  async function cancel() {
+    if (!job || cancelling) return;
+    setCancelling(true);
+    try {
+      const snapshot = await api.cancelJob(job.id);
+      dispatch({ type: "jobProgress", job: snapshot });
+    } catch (err) {
+      dispatch({
+        type: "noticeReceived",
+        notice: {
+          level: "warning",
+          code: "job-cancel-failed",
+          message: `取消交付作业失败：${
+            err instanceof Error ? err.message : String(err)
+          }`,
           occurredAt: new Date().toISOString(),
         },
       });
     } finally {
-      // 单点复位：无论成功还是失败，互斥锁与阶段都在这里收口，
-      // 免得某条分支漏掉复位、把分类屏永久锁死
-      setPhase("done");
-      onWorkingChange?.(false);
+      setCancelling(false);
     }
   }
 
@@ -67,9 +92,14 @@ export function DeliveryButton({
         "打包期间请勿在任何工作站进行分类操作。" +
         "打包完成后，上传网盘与发送链接仍需人工完成。",
       confirmLabel: "开始打包",
-      onConfirm: () => void run(),
+      onConfirm: () => void start(),
     });
   }
+
+  const terminal =
+    job !== null &&
+    (job.state === "done" || job.state === "failed" || job.state === "cancelled");
+  const showResult = terminal && dismissed !== job.id;
 
   return (
     <>
@@ -77,39 +107,155 @@ export function DeliveryButton({
         type="button"
         className="btn btn--sm"
         data-testid="delivery-open"
-        disabled={phase === "working"}
+        disabled={working}
         onClick={requestConfirm}
       >
-        {phase === "working" ? "打包中…" : "交付打包"}
+        {working ? "打包中…" : "交付打包"}
       </button>
 
       <ConfirmDialog request={confirm} onCancel={() => setConfirm(null)} />
 
-      {phase === "done" ? (
+      {working && job ? (
+        <DeliveryProgress job={job} cancelling={cancelling} onCancel={cancel} />
+      ) : null}
+
+      {showResult && job ? (
         <DeliveryResult
-          summary={summary}
-          error={error}
-          onClose={() => {
-            setPhase("idle");
-            setSummary(null);
-            setError(null);
-          }}
+          job={job}
+          error={startError ?? job.error ?? null}
+          onClose={() => setDismissed(job.id)}
+        />
+      ) : null}
+
+      {startError && !job ? (
+        <DeliveryResult
+          job={null}
+          error={startError}
+          onClose={() => setStartError(null)}
         />
       ) : null}
     </>
   );
 }
 
+/** 进度视图：当前文件 + done/total + 进度条 + 取消 */
+function DeliveryProgress({
+  job,
+  cancelling,
+  onCancel,
+}: {
+  job: JobSnapshot;
+  cancelling: boolean;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="overlay">
+      <div
+        className="dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="交付打包进行中"
+        data-testid="delivery-progress"
+      >
+        <h2 className="dialog__title">正在交付打包</h2>
+        <p className="dialog__message">
+          {job.state === "queued"
+            ? "作业已排队，等待开始…"
+            : "正在复制文件，可随时取消；已完成的部分会保留，重跑安全续打。"}
+        </p>
+
+        <div className="stack stack--lg dialog__form">
+          <div className="stack stack--sm">
+            <ProgressBar
+              value={job.done}
+              total={job.total}
+              label="交付打包进度"
+              valueText={`${job.done}/${job.total}`}
+            />
+            <div className="row-inline text-xs dim">
+              <span className="mono" data-testid="delivery-progress-count">
+                {job.done}/{job.total}
+              </span>
+              <span className="mono">{formatBytes(job.bytesDone)}</span>
+              {job.message ? (
+                <span className="mono truncate" data-testid="delivery-progress-file">
+                  {job.message}
+                </span>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="dialog__actions">
+            <button
+              type="button"
+              className="btn"
+              data-testid="delivery-cancel"
+              disabled={cancelling}
+              onClick={onCancel}
+            >
+              {cancelling ? "正在取消…" : "取消打包"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function DeliveryResult({
-  summary,
+  job,
   error,
   onClose,
 }: {
-  summary: DeliverySummary | null;
+  job: JobSnapshot | null;
   error: string | null;
   onClose: () => void;
 }) {
   const [revealError, setRevealError] = useState<string | null>(null);
+  const summary: DeliverySummary | null = job?.result ?? null;
+  const cancelled = job?.state === "cancelled";
+
+  // 取消是终态且 result 为空：按快照计数如实说明已完成量
+  if (cancelled) {
+    return (
+      <div className="overlay" onClick={onClose}>
+        <div
+          className="dialog dialog--wide"
+          role="dialog"
+          aria-modal="true"
+          aria-label="交付打包已取消"
+          data-testid="delivery-result"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <h2 className="dialog__title">交付打包已取消</h2>
+          <p className="dialog__message" data-testid="delivery-cancelled">
+            已取消，清单按实况已更新，重跑安全续打。
+          </p>
+          <div className="stack stack--lg dialog__form">
+            <div className="notice" data-testid="delivery-cancelled-count">
+              <strong>
+                已完成 {job.done}/{job.total} 个文件（{formatBytes(job.bytesDone)}）
+              </strong>
+              <span>
+                已复制的部分保留在交付目录里，清单已按实况写入；
+                再次打包会跳过这些文件、只补剩下的。
+              </span>
+            </div>
+          </div>
+          <div className="dialog__actions">
+            <button
+              type="button"
+              className="btn btn--primary"
+              data-testid="delivery-close"
+              onClick={onClose}
+            >
+              完成
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (error || !summary) {
     return (
@@ -134,6 +280,14 @@ function DeliveryResult({
               onClick={onClose}
             >
               关闭
+            </button>
+            <button
+              type="button"
+              className="btn btn--primary"
+              data-testid="delivery-retry"
+              onClick={onClose}
+            >
+              重试
             </button>
           </div>
         </div>

@@ -5,7 +5,12 @@ import type {
   Project,
   StorageCard,
 } from "../api/types";
-import { initialState, reducer, repeatDelta } from "./store";
+import {
+  initialState,
+  reducer,
+  repeatDelta,
+  selectDeliveryWorking,
+} from "./store";
 
 const project: Project = {
   id: "p-new",
@@ -394,14 +399,113 @@ describe("repeatDelta（通知计数增量）", () => {
   });
 });
 
-describe("打包互斥全局态", () => {
-  it("deliveryWorkingChanged 落到全局 state", () => {
-    const on = reducer(initialState, {
-      type: "deliveryWorkingChanged",
-      working: true,
+describe("作业快照归约", () => {
+  const job = {
+    id: "job-1",
+    kind: "delivery" as const,
+    projectId: "p-new",
+    state: "running" as const,
+    done: 10,
+    total: 100,
+    bytesDone: 1024,
+    revision: 3,
+    startedAt: "2026-08-24T10:00:00+08:00",
+  };
+
+  it("首次见到的作业直接入列", () => {
+    const next = reducer(initialState, { type: "jobProgress", job });
+    expect(next.jobs).toHaveLength(1);
+    expect(next.jobs[0].done).toBe(10);
+  });
+
+  it("revision 前进才更新", () => {
+    const seeded = { ...initialState, jobs: [job] };
+    const next = reducer(seeded, {
+      type: "jobProgress",
+      job: { ...job, revision: 4, done: 40 },
     });
-    expect(on.deliveryWorking).toBe(true);
-    const off = reducer(on, { type: "deliveryWorkingChanged", working: false });
-    expect(off.deliveryWorking).toBe(false);
+    expect(next.jobs[0].done).toBe(40);
+  });
+
+  it("乱序/过期事件被丢弃，进度不回退", () => {
+    const seeded = { ...initialState, jobs: [{ ...job, revision: 9, done: 90 }] };
+    const stale = reducer(seeded, {
+      type: "jobProgress",
+      job: { ...job, revision: 4, done: 40 },
+    });
+    expect(stale.jobs[0].done).toBe(90);
+    // 同 revision 也不接受（幂等重发不该改状态）
+    const same = reducer(seeded, {
+      type: "jobProgress",
+      job: { ...job, revision: 9, done: 5 },
+    });
+    expect(same.jobs[0].done).toBe(90);
+  });
+
+  it("jobsLoaded 对账同样保单调", () => {
+    const seeded = { ...initialState, jobs: [{ ...job, revision: 9, done: 90 }] };
+    const next = reducer(seeded, {
+      type: "jobsLoaded",
+      jobs: [{ ...job, revision: 2, done: 20 }],
+    });
+    expect(next.jobs[0].done).toBe(90);
+  });
+
+  it("jobsLoaded 会补进订阅期间错过的新作业", () => {
+    const next = reducer(initialState, { type: "jobsLoaded", jobs: [job] });
+    expect(next.jobs).toHaveLength(1);
+  });
+});
+
+describe("selectDeliveryWorking", () => {
+  const base = {
+    id: "job-1",
+    kind: "delivery" as const,
+    projectId: "p-new",
+    done: 0,
+    total: 10,
+    bytesDone: 0,
+    revision: 1,
+    startedAt: "2026-08-24T10:00:00+08:00",
+  };
+
+  it("queued / running 视为进行中", () => {
+    for (const state of ["queued", "running"] as const) {
+      expect(
+        selectDeliveryWorking({
+          ...initialState,
+          selectedProjectId: "p-new",
+          jobs: [{ ...base, state }],
+        }),
+      ).toBe(true);
+    }
+  });
+
+  it("终态一律不算进行中", () => {
+    for (const state of ["done", "failed", "cancelled"] as const) {
+      expect(
+        selectDeliveryWorking({
+          ...initialState,
+          selectedProjectId: "p-new",
+          jobs: [{ ...base, state }],
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it("别的项目的作业不锁本项目", () => {
+    expect(
+      selectDeliveryWorking({
+        ...initialState,
+        selectedProjectId: "p-other",
+        jobs: [{ ...base, state: "running" as const }],
+      }),
+    ).toBe(false);
+  });
+
+  it("没有作业（例如应用重启后）= 不锁", () => {
+    expect(
+      selectDeliveryWorking({ ...initialState, selectedProjectId: "p-new" }),
+    ).toBe(false);
   });
 });

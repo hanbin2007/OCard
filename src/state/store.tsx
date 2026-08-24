@@ -22,6 +22,7 @@ import type {
   CopyFileItem,
   CopyProgressEvent,
   CopyTask,
+  JobSnapshot,
   NoticeDto,
   NoticeLevel,
   Project,
@@ -81,11 +82,8 @@ export interface AppState {
   noticesOpen: boolean;
   /** 生成稳定 id 用，保持 reducer 纯函数 */
   noticeSeq: number;
-  /**
-   * 交付打包进行中。全局态：侧栏导航、删除链路都要据此禁用——
-   * 打包中导航离开会让结果面板（含未交付明细）静默蒸发。
-   */
-  deliveryWorking: boolean;
+  /** 后台作业快照（交付/转码/分析）。打包互斥由它派生，不再另存布尔值。 */
+  jobs: JobSnapshot[];
   /** 已摄入通知的 `code@occurredAt`，供启动回放去重 */
   noticeKeys: Record<string, true>;
 }
@@ -121,7 +119,8 @@ export type AppAction =
   | { type: "noticesCleared" }
   | { type: "noticesPanelToggled" }
   | { type: "noticesPanelClosed" }
-  | { type: "deliveryWorkingChanged"; working: boolean };
+  | { type: "jobsLoaded"; jobs: JobSnapshot[] }
+  | { type: "jobProgress"; job: JobSnapshot };
 
 /** 孤儿对账的退避档位：失败一次等 2s，再失败 5s，之后稳定在 10s */
 const ORPHAN_BACKOFF_MS = [2000, 5000, 10000];
@@ -144,7 +143,7 @@ export const initialState: AppState = {
   noticesOpen: false,
   noticeSeq: 0,
   noticeKeys: {},
-  deliveryWorking: false,
+  jobs: [],
 };
 
 /** 把增量事件合并进文件列表；未在事件里出现的文件保持原样 */
@@ -492,8 +491,27 @@ export function reducer(state: AppState, action: AppAction): AppState {
     case "noticesPanelClosed":
       return { ...state, noticesOpen: false };
 
-    case "deliveryWorkingChanged":
-      return { ...state, deliveryWorking: action.working };
+    case "jobsLoaded": {
+      // 对账：以后端为准，但逐条按 revision 保单调，别让慢到的旧快照回踩
+      const merged = [...state.jobs];
+      for (const job of action.jobs) {
+        const index = merged.findIndex((j) => j.id === job.id);
+        if (index < 0) merged.push(job);
+        else if (job.revision >= merged[index].revision) merged[index] = job;
+      }
+      return { ...state, jobs: merged };
+    }
+
+    case "jobProgress": {
+      const { job } = action;
+      const index = state.jobs.findIndex((j) => j.id === job.id);
+      if (index < 0) return { ...state, jobs: [...state.jobs, job] };
+      // 乱序保护：revision 不前进的事件一律丢弃
+      if (job.revision <= state.jobs[index].revision) return state;
+      const jobs = [...state.jobs];
+      jobs[index] = job;
+      return { ...state, jobs };
+    }
 
     case "settingsOpened":
       return { ...state, settingsOpen: true };
@@ -664,6 +682,59 @@ export function StoreProvider({
     );
   }, []);
 
+  /**
+   * 作业进度常驻订阅 + ready 后对账。
+   * ready 之前跑完的作业，其终态事件会丢——所以必须 listJobs 补一次，
+   * 这就是 M2 #13 的同型竞态，不能再犯。
+   */
+  useEffect(() => {
+    let cancelled = false;
+
+    const sub = api.subscribeJobProgress(
+      (job) => dispatch({ type: "jobProgress", job }),
+      (err) =>
+        dispatch({
+          type: "noticeReceived",
+          notice: {
+            level: "warning",
+            code: "job-listen-failed",
+            message: `作业进度监听未能建立：${
+              err instanceof Error ? err.message : String(err)
+            }。后台作业仍在运行，但界面不会自动刷新。`,
+            occurredAt: new Date().toISOString(),
+          },
+        }),
+    );
+
+    void sub.ready
+      .catch(() => undefined)
+      .then(async () => {
+        if (cancelled) return;
+        try {
+          const jobs = await api.listJobs();
+          if (!cancelled) dispatch({ type: "jobsLoaded", jobs });
+        } catch (err) {
+          if (cancelled) return;
+          dispatch({
+            type: "noticeReceived",
+            notice: {
+              level: "warning",
+              code: "jobs-reconcile-failed",
+              message: `读取后台作业列表失败：${
+                err instanceof Error ? err.message : String(err)
+              }。进行中的作业状态可能不准确。`,
+              occurredAt: new Date().toISOString(),
+            },
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      sub.dispose();
+    };
+  }, []);
+
   /** 拉一次任务快照与后端对账（start/resume/retry 之后调用） */
   const refreshTask = useCallback(async (taskId: string) => {
     try {
@@ -784,6 +855,37 @@ export function useStore(): StoreValue {
   const ctx = useContext(StoreContext);
   if (!ctx) throw new Error("useStore 必须在 StoreProvider 内使用");
   return ctx;
+}
+
+/**
+ * 该项目是否有进行中的交付作业。
+ *
+ * 这是打包互斥的**唯一真相来源**：侧栏禁用、分类屏禁用、删除链路禁用都读它。
+ * 应用重启后作业不再存在 → 不 working，这是声明语义（后端不持久化作业）。
+ */
+export function selectDeliveryWorking(state: AppState): boolean {
+  const projectId = state.selectedProjectId;
+  if (!projectId) return false;
+  return state.jobs.some(
+    (job) =>
+      job.kind === "delivery" &&
+      job.projectId === projectId &&
+      (job.state === "queued" || job.state === "running"),
+  );
+}
+
+/** 该项目最近一个交付作业（用于结果/进度呈现） */
+export function selectLatestDeliveryJob(
+  state: AppState,
+  projectId: string,
+): JobSnapshot | null {
+  const candidates = state.jobs.filter(
+    (job) => job.kind === "delivery" && job.projectId === projectId,
+  );
+  if (candidates.length === 0) return null;
+  return candidates.reduce((latest, job) =>
+    job.startedAt >= latest.startedAt ? job : latest,
+  );
 }
 
 /** 便捷选择器 */

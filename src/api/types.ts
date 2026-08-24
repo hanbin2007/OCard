@@ -477,3 +477,39 @@ export interface RemoteActivity {
   targetFolder: string;
   startedAt: string;
 }
+
+/* ------------------------------------------------------------------ *
+ * 后台作业（M3 W2：交付由同步命令改为后台作业）
+ * ------------------------------------------------------------------ */
+
+export type JobKind = "delivery" | "transcode" | "analyze";
+
+export type JobState = "queued" | "running" | "done" | "failed" | "cancelled";
+
+/**
+ * 后台作业快照。
+ *
+ * `revision` 单调递增，用于乱序保护——沿 `copy://progress` 的既有模式。
+ * 终态语义：
+ * - `done`：`result` 为该 kind 的结果（delivery = DeliverySummary）
+ * - `failed`：`error` 为原因
+ * - `cancelled`：**result 为空**。取消时后端仍按实况写清单（目录绝不处于
+ *   无清单的说谎态），已完成量看 `done`/`total`，详情由 `job-cancelled` 通知给出。
+ */
+export interface JobSnapshot {
+  id: string;
+  kind: JobKind;
+  projectId: string;
+  state: JobState;
+  done: number;
+  total: number;
+  bytesDone: number;
+  /** 当前正在处理的文件名等进度描述 */
+  message?: string;
+  revision: number;
+  startedAt: string;
+  finishedAt?: string;
+  /** kind = "delivery" 且 state = "done" 时为 DeliverySummary；未来 kind 会扩这个联合 */
+  result?: DeliverySummary;
+  error?: string;
+}

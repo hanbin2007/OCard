@@ -1,4 +1,7 @@
-/** 交付打包：确认流程、结果面板、重跑文案、部分失败的界面内可见性。 */
+/**
+ * 交付打包（M3 作业化）：确认 → 进度 → 终态。
+ * 终态 done 必须渲染与作业化之前**完全相同**的结果块（delivery-result 语义，E2E 依赖）。
+ */
 
 import {
   act,
@@ -10,13 +13,36 @@ import {
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import * as api from "../api";
 import { mockDelivery, mockProjects, mockWorkstation } from "../api/mock";
-import type { DeliverySummary } from "../api/types";
+import { resetMockJobs } from "../api/mockJobs";
+import type { DeliverySummary, JobSnapshot } from "../api/types";
 
-afterEach(cleanup);
+/** 收集 store 建立的作业订阅回调，供测试手工投递事件 */
+let jobEmitters: Array<(job: JobSnapshot) => void> = [];
+
+beforeEach(() => {
+  jobEmitters = [];
+  // 装在 beforeEach 里：模块级 spy 会被 restoreAllMocks 清掉
+  vi.spyOn(api, "subscribeJobProgress").mockImplementation((onEvent) => {
+    jobEmitters.push(onEvent);
+    return {
+      dispose: () => {
+        const i = jobEmitters.indexOf(onEvent);
+        if (i >= 0) jobEmitters.splice(i, 1);
+      },
+      ready: Promise.resolve(),
+    };
+  });
+});
+
+afterEach(() => {
+  cleanup();
+  resetMockJobs();
+  vi.restoreAllMocks();
+});
 
 const preloaded = {
   route: "sorting" as const,
@@ -25,6 +51,23 @@ const preloaded = {
   selectedProjectId: mockProjects[0].id,
 };
 
+function deliveryJob(over: Partial<JobSnapshot> = {}): JobSnapshot {
+  return {
+    id: "job-test",
+    kind: "delivery",
+    projectId: mockProjects[0].id,
+    state: "done",
+    done: 769,
+    total: 769,
+    bytesDone: mockDelivery.totalBytes,
+    revision: 9,
+    startedAt: "2026-08-24T10:00:00+08:00",
+    finishedAt: "2026-08-24T10:05:00+08:00",
+    result: mockDelivery,
+    ...over,
+  };
+}
+
 async function openWorkbench() {
   const user = userEvent.setup();
   render(<App preloaded={preloaded} />);
@@ -32,472 +75,50 @@ async function openWorkbench() {
   return user;
 }
 
-describe("交付打包", () => {
-  it("入口在工作台顶栏，点开先出确认对话框", async () => {
-    const user = await openWorkbench();
-    const spy = vi.spyOn(api, "buildDelivery");
+/** 走完「确认 → 开始」，startDelivery 直接返回给定终态/进行态快照 */
+async function startWith(job: JobSnapshot) {
+  const spy = vi.spyOn(api, "startDelivery").mockResolvedValue(job);
+  const user = await openWorkbench();
+  await user.click(screen.getByTestId("delivery-open"));
+  await user.click(screen.getByRole("button", { name: "开始打包" }));
+  return { user, spy };
+}
 
+describe("确认与启动", () => {
+  it("点开先出确认对话框，确认前不启动作业", async () => {
+    const spy = vi.spyOn(api, "startDelivery");
+    const user = await openWorkbench();
     await user.click(screen.getByTestId("delivery-open"));
 
     const dialog = screen.getByRole("alertdialog");
-    // 确认文案要讲清纳入范围、复制语义、上传仍需人工
     expect(dialog.textContent).toContain("精选/已修");
     expect(dialog.textContent).toContain("待分类与待修不交付");
     expect(dialog.textContent).toContain("不改动分类夹里的原件");
+    expect(dialog.textContent).toContain("打包期间请勿在任何工作站进行分类操作");
     expect(dialog.textContent).toContain("上传网盘与发送链接仍需人工完成");
-    // 确认前绝不动手
     expect(spy).not.toHaveBeenCalled();
-    spy.mockRestore();
   });
 
-  it("#4 确认文案提醒打包期间勿分类", async () => {
+  it("取消则不启动作业", async () => {
+    const spy = vi.spyOn(api, "startDelivery");
     const user = await openWorkbench();
-    await user.click(screen.getByTestId("delivery-open"));
-    expect(screen.getByRole("alertdialog").textContent).toContain(
-      "打包期间请勿在任何工作站进行分类操作",
-    );
-  });
-
-  it("#4 打包期间禁用分类操作并给出提示", async () => {
-    const user = await openWorkbench();
-    let finish: ((s: DeliverySummary) => void) | undefined;
-    const spy = vi
-      .spyOn(api, "buildDelivery")
-      .mockImplementation(
-        () =>
-          new Promise<DeliverySummary>((resolve) => {
-            finish = resolve;
-          }),
-      );
-
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-
-    await screen.findByTestId("sorting-delivery-lock");
-    const chip = screen
-      .getAllByTestId("sorting-category")
-      .find((c) => c.getAttribute("data-category") === "cat-1") as HTMLButtonElement;
-    expect(chip.disabled).toBe(true);
-
-    await act(async () => {
-      finish?.(mockDelivery);
-    });
-    await waitFor(() =>
-      expect(screen.queryByTestId("sorting-delivery-lock")).toBeNull(),
-    );
-    spy.mockRestore();
-  });
-
-  it("#3 打包期间禁止离开分类屏，结果面板不会被导航走", async () => {
-    const user = await openWorkbench();
-    let finish: ((s: DeliverySummary) => void) | undefined;
-    const spy = vi
-      .spyOn(api, "buildDelivery")
-      .mockImplementation(
-        () =>
-          new Promise<DeliverySummary>((resolve) => {
-            finish = resolve;
-          }),
-      );
-
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-    await screen.findByTestId("sorting-delivery-lock");
-
-    expect(
-      (screen.getByTestId("sorting-open-trash") as HTMLButtonElement).disabled,
-    ).toBe(true);
-
-    await act(async () => {
-      finish?.(mockDelivery);
-    });
-    await waitFor(() =>
-      expect(
-        (screen.getByTestId("sorting-open-trash") as HTMLButtonElement).disabled,
-      ).toBe(false),
-    );
-    spy.mockRestore();
-  });
-
-  it("#3 打包期间键盘分类被挡住", async () => {
-    const user = await openWorkbench();
-    let finish: ((s: DeliverySummary) => void) | undefined;
-    const buildSpy = vi
-      .spyOn(api, "buildDelivery")
-      .mockImplementation(
-        () =>
-          new Promise<DeliverySummary>((resolve) => {
-            finish = resolve;
-          }),
-      );
-    const moveSpy = vi.spyOn(api, "moveAssets");
-
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-    await screen.findByTestId("sorting-delivery-lock");
-
-    const gridWrap = screen.getByTestId("sorting-grid-wrap");
-    fireEvent.keyDown(gridWrap, { key: "ArrowRight" });
-    fireEvent.keyDown(gridWrap, { key: "1" });
-    await new Promise((r) => setTimeout(r, 50));
-    expect(moveSpy).not.toHaveBeenCalled();
-
-    await act(async () => {
-      finish?.(mockDelivery);
-    });
-    buildSpy.mockRestore();
-    moveSpy.mockRestore();
-  });
-
-  it("#3 打包失败也会复位互斥锁，不把分类屏永久锁死", async () => {
-    const user = await openWorkbench();
-    const spy = vi
-      .spyOn(api, "buildDelivery")
-      .mockRejectedValue(new Error("NAS 只读"));
-
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-
-    await screen.findByTestId("delivery-error");
-    // 失败路径同样要解锁
-    expect(screen.queryByTestId("sorting-delivery-lock")).toBeNull();
-    expect(
-      (screen.getByTestId("sorting-open-trash") as HTMLButtonElement).disabled,
-    ).toBe(false);
-    const chip = screen
-      .getAllByTestId("sorting-category")
-      .find((c) => c.getAttribute("data-category") === "cat-1") as HTMLButtonElement;
-    expect(chip.disabled).toBe(false);
-    spy.mockRestore();
-  });
-
-  it("#1 打包期间 D 键标删无效（UI 先行拦下，不靠后端报错）", async () => {
-    const user = await openWorkbench();
-    let finish: ((s: DeliverySummary) => void) | undefined;
-    const spy = vi
-      .spyOn(api, "buildDelivery")
-      .mockImplementation(
-        () =>
-          new Promise<DeliverySummary>((resolve) => {
-            finish = resolve;
-          }),
-      );
-
-    const gridWrap = screen.getByTestId("sorting-grid-wrap");
-    fireEvent.keyDown(gridWrap, { key: "ArrowRight" });
-
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-    await screen.findByTestId("sorting-delivery-lock");
-
-    fireEvent.keyDown(gridWrap, { key: "d" });
-    // 待删清单不该出现
-    expect(screen.queryByTestId("sorting-pending-delete")).toBeNull();
-
-    await act(async () => {
-      finish?.(mockDelivery);
-    });
-    spy.mockRestore();
-  });
-
-  it("#1 打包期间「确认移入回收站」按钮禁用且不下发删除", async () => {
-    const user = await openWorkbench();
-    const trashSpy = vi.spyOn(api, "trashAssets");
-
-    // 先在非打包期标记一条
-    const gridWrap = screen.getByTestId("sorting-grid-wrap");
-    fireEvent.keyDown(gridWrap, { key: "ArrowRight" });
-    fireEvent.keyDown(gridWrap, { key: "d" });
-    expect(screen.getByTestId("sorting-pending-delete")).toBeDefined();
-
-    let finish: ((s: DeliverySummary) => void) | undefined;
-    const spy = vi
-      .spyOn(api, "buildDelivery")
-      .mockImplementation(
-        () =>
-          new Promise<DeliverySummary>((resolve) => {
-            finish = resolve;
-          }),
-      );
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-    await screen.findByTestId("sorting-delivery-lock");
-
-    const confirmBtn = screen.getByTestId(
-      "sorting-confirm-delete",
-    ) as HTMLButtonElement;
-    expect(confirmBtn.disabled).toBe(true);
-    fireEvent.click(confirmBtn);
-    expect(screen.queryByRole("alertdialog")).toBeNull();
-    expect(trashSpy).not.toHaveBeenCalled();
-
-    await act(async () => {
-      finish?.(mockDelivery);
-    });
-    // 打包结束后恢复可用
-    await waitFor(() =>
-      expect(
-        (screen.getByTestId("sorting-confirm-delete") as HTMLButtonElement).disabled,
-      ).toBe(false),
-    );
-    spy.mockRestore();
-    trashSpy.mockRestore();
-  });
-
-  it("#2 打包期间侧栏导航被锁住，结果面板不会被导航走", async () => {
-    const user = await openWorkbench();
-    let finish: ((s: DeliverySummary) => void) | undefined;
-    const spy = vi
-      .spyOn(api, "buildDelivery")
-      .mockImplementation(
-        () =>
-          new Promise<DeliverySummary>((resolve) => {
-            finish = resolve;
-          }),
-      );
-
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-    await screen.findByTestId("sorting-delivery-lock");
-
-    const navProjects = screen.getByTestId("nav-projects") as HTMLButtonElement;
-    expect(navProjects.disabled).toBe(true);
-    expect(navProjects.title).toContain("交付打包进行中");
-    fireEvent.click(navProjects);
-    // 仍停留在分类屏
-    expect(screen.getByTestId("sorting-grid-wrap")).toBeDefined();
-
-    await act(async () => {
-      finish?.(mockDelivery);
-    });
-    await waitFor(() =>
-      expect((screen.getByTestId("nav-projects") as HTMLButtonElement).disabled).toBe(
-        false,
-      ),
-    );
-    spy.mockRestore();
-  });
-
-  it("#4 表头说明包内为实况总量", async () => {
-    const user = await openWorkbench();
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-    await screen.findByTestId("delivery-result");
-
-    expect(screen.getByTestId("delivery-package-note").textContent).toContain(
-      "当前实况",
-    );
-    expect(screen.getByTestId("delivery-total").textContent).toContain("本次新交付");
-  });
-
-  it("#4 失败超过 8 条时指向交付总清单，而不是通知中心", async () => {
-    const user = await openWorkbench();
-    const spy = vi.spyOn(api, "buildDelivery").mockResolvedValue({
-      ...mockDelivery,
-      alreadyDelivered: 0,
-      failures: Array.from({ length: 12 }, (_, i) => ({
-        assetId: `5. 其他/DSC_${i}.JPG`,
-        message: "磁盘写满",
-        kind: "error" as const,
-      })),
-    });
-
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-    await screen.findByTestId("delivery-result");
-
-    const hint = screen.getByTestId("delivery-more-hint");
-    expect(hint.textContent).toContain("交付总清单.txt");
-    expect(hint.textContent).not.toContain("通知中心");
-    spy.mockRestore();
-  });
-
-  it("取消则不打包", async () => {
-    const user = await openWorkbench();
-    const spy = vi.spyOn(api, "buildDelivery");
-
     await user.click(screen.getByTestId("delivery-open"));
     await user.click(screen.getByRole("button", { name: "取消" }));
 
     expect(spy).not.toHaveBeenCalled();
     expect(screen.queryByTestId("delivery-result")).toBeNull();
-    spy.mockRestore();
   });
 
-  it("执行中按钮禁用并显示进行中", async () => {
-    const user = await openWorkbench();
-    // 不写 `= null` 初值：否则 TS 会把它窄化成 null，闭包里的赋值追踪不到
-    let finish: ((s: DeliverySummary) => void) | undefined;
+  it("启动失败当普通错误展示并进通知中心", async () => {
     const spy = vi
-      .spyOn(api, "buildDelivery")
-      .mockImplementation(
-        () =>
-          new Promise<DeliverySummary>((resolve) => {
-            finish = resolve;
-          }),
-      );
-
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-
-    const button = screen.getByTestId("delivery-open") as HTMLButtonElement;
-    await waitFor(() => expect(button.disabled).toBe(true));
-    expect(button.textContent).toContain("打包中");
-
-    finish?.(mockDelivery);
-    await screen.findByTestId("delivery-result");
-    spy.mockRestore();
-  });
-
-  it("结果面板逐包列出名称/文件数/容量与合计", async () => {
+      .spyOn(api, "startDelivery")
+      .mockRejectedValue(new Error("交付打包进行中，请稍候"));
     const user = await openWorkbench();
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-
-    await screen.findByTestId("delivery-result");
-    const packages = screen.getAllByTestId("delivery-package");
-    expect(packages).toHaveLength(mockDelivery.packages.length);
-    expect(packages[0].textContent).toContain("0824上午");
-    expect(packages[0].textContent).toContain("412");
-
-    const total = screen.getByTestId("delivery-total");
-    expect(total.textContent).toContain(String(mockDelivery.totalFiles));
-  });
-
-  it("重跑把 alreadyDelivered 当正常结果展示，不当成事故", async () => {
-    const user = await openWorkbench();
-    const spy = vi.spyOn(api, "buildDelivery").mockResolvedValue({
-      ...mockDelivery,
-      alreadyDelivered: 24,
-      failures: [],
-    });
-
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-
-    await screen.findByTestId("delivery-result");
-    const headline = screen.getByTestId("delivery-headline");
-    expect(headline.textContent).toContain("已交付跳过 24 个");
-    expect(headline.textContent).not.toContain("未交付");
-
-    const already = screen.getByTestId("delivery-already");
-    expect(already.textContent).toContain("内容一致，本次跳过");
-    expect(already.textContent).toContain("绝不覆盖已有交付文件");
-    // 纯重跑不该出现任何失败区块
-    expect(screen.queryByTestId("delivery-errors")).toBeNull();
-    expect(screen.queryByTestId("delivery-manifest-errors")).toBeNull();
-    spy.mockRestore();
-  });
-
-  it("name-collision 红色标为「未交付」并提示人工核对", async () => {
-    const user = await openWorkbench();
-    const spy = vi.spyOn(api, "buildDelivery").mockResolvedValue({
-      ...mockDelivery,
-      alreadyDelivered: 0,
-      failures: [
-        { assetId: "5. 其他/DSC_9.JPG", message: "包内同名文件内容不同", kind: "name-collision" },
-      ],
-    });
-
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-    await screen.findByTestId("delivery-result");
-
-    const box = screen.getByTestId("delivery-errors");
-    expect(box.getAttribute("role")).toBe("alert");
-    expect(box.textContent).toContain("1 个文件未交付");
-    expect(box.textContent).toContain("同名不同内容");
-    expect(screen.getByTestId("delivery-collision-note").textContent).toContain(
-      "请人工核对",
-    );
-    spy.mockRestore();
-  });
-
-  it("manifest-error 单列为可重跑补齐，不算未交付", async () => {
-    const user = await openWorkbench();
-    const spy = vi.spyOn(api, "buildDelivery").mockResolvedValue({
-      ...mockDelivery,
-      alreadyDelivered: 0,
-      failures: [
-        { assetId: "5. 其他/DSC_8.JPG", message: "清单条目未写入", kind: "manifest-error" },
-      ],
-    });
-
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-    await screen.findByTestId("delivery-result");
-
-    const box = screen.getByTestId("delivery-manifest-errors");
-    expect(box.textContent).toContain("文件本身已交付成功");
-    expect(box.textContent).toContain("重新执行一次打包即可补齐");
-    // 清单缺失不该被算进「未交付」
-    expect(screen.queryByTestId("delivery-errors")).toBeNull();
-    expect(screen.getByTestId("delivery-headline").textContent).not.toContain(
-      "未交付",
-    );
-    spy.mockRestore();
-  });
-
-  it("真失败在界面内直接列出，不只藏在铃铛里", async () => {
-    const user = await openWorkbench();
-    const spy = vi.spyOn(api, "buildDelivery").mockResolvedValue({
-      ...mockDelivery,
-      alreadyDelivered: 3,
-      failures: [
-        { assetId: "5. 其他/DSC_1.JPG", message: "磁盘空间不足", kind: "error" },
-      ],
-    });
-
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-
-    await screen.findByTestId("delivery-result");
-    const errors = screen.getByTestId("delivery-errors");
-    expect(errors.getAttribute("role")).toBe("alert");
-    expect(errors.textContent).toContain("磁盘空间不足");
-    expect(errors.textContent).toContain("DSC_1.JPG");
-    // 未交付与「已交付跳过」分开统计，不混为一谈
-    expect(errors.textContent).toContain("1 个文件未交付");
-    expect(screen.getByTestId("delivery-already").textContent).toContain("3 个文件");
-    spy.mockRestore();
-  });
-
-  it("交付目录等宽显示，可在文件管理器中定位", async () => {
-    const user = await openWorkbench();
-    const revealSpy = vi.spyOn(api, "revealPath").mockResolvedValue(undefined);
-
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-    await screen.findByTestId("delivery-result");
-
-    expect(screen.getByTestId("delivery-path").textContent).toBe(
-      mockDelivery.deliveryPath,
-    );
-    await user.click(screen.getByTestId("delivery-reveal"));
-    expect(revealSpy).toHaveBeenCalledWith(mockDelivery.deliveryPath);
-    revealSpy.mockRestore();
-  });
-
-  it("结果面板提醒上传仍需人工", async () => {
-    const user = await openWorkbench();
-    await user.click(screen.getByTestId("delivery-open"));
-    await user.click(screen.getByRole("button", { name: "开始打包" }));
-
-    const result = await screen.findByTestId("delivery-result");
-    expect(within(result).getByText(/上传网盘与发送链接需人工完成/)).toBeDefined();
-  });
-
-  it("打包整体失败时给出错误面板并送进通知中心", async () => {
-    const user = await openWorkbench();
-    const spy = vi
-      .spyOn(api, "buildDelivery")
-      .mockRejectedValue(new Error("NAS 只读，无法写入交付目录"));
-
     await user.click(screen.getByTestId("delivery-open"));
     await user.click(screen.getByRole("button", { name: "开始打包" }));
 
     const err = await screen.findByTestId("delivery-error");
-    expect(err.textContent).toContain("NAS 只读");
+    expect(err.textContent).toContain("交付打包进行中");
 
     await user.click(screen.getByTestId("delivery-close"));
     await user.click(screen.getByTestId("notice-bell"));
@@ -505,5 +126,298 @@ describe("交付打包", () => {
       "delivery-failed",
     );
     spy.mockRestore();
+  });
+});
+
+describe("进度视图", () => {
+  it("排队/运行中显示文件名、done/total、进度条与取消按钮", async () => {
+    await startWith(
+      deliveryJob({
+        state: "running",
+        done: 300,
+        total: 769,
+        message: "DSC_00300.JPG",
+        result: undefined,
+        finishedAt: undefined,
+      }),
+    );
+
+    const panel = await screen.findByTestId("delivery-progress");
+    expect(within(panel).getByTestId("delivery-progress-count").textContent).toBe(
+      "300/769",
+    );
+    expect(within(panel).getByTestId("delivery-progress-file").textContent).toBe(
+      "DSC_00300.JPG",
+    );
+    expect(within(panel).getByTestId("delivery-cancel")).toBeDefined();
+    // 进行中不该出现结果块
+    expect(screen.queryByTestId("delivery-result")).toBeNull();
+  });
+
+  it("取消后显示「已取消，重跑安全续打」并按快照给出已完成量", async () => {
+    const { user } = await startWith(
+      deliveryJob({
+        state: "running",
+        done: 300,
+        result: undefined,
+        finishedAt: undefined,
+      }),
+    );
+    await screen.findByTestId("delivery-progress");
+
+    const cancelSpy = vi.spyOn(api, "cancelJob").mockResolvedValue(
+      deliveryJob({
+        state: "cancelled",
+        done: 312,
+        total: 769,
+        revision: 12,
+        result: undefined,
+      }),
+    );
+    await user.click(screen.getByTestId("delivery-cancel"));
+
+    const result = await screen.findByTestId("delivery-result");
+    expect(within(result).getByTestId("delivery-cancelled").textContent).toContain(
+      "已取消，清单按实况已更新，重跑安全续打",
+    );
+    // result 为空，已完成量来自快照计数
+    expect(
+      within(result).getByTestId("delivery-cancelled-count").textContent,
+    ).toContain("312/769");
+    cancelSpy.mockRestore();
+  });
+});
+
+describe("终态 done 的结果块（E2E 依赖，语义保持不变）", () => {
+  it("逐包列出并给出合计", async () => {
+    await startWith(deliveryJob());
+    await screen.findByTestId("delivery-result");
+
+    const packages = screen.getAllByTestId("delivery-package");
+    expect(packages).toHaveLength(mockDelivery.packages.length);
+    expect(packages[0].textContent).toContain("0824上午");
+    expect(screen.getByTestId("delivery-total").textContent).toContain("本次新交付");
+    expect(screen.getByTestId("delivery-package-note").textContent).toContain(
+      "当前实况",
+    );
+  });
+
+  it("alreadyDelivered 作为正常结果展示", async () => {
+    await startWith(
+      deliveryJob({
+        result: { ...mockDelivery, alreadyDelivered: 24, failures: [] },
+      }),
+    );
+    await screen.findByTestId("delivery-result");
+
+    expect(screen.getByTestId("delivery-headline").textContent).toContain(
+      "已交付跳过 24 个",
+    );
+    expect(screen.getByTestId("delivery-already").textContent).toContain(
+      "绝不覆盖已有交付文件",
+    );
+    expect(screen.queryByTestId("delivery-errors")).toBeNull();
+  });
+
+  it("name-collision 标为未交付并提示人工核对", async () => {
+    await startWith(
+      deliveryJob({
+        result: {
+          ...mockDelivery,
+          alreadyDelivered: 0,
+          failures: [
+            {
+              assetId: "5. 其他/DSC_9.JPG",
+              message: "包内同名文件内容不同",
+              kind: "name-collision",
+            },
+          ],
+        },
+      }),
+    );
+    await screen.findByTestId("delivery-result");
+
+    const box = screen.getByTestId("delivery-errors");
+    expect(box.getAttribute("role")).toBe("alert");
+    expect(box.textContent).toContain("1 个文件未交付");
+    expect(screen.getByTestId("delivery-collision-note").textContent).toContain(
+      "请人工核对",
+    );
+  });
+
+  it("manifest-error 单列为可重跑补齐", async () => {
+    await startWith(
+      deliveryJob({
+        result: {
+          ...mockDelivery,
+          alreadyDelivered: 0,
+          failures: [
+            { assetId: "a.JPG", message: "清单条目未写入", kind: "manifest-error" },
+          ],
+        },
+      }),
+    );
+    await screen.findByTestId("delivery-result");
+
+    expect(screen.getByTestId("delivery-manifest-errors").textContent).toContain(
+      "重新执行一次打包即可补齐",
+    );
+    expect(screen.queryByTestId("delivery-errors")).toBeNull();
+  });
+
+  it("失败超过 8 条指向交付总清单", async () => {
+    await startWith(
+      deliveryJob({
+        result: {
+          ...mockDelivery,
+          alreadyDelivered: 0,
+          failures: Array.from({ length: 12 }, (_, i) => ({
+            assetId: `x/DSC_${i}.JPG`,
+            message: "磁盘写满",
+            kind: "error" as const,
+          })),
+        },
+      }),
+    );
+    await screen.findByTestId("delivery-result");
+
+    const hint = screen.getByTestId("delivery-more-hint");
+    expect(hint.textContent).toContain("交付总清单.txt");
+    expect(hint.textContent).not.toContain("通知中心");
+  });
+
+  it("交付目录可定位，并提醒上传仍需人工", async () => {
+    const reveal = vi.spyOn(api, "revealPath").mockResolvedValue(undefined);
+    const { user } = await startWith(deliveryJob());
+    const result = await screen.findByTestId("delivery-result");
+
+    expect(screen.getByTestId("delivery-path").textContent).toBe(
+      mockDelivery.deliveryPath,
+    );
+    await user.click(screen.getByTestId("delivery-reveal"));
+    expect(reveal).toHaveBeenCalledWith(mockDelivery.deliveryPath);
+    expect(within(result).getByText(/上传网盘与发送链接需人工完成/)).toBeDefined();
+  });
+
+  it("作业 failed 显示错误与重试入口", async () => {
+    await startWith(
+      deliveryJob({ state: "failed", error: "NAS 只读", result: undefined }),
+    );
+    const err = await screen.findByTestId("delivery-error");
+    expect(err.textContent).toContain("NAS 只读");
+    expect(screen.getByTestId("delivery-retry")).toBeDefined();
+  });
+});
+
+describe("作业进行中的互斥（M2 收口行为必须保持）", () => {
+  const runningJob = deliveryJob({
+    state: "running",
+    done: 5,
+    result: undefined,
+    finishedAt: undefined,
+  });
+
+  async function enterWorking() {
+    const { user } = await startWith(runningJob);
+    await screen.findByTestId("sorting-delivery-lock");
+    return user;
+  }
+
+  it("分类条禁用并给出锁定提示", async () => {
+    await enterWorking();
+    const chip = screen
+      .getAllByTestId("sorting-category")
+      .find((c) => c.getAttribute("data-category") === "cat-1") as HTMLButtonElement;
+    expect(chip.disabled).toBe(true);
+  });
+
+  it("D 键标删无效", async () => {
+    await enterWorking();
+    const gridWrap = screen.getByTestId("sorting-grid-wrap");
+    fireEvent.keyDown(gridWrap, { key: "ArrowRight" });
+    fireEvent.keyDown(gridWrap, { key: "d" });
+    expect(screen.queryByTestId("sorting-pending-delete")).toBeNull();
+  });
+
+  it("侧栏导航与回收站入口都被锁住", async () => {
+    await enterWorking();
+    const nav = screen.getByTestId("nav-projects") as HTMLButtonElement;
+    expect(nav.disabled).toBe(true);
+    expect(nav.title).toContain("交付打包进行中");
+    expect(
+      (screen.getByTestId("sorting-open-trash") as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("作业转终态后互斥解除", async () => {
+    await enterWorking();
+
+    const done = deliveryJob({ state: "done", revision: 99 });
+    // 直接走订阅回调：与真实事件同路径
+    await act(async () => {
+      jobEmitters.forEach((emit) => emit(done));
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("sorting-delivery-lock")).toBeNull(),
+    );
+    expect(
+      (screen.getByTestId("nav-projects") as HTMLButtonElement).disabled,
+    ).toBe(false);
+  });
+});
+
+describe("乱序与对账", () => {
+  it("revision 倒退的事件不会把进度拉回去", async () => {
+    await startWith(
+      deliveryJob({
+        state: "running",
+        done: 300,
+        revision: 10,
+        result: undefined,
+        finishedAt: undefined,
+      }),
+    );
+    await screen.findByTestId("delivery-progress");
+
+    await act(async () => {
+      jobEmitters.forEach((emit) =>
+        emit(
+          deliveryJob({
+            state: "running",
+            done: 5,
+            revision: 4,
+            result: undefined,
+            finishedAt: undefined,
+          }),
+        ),
+      );
+    });
+
+    expect(screen.getByTestId("delivery-progress-count").textContent).toBe(
+      "300/769",
+    );
+  });
+
+  it("ready 之后用 listJobs 对账，补回订阅前就结束的作业", async () => {
+    const finished = deliveryJob({ id: "job-early", state: "done", revision: 20 });
+    const listSpy = vi.spyOn(api, "listJobs").mockResolvedValue([finished]);
+
+    render(<App preloaded={preloaded} />);
+    await screen.findAllByTestId("asset-cell");
+
+    await waitFor(() => expect(listSpy).toHaveBeenCalled());
+    // 对账后终态结果块可见——订阅前结束的作业没有被丢掉
+    expect(await screen.findByTestId("delivery-result")).toBeDefined();
+    listSpy.mockRestore();
+  });
+});
+
+describe("DeliverySummary 类型未变（E2E 结果块语义）", () => {
+  it("done 作业的 result 就是 DeliverySummary", async () => {
+    const summary: DeliverySummary = mockDelivery;
+    await startWith(deliveryJob({ result: summary }));
+    await screen.findByTestId("delivery-result");
+    expect(screen.getByTestId("delivery-headline")).toBeDefined();
   });
 });
