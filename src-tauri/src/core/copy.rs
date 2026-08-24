@@ -345,7 +345,9 @@ fn copy_one(
                 )));
             }
         }
-        // 全部通过,统一落位;最终名若已被并发写入者占据,create 语义再拦一次
+        // 全部通过,统一落位。改名前复查目标是否被并发写入者占据;
+        // 注意 rename 本身会覆盖,此复查与 rename 之间仍有微秒级窗口——
+        // 长窗口已被入口 pre_existing 检查夹住,原子化(RENAME_EXCL)记 M2。
         for (part, &i) in parts.iter().zip(&missing) {
             if finals[i].exists() {
                 return Err(super::CoreError::Invalid(format!(

@@ -20,7 +20,8 @@ pub struct TaskHandle {
     pub snapshot: Mutex<CopyTaskDto>,
     pub project_root: PathBuf,
     pub manifest_id: String,
-    pub source_root: PathBuf,
+    /// 源卷挂载点。可变:续传时可能按卷名重解析到新挂载点(卡后插/换口)。
+    pub source_root: Mutex<PathBuf>,
     pub dest_targets: Vec<PathBuf>,
     pub machine_id: String,
     /// 应用配置目录(审计 outbox 兜底用)。
@@ -96,8 +97,37 @@ pub fn spawn_worker(app: AppHandle, handle: Arc<TaskHandle>) {
     });
 }
 
+/// 续传源卷解析(纯函数,可测):记录的挂载点上卷名相符则沿用;
+/// 否则按 manifest 卷名在当前挂载卷中重解析(卡后插/换挂载点,复核必修 A);
+/// 都找不到给出准确报错。
+pub fn resolve_resume_source(
+    recorded_mount: &std::path::Path,
+    expected_label: &str,
+    volumes: &[(PathBuf, String)],
+) -> std::result::Result<PathBuf, String> {
+    if let Some((mp, name)) = volumes.iter().find(|(mp, _)| mp == recorded_mount) {
+        if name == expected_label {
+            return Ok(mp.clone());
+        }
+    }
+    if let Some((mp, _)) = volumes.iter().find(|(_, name)| name == expected_label) {
+        return Ok(mp.clone());
+    }
+    if volumes.iter().any(|(mp, _)| mp == recorded_mount) {
+        Err(format!(
+            "源卷不匹配:任务记录的是「{expected_label}」,当前该位置挂载的是其他卷。请插回原卡"
+        ))
+    } else {
+        Err(format!("源卷未挂载:请插回「{expected_label}」后再续传"))
+    }
+}
+
 /// journal 追加带重试;彻底失败时写本机 outbox 兜底,绝不静默丢审计(评审 P1-7)。
-fn append_audit(project_root: &std::path::Path, outbox_dir: &std::path::Path, ev: &journal::Event) {
+pub fn append_audit(
+    project_root: &std::path::Path,
+    outbox_dir: &std::path::Path,
+    ev: &journal::Event,
+) {
     for _ in 0..3 {
         if journal::append(project_root, ev).is_ok() {
             return;
@@ -123,7 +153,7 @@ fn run_worker(app: &AppHandle, handle: &TaskHandle) -> crate::core::Result<()> {
     let mut m = manifest::load(&handle.project_root, &handle.manifest_id)?;
 
     let req = copy::CopyRequest {
-        source_root: handle.source_root.clone(),
+        source_root: handle.source_root.lock().unwrap().clone(),
         destinations: handle.dest_targets.clone(),
         task_tag: handle.manifest_id.chars().take(8).collect(),
     };
@@ -371,4 +401,50 @@ pub fn build_task(
         finished_at: None,
     };
     Ok((dto, dest_targets))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_resume_source;
+    use std::path::PathBuf;
+
+    fn vols(list: &[(&str, &str)]) -> Vec<(PathBuf, String)> {
+        list.iter()
+            .map(|(mp, n)| (PathBuf::from(mp), n.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn same_mount_same_label_is_reused() {
+        let v = vols(&[("/Volumes/CARD", "CARD")]);
+        assert_eq!(
+            resolve_resume_source(&PathBuf::from("/Volumes/CARD"), "CARD", &v).unwrap(),
+            PathBuf::from("/Volumes/CARD")
+        );
+    }
+
+    #[test]
+    fn card_replugged_at_new_mount_is_re_resolved() {
+        // 卡后插被挂到了新位置(复核必修 A 的核心场景)
+        let v = vols(&[("/Volumes/CARD 1", "CARD")]);
+        assert_eq!(
+            resolve_resume_source(&PathBuf::from("/Volumes/CARD"), "CARD", &v).unwrap(),
+            PathBuf::from("/Volumes/CARD 1")
+        );
+    }
+
+    #[test]
+    fn different_card_at_recorded_mount_is_rejected() {
+        // 同一挂载点换了另一张卡 → 拒绝(评审 M10)
+        let v = vols(&[("/Volumes/CARD", "OTHER")]);
+        let err = resolve_resume_source(&PathBuf::from("/Volumes/CARD"), "CARD", &v).unwrap_err();
+        assert!(err.contains("源卷不匹配"), "{err}");
+    }
+
+    #[test]
+    fn missing_card_reports_unmounted() {
+        let v = vols(&[("/Volumes/ELSE", "ELSE")]);
+        let err = resolve_resume_source(&PathBuf::from("/Volumes/CARD"), "CARD", &v).unwrap_err();
+        assert!(err.contains("源卷未挂载"), "{err}");
+    }
 }

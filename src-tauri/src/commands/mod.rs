@@ -144,8 +144,9 @@ pub fn create_project(state: State<AppState>, input: NewProjectInput) -> CmdResu
     let date = parse_compact_date(&input.date)?;
     let root = project::create_project(&nas, date, &input.name, input.scenario, &input.categories)
         .map_err(err)?;
-    let _ = journal::append(
+    tasks::append_audit(
         &root,
+        &state.config_dir,
         &journal::Event::new(
             state.machine_id.clone(),
             operator(&state),
@@ -511,8 +512,9 @@ pub fn start_copy_task(
         .collect();
     manifest::save(&stats.root, &m).map_err(err)?;
 
-    let _ = journal::append(
+    tasks::append_audit(
         &stats.root,
+        &state.config_dir,
         &journal::Event::new(
             state.machine_id.clone(),
             op,
@@ -533,7 +535,7 @@ pub fn start_copy_task(
         snapshot: std::sync::Mutex::new(dto.clone()),
         project_root: stats.root.clone(),
         manifest_id: m.id.clone(),
-        source_root,
+        source_root: std::sync::Mutex::new(source_root),
         dest_targets,
         machine_id: state.machine_id.clone(),
         config_dir: state.config_dir.clone(),
@@ -561,26 +563,25 @@ pub fn resume_copy_task(app: AppHandle, state: State<AppState>, task_id: String)
         .ok_or_else(|| format!("任务不存在: {task_id}"))?;
 
     if !handle.running.load(Ordering::SeqCst) {
-        // 续传身份核对(评审 M10/P0-1):同一挂载点可能已换了另一张卡
+        // 续传身份核对(评审 M10/P0-1)+ 按卷名重解析挂载点(复核必修 A:
+        // 卡后插/换挂载口场景,插回原卡即可续传,无需重启应用)
         let m = manifest::load(&handle.project_root, &handle.manifest_id).map_err(err)?;
-        let current_name = volumes::list_volumes()
+        let vols: Vec<(PathBuf, String)> = volumes::list_volumes()
             .into_iter()
-            .find(|v| v.mount_point == handle.source_root)
-            .map(|v| v.name);
-        match current_name {
-            Some(name) if name == m.source_label => {}
-            Some(name) => {
-                return Err(format!(
-                    "源卷不匹配:任务记录的是「{}」,当前挂载的是「{name}」。请插回原卡再续传",
-                    m.source_label
-                ));
-            }
-            None => {
-                return Err(format!("源卷未挂载:请插回「{}」后再续传", m.source_label));
-            }
+            .map(|v| (v.mount_point, v.name))
+            .collect();
+        let recorded = handle.source_root.lock().unwrap().clone();
+        let resolved = tasks::resolve_resume_source(&recorded, &m.source_label, &vols)?;
+        {
+            let mut src = handle.source_root.lock().unwrap();
+            *src = resolved.clone();
+        }
+        {
+            let mut snap = handle.snapshot.lock().unwrap();
+            snap.volume_id = resolved.display().to_string();
         }
         // 刷新清单:源卡内容可能在暂停期间变化,快照与引擎必须消费同一份新清单
-        let files = copy::scan_source(&handle.source_root).map_err(err)?;
+        let files = copy::scan_source(&resolved).map_err(err)?;
         let mut snap = handle.snapshot.lock().unwrap();
         let old: std::collections::HashMap<String, &'static str> = snap
             .files
@@ -703,7 +704,7 @@ pub fn rebuild_tasks(state: &AppState) {
                 snapshot: std::sync::Mutex::new(dto),
                 project_root: p.root.clone(),
                 manifest_id: m.id.clone(),
-                source_root,
+                source_root: std::sync::Mutex::new(source_root),
                 dest_targets,
                 machine_id: state.machine_id.clone(),
                 config_dir: state.config_dir.clone(),
