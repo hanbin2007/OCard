@@ -158,31 +158,36 @@ pub struct RegistryLoad {
     pub registry: Registry,
     pub skipped_lines: usize,
     pub unreadable_files: usize,
+    /// 事件外壳合法但 payload 解析失败被忽略的条数(零静默原则)。
+    pub skipped_payloads: usize,
 }
 
 /// 读取并折叠当前登记表(同 id 后写胜;删除事件移除)。
 pub fn load(nas_root: &Path) -> Result<RegistryLoad> {
     let read = journal::read_all_in(&registry_dir(nas_root))?;
     let mut reg = Registry::default();
+    let mut skipped_payloads = 0usize;
     for ev in read.events {
         match ev.kind.as_str() {
-            kind::CAMERA_REGISTERED => {
-                if let Ok(cam) = serde_json::from_value::<CameraReg>(ev.data) {
+            kind::CAMERA_REGISTERED => match serde_json::from_value::<CameraReg>(ev.data) {
+                Ok(cam) => {
                     reg.cameras.retain(|c| c.id != cam.id);
                     reg.cameras.push(cam);
                 }
-            }
+                Err(_) => skipped_payloads += 1,
+            },
             kind::CAMERA_DELETED => {
                 if let Some(id) = ev.data.get("id").and_then(|v| v.as_str()) {
                     reg.cameras.retain(|c| c.id != id);
                 }
             }
-            kind::CARD_REGISTERED => {
-                if let Ok(card) = serde_json::from_value::<StorageCard>(ev.data) {
+            kind::CARD_REGISTERED => match serde_json::from_value::<StorageCard>(ev.data) {
+                Ok(card) => {
                     reg.cards.retain(|c| c.id != card.id);
                     reg.cards.push(card);
                 }
-            }
+                Err(_) => skipped_payloads += 1,
+            },
             kind::CARD_DELETED => {
                 if let Some(id) = ev.data.get("id").and_then(|v| v.as_str()) {
                     reg.cards.retain(|c| c.id != id);
@@ -195,6 +200,7 @@ pub fn load(nas_root: &Path) -> Result<RegistryLoad> {
         registry: reg,
         skipped_lines: read.skipped_lines,
         unreadable_files: read.unreadable_files,
+        skipped_payloads,
     })
 }
 

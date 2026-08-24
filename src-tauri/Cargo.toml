@@ -27,6 +27,8 @@ thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 sysinfo = "0.39"
+tauri-plugin-updater = "2.10.1"
+tokio = { version = "1.53.1", features = ["time"] }
 
 [dev-dependencies]
 tempfile = "3"

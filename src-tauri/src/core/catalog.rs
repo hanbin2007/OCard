@@ -39,6 +39,11 @@ pub struct CatalogScan {
 pub fn scan(nas_root: &Path) -> Result<CatalogScan> {
     let mut out = CatalogScan::default();
     if !nas_root.exists() {
+        // 零静默:配置了 NAS 根但路径不可达,不能伪装成「零项目」
+        out.warnings.push(format!(
+            "NAS 根路径不存在或不可达: {}(项目列表为空可能并非真实状态)",
+            nas_root.display()
+        ));
         return Ok(out);
     }
     for entry in fs::read_dir(nas_root)? {
@@ -57,7 +62,26 @@ pub fn scan(nas_root: &Path) -> Result<CatalogScan> {
             }
             continue;
         };
-        let manifests = manifest::list(&path).unwrap_or_default();
+        let folder = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let manifests = match manifest::list(&path) {
+            Ok(list) => {
+                if list.skipped > 0 {
+                    out.warnings.push(format!(
+                        "项目「{folder}」有 {} 份拷卡清单损坏或不可读,统计与续传可能不完整",
+                        list.skipped
+                    ));
+                }
+                list.manifests
+            }
+            Err(e) => {
+                out.warnings
+                    .push(format!("项目「{folder}」的拷卡清单目录不可读: {e}"));
+                Vec::new()
+            }
+        };
         let cards_copied = manifests.iter().filter(|m| m.completed).count();
         let has_incomplete_copy = manifests.iter().any(|m| !m.completed);
         let bytes_copied = manifests
@@ -83,10 +107,7 @@ pub fn scan(nas_root: &Path) -> Result<CatalogScan> {
             .max()
             .unwrap_or(0);
         out.projects.push(ProjectStats {
-            folder_name: path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default(),
+            folder_name: folder,
             root: path,
             meta,
             cards_copied,

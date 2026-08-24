@@ -29,26 +29,41 @@ pub fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
+/// 跨平台安全比较键:词法归一之上,Windows 再做大小写折叠与 `\\?\` 详细前缀剥离
+/// (Windows 文件系统大小写不敏感,`E:\CARD` 与 `e:\card` 是同一棵树;
+/// codex 收口验证 P0:大小写别名可绕过嵌套检查写回源卡)。
+fn comparison_key(path: &Path) -> PathBuf {
+    let n = normalize_lexical(path);
+    if cfg!(windows) {
+        let s = n.to_string_lossy().to_lowercase();
+        let s = s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s);
+        PathBuf::from(s)
+    } else {
+        n
+    }
+}
+
 /// 源与目的地布局校验:绝对路径、拒绝源目标双向嵌套、拒绝重复目的地。
-/// 一切比较基于词法归一后的路径。
+/// 一切比较基于 comparison_key(大小写/别名安全)。
 pub fn validate_dest_layout(source_root: &Path, dest_targets: &[PathBuf]) -> Result<(), String> {
-    let source_root = normalize_lexical(source_root);
+    let source_key = comparison_key(source_root);
     let normalized: Vec<PathBuf> = dest_targets.iter().map(|t| normalize_lexical(t)).collect();
-    for t in &normalized {
+    let keys: Vec<PathBuf> = dest_targets.iter().map(|t| comparison_key(t)).collect();
+    for (t, k) in normalized.iter().zip(&keys) {
         if !t.is_absolute() {
             return Err(format!("目的地必须是绝对路径: {}", t.display()));
         }
-        if t.starts_with(&source_root) || source_root.starts_with(t) {
+        if k.starts_with(&source_key) || source_key.starts_with(k) {
             return Err(format!(
                 "目的地与源卷互相嵌套,拒绝执行(会写回源卡): {}",
                 t.display()
             ));
         }
     }
-    for (i, a) in normalized.iter().enumerate() {
-        for b in normalized.iter().skip(i + 1) {
+    for (i, a) in keys.iter().enumerate() {
+        for (b, orig) in keys.iter().zip(&normalized).skip(i + 1) {
             if a == b {
-                return Err(format!("两个目的地指向同一位置: {}", a.display()));
+                return Err(format!("两个目的地指向同一位置: {}", orig.display()));
             }
         }
     }
@@ -113,5 +128,34 @@ pub(crate) mod tests {
         assert!(
             validate_dest_layout(&abs("/mnt/card"), &[abs("/nas/t"), abs("/backup/t")]).is_ok()
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn case_insensitive_nesting_is_rejected() {
+        // codex 收口验证 P0:Windows 大小写别名绕过
+        assert!(validate_dest_layout(
+            &PathBuf::from(r"E:\CARD"),
+            &[PathBuf::from(r"e:\card\Backup")]
+        )
+        .is_err());
+        assert!(
+            validate_dest_layout(&PathBuf::from(r"e:\card\sub"), &[PathBuf::from(r"E:\CARD")])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn verbatim_prefix_alias_duplicate_is_rejected() {
+        assert!(validate_dest_layout(
+            &PathBuf::from(r"D:\src"),
+            &[PathBuf::from(r"C:\nas\t"), PathBuf::from(r"\\?\C:\NAS\t")]
+        )
+        .is_err());
     }
 }

@@ -17,11 +17,20 @@ pub struct WorkstationConfig {
     pub nas_root: Option<PathBuf>,
 }
 
+/// 读取配置并区分「文件不存在(首跑,正常)」与「文件存在但损坏(必须上报)」。
+/// 返回 (配置, 是否损坏)。零静默原则:损坏被当首跑处理时用户必须知情。
+pub fn load_checked(config_dir: &Path) -> (WorkstationConfig, bool) {
+    match fs::read(config_dir.join(CONFIG_FILE)) {
+        Err(_) => (WorkstationConfig::default(), false),
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(cfg) => (cfg, false),
+            Err(_) => (WorkstationConfig::default(), true),
+        },
+    }
+}
+
 pub fn load(config_dir: &Path) -> WorkstationConfig {
-    fs::read(config_dir.join(CONFIG_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    load_checked(config_dir).0
 }
 
 pub fn save(config_dir: &Path, cfg: &WorkstationConfig) -> Result<()> {

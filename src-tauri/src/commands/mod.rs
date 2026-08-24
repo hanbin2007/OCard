@@ -4,6 +4,7 @@
 pub mod dto;
 pub mod notify;
 pub mod tasks;
+pub mod updater;
 
 use crate::core::{catalog, config, copy, journal, manifest, project, registry, volumes};
 use chrono::{Local, NaiveDate, TimeZone, Utc};
@@ -18,6 +19,8 @@ pub struct AppState {
     pub config_dir: PathBuf,
     pub machine_id: String,
     pub tasks: TaskManager,
+    /// 通知积压:堵住「前端监听就绪前发出的通知永久丢失」的窗口。
+    pub notices: std::sync::Mutex<Vec<notify::NoticeDto>>,
 }
 
 type CmdResult<T> = std::result::Result<T, String>;
@@ -85,8 +88,15 @@ fn find_project(nas: &Path, project_id: &str) -> CmdResult<catalog::ProjectStats
 // ---------- 工作站 ----------
 
 #[tauri::command]
-pub fn get_workstation_info(state: State<AppState>) -> WorkstationInfoDto {
-    let cfg = config::load(&state.config_dir);
+pub fn get_workstation_info(app: AppHandle, state: State<AppState>) -> WorkstationInfoDto {
+    let (cfg, corrupt) = config::load_checked(&state.config_dir);
+    if corrupt {
+        notify::warn(
+            &app,
+            "workstation-config-corrupt",
+            "本机配置文件损坏,已按未配置状态处理;请重新填写设置(原配置无法恢复)".to_string(),
+        );
+    }
     WorkstationInfoDto {
         machine_id: state.machine_id.clone(),
         operator: cfg.operator,
@@ -99,6 +109,7 @@ pub fn get_workstation_info(state: State<AppState>) -> WorkstationInfoDto {
 
 #[tauri::command]
 pub fn set_workstation_info(
+    app: AppHandle,
     state: State<AppState>,
     operator: String,
     nas_root: String,
@@ -112,20 +123,20 @@ pub fn set_workstation_info(
         },
     };
     config::save(&state.config_dir, &cfg).map_err(err)?;
-    Ok(get_workstation_info(state))
+    Ok(get_workstation_info(app, state))
 }
 
 // ---------- 项目 ----------
 
 /// 上报登记表 journal 健康度(UX 原则:容错跳过必须让用户看见)。
 fn notice_registry_health(app: &AppHandle, load: &registry::RegistryLoad) {
-    if load.skipped_lines > 0 || load.unreadable_files > 0 {
+    if load.skipped_lines > 0 || load.unreadable_files > 0 || load.skipped_payloads > 0 {
         notify::warn(
             app,
             "registry-journal-degraded",
             format!(
-                "登记表日志存在损坏数据:已跳过 {} 行、{} 个文件。登记内容可能不完整,请检查 NAS 上的 .ocard-registry",
-                load.skipped_lines, load.unreadable_files
+                "登记表日志存在损坏数据:已跳过 {} 行、{} 个文件、{} 条无效载荷。登记内容可能不完整,请检查 NAS 上的 .ocard-registry",
+                load.skipped_lines, load.unreadable_files, load.skipped_payloads
             ),
         );
     }
@@ -306,12 +317,25 @@ pub fn delete_storage_card(state: State<AppState>, card_id: String) -> CmdResult
 // ---------- 卷 ----------
 
 #[tauri::command]
-pub fn list_volumes(state: State<AppState>) -> Vec<VolumeDto> {
-    let cards = nas_root(&state)
-        .ok()
-        .and_then(|nas| registry::load(&nas).ok())
-        .map(|r| r.registry.cards)
-        .unwrap_or_default();
+pub fn list_volumes(app: AppHandle, state: State<AppState>) -> Vec<VolumeDto> {
+    // 卡匹配是增强信息:登记表读不到时降级为「不匹配」,但必须告知(零静默)
+    let cards = match nas_root(&state) {
+        Err(_) => Vec::new(), // NAS 未配置:首跑正常态,引导页已在处理,不算降级
+        Ok(nas) => match registry::load(&nas) {
+            Ok(load) => {
+                notice_registry_health(&app, &load);
+                load.registry.cards
+            }
+            Err(e) => {
+                notify::warn(
+                    &app,
+                    "volumes-registry-unavailable",
+                    format!("登记表读取失败,卷列表暂无法关联已登记的卡: {e}"),
+                );
+                Vec::new()
+            }
+        },
+    };
     volumes::list_volumes()
         .into_iter()
         .map(|v| {
@@ -680,18 +704,31 @@ pub fn rebuild_tasks(app: &AppHandle, state: &AppState) {
     let projects = scan.projects;
     let vols = volumes::list_volumes();
     for p in projects {
-        let Ok(manifests) = manifest::list(&p.root) else {
+        let list = match manifest::list(&p.root) {
+            Ok(l) => l,
+            Err(_) => {
+                notify::warn(
+                    app,
+                    "rebuild-manifest-unreadable",
+                    format!(
+                        "项目「{}」的拷卡清单不可读,其中未完成任务未能重建",
+                        p.folder_name
+                    ),
+                );
+                continue;
+            }
+        };
+        if list.skipped > 0 {
             notify::warn(
                 app,
-                "rebuild-manifest-unreadable",
+                "rebuild-manifest-corrupt",
                 format!(
-                    "项目「{}」的拷卡清单不可读,其中未完成任务未能重建",
-                    p.folder_name
+                    "项目「{}」有 {} 份拷卡清单损坏,对应任务未能重建",
+                    p.folder_name, list.skipped
                 ),
             );
-            continue;
-        };
-        for m in manifests.into_iter().filter(|m| !m.completed) {
+        }
+        for m in list.manifests.into_iter().filter(|m| !m.completed) {
             // 归一后再用:旧 manifest 可能携带 `..` 等病态目的地字符串(codex 终验 #6);
             // 续传时还会经 validate_dest_layout 与重绑后的源做嵌套复核
             let dest_targets: Vec<PathBuf> = m
@@ -700,7 +737,16 @@ pub fn rebuild_tasks(app: &AppHandle, state: &AppState) {
                 .map(|d| normalize_lexical(Path::new(d)))
                 .collect();
             if dest_targets.is_empty() {
-                continue; // 旧格式 manifest,无法重建
+                // 零静默:旧格式清单缺目的地记录,无法重建必须告知
+                notify::warn(
+                    app,
+                    "rebuild-legacy-manifest",
+                    format!(
+                        "项目「{}」的任务「{}」为旧格式清单(无目的地记录),无法自动续传;重新发起拷卡即可,不会覆盖已有素材",
+                        p.folder_name, m.target_rel
+                    ),
+                );
+                continue;
             }
             // 源卷按卷名匹配当前挂载;找不到则置空,续传时会要求插回原卡
             let source_root = vols

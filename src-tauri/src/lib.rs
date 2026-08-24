@@ -8,6 +8,7 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             let machine_id = core::machine::machine_id(&config_dir)
@@ -16,9 +17,15 @@ pub fn run() {
                 config_dir,
                 machine_id,
                 tasks: Default::default(),
+                notices: Default::default(),
             });
             // 崩溃/重启后从未完成的 manifest 重建可续传任务
             commands::rebuild_tasks(app.handle(), &app.state::<AppState>());
+            // 静默 OTA:后台周期检查、签名校验、静默安装,重启生效
+            let update_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                commands::updater::silent_update_loop(update_handle).await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -44,6 +51,8 @@ pub fn run() {
             commands::pause_copy_task,
             commands::resume_copy_task,
             commands::retry_copy_file,
+            commands::updater::check_for_update,
+            commands::notify::list_notices,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

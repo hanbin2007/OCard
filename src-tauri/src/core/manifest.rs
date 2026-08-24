@@ -109,21 +109,33 @@ pub fn load(project_root: &Path, id: &str) -> Result<CopyManifest> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
-pub fn list(project_root: &Path) -> Result<Vec<CopyManifest>> {
+/// 清单列表 + 健康度(损坏清单计数必须上报,零静默原则)。
+#[derive(Debug, Default)]
+pub struct ManifestList {
+    pub manifests: Vec<CopyManifest>,
+    /// 损坏/不可读被跳过的清单文件数。
+    pub skipped: usize,
+}
+
+pub fn list(project_root: &Path) -> Result<ManifestList> {
     let dir = manifest_dir(project_root);
-    let mut out = Vec::new();
+    let mut out = ManifestList::default();
     if !dir.exists() {
         return Ok(out);
     }
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         if path.extension().is_some_and(|e| e == "json") {
-            if let Ok(m) = serde_json::from_slice::<CopyManifest>(&fs::read(&path)?) {
-                out.push(m);
+            match fs::read(&path) {
+                Ok(bytes) => match serde_json::from_slice::<CopyManifest>(&bytes) {
+                    Ok(m) => out.manifests.push(m),
+                    Err(_) => out.skipped += 1,
+                },
+                Err(_) => out.skipped += 1,
             }
         }
     }
-    out.sort_by_key(|m| m.created_at);
+    out.manifests.sort_by_key(|m| m.created_at);
     Ok(out)
 }
 
@@ -157,7 +169,9 @@ mod tests {
         let loaded = load(tmp.path(), &m.id).unwrap();
         assert_eq!(loaded.entries, m.entries);
         assert_eq!(loaded.camera_code, "A7M4_A_ZS");
-        assert_eq!(list(tmp.path()).unwrap().len(), 1);
+        let l = list(tmp.path()).unwrap();
+        assert_eq!(l.manifests.len(), 1);
+        assert_eq!(l.skipped, 0);
     }
 
     #[test]
