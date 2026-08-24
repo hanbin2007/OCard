@@ -1,0 +1,129 @@
+/**
+ * 内联图标：16px 网格、1.5px 描边、currentColor。
+ * 全部自绘线条，不引第三方图标库，也不使用任何第三方品牌资产。
+ */
+
+import type { SVGProps } from "react";
+
+type IconProps = SVGProps<SVGSVGElement> & { size?: number };
+
+function Svg({ size = 16, children, ...rest }: IconProps) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+      {...rest}
+    >
+      {children}
+    </svg>
+  );
+}
+
+export function IconProjects(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.2l1.3 1.6h5.5A1.5 1.5 0 0 1 14 6.1v5.4A1.5 1.5 0 0 1 12.5 13h-9A1.5 1.5 0 0 1 2 11.5z" />
+    </Svg>
+  );
+}
+
+export function IconPlus(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M8 3.5v9M3.5 8h9" />
+    </Svg>
+  );
+}
+
+export function IconCamera(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M2 5.8A1.3 1.3 0 0 1 3.3 4.5h1.6l1-1.5h4.2l1 1.5h1.6A1.3 1.3 0 0 1 14 5.8v5.4a1.3 1.3 0 0 1-1.3 1.3H3.3A1.3 1.3 0 0 1 2 11.2z" />
+      <circle cx="8" cy="8.4" r="2.3" />
+    </Svg>
+  );
+}
+
+export function IconCard(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M3.2 2.5h6.3L12.8 5.8v7.7H3.2z" />
+      <path d="M5.6 2.5v3.1M7.8 2.5v3.1M10 4.7v.9" />
+    </Svg>
+  );
+}
+
+export function IconCheck(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M3.2 8.4 6.4 11.6l6.4-7.2" />
+    </Svg>
+  );
+}
+
+export function IconChevronRight(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M6 3.5 10.5 8 6 12.5" />
+    </Svg>
+  );
+}
+
+export function IconSun(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <circle cx="8" cy="8" r="2.8" />
+      <path d="M8 1.6v1.4M8 13v1.4M1.6 8H3M13 8h1.4M3.5 3.5l1 1M11.5 11.5l1 1M12.5 3.5l-1 1M4.5 11.5l-1 1" />
+    </Svg>
+  );
+}
+
+export function IconMoon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M13 9.6A5.4 5.4 0 0 1 6.4 3 5.6 5.6 0 1 0 13 9.6" />
+    </Svg>
+  );
+}
+
+export function IconMonitor(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <rect x="2" y="3" width="12" height="8.2" rx="1.2" />
+      <path d="M6 13.6h4" />
+    </Svg>
+  );
+}
+
+export function IconTrash(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M3 4.4h10M6.4 4.4V3h3.2v1.4M4.4 4.4l.6 8.2h6l.6-8.2" />
+    </Svg>
+  );
+}
+
+export function IconRetry(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M13 8a5 5 0 1 1-1.6-3.7" />
+      <path d="M13.2 2.6v2.9h-2.9" />
+    </Svg>
+  );
+}
+
+export function IconArrowLeft(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M12.5 8h-9M6.8 3.6 3 8l3.8 4.4" />
+    </Svg>
+  );
+}

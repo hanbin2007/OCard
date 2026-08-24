@@ -8,49 +8,104 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: Release (${{ matrix.platform }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux
-            os: ubuntu-latest
-          - platform: macos
-            os: macos-latest
-          - platform: windows
-            os: windows-latest
-    runs-on: ${{ matrix.os }}
+  # Linux / Windows 完全接触不到 Apple 凭据(凭据只进 release-macos)
+  release-linux:
+    name: Release (linux)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Linux system deps (Tauri v2)
-        if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 
       - uses: pnpm/action-setup@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-
       - run: pnpm install --frozen-lockfile
 
       - name: Build and attach to GitHub Release
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # macOS 签名+公证:secrets 未配置时自动跳过,配好即生效(见 docs/signing-setup.md)
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "OCard ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+
+  release-windows:
+    name: Release (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build and attach to GitHub Release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "OCard ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+
+  release-macos:
+    name: Release (macos, signed + notarized)
+    # 固定 macos-15:签名链对 runner 镜像/Xcode 迁移敏感,升级走定期 PR 而非跟随 latest
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # fail-closed:正式标签构建缺任何签名/公证凭据必须失败,而不是发未签名产物
+      - name: Ensure signing credentials present
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=0
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!v}" ]; then echo "::error::缺少 Secret: $v"; missing=1; fi
+          done
+          exit $missing
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build, sign, notarize and attach to GitHub Release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -62,3 +117,12 @@ jobs:
           releaseName: "OCard ${{ github.ref_name }}"
           releaseDraft: true
           prerelease: false
+
+      # 构建后验证:签名、Gatekeeper 评估、公证 staple 三关全过才算合格产物
+      - name: Verify signature and notarization
+        run: |
+          APP=$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name "*.app" | head -1)
+          echo "Verifying: $APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          spctl -a -t exec -vv "$APP"
+          xcrun stapler validate "$APP"

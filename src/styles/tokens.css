@@ -1,0 +1,173 @@
+/*
+ * OCard 设计令牌
+ * 视觉语言基线：PRD §5.9 —— 近白/近黑双主题、克制灰阶、大留白、
+ * 1px 细分割线、小圆角、无装饰阴影、低饱和单一强调色、150ms 克制过渡。
+ * 所有颜色一律经由变量引用，组件样式中不得出现字面色值。
+ */
+
+:root {
+  /* ---- 字体 ---- */
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, "Helvetica Neue",
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono:
+    ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono",
+    "Roboto Mono", monospace;
+
+  /* ---- 字号层级 ---- */
+  --text-2xs: 11px;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-md: 16px;
+  --text-lg: 20px;
+  --text-xl: 24px;
+
+  --leading-tight: 1.25;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.7;
+
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+
+  /* ---- 间距（4 的倍数） ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* ---- 圆角 ---- */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+
+  /* ---- 过渡 ---- */
+  --transition: 150ms ease;
+
+  /* ---- 布局尺寸 ---- */
+  --sidebar-width: 232px;
+  --topbar-height: 52px;
+  --content-max: 1180px;
+
+  /* ---- 浅色主题（默认，近白） ---- */
+  --bg: #ffffff;
+  --bg-subtle: #f9f9f9;
+  --bg-sunken: #f4f4f4;
+  --panel: #ffffff;
+  --panel-raised: #fafafa;
+
+  --border: #e5e5e5;
+  --border-strong: #d4d4d4;
+  --border-focus: #b4b4b4;
+
+  --text-primary: #0d0d0d;
+  --text-secondary: #5d5d5d;
+  /* #8f8f8f 在白底上只有 3.2:1，达不到 AA 4.5:1；收到 #6e6e6e（4.9:1） */
+  --text-tertiary: #6e6e6e;
+  --text-inverse: #ffffff;
+
+  --hover: rgba(13, 13, 13, 0.04);
+  --active: rgba(13, 13, 13, 0.07);
+  --selected: rgba(13, 13, 13, 0.06);
+
+  /* 唯一强调色，用量极少：仅主按钮、焦点环、进度条 */
+  --accent: #2f6fd0;
+  --accent-hover: #2a63bb;
+  --accent-soft: rgba(47, 111, 208, 0.1);
+  --accent-ring: rgba(47, 111, 208, 0.35);
+  /* 强调色上的文字，两主题一致 */
+  --on-accent: #ffffff;
+
+  /* 状态色（低饱和，仅用于文字/圆点，不做大面积填充） */
+  --ok: #2f7d54;
+  --ok-soft: rgba(47, 125, 84, 0.1);
+  --warn: #8a6216;
+  --warn-soft: rgba(138, 98, 22, 0.1);
+  --danger: #b3352b;
+  --danger-soft: rgba(179, 53, 43, 0.1);
+
+  color-scheme: light;
+}
+
+/* ---- 深色主题：跟随系统 ---- */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d0d0d;
+    --bg-subtle: #171717;
+    --bg-sunken: #0a0a0a;
+    --panel: #171717;
+    --panel-raised: #212121;
+
+    --border: #2f2f2f;
+    --border-strong: #3d3d3d;
+    --border-focus: #565656;
+
+    --text-primary: #ececec;
+    --text-secondary: #b4b4b4;
+    --text-tertiary: #8f8f8f;
+    --text-inverse: #0d0d0d;
+
+    --hover: rgba(255, 255, 255, 0.05);
+    --active: rgba(255, 255, 255, 0.08);
+    --selected: rgba(255, 255, 255, 0.07);
+
+    --accent: #5b8def;
+    --accent-hover: #6d9bf3;
+    --accent-soft: rgba(91, 141, 239, 0.14);
+    --accent-ring: rgba(91, 141, 239, 0.4);
+    --on-accent: #ffffff;
+
+    --ok: #5fb083;
+    --ok-soft: rgba(95, 176, 131, 0.14);
+    --warn: #cba14a;
+    --warn-soft: rgba(203, 161, 74, 0.14);
+    --danger: #e0776d;
+    --danger-soft: rgba(224, 119, 109, 0.14);
+
+    color-scheme: dark;
+  }
+}
+
+/* ---- 深色主题：手动切换覆盖 ---- */
+:root[data-theme="dark"] {
+  --bg: #0d0d0d;
+  --bg-subtle: #171717;
+  --bg-sunken: #0a0a0a;
+  --panel: #171717;
+  --panel-raised: #212121;
+
+  --border: #2f2f2f;
+  --border-strong: #3d3d3d;
+  --border-focus: #565656;
+
+  --text-primary: #ececec;
+  --text-secondary: #b4b4b4;
+  --text-tertiary: #8f8f8f;
+  --text-inverse: #0d0d0d;
+
+  --hover: rgba(255, 255, 255, 0.05);
+  --active: rgba(255, 255, 255, 0.08);
+  --selected: rgba(255, 255, 255, 0.07);
+
+  --accent: #5b8def;
+  --accent-hover: #6d9bf3;
+  --accent-soft: rgba(91, 141, 239, 0.14);
+  --accent-ring: rgba(91, 141, 239, 0.4);
+  --on-accent: #ffffff;
+
+  --ok: #5fb083;
+  --ok-soft: rgba(95, 176, 131, 0.14);
+  --warn: #cba14a;
+  --warn-soft: rgba(203, 161, 74, 0.14);
+  --danger: #e0776d;
+  --danger-soft: rgba(224, 119, 109, 0.14);
+
+  color-scheme: dark;
+}
