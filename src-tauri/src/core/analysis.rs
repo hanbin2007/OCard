@@ -41,6 +41,9 @@ pub struct FeatureRecord {
     pub under_exposed: f32,
     /// 拍摄时刻(epoch 秒,EXIF 优先 mtime 回退;聚类排序用,避免列表期重读 EXIF)。
     pub shot_at_epoch: Option<i64>,
+    /// 检出人脸数(None=本次分析时人脸检测不可用;闭眼检测已砍,见 yunet.rs 边界)。
+    #[serde(default)]
+    pub faces: Option<u32>,
     pub analyzed_at: chrono::DateTime<chrono::Utc>,
     pub machine_id: String,
 }
@@ -182,6 +185,20 @@ fn exposure_fractions(gray: &image::GrayImage) -> (f32, f32) {
     (over as f32 / total, under as f32 / total)
 }
 
+/// 归一化区域(如人脸框)的清晰度:裁块后按同一拉普拉斯口径计算。
+/// 人脸在场时清晰度以最大脸区域为准(对焦在脸=可用,背景糊无妨)。
+pub fn sharpness_region(img: &image::DynamicImage, x: f32, y: f32, w: f32, h: f32) -> f32 {
+    let (iw, ih) = (img.width() as f32, img.height() as f32);
+    // 外扩 20% 再裁,防框贴边切掉高频细节
+    let ex = (w * 0.2).max(0.02);
+    let ey = (h * 0.2).max(0.02);
+    let x0 = ((x - ex) * iw).max(0.0) as u32;
+    let y0 = ((y - ey) * ih).max(0.0) as u32;
+    let cw = (((w + 2.0 * ex) * iw) as u32).clamp(8, img.width() - x0.min(img.width() - 1));
+    let ch = (((h + 2.0 * ey) * ih) as u32).clamp(8, img.height() - y0.min(img.height() - 1));
+    laplacian_score(&image::imageops::grayscale(&img.crop_imm(x0, y0, cw, ch)))
+}
+
 /// 清晰度:原始分辨率中心裁块(≤512²)的拉普拉斯方差,log 压缩到 0-100 量级。
 /// 在整图降采样上算会把糊片和清晰片抹平(计划 C3)。
 fn sharpness_center_crop(img: &image::DynamicImage) -> f32 {
@@ -191,7 +208,10 @@ fn sharpness_center_crop(img: &image::DynamicImage) -> f32 {
     let x = (w - cw) / 2;
     let y = (h - ch) / 2;
     let crop = img.crop_imm(x, y, cw, ch);
-    let gray = image::imageops::grayscale(&crop);
+    laplacian_score(&image::imageops::grayscale(&crop))
+}
+
+fn laplacian_score(gray: &image::GrayImage) -> f32 {
     let (gw, gh) = gray.dimensions();
     if gw < 3 || gh < 3 {
         return 0.0;
@@ -223,6 +243,8 @@ fn sharpness_center_crop(img: &image::DynamicImage) -> f32 {
 #[serde(rename_all = "camelCase")]
 pub struct AssetJudgement {
     pub group_id: Option<String>,
+    /// 检出人脸数(None=分析时检测不可用)。
+    pub faces: Option<u32>,
     pub score: f32,
     pub blurry: bool,
     pub over_exposed: bool,
@@ -292,6 +314,7 @@ pub fn judge(
                 rel.clone(),
                 AssetJudgement {
                     group_id: group_id.clone(),
+                    faces: feat.as_ref().and_then(|f| f.faces),
                     score,
                     blurry,
                     over_exposed: over,
@@ -325,6 +348,7 @@ mod tests {
             over_exposed: 0.0,
             under_exposed: 0.0,
             shot_at_epoch: None,
+            faces: None,
             analyzed_at: Utc::now(),
             machine_id: "M".into(),
         }

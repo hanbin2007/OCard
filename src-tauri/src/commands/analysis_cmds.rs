@@ -5,7 +5,7 @@
 use super::notify;
 use super::sorting_cmds::JOB_EVENT;
 use crate::core::jobs::{JobKind, JobManager, JobSnapshot};
-use crate::core::{analysis, media};
+use crate::core::{analysis, media, yunet};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,6 +48,9 @@ pub fn start_analysis<R: tauri::Runtime>(
     let files = super::sorting_cmds::inbox_files_for_analysis(&stats.root)?;
     let root = stats.root.clone();
     let machine_id = state.machine_id.clone();
+    // 人脸模型:资源目录解析(测试/E2E 用 OCARD_MODELS_DIR 覆盖);
+    // 校验/加载失败=可见 error + 本轮 faces=None(客观分析继续,零静默)
+    let model_path = resolve_model_path(&app);
     let handle = jobs.create(JobKind::Analyze, &project_id);
     let body_app = app.clone();
     let event_app = app.clone();
@@ -57,6 +60,28 @@ pub fn start_analysis<R: tauri::Runtime>(
         handle.clone(),
         || Ok(()),
         move |h| {
+            let detector = match &model_path {
+                Ok(p) => match yunet::FaceDetector::load(p) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        notify::error(
+                            &body_app,
+                            "ai-models-corrupt",
+                            format!("人脸检测模型不可用({e}):本轮分析不含人脸信息,其余客观指标不受影响"),
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    notify::error(
+                        &body_app,
+                        "ai-models-corrupt",
+                        format!("人脸检测模型未找到({e}):本轮分析不含人脸信息"),
+                    );
+                    None
+                }
+            };
+            let detector = detector.as_ref();
             let (features, skipped) = analysis::load_features(&root);
             if skipped > 0 {
                 notify::warn(
@@ -88,7 +113,7 @@ pub fn start_analysis<R: tauri::Runtime>(
                         return;
                     }
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        analyze_one(&root, &machine_id, rel, *size, *mtime, &features)
+                        analyze_one(&root, &machine_id, rel, *size, *mtime, &features, detector)
                     }));
                     match outcome {
                         Ok(AnalyzeOne::Cached) => {
@@ -176,6 +201,31 @@ enum AnalyzeOne {
     Failed(String),
 }
 
+fn resolve_model_path<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> std::result::Result<PathBuf, String> {
+    if let Ok(dir) = std::env::var("OCARD_MODELS_DIR") {
+        let p = PathBuf::from(dir).join(yunet::YUNET_FILE);
+        return p
+            .is_file()
+            .then_some(p)
+            .ok_or_else(|| format!("OCARD_MODELS_DIR 下找不到 {}", yunet::YUNET_FILE));
+    }
+    use tauri::path::BaseDirectory;
+    use tauri::Manager as _;
+    app.path()
+        .resolve(
+            format!("resources/models/{}", yunet::YUNET_FILE),
+            BaseDirectory::Resource,
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|p| {
+            p.is_file()
+                .then_some(p)
+                .ok_or_else(|| "安装包中缺少模型资源".to_string())
+        })
+}
+
 fn analyze_one(
     root: &std::path::Path,
     machine_id: &str,
@@ -183,6 +233,7 @@ fn analyze_one(
     size: u64,
     mtime: u128,
     features: &std::collections::HashMap<u64, analysis::FeatureRecord>,
+    detector: Option<&yunet::FaceDetector>,
 ) -> AnalyzeOne {
     let fp = analysis::src_fingerprint(rel, size, mtime);
     if features.contains_key(&fp) {
@@ -202,7 +253,20 @@ fn analyze_one(
         Err(e) => return AnalyzeOne::Failed(format!("解码失败: {e}")),
     };
     // 单次解码产出全部特征 + 回填共享缩略图缓存
-    let (dhash, sharpness, over, under) = analysis::extract_features(&img);
+    let (dhash, mut sharpness, over, under) = analysis::extract_features(&img);
+    // 人脸在场:清晰度改按最大脸区域(对焦在脸=可用;检测失败按不可用处理)
+    let faces = detector.map(|d| match d.detect(&img) {
+        Ok(list) => {
+            if let Some(best) = list
+                .iter()
+                .max_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h)))
+            {
+                sharpness = analysis::sharpness_region(&img, best.x, best.y, best.w, best.h);
+            }
+            list.len() as u32
+        }
+        Err(_) => 0,
+    });
     let _ = media::store_thumb_from_image(root, rel, size, mtime, &img);
     let shot_at_epoch = media::exif_shot_at(&abs)
         .map(|t| t.timestamp())
@@ -222,6 +286,7 @@ fn analyze_one(
         over_exposed: over,
         under_exposed: under,
         shot_at_epoch,
+        faces,
         analyzed_at: chrono::Utc::now(),
         machine_id: machine_id.to_string(),
     })

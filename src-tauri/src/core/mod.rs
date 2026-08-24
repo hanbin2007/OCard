@@ -19,5 +19,6 @@ pub mod registry;
 pub mod sorting;
 pub mod transcode;
 pub mod volumes;
+pub mod yunet;
 
 pub use error::{CoreError, Result};
