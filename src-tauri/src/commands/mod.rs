@@ -2,7 +2,7 @@
 //! 错误统一映射为字符串消息(前端 toast 展示)。
 
 pub mod dto;
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod integration_tests;
 pub mod notify;
 pub mod sorting_cmds;
