@@ -138,22 +138,18 @@ fn deliver_one(
             ))
         }
     };
-    if dst.exists() {
-        return verdict_existing(src, dst);
-    }
-    fs::create_dir_all(dst_dir).map_err(|e| ("error", format!("创建包目录失败: {e}")))?;
-    let canon_root =
-        fs::canonicalize(project_root).map_err(|e| ("error", format!("项目根解析失败: {e}")))?;
-    let canon_dir =
-        fs::canonicalize(dst_dir).map_err(|e| ("error", format!("包目录解析失败: {e}")))?;
-    if !canon_dir.starts_with(&canon_root) {
+    // 闸在一切判定与副作用之前(终审复票 P0):包目录先过落地闸
+    // (探针先行,链接祖先下不会先在项目外建目录),dst 自身是链接也拒
+    // (经链接做 exists/hash 判定会把外部文件误当包内既有文件)。
+    super::paths::ensure_dir_within(project_root, dst_dir).map_err(|e| ("error", e))?;
+    if super::paths::is_symlink(dst) {
         return Err((
             "error",
-            format!(
-                "包目录实际位置在项目外(疑似被符号链接替换),拒绝写入: {}",
-                dst_dir.display()
-            ),
+            format!("目标位置是符号链接,拒绝交付: {}", dst.display()),
         ));
+    }
+    if dst.exists() {
+        return verdict_existing(src, dst);
     }
     let tmp = dst_dir.join(format!(".{}.deliverypart", uuid::Uuid::new_v4()));
     if let Err(e) = fs::copy(src, &tmp) {
@@ -220,12 +216,20 @@ pub fn build_delivery(project_root: &Path, meta: &project::ProjectMeta) -> Resul
     let mut out = DeliveryOutcome::default();
 
     for (category, dir) in &sources {
-        // 分类夹本身被换成链接:整夹拒绝交付(终审 P0:扫描根不跟随链接)
-        if super::paths::is_symlink(dir) {
+        // 分类夹本身或其祖先被换成链接:整夹拒绝交付(终审复票:
+        // 只查夹自身不够,「精选/已修」的父夹是链接同样会把扫描带出项目)
+        let dir_escapes = super::paths::is_symlink(dir)
+            || (dir.exists()
+                && !matches!(
+                    (fs::canonicalize(project_root), fs::canonicalize(dir)),
+                    (Ok(cr), Ok(cd)) if super::paths::comparison_key(&cd)
+                        .starts_with(super::paths::comparison_key(&cr))
+                ));
+        if dir_escapes {
             out.failures.push((
                 category.clone(),
                 "error",
-                "分类夹是符号链接,拒绝交付该夹".to_string(),
+                "分类夹实际位置在项目外(自身或祖先是符号链接),拒绝交付该夹".to_string(),
             ));
             continue;
         }
@@ -310,11 +314,36 @@ fn write_manifests(project_root: &Path, delivery_root: &Path, out: &mut Delivery
         }
     }
     let mut pkg_dirs: Vec<String> = match fs::read_dir(delivery_root) {
-        Ok(entries) => entries
-            .flatten()
-            .filter(|e| e.path().is_dir() && !is_hidden(&e.file_name().to_string_lossy()))
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect(),
+        Ok(entries) => {
+            let mut dirs = Vec::new();
+            for e in entries {
+                // 逐项错误与链接条目都不许静默(终审复票:包目录本身是链接
+                // 会把清单写出项目;枚举错误会让清单漏包)
+                match e {
+                    Ok(e) => {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if is_hidden(&name) {
+                            continue;
+                        }
+                        match e.file_type() {
+                            Ok(t) if t.is_symlink() => out.failures.push((
+                                format!("{DELIVERY_DIR}/{name}"),
+                                "manifest-error",
+                                "包目录是符号链接,清单未写入,需人工核查".to_string(),
+                            )),
+                            Ok(t) if t.is_dir() => dirs.push(name),
+                            _ => {}
+                        }
+                    }
+                    Err(err) => out.failures.push((
+                        DELIVERY_DIR.to_string(),
+                        "manifest-error",
+                        format!("交付目录枚举出错,清单可能不完整: {err}"),
+                    )),
+                }
+            }
+            dirs
+        }
         Err(e) => {
             if delivery_root.exists() {
                 out.failures.push((
@@ -545,6 +574,50 @@ mod tests {
         );
         let total_bytes: u64 = again.package_totals.iter().map(|(_, _, b)| b).sum();
         assert_eq!(total_bytes, 600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_delivery_root_creates_nothing_outside() {
+        // 终审复票 P0:「交付」根被换成指向项目外的链接时,
+        // 不许在项目外产生任何新目录/文件(闸前零副作用),失败可见
+        let (tmp, root, meta) = setup();
+        let outside = tmp.path().join("外部交付");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(DELIVERY_DIR)).unwrap();
+
+        let out = build_delivery(&root, &meta).unwrap();
+        assert_eq!(out.files.len(), 0, "不许有任何文件被交付出去");
+        assert!(!out.failures.is_empty(), "失败必须可见");
+        assert!(
+            fs::read_dir(&outside).unwrap().next().is_none(),
+            "项目外不许出现任何新目录或文件"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_category_ancestor_is_refused() {
+        // 终审复票:「精选」父夹被换链接,「精选/已修」扫描不得跟出项目
+        let (tmp, root, meta) = setup();
+        let outside = tmp.path().join("外部精选");
+        fs::create_dir_all(outside.join("已修")).unwrap();
+        fs::write(outside.join("已修/外部.jpg"), b"secret").unwrap();
+        let curated = root.join("3. 精选");
+        fs::remove_dir_all(&curated).unwrap();
+        std::os::unix::fs::symlink(&outside, &curated).unwrap();
+
+        let out = build_delivery(&root, &meta).unwrap();
+        let all: Vec<_> = out.files.iter().map(|f| f.source_rel.clone()).collect();
+        assert!(
+            !all.iter().any(|r| r.contains("外部")),
+            "链接祖先的内容不许进包"
+        );
+        assert!(
+            out.failures.iter().any(|f| f.2.contains("符号链接")),
+            "整夹拒绝必须可见: {:?}",
+            out.failures
+        );
     }
 
     #[cfg(unix)]
