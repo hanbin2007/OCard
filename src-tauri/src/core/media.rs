@@ -65,8 +65,11 @@ fn thumb_cache_name(rel_path: &str, size: u64) -> String {
     format!("{:016x}.jpg", xxhash_rust::xxh3::xxh3_64(key.as_bytes()))
 }
 
-/// 提取 EXIF 拍摄时间(DateTimeOriginal 优先,其次 DateTime)。
-pub fn exif_shot_at(abs_path: &Path) -> Option<DateTime<Utc>> {
+/// 提取 EXIF 拍摄时间的**墙钟**(DateTimeOriginal 优先,其次 DateTime)。
+/// EXIF 不带时区:这就是相机表盘上的时间。半天分包等「以拍摄现场为准」的
+/// 判定必须直接用它,绝不能先套一个时区再转回来(codex 评审 9:那样
+/// 非 UTC 时区会把 10:30 翻成下午)。
+pub fn exif_shot_naive(abs_path: &Path) -> Option<NaiveDateTime> {
     let file = fs::File::open(abs_path).ok()?;
     let mut reader = BufReader::new(file);
     let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
@@ -82,12 +85,25 @@ pub fn exif_shot_at(abs_path: &Path) -> Option<DateTime<Utc>> {
                 text
             };
             if let Ok(naive) = NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S") {
-                // EXIF 无时区,按本地墙钟直接以 UTC 存(展示端一致即可,规范只关心半天粒度)
-                return Some(DateTime::from_naive_utc_and_offset(naive, Utc));
+                return Some(naive);
             }
         }
     }
     None
+}
+
+/// EXIF 拍摄时间的绝对时刻:墙钟按**本机时区**解释后转 UTC(展示用)。
+/// 相机与工作站同时区时准确;跨时区拍摄是 EXIF 自身的边界,如实近似。
+pub fn exif_shot_at(abs_path: &Path) -> Option<DateTime<Utc>> {
+    let naive = exif_shot_naive(abs_path)?;
+    Some(
+        naive
+            .and_local_timezone(chrono::Local)
+            .earliest()
+            .map(|t| t.to_utc())
+            // 夏令时空档等罕见歧义:退化为按 UTC 解释,总好过丢时间
+            .unwrap_or_else(|| DateTime::from_naive_utc_and_offset(naive, Utc)),
+    )
 }
 
 /// EXIF 内嵌缩略图字节(RAW 的 v1 预览来源)。
@@ -122,12 +138,17 @@ pub fn index_asset(project_root: &Path, asset_abs: &Path, rel_path: &str) -> Res
     let dir = thumbs_dir(project_root);
     let cache = dir.join(thumb_cache_name(rel_path, meta.len()));
     if cache.is_file() {
-        return Ok(AssetIndex {
-            rel_path: rel_path.to_string(),
-            kind,
-            shot_at,
-            thumb: Some(cache),
-        });
+        // 缓存命中要验完整性:半截/损坏的缓存(断电、并发写事故)必须自愈,
+        // 否则坏图永远占着缓存键(评审 M2)
+        if looks_like_valid_jpeg(&cache) {
+            return Ok(AssetIndex {
+                rel_path: rel_path.to_string(),
+                kind,
+                shot_at,
+                thumb: Some(cache),
+            });
+        }
+        let _ = fs::remove_file(&cache);
     }
 
     let thumb = match kind {
@@ -157,16 +178,53 @@ fn make_raw_thumb(abs: &Path, dir: &Path, cache: &Path) -> Option<PathBuf> {
     write_jpeg(&thumb, dir, cache)
 }
 
+/// 轻量 JPEG 完整性检查:SOI(FFD8)开头 + EOI(FFD9)结尾。
+/// 挡得住半截文件与非 JPEG 垃圾;不做全解码(索引热路径,开销要小)。
+fn looks_like_valid_jpeg(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 2];
+    let mut tail = [0u8; 2];
+    if f.read_exact(&mut head).is_err()
+        || f.seek(SeekFrom::End(-2)).is_err()
+        || f.read_exact(&mut tail).is_err()
+    {
+        return false;
+    }
+    head == [0xFF, 0xD8] && tail == [0xFF, 0xD9]
+}
+
 fn write_jpeg(img: &image::DynamicImage, dir: &Path, cache: &Path) -> Option<PathBuf> {
     fs::create_dir_all(dir).ok()?;
-    let tmp = cache.with_extension("jpg.tmp");
+    // 临时名带随机后缀:thumbs 在 NAS 上多机共享,固定 tmp 名会互相截断(评审 M2)
+    let tmp = dir.join(format!(
+        ".{}.{}.thumbpart",
+        cache.file_stem().unwrap_or_default().to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
     {
         let mut out = fs::File::create(&tmp).ok()?;
         let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, THUMB_QUALITY);
-        img.to_rgb8().write_with_encoder(encoder).ok()?;
+        if img.to_rgb8().write_with_encoder(encoder).is_err() {
+            drop(out);
+            let _ = fs::remove_file(&tmp);
+            return None;
+        }
     }
-    fs::rename(&tmp, cache).ok()?;
-    Some(cache.to_path_buf())
+    match super::fsx::rename_no_replace(&tmp, cache) {
+        Ok(()) => Some(cache.to_path_buf()),
+        // 别机先写完:它的成品就是我们要的,弃自己的临时文件
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&tmp);
+            Some(cache.to_path_buf())
+        }
+        Err(_) => {
+            let _ = fs::remove_file(&tmp);
+            None
+        }
+    }
 }
 
 /// 素材对应的缩略图缓存路径(存在与否由调用方检查)。
@@ -241,6 +299,44 @@ mod tests {
 
         let idx = index_asset(&project, &bad, "broken.jpg").unwrap();
         assert!(idx.thumb.is_none());
+    }
+
+    #[test]
+    fn corrupt_thumb_cache_self_heals() {
+        // 评审 M2:半截缓存不能永远占着缓存键
+        let tmp = tempdir().unwrap();
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let photo = tmp.path().join("IMG_0002.jpg");
+        write_test_jpeg(&photo, 800, 600);
+        let size = fs::metadata(&photo).unwrap().len();
+
+        // 伪造一个损坏的缓存文件(无 JPEG 头尾)
+        let cache = cached_thumb_path(&project, "IMG_0002.jpg", size);
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(&cache, b"truncated-garbage").unwrap();
+
+        let idx = index_asset(&project, &photo, "IMG_0002.jpg").unwrap();
+        let thumb = idx.thumb.expect("损坏缓存应被重建");
+        assert!(image::open(&thumb).is_ok(), "重建后必须是可解码的 JPEG");
+        // 目录里不残留 thumbpart 临时文件
+        let leftovers: Vec<_> = fs::read_dir(thumbs_dir(&project))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("thumbpart"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn exif_naive_is_wall_clock_without_timezone_math() {
+        // exif_shot_at 是 naive 的本地化包装:两者必须表示同一墙钟
+        let tmp = tempdir().unwrap();
+        let photo = tmp.path().join("noexif.jpg");
+        write_test_jpeg(&photo, 32, 32);
+        // 测试图无 EXIF:两个口径都应为 None(回退逻辑在调用方)
+        assert!(exif_shot_naive(&photo).is_none());
+        assert!(exif_shot_at(&photo).is_none());
     }
 
     #[test]

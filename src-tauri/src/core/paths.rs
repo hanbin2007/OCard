@@ -32,7 +32,7 @@ pub fn normalize_lexical(path: &Path) -> PathBuf {
 /// 跨平台安全比较键:词法归一之上,Windows 再做大小写折叠与 `\\?\` 详细前缀剥离
 /// (Windows 文件系统大小写不敏感,`E:\CARD` 与 `e:\card` 是同一棵树;
 /// codex 收口验证 P0:大小写别名可绕过嵌套检查写回源卡)。
-fn comparison_key(path: &Path) -> PathBuf {
+pub(crate) fn comparison_key(path: &Path) -> PathBuf {
     let n = normalize_lexical(path);
     if cfg!(windows) {
         let s = n.to_string_lossy().to_lowercase();

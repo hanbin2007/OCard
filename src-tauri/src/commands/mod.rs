@@ -556,26 +556,17 @@ pub fn start_copy_task(
     if files.is_empty() {
         return Err("源卷上没有可拷贝的素材".into());
     }
-    let volume_name = volumes::list_volumes()
+    // 源必须是当前真实挂载的卷:这是后面写卡片指纹文件的前提
+    // (codex 评审 12:不核实挂载点就写指纹,等于往任意目录塞文件)
+    let mounted = volumes::list_volumes()
         .into_iter()
-        .find(|v| v.mount_point == source_root)
-        .map(|v| v.name)
+        .find(|v| v.mount_point == source_root);
+    let volume_name = mounted
+        .as_ref()
+        .map(|v| v.name.clone())
         .unwrap_or_else(|| input.volume_id.clone());
-
-    // 卡片指纹:身份随卡走;写保护卡拿不到指纹要告知(退化为卷名匹配,零静默)
-    let source_uid = volumes::ensure_volume_uid(&source_root);
-    if source_uid.is_none() {
-        notify::warn(
-            &app,
-            "volume-uid-unwritable",
-            format!(
-                "无法在卡「{volume_name}」上写入身份指纹(可能写保护):中断后续传将按卷名匹配,同名卡存在误认风险"
-            ),
-        );
-    }
     let op = operator(&app, &state);
     let mut m = manifest::CopyManifest::new("", &volume_name, &camera.code, &op, &input.note);
-    m.source_uid = source_uid;
     let (dto, dest_targets) = tasks::build_task(
         &input,
         &stats.root,
@@ -592,6 +583,31 @@ pub fn start_copy_task(
     let dest_targets: Vec<PathBuf> = dest_targets.iter().map(|t| normalize_lexical(t)).collect();
     validate_copy_paths(&source_root, &dest_targets)?;
     check_existing_target(&dest_targets, input.confirm_existing_target)?;
+
+    // 卡片指纹:身份随卡走。**全部路径校验通过后**才允许往卡上写文件;
+    // 写保护/非挂载卷拿不到指纹要告知(退化为卷名匹配,零静默)
+    let source_uid = if mounted.is_some() {
+        volumes::ensure_volume_uid(&source_root)
+    } else {
+        notify::warn(
+            &app,
+            "volume-uid-skipped",
+            format!(
+                "所选源「{volume_name}」不是当前挂载的卷,跳过身份指纹写入:中断后续传将按卷名匹配,同名卡存在误认风险"
+            ),
+        );
+        None
+    };
+    if mounted.is_some() && source_uid.is_none() {
+        notify::warn(
+            &app,
+            "volume-uid-unwritable",
+            format!(
+                "无法在卡「{volume_name}」上写入身份指纹(可能写保护):中断后续传将按卷名匹配,同名卡存在误认风险"
+            ),
+        );
+    }
+    m.source_uid = source_uid;
 
     // target_rel 带上素材根父级(评审 P1-13)
     let raw_dir_name = match stats.meta.scenario {

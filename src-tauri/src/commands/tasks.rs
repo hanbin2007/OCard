@@ -156,8 +156,14 @@ pub fn resolve_resume_source(
                 return Ok(mp.clone());
             }
         }
+        // 区分「没插卡」与「插了别的卡」,报文各说各的(评审 L3)
+        if volumes.is_empty() {
+            return Err(format!(
+                "没有检测到可移动卷:请插入原卡「{expected_label}」后再续传"
+            ));
+        }
         return Err(format!(
-            "源卡身份指纹不匹配:请插回原卡「{expected_label}」。若卡已被格式化,请重新发起拷卡(不会覆盖已拷素材)"
+            "当前挂载的卷中没有一张带有原卡的身份指纹:请插回原卡「{expected_label}」。若卡已被格式化,请重新发起拷卡(不会覆盖已拷素材)"
         ));
     }
     if let Some((mp, name)) = volumes.iter().find(|(mp, _)| mp == recorded_mount) {
@@ -616,7 +622,22 @@ mod uid_resolution_tests {
             &|_| Some("uid-impostor".to_string()),
         )
         .unwrap_err();
-        assert!(err.contains("指纹不匹配"), "{err}");
+        assert!(err.contains("身份指纹"), "{err}");
+        assert!(err.contains("插回原卡"), "{err}");
+    }
+
+    #[test]
+    fn uid_mismatch_message_distinguishes_no_volume_at_all() {
+        // 评审 L3:没插卡与插错卡要说不同的话
+        let err = resolve_resume_source(
+            &abs("/Volumes/CARD"),
+            "CARD",
+            Some("uid-original"),
+            &[],
+            &|_| None,
+        )
+        .unwrap_err();
+        assert!(err.contains("没有检测到可移动卷"), "{err}");
     }
 
     #[test]

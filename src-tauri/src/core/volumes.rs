@@ -70,14 +70,22 @@ pub fn read_volume_uid(mount: &std::path::Path) -> Option<String> {
 }
 
 /// 读取或写入卡片指纹。卡写保护/只读时返回 None(调用方须告知用户退化为卷名匹配)。
+/// 写入用 `create_new` 独占竞选:两台工作站同时首拷同一张卡时只有一台写成,
+/// 落败方回读胜者的 uid,不会互相截断(codex 评审 12)。
+/// 调用方必须先完成源路径校验(确认是已挂载卷)再调用——别往任意目录写指纹。
 pub fn ensure_volume_uid(mount: &std::path::Path) -> Option<String> {
     if let Some(uid) = read_volume_uid(mount) {
         return Some(uid);
     }
     let uid = uuid::Uuid::new_v4().to_string();
-    std::fs::write(mount.join(VOLUME_UID_FILE), &uid)
-        .ok()
-        .map(|_| uid)
+    match std::fs::File::create_new(mount.join(VOLUME_UID_FILE)) {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(uid.as_bytes()).ok().map(|_| uid)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_volume_uid(mount),
+        Err(_) => None,
+    }
 }
 
 #[cfg(test)]

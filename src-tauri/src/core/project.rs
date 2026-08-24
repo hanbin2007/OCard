@@ -71,6 +71,24 @@ pub fn create_project(
     if root.exists() {
         return Err(CoreError::AlreadyExists(root.display().to_string()));
     }
+    // 分类名校验:空名、路径分隔符、保留名(与固定夹「待分类/精选/其他」同名
+    // 或以其结尾)都拒绝——夹名带序号前缀,结尾撞名会让人无法分辨(评审 M1)
+    for c in categories {
+        let c = c.trim();
+        if c.is_empty() {
+            return Err(CoreError::Invalid("分类名不能为空".into()));
+        }
+        if c.contains('/') || c.contains('\\') {
+            return Err(CoreError::Invalid(format!("分类名不能包含路径分隔符: {c}")));
+        }
+        for reserved in ["待分类", CURATED_DIR_NAME, MISC_DIR_NAME] {
+            if c.ends_with(reserved) {
+                return Err(CoreError::Invalid(format!(
+                    "分类名不能是「{reserved}」或以它结尾(与固定文件夹混淆): {c}"
+                )));
+            }
+        }
+    }
 
     match scenario {
         Scenario::A => {
@@ -83,11 +101,8 @@ pub fn create_project(
             for d in &dirs {
                 fs::create_dir_all(root.join(d))?;
             }
-            // 精选夹内含「待修」「已修」
-            let curated = dirs
-                .iter()
-                .find(|d| d.ends_with(CURATED_DIR_NAME))
-                .expect("scenario_b_dirs 恒包含精选");
+            // 精选夹内含「待修」「已修」;按布局下标定位(倒数第二),不猜名字
+            let curated = &dirs[dirs.len() - 2];
             fs::create_dir_all(root.join(curated).join(CURATED_TODO))?;
             fs::create_dir_all(root.join(curated).join(CURATED_DONE))?;
         }

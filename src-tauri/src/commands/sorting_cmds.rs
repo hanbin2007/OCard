@@ -73,7 +73,8 @@ pub struct BulkResultDto {
 pub struct BulkFailure {
     pub asset_id: String,
     pub message: String,
-    /// 稳定机器码(交付打包用): "already-exists" | "error";批量分类操作暂缺省。
+    /// 稳定机器码(交付打包用): "name-collision" | "error" | "manifest-error";
+    /// 批量分类操作暂缺省。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'static str>,
 }
@@ -97,6 +98,8 @@ pub struct IndexingStatusDto {
     pub total: usize,
     pub running: bool,
     pub failed: usize,
+    /// 索引期间被移走/删除的文件数(信息性,不是失败)。
+    pub missing: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,7 +117,22 @@ pub struct IndexState {
     pub indexed: usize,
     pub total: usize,
     pub failed: usize,
+    /// 索引期间被移走/删除的文件(不算失败,不触发损坏告警,评审 M3)。
+    pub missing: usize,
     pub running: bool,
+    /// 待分类清单指纹(相对路径+大小):文件改名/替换但总数不变时也要重索引(评审 M4)。
+    pub fingerprint: u64,
+}
+
+fn inbox_fingerprint(files: &[(String, u64)]) -> u64 {
+    let mut key = String::new();
+    for (rel, size) in files {
+        key.push_str(rel);
+        key.push('\u{0}');
+        key.push_str(&size.to_string());
+        key.push('\n');
+    }
+    xxhash_rust::xxh3::xxh3_64(key.as_bytes())
 }
 
 #[derive(Default)]
@@ -130,6 +148,7 @@ fn emit_index_progress(app: &AppHandle, project_id: &str, st: &IndexState) {
                 total: st.total,
                 running: st.running,
                 failed: st.failed,
+                missing: st.missing,
             },
             occurred_at: Utc::now().to_rfc3339(),
         },
@@ -143,6 +162,7 @@ fn ensure_indexing(
     project_root: &Path,
     files: &[(String, u64)],
 ) {
+    let fingerprint = inbox_fingerprint(files);
     let mgr = app.state::<IndexManager>();
     {
         let mut map = mgr.0.lock().unwrap();
@@ -150,15 +170,20 @@ fn ensure_indexing(
         if st.running {
             return;
         }
-        // 已全部索引且清单规模没变:不重启
-        if st.total == files.len() && st.indexed + st.failed >= st.total && st.total > 0 {
+        // 已全部索引且清单指纹没变:不重启(计数相同但文件被替换时指纹会变)
+        if st.fingerprint == fingerprint
+            && st.indexed + st.failed + st.missing >= st.total
+            && st.total > 0
+        {
             return;
         }
         *st = IndexState {
             indexed: 0,
             total: files.len(),
             failed: 0,
+            missing: 0,
             running: true,
+            fingerprint,
         };
     }
     let app = app.clone();
@@ -166,27 +191,40 @@ fn ensure_indexing(
     let project_root = project_root.to_path_buf();
     let files: Vec<(String, u64)> = files.to_vec();
     std::thread::spawn(move || {
-        let mut last_emit = std::time::Instant::now();
-        for (rel, _) in &files {
-            let abs = project_root.join(rel.split('/').collect::<PathBuf>());
-            let ok = media::index_asset(&project_root, &abs, rel)
-                .map(|i| i.thumb.is_some() || !matches!(i.kind, media::AssetKind::Photo))
-                .unwrap_or(false);
-            let mgr = app.state::<IndexManager>();
-            let mut map = mgr.0.lock().unwrap();
-            let st = map.entry(project_id.clone()).or_default();
-            if ok {
-                st.indexed += 1;
-            } else {
-                st.failed += 1;
+        // 整体兜底:图像解码库对畸形文件可能 panic,索引线程死了必须可见,
+        // 且状态要收尾(running=false),不能永远显示「索引中」(评审 M3)
+        let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut last_emit = std::time::Instant::now();
+            for (rel, _) in &files {
+                let abs = project_root.join(rel.split('/').collect::<PathBuf>());
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    media::index_asset(&project_root, &abs, rel)
+                }));
+                let mgr = app.state::<IndexManager>();
+                let mut map = mgr.0.lock().unwrap();
+                let st = map.entry(project_id.clone()).or_default();
+                match outcome {
+                    Ok(Ok(i))
+                        if i.thumb.is_some() || !matches!(i.kind, media::AssetKind::Photo) =>
+                    {
+                        st.indexed += 1;
+                    }
+                    // 文件在索引期间被分类走/删除:不是损坏,单独计数(评审 M3)
+                    Ok(Err(crate::core::CoreError::Io(e)))
+                        if e.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        st.missing += 1;
+                    }
+                    _ => st.failed += 1,
+                }
+                let snapshot = st.clone();
+                drop(map);
+                if last_emit.elapsed().as_millis() >= 500 {
+                    last_emit = std::time::Instant::now();
+                    emit_index_progress(&app, &project_id, &snapshot);
+                }
             }
-            let snapshot = st.clone();
-            drop(map);
-            if last_emit.elapsed().as_millis() >= 500 {
-                last_emit = std::time::Instant::now();
-                emit_index_progress(&app, &project_id, &snapshot);
-            }
-        }
+        }));
         let mgr = app.state::<IndexManager>();
         let mut map = mgr.0.lock().unwrap();
         let st = map.entry(project_id.clone()).or_default();
@@ -194,7 +232,16 @@ fn ensure_indexing(
         let snapshot = st.clone();
         drop(map);
         emit_index_progress(&app, &project_id, &snapshot);
-        // 零静默:索引失败数最终不为零,给一条汇总告警
+        if loop_result.is_err() {
+            notify::error(
+                &app,
+                "index-thread-panicked",
+                "素材索引线程异常终止(可能遇到严重畸形的文件),部分素材无预览;重新进入分类页可重试"
+                    .into(),
+            );
+            return;
+        }
+        // 零静默:真失败(损坏/不支持)给告警;被移走的只给提示,不吓唬人
         if snapshot.failed > 0 {
             notify::warn(
                 &app,
@@ -202,6 +249,16 @@ fn ensure_indexing(
                 format!(
                     "项目素材索引完成,{} 个文件无法生成预览(损坏或不支持的格式),网格中以占位显示",
                     snapshot.failed
+                ),
+            );
+        }
+        if snapshot.missing > 0 {
+            notify::info(
+                &app,
+                "index-files-moved",
+                format!(
+                    "{} 个文件在索引期间被移动或删除(可能是本机或其他工作站在分类),已跳过",
+                    snapshot.missing
                 ),
             );
         }
@@ -253,7 +310,8 @@ fn asset_dto(project_root: &Path, rel: &str, size: u64) -> SortingAssetDto {
         kind: match kind {
             media::AssetKind::Photo => "photo",
             media::AssetKind::Raw => "raw",
-            media::AssetKind::Video | media::AssetKind::Other => "video",
+            media::AssetKind::Video => "video",
+            media::AssetKind::Other => "other",
         },
         group_id: None, // 连拍分组归 M3 聚类,如实为 None
     }
@@ -359,13 +417,15 @@ pub fn move_assets(
 ) -> CmdResult<BulkResultDto> {
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
-    // 分类夹白名单:category_id 必须是该项目已知分类
+    // 分类夹白名单:必须是该项目已知分类;精选是复制语义,走 curate_assets,
+    // move 到精选一律拒绝(codex 评审 11:防止素材被移出流程)
     let cats = sorting::list_categories(&stats.root, &stats.meta).map_err(err)?;
-    if !cats
-        .iter()
-        .any(|c| c.id == category_id && c.kind != "inbox")
-    {
-        return Err(format!("未知分类: {category_id}"));
+    match cats.iter().find(|c| c.id == category_id) {
+        Some(c) if c.kind == "custom" || c.kind == "other" => {}
+        Some(c) if c.kind == "curated" => {
+            return Err("「精选」是复制语义,请使用精选操作(curate),不能移动进精选夹".into())
+        }
+        _ => return Err(format!("未知分类: {category_id}")),
     }
     let res = bulk(sorting::move_assets(&stats.root, &asset_ids, &category_id));
     audit_bulk(
@@ -388,7 +448,7 @@ pub fn curate_assets(
 ) -> CmdResult<BulkResultDto> {
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
-    let res = bulk(sorting::curate_assets(&stats.root, &asset_ids));
+    let res = bulk(sorting::curate_assets(&stats.root, &stats.meta, &asset_ids));
     audit_bulk(
         &app,
         &state,
@@ -430,15 +490,30 @@ pub fn list_trash(
 ) -> CmdResult<Vec<TrashEntryDto>> {
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
-    let (records, skipped) = sorting::list_trash(&stats.root).map_err(err)?;
-    if skipped > 0 {
+    let list = sorting::list_trash(&stats.root).map_err(err)?;
+    if list.skipped > 0 {
         notify::warn(
             &app,
             "trash-index-degraded",
-            format!("回收站索引有 {skipped} 行损坏被跳过,列表可能不完整"),
+            format!(
+                "回收站索引有 {} 行损坏或非法被跳过,列表可能不完整",
+                list.skipped
+            ),
         );
     }
-    Ok(records
+    if !list.orphans.is_empty() {
+        notify::warn(
+            &app,
+            "trash-orphan-files",
+            format!(
+                "回收站目录中有 {} 个无索引的孤儿文件(通常来自索引写入失败),它们不会被「清空回收站」删除,需人工在 .ocard/trash 下核查: {}",
+                list.orphans.len(),
+                list.orphans.join("、")
+            ),
+        );
+    }
+    Ok(list
+        .records
         .into_iter()
         .map(|r| TrashEntryDto {
             id: r.id,
@@ -472,11 +547,22 @@ pub fn restore_from_trash(
     Ok(res)
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmptyTrashResultDto {
+    pub removed: usize,
+    pub failed: usize,
+}
+
 #[tauri::command]
-pub fn empty_trash(app: AppHandle, state: State<AppState>, project_id: String) -> CmdResult<usize> {
+pub fn empty_trash(
+    app: AppHandle,
+    state: State<AppState>,
+    project_id: String,
+) -> CmdResult<EmptyTrashResultDto> {
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
-    let (deleted, failed) = sorting::empty_trash(&stats.root).map_err(err)?;
+    let out = sorting::empty_trash(&stats.root).map_err(err)?;
     let op = operator(&app, &state);
     super::tasks::append_audit(
         &app,
@@ -486,17 +572,32 @@ pub fn empty_trash(app: AppHandle, state: State<AppState>, project_id: String) -
             &state.machine_id,
             &op,
             sorting::kind::TRASH_EMPTIED,
-            serde_json::json!({ "deleted": deleted, "failed": failed }),
+            serde_json::json!({ "deleted": out.deleted, "failed": out.failed }),
         ),
     );
-    if failed > 0 {
+    if let Some(e) = &out.index_rewrite_error {
+        notify::warn(
+            &app,
+            "trash-index-rewrite-failed",
+            format!(
+                "清空回收站:文件已按结果删除,但索引更新失败({e});陈旧条目会在下次打开回收站时自动过滤"
+            ),
+        );
+    }
+    if out.failed > 0 {
         notify::warn(
             &app,
             "trash-empty-partial",
-            format!("清空回收站:{deleted} 个已删除,{failed} 个删除失败(索引已保留,可重试)"),
+            format!(
+                "清空回收站:{} 个已删除,{} 个删除失败(索引已保留,可重试)",
+                out.deleted, out.failed
+            ),
         );
     }
-    Ok(deleted)
+    Ok(EmptyTrashResultDto {
+        removed: out.deleted,
+        failed: out.failed,
+    })
 }
 
 #[tauri::command]
@@ -510,6 +611,7 @@ pub fn indexing_status(app: AppHandle, project_id: String) -> IndexingStatusDto 
         total: st.total,
         running: st.running,
         failed: st.failed,
+        missing: st.missing,
     }
 }
 
@@ -529,6 +631,8 @@ pub struct DeliverySummaryDto {
     pub packages: Vec<DeliveryPackageDto>,
     pub total_files: usize,
     pub total_bytes: u64,
+    /// 重跑时已在包内且 hash 校验一致的文件数(安全跳过,不算失败)。
+    pub already_delivered: usize,
     pub failures: Vec<BulkFailure>,
     /// 交付根目录绝对路径(人工上传百度网盘的入口)。
     pub delivery_path: String,
@@ -568,6 +672,9 @@ pub fn build_delivery(
         })
         .collect();
 
+    for w in &out.warnings {
+        notify::warn(&app, "delivery-scan-degraded", w.clone());
+    }
     let op = operator(&app, &state);
     super::tasks::append_audit(
         &app,
@@ -581,24 +688,34 @@ pub fn build_delivery(
                 "packages": out.packages,
                 "files": out.files.len(),
                 "bytes": out.total_bytes,
+                "alreadyDelivered": out.already_delivered,
                 "failures": failures.len(),
             }),
         ),
     );
     if !failures.is_empty() {
-        notify::warn(
-            &app,
-            "delivery-partial",
+        let collisions = failures
+            .iter()
+            .filter(|f| f.kind == Some("name-collision"))
+            .count();
+        let msg = if collisions > 0 {
             format!(
-                "交付打包完成,但 {} 个文件失败(多为重跑时已存在,详见交付总清单)",
+                "交付打包完成,但 {} 个文件未交付,其中 {collisions} 个是同名不同内容的冲突,需人工核对包内文件(详见交付总清单)",
                 failures.len()
-            ),
-        );
+            )
+        } else {
+            format!(
+                "交付打包完成,但 {} 个文件失败(详见交付总清单)",
+                failures.len()
+            )
+        };
+        notify::warn(&app, "delivery-partial", msg);
     }
     Ok(DeliverySummaryDto {
         packages,
         total_files: out.files.len(),
         total_bytes: out.total_bytes,
+        already_delivered: out.already_delivered,
         failures,
         delivery_path: stats
             .root
@@ -651,6 +768,11 @@ pub fn list_remote_activity(
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        // 无 taskId 的事件配不成 started/completed 对,跳过,
+        // 免得互相顶掉造成横幅误报(评审 L9)
+        if task_id.is_empty() {
+            continue;
+        }
         match ev.kind.as_str() {
             k if k == crate::core::journal::kind::COPY_STARTED => {
                 if ev.machine != state.machine_id && ev.ts >= cutoff {
