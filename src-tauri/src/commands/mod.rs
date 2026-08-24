@@ -95,7 +95,7 @@ fn project_dto(stats: &catalog::ProjectStats, running: bool) -> ProjectDto {
 }
 
 fn find_project(nas: &Path, project_id: &str) -> CmdResult<catalog::ProjectStats> {
-    catalog::scan(nas)
+    catalog::scan_cached(nas)
         .map_err(err)?
         .projects
         .into_iter()
@@ -178,7 +178,7 @@ pub fn list_projects<R: tauri::Runtime>(
         .filter(|t| t.state == "running")
         .map(|t| t.project_id)
         .collect();
-    let scan = catalog::scan(&nas).map_err(err)?;
+    let scan = catalog::scan_cached(&nas).map_err(err)?;
     notice_catalog_warnings(&app, &scan.warnings);
     Ok(scan
         .projects
@@ -219,6 +219,7 @@ pub fn create_project<R: tauri::Runtime>(
             serde_json::json!({"name": input.name, "scenario": input.scenario}),
         ),
     );
+    catalog::invalidate_cache(&nas);
     let stats = find_project(&nas, &root.file_name().unwrap().to_string_lossy())?;
     Ok(project_dto(&stats, false))
 }
@@ -784,7 +785,7 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
     let Some(nas) = load_config(app, state).nas_root else {
         return;
     };
-    let scan = match catalog::scan(&nas) {
+    let scan = match catalog::scan_cached(&nas) {
         Ok(s) => s,
         Err(e) => {
             notify::warn(

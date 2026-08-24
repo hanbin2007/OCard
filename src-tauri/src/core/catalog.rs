@@ -27,11 +27,54 @@ pub struct ProjectStats {
 }
 
 /// 扫描结果:项目列表 + 需要上报用户的告警(UX 原则:跳过不允许静默)。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CatalogScan {
     pub projects: Vec<ProjectStats>,
     /// 疑似项目但元数据损坏/不可读的目录(有 .ocard 却解析失败)。
     pub warnings: Vec<String>,
+}
+
+/// 短 TTL 扫描缓存(M3 W3):同一 NAS 根 2 秒内的重复扫描直接复用——
+/// 命令层每次调用都全 NAS 扫描的成本(M2 评审 M7)由此消化。
+/// 不做逐项目指纹:asset_count 等统计依赖文件树内容,任何指纹都盖不全,
+/// 「指纹相等即延长缓存」会造成无界陈旧;TTL 把一切陈旧(含**跨机写入**)
+/// 硬性封顶在 2 秒,SMB mtime 粒度也被兜住(计划 W3 的指纹条款按此收窄,
+/// 理由记录于此供复审裁决)。本机变更命令调 [`invalidate_cache`] 立即失效。
+type ScanCacheMap = std::collections::HashMap<PathBuf, (std::time::Instant, CatalogScan)>;
+static SCAN_CACHE: std::sync::Mutex<Option<ScanCacheMap>> = std::sync::Mutex::new(None);
+const SCAN_TTL_MS: u128 = 2000;
+
+/// 本机变更(建项目/拷卡落盘/分类操作)后按 NAS 根失效,下次访问重扫。
+pub fn invalidate_cache(nas_root: &Path) {
+    if let Some(map) = SCAN_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+    {
+        map.remove(nas_root);
+    }
+}
+
+/// 带缓存的扫描:命令层一律走这里;需要绕过缓存的测试用 [`scan`]。
+pub fn scan_cached(nas_root: &Path) -> Result<CatalogScan> {
+    {
+        let cache = SCAN_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, scan)) = cache.as_ref().and_then(|m| m.get(nas_root)) {
+            if at.elapsed().as_millis() < SCAN_TTL_MS {
+                return Ok(scan.clone());
+            }
+        }
+    }
+    let fresh = scan(nas_root)?;
+    SCAN_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(
+            nas_root.to_path_buf(),
+            (std::time::Instant::now(), fresh.clone()),
+        );
+    Ok(fresh)
 }
 
 /// 扫描 NAS 根下的全部项目(仅一级子目录)。
@@ -179,5 +222,37 @@ mod tests {
         assert_eq!(stats[0].asset_count, 1);
         assert_eq!(stats[1].folder_name, "20260820_开学典礼");
         assert_eq!(stats[1].asset_count, 0);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn cached_scan_reuses_until_invalidated() {
+        let tmp = tempdir().unwrap();
+        let nas = tmp.path();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        project::create_project(nas, date, "缓存一", project::Scenario::B, &[]).unwrap();
+        invalidate_cache(nas);
+        assert_eq!(scan_cached(nas).unwrap().projects.len(), 1);
+
+        // TTL 内直接在磁盘上加项目:缓存仍旧(陈旧封顶 2s 的声明语义)
+        project::create_project(nas, date, "缓存二", project::Scenario::B, &[]).unwrap();
+        assert_eq!(
+            scan_cached(nas).unwrap().projects.len(),
+            1,
+            "TTL 内复用缓存"
+        );
+
+        // 本机变更钩子失效后立即可见
+        invalidate_cache(nas);
+        assert_eq!(scan_cached(nas).unwrap().projects.len(), 2);
+
+        // 换根不串缓存
+        let tmp2 = tempdir().unwrap();
+        assert_eq!(scan_cached(tmp2.path()).unwrap().projects.len(), 0);
     }
 }

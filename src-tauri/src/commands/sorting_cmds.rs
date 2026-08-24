@@ -487,6 +487,12 @@ fn bulk(outcomes: Vec<sorting::ItemOutcome>) -> BulkResultDto {
 
 /// 批量操作的审计事件(汇总一条,失败逐项列出)。
 #[allow(clippy::too_many_arguments)]
+fn invalidate_catalog(project_root: &Path) {
+    if let Some(nas) = project_root.parent() {
+        crate::core::catalog::invalidate_cache(nas);
+    }
+}
+
 fn audit_bulk<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &State<AppState>,
@@ -495,6 +501,7 @@ fn audit_bulk<R: tauri::Runtime>(
     detail: &str,
     result: &BulkResultDto,
 ) {
+    invalidate_catalog(project_root);
     let op = operator(app, state);
     super::tasks::append_audit(
         app,
@@ -844,6 +851,7 @@ pub fn start_delivery<R: tauri::Runtime>(
                 &|| h.cancel_requested(),
             )
             .map_err(|e| e.to_string())?;
+            invalidate_catalog(&root);
             notify_if_unsafe_fallback(&body_app);
             for w in &out.warnings {
                 notify::warn(&body_app, "delivery-scan-degraded", w.clone());
