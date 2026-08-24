@@ -67,7 +67,6 @@ fn invoke(
         },
     )
     .map(|b| b.deserialize::<Value>().unwrap())
-    .map_err(|e| e)
 }
 
 fn create_b_project(window: &WebviewWindow<tauri::test::MockRuntime>) -> String {
