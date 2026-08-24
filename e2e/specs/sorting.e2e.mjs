@@ -24,15 +24,11 @@ async function confirmDangerDialog() {
   await btn.click();
 }
 
-async function clickProjectRow(text) {
-  const rows = await $$('[data-testid="project-row"]');
-  for (const row of rows) {
-    if ((await row.getText()).includes(text)) {
-      await row.click();
-      return;
-    }
-  }
-  throw new Error(`找不到项目行: ${text}`);
+async function clickProjectRow(name) {
+  // 名字列有 truncate 样式,WebDriver getText 可能取不到;title 属性是稳定锚点
+  const el = $(`[data-testid="project-row"] span[title="${name}"]`);
+  await el.waitForClickable({ timeout: 15000 });
+  await el.click();
 }
 
 describe("OCard M2 分类工作台冒烟", () => {
