@@ -4,7 +4,7 @@
 // 注意:本文件会被 wdio 的 launcher 与每个 worker 各加载一遍,
 // 顶层只允许「确定性」计算(路径拼接);目录创建/清理只在 onPrepare(仅 launcher 执行)。
 import { spawn } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -16,6 +16,9 @@ const application = path.resolve("../src-tauri/target/debug/ocard");
 const tmpRoot = path.join(os.tmpdir(), "ocard-e2e");
 const configHome = path.join(tmpRoot, "config");
 const nasRoot = path.join(tmpRoot, "nas");
+// sidecar 注入:把拉取的 target-triple 命名二进制以裸名放进独立目录,
+// 应用经 OCARD_FFMPEG_DIR 定位(不依赖 tauri CLI 的 debug 拷贝行为)
+const ffmpegDir = path.join(tmpRoot, "ffmpeg");
 process.env.OCARD_E2E_NAS_ROOT = nasRoot;
 
 export const config = {
@@ -46,9 +49,22 @@ export const config = {
       path.join(configHome, "cn.origenclub.ocard", "workstation.json"),
       JSON.stringify({ operator: "E2E机器人", nasRoot }),
     );
+    mkdirSync(ffmpegDir, { recursive: true });
+    for (const tool of ["ffmpeg", "ffprobe"]) {
+      const src = path.resolve(
+        `../src-tauri/binaries/${tool}-x86_64-unknown-linux-gnu`,
+      );
+      const dst = path.join(ffmpegDir, tool);
+      copyFileSync(src, dst);
+      chmodSync(dst, 0o755);
+    }
     tauriDriver = spawn("tauri-driver", [], {
       stdio: [null, process.stdout, process.stderr],
-      env: { ...process.env, XDG_CONFIG_HOME: configHome },
+      env: {
+        ...process.env,
+        XDG_CONFIG_HOME: configHome,
+        OCARD_FFMPEG_DIR: ffmpegDir,
+      },
     });
   },
   onComplete: () => {

@@ -518,11 +518,11 @@ mod bench {
             let _ = extract_features(&decoded);
         }
         let per = t0.elapsed().as_secs_f64() / n as f64;
-        let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(4);
+        let cores = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(4);
         let est_1000 = per * 1000.0 / (cores.saturating_sub(1).max(1)) as f64;
-        eprintln!(
-            "单张 24MP 全流水线 {per:.3}s;{cores} 核外推千张 ≈ {est_1000:.0}s(预算 300s)"
-        );
+        eprintln!("单张 24MP 全流水线 {per:.3}s;{cores} 核外推千张 ≈ {est_1000:.0}s(预算 300s)");
         assert!(
             est_1000 < 300.0,
             "工程预验超预算:外推千张 {est_1000:.0}s ≥ 300s"
