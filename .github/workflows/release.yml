@@ -13,7 +13,7 @@ jobs:
     name: Release (linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux system deps (Tauri v2)
         run: |
@@ -46,7 +46,7 @@ jobs:
     name: Release (windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v4
         with:
@@ -73,7 +73,7 @@ jobs:
     # 固定 macos-15:签名链对 runner 镜像/Xcode 迁移敏感,升级走定期 PR 而非跟随 latest
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # fail-closed:正式标签构建缺任何签名/公证凭据必须失败,而不是发未签名产物
       - name: Ensure signing credentials present
