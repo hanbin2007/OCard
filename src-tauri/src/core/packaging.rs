@@ -332,7 +332,12 @@ fn write_manifests(project_root: &Path, delivery_root: &Path, out: &mut Delivery
                                 "包目录是符号链接,清单未写入,需人工核查".to_string(),
                             )),
                             Ok(t) if t.is_dir() => dirs.push(name),
-                            _ => {}
+                            Ok(_) => {} // 交付根下的普通文件(总清单等),不是包
+                            Err(err) => out.failures.push((
+                                format!("{DELIVERY_DIR}/{name}"),
+                                "manifest-error",
+                                format!("条目类型读取失败,清单可能漏包: {err}"),
+                            )),
                         }
                     }
                     Err(err) => out.failures.push((
