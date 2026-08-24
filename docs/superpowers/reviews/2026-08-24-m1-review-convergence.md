@@ -25,6 +25,30 @@
 | 16 | 登记表低垂果实(P1-12 部分) | register_card 校验相机存在;delete_camera 级联写 card_deleted 事件 | Rust |
 | 17 | 测试盲区(M18/codex) | 新增:目标已存在冲突(哈希异同两路)、续传目标被删、part 残留清理、换卡拒绝;cargo test 上三平台矩阵 | Rust+CI |
 
+## 终审复核追加修复(2026-08-24,提交 7e98b02 / 56da827)
+
+双路终审(fable-5:有条件可收口;gpt-5.6-sol:不可收口)开出的全部必修/阻塞项已落地:
+
+| 终审发现 | 修复 |
+|---|---|
+| rename 非原子防覆盖(codex P0) | `finalize_no_replace`:hard_link 优先(目标存在原子失败),不支持的文件系统回退复查+rename |
+| 计划清单未持久化,源文件消失可漏拷(codex P0) | manifest 新增 `planned` 全量清单;续传取并集、重建以 planned 为准;消失文件显式 Failed |
+| `..` 别名绕过嵌套防线(codex P0) | `normalize_lexical` 词法归一后再校验/存储 |
+| 重建任务源卷固化无法重绑(fable 必修A/codex P1) | `resolve_resume_source` 按卷名重解析,卡后插免重启;4 项纯函数测试 |
+| 逐文件 IO 失败降格为 failed(codex P1) | 连续 3 次 IO 失败转 paused(基础设施故障语义) |
+| 终态事件先于 running=false(codex P1) | 终态事件移到旗标翻转后、读实时快照发出 |
+| 审计 fail-open 残留(fable 必修B/codex P1) | project_created/copy_started 改 append_audit;outbox 失败不谎报 |
+| 前端快照回踩/孤儿无重试/双份来源(codex P1) | mergeSnapshot 按 revision 单调、孤儿按 revision 重试、taskStarted 消费缓存(8 项变异验证测试) |
+| 运行态分页被进度事件重置(fable 建议) | 2s 节流+保留已加载页数,统计只报已加载口径 |
+| destination_count 虚报 1(codex #14) | 如实报 0 |
+| 测试缺口(#17) | +残留 part/消失计划文件/IO 暂停/路径归一/换卡拒绝,Rust 45 项、前端 190 项 |
+
+## 已知边界(随 M2 处理,不影响 M1 语义宣称)
+
+- **卷身份以卷标名判定**:同名卷可通过续传核对(错误卡新文件会入错档但绝不覆盖旧素材——Conflict 闸兜底)。M2 引入卷 UUID/序列号强身份。
+- **hard_link 回退路径**(部分 SMB/exFAT):存在微秒级复查窗口,长窗口已被入口检查夹住。M2 平台原生 RENAME_EXCL。
+- **回读校验命中页缓存**:当前校验覆盖传输链路,不宣称覆盖介质静默损坏。M2 直读。
+
 ## 显式推迟到 M2(记录为已知边界,不改语义宣称)
 
 - 回读校验的页缓存问题(M9):当前校验覆盖传输链路,不覆盖落盘静默损坏;M2 用 F_NOCACHE/O_DIRECT 直读。
