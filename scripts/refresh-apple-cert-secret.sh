@@ -44,8 +44,12 @@ if security find-certificate -c "Developer ID Certification Authority" -p > "$TM
   echo "==> 已附带 Developer ID 中间证书"
 fi
 
-openssl pkcs12 -export -out "$TMP/devid.p12" -passout "pass:$P12PASS" \
-  -inkey "$TMP/key.pem" -in "$TMP/cert.pem" "${EXTRA[@]+"${EXTRA[@]}"}" -name "$IDENTITY"
+# macOS security import 不认 OpenSSL 3 默认的新式 p12(AES/SHA256-MAC),需 -legacy;
+# LibreSSL 无 -legacy 参数但默认即老式算法,失败时回退。
+openssl pkcs12 -export -legacy -out "$TMP/devid.p12" -passout "pass:$P12PASS" \
+  -inkey "$TMP/key.pem" -in "$TMP/cert.pem" "${EXTRA[@]+"${EXTRA[@]}"}" -name "$IDENTITY" 2>/dev/null ||
+  openssl pkcs12 -export -out "$TMP/devid.p12" -passout "pass:$P12PASS" \
+    -inkey "$TMP/key.pem" -in "$TMP/cert.pem" "${EXTRA[@]+"${EXTRA[@]}"}" -name "$IDENTITY"
 
 echo "==> 更新 GitHub Secrets"
 gh secret set APPLE_CERTIFICATE --body "$(base64 -i "$TMP/devid.p12")"
