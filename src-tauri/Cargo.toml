@@ -31,6 +31,7 @@ tauri-plugin-updater = "2.10.1"
 tokio = { version = "1.53.1", features = ["time"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 kamadak-exif = "0.6.1"
+base64 = "0.23.1"
 
 [dev-dependencies]
 tempfile = "3"
