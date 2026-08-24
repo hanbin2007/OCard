@@ -89,13 +89,9 @@ fn find_project(nas: &Path, project_id: &str) -> CmdResult<catalog::ProjectStats
 
 #[tauri::command]
 pub fn get_workstation_info(app: AppHandle, state: State<AppState>) -> WorkstationInfoDto {
-    let (cfg, corrupt) = config::load_checked(&state.config_dir);
-    if corrupt {
-        notify::warn(
-            &app,
-            "workstation-config-corrupt",
-            "本机配置文件损坏,已按未配置状态处理;请重新填写设置(原配置无法恢复)".to_string(),
-        );
+    let (cfg, problem) = config::load_checked(&state.config_dir);
+    if let Some(msg) = problem {
+        notify::warn(&app, "workstation-config-degraded", msg);
     }
     WorkstationInfoDto {
         machine_id: state.machine_id.clone(),
@@ -477,12 +473,15 @@ fn check_existing_target(dest_targets: &[PathBuf], confirmed: bool) -> CmdResult
 /// 解析一次拷卡任务的真实落盘目标(不落任何盘)。供前端双确认屏展示真值(评审 H6/P1-6)。
 #[tauri::command]
 pub fn preview_copy_task(
+    app: AppHandle,
     state: State<AppState>,
     input: StartCopyInput,
 ) -> CmdResult<serde_json::Value> {
     let nas = nas_root(&state)?;
     let stats = find_project(&nas, &input.project_id)?;
-    let reg = registry::load(&nas).map_err(err)?.registry;
+    let load = registry::load(&nas).map_err(err)?;
+    notice_registry_health(&app, &load);
+    let reg = load.registry;
     let camera = reg
         .cameras
         .iter()
@@ -517,7 +516,9 @@ pub fn start_copy_task(
     }
     let nas = nas_root(&state)?;
     let stats = find_project(&nas, &input.project_id)?;
-    let reg = registry::load(&nas).map_err(err)?.registry;
+    let load = registry::load(&nas).map_err(err)?;
+    notice_registry_health(&app, &load);
+    let reg = load.registry;
     let camera = reg
         .cameras
         .iter()

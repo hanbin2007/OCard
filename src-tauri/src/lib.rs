@@ -13,6 +13,7 @@ pub fn run() {
             let config_dir = app.path().app_config_dir()?;
             let machine_id = core::machine::machine_id(&config_dir)
                 .map_err(|e| format!("初始化机器 ID 失败: {e}"))?;
+            app.manage(commands::updater::PendingUpdate::default());
             app.manage(AppState {
                 config_dir,
                 machine_id,
@@ -52,6 +53,7 @@ pub fn run() {
             commands::resume_copy_task,
             commands::retry_copy_file,
             commands::updater::check_for_update,
+            commands::updater::install_update,
             commands::notify::list_notices,
         ])
         .run(tauri::generate_context!())

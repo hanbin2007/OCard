@@ -36,7 +36,15 @@ fn comparison_key(path: &Path) -> PathBuf {
     let n = normalize_lexical(path);
     if cfg!(windows) {
         let s = n.to_string_lossy().to_lowercase();
-        let s = s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s);
+        // \\?\C:\x → c:\x;\\?\UNC\server\share → \\server\share(codex 四轮 P0:
+        // 扩展 UNC 前缀剥成 unc\... 会与普通 UNC 失配,别名漏判)
+        let s = match s.strip_prefix(r"\\?\") {
+            Some(rest) => match rest.strip_prefix(r"unc\") {
+                Some(unc_rest) => format!(r"\\{unc_rest}"),
+                None => rest.to_string(),
+            },
+            None => s,
+        };
         PathBuf::from(s)
     } else {
         n
@@ -155,6 +163,25 @@ mod windows_tests {
         assert!(validate_dest_layout(
             &PathBuf::from(r"D:\src"),
             &[PathBuf::from(r"C:\nas\t"), PathBuf::from(r"\\?\C:\NAS\t")]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn extended_unc_alias_matches_plain_unc() {
+        // codex 四轮 P0:\\?\UNC\server\share 与 \\server\share 是同一位置
+        assert!(validate_dest_layout(
+            &PathBuf::from(r"D:\src"),
+            &[
+                PathBuf::from(r"\\server\share\t"),
+                PathBuf::from(r"\\?\UNC\SERVER\share\t")
+            ]
+        )
+        .is_err());
+        // 扩展 UNC 源与普通 UNC 目的地嵌套同样拦截
+        assert!(validate_dest_layout(
+            &PathBuf::from(r"\\?\UNC\nas\card"),
+            &[PathBuf::from(r"\\nas\card\backup")]
         )
         .is_err());
     }

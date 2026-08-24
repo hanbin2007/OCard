@@ -176,11 +176,10 @@ pub fn load(nas_root: &Path) -> Result<RegistryLoad> {
                 }
                 Err(_) => skipped_payloads += 1,
             },
-            kind::CAMERA_DELETED => {
-                if let Some(id) = ev.data.get("id").and_then(|v| v.as_str()) {
-                    reg.cameras.retain(|c| c.id != id);
-                }
-            }
+            kind::CAMERA_DELETED => match ev.data.get("id").and_then(|v| v.as_str()) {
+                Some(id) => reg.cameras.retain(|c| c.id != id),
+                None => skipped_payloads += 1,
+            },
             kind::CARD_REGISTERED => match serde_json::from_value::<StorageCard>(ev.data) {
                 Ok(card) => {
                     reg.cards.retain(|c| c.id != card.id);
@@ -188,11 +187,10 @@ pub fn load(nas_root: &Path) -> Result<RegistryLoad> {
                 }
                 Err(_) => skipped_payloads += 1,
             },
-            kind::CARD_DELETED => {
-                if let Some(id) = ev.data.get("id").and_then(|v| v.as_str()) {
-                    reg.cards.retain(|c| c.id != id);
-                }
-            }
+            kind::CARD_DELETED => match ev.data.get("id").and_then(|v| v.as_str()) {
+                Some(id) => reg.cards.retain(|c| c.id != id),
+                None => skipped_payloads += 1,
+            },
             _ => {}
         }
     }

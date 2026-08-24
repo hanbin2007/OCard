@@ -1,62 +1,86 @@
 //! 静默 OTA:后台检查 GitHub Release 的 latest.json,签名校验通过后
-//! 静默下载安装,重启生效。"静默"指无需用户操作;按零静默 UX 原则,
-//! 更新就绪与失败都经通知中心告知用户。
+//! **只静默下载**;安装由用户在设置中主动触发「重启并更新」。
 //!
-//! 发布门:Release 工作流产出的是草稿 Release,**人工点发布**后 OTA 才会分发——
-//! 这是既定的人工质量闸,不是缺陷。
+//! 为什么不后台安装:Windows 上 updater 安装会直接退出进程(上游行为),
+//! 后台安装可能当场杀掉在途拷卡任务(codex 四轮 P1)。因此:
+//! - 后台:检查 + 下载 + 通知「已就绪」;
+//! - 安装:用户点击触发,且**有运行中拷卡任务时拒绝**;
+//! - 全程 IN_PROGRESS 串行化,后台与手动检查不并发。
+//!
+//! 发布门:Release 工作流产出草稿,人工发布后 OTA 才分发(既定人工质量闸)。
 
 use super::notify;
+use super::AppState;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tauri_plugin_updater::UpdaterExt;
 
 /// 检查间隔:4 小时。
 const CHECK_INTERVAL: Duration = Duration::from_secs(4 * 3600);
-/// 已就绪的更新只提示一次,避免每 4 小时重复打扰。
-static UPDATE_READY: AtomicBool = AtomicBool::new(false);
-/// 上次后台检查是否失败:失败通知只在「转入失败」时发一次(每次故障期一条),
-/// 既满足零静默原则,又不在离线外勤时无限刷屏。
+/// 串行闸:检查/下载/安装全程互斥,后台循环与手动检查不并发。
+static IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+/// 上次检查是否失败:失败通知按「故障期」去重(转入失败时发一次);
+/// **任何一次成功的 check()**(无论有无更新)都会结束故障期。
 static LAST_CHECK_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// 已下载待安装的更新(字节留在内存,由用户触发安装)。
+#[derive(Default)]
+pub struct PendingUpdate(pub Mutex<Option<(tauri_plugin_updater::Update, Vec<u8>)>>);
 
 /// 后台静默更新循环:启动即查一次,此后周期性检查。
 pub async fn silent_update_loop(app: AppHandle) {
     loop {
-        check_and_install(&app, false).await;
+        check_and_download(&app, false).await;
         tokio::time::sleep(CHECK_INTERVAL).await;
     }
 }
 
-/// 执行一次检查+静默安装。`manual` 为 true 时(用户点「检查更新」)
-/// 无更新/失败也要给出反馈;后台模式只在有实质进展或降级时发声。
-pub async fn check_and_install(app: &AppHandle, manual: bool) -> String {
-    if UPDATE_READY.load(Ordering::SeqCst) {
-        return "ready".into();
+/// 执行一次检查+静默下载(不安装)。`manual` 时无更新/失败也给反馈。
+pub async fn check_and_download(app: &AppHandle, manual: bool) -> String {
+    if IN_PROGRESS.swap(true, Ordering::SeqCst) {
+        return "busy".into();
+    }
+    let result = do_check_and_download(app, manual).await;
+    IN_PROGRESS.store(false, Ordering::SeqCst);
+    result
+}
+
+async fn do_check_and_download(app: &AppHandle, manual: bool) -> String {
+    if let Some(pending) = app.try_state::<PendingUpdate>() {
+        if pending.0.lock().unwrap().is_some() {
+            return "ready".into();
+        }
     }
     let updater = match app.updater() {
         Ok(u) => u,
-        // 平台不支持(如 deb/rpm 安装的 Linux):不是降级,静默跳过;手动检查时如实告知
+        // 平台不支持(如 deb/rpm 安装的 Linux):非降级,手动检查时如实告知
         Err(_) => return "unsupported".into(),
     };
     match updater.check().await {
         Ok(Some(update)) => {
+            LAST_CHECK_FAILED.store(false, Ordering::SeqCst);
             let version = update.version.clone();
-            match update.download_and_install(|_, _| {}, || {}).await {
-                Ok(()) => {
-                    UPDATE_READY.store(true, Ordering::SeqCst);
-                    notify::emit_notice(
+            match update.download(|_, _| {}, || {}).await {
+                Ok(bytes) => {
+                    if let Some(pending) = app.try_state::<PendingUpdate>() {
+                        *pending.0.lock().unwrap() = Some((update, bytes));
+                    }
+                    notify::info(
                         app,
-                        "info",
                         "update-ready",
-                        format!("已在后台更新到 v{version},重启应用后生效"),
+                        format!(
+                            "v{version} 已在后台下载完成;到设置中点「重启并更新」安装(不会打断拷卡)"
+                        ),
                     );
                     "ready".into()
                 }
                 Err(e) => {
                     notify::warn(
                         app,
-                        "update-install-failed",
-                        format!("v{version} 更新下载或安装失败: {e}"),
+                        "update-download-failed",
+                        format!("v{version} 更新下载失败: {e}"),
                     );
                     "failed".into()
                 }
@@ -67,8 +91,7 @@ pub async fn check_and_install(app: &AppHandle, manual: bool) -> String {
             "uptodate".into()
         }
         Err(e) => {
-            // 零静默:检查失败必须可见。后台模式按「故障期」去重——
-            // 只在从正常转入失败时发一次,恢复后再失败会再次提示;手动检查始终告知。
+            // 零静默:检查失败必须可见,按故障期去重;手动检查始终告知
             let first_failure = !LAST_CHECK_FAILED.swap(true, Ordering::SeqCst);
             if manual || first_failure {
                 notify::warn(
@@ -85,5 +108,35 @@ pub async fn check_and_install(app: &AppHandle, manual: bool) -> String {
 /// 手动检查更新(设置界面「检查更新」按钮)。
 #[tauri::command]
 pub async fn check_for_update(app: AppHandle) -> Result<String, String> {
-    Ok(check_and_install(&app, true).await)
+    Ok(check_and_download(&app, true).await)
+}
+
+/// 用户主动安装已下载的更新。有运行中拷卡任务时拒绝(安装会退出进程)。
+#[tauri::command]
+pub fn install_update(app: AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+    if state.tasks.any_running() {
+        return Err("有拷卡任务正在进行,安装更新会中断它们;请等任务完成或暂停后再更新".into());
+    }
+    let pending = app
+        .try_state::<PendingUpdate>()
+        .ok_or("更新状态不可用")?
+        .0
+        .lock()
+        .unwrap()
+        .take();
+    let Some((update, bytes)) = pending else {
+        return Err("没有已下载的更新;请先检查更新".into());
+    };
+    // install 在 Windows 上启动安装器并退出进程;macOS/Linux 替换后重启由用户完成
+    update.install(bytes).map_err(|e| {
+        notify::error(&app, "update-install-failed", format!("更新安装失败: {e}"));
+        format!("更新安装失败: {e}")
+    })?;
+    // 到达此处的平台(mac/linux):提示重启
+    notify::info(
+        &app,
+        "update-installed",
+        "更新已安装,重启应用后生效".to_string(),
+    );
+    Ok(())
 }

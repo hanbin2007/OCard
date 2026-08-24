@@ -42,6 +42,15 @@ impl TaskManager {
         self.inner.lock().unwrap().insert(task_id, handle);
     }
 
+    /// 是否有任务的工作线程正在运行(安装更新前的安全闸)。
+    pub fn any_running(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .any(|h| h.running.load(Ordering::SeqCst))
+    }
+
     pub fn snapshots(&self, project_id: Option<&str>) -> Vec<CopyTaskDto> {
         let map = self.inner.lock().unwrap();
         let mut out: Vec<CopyTaskDto> = map

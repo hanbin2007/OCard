@@ -17,14 +17,24 @@ pub struct WorkstationConfig {
     pub nas_root: Option<PathBuf>,
 }
 
-/// 读取配置并区分「文件不存在(首跑,正常)」与「文件存在但损坏(必须上报)」。
-/// 返回 (配置, 是否损坏)。零静默原则:损坏被当首跑处理时用户必须知情。
-pub fn load_checked(config_dir: &Path) -> (WorkstationConfig, bool) {
+/// 读取配置,区分三种情况(零静默原则,codex 四轮 P1):
+/// 文件不存在=首跑正常(None);解析失败=损坏;读取失败(权限/IO)=不可读——
+/// 后两者都会被按未配置处理,用户必须知情,返回具体问题描述。
+pub fn load_checked(config_dir: &Path) -> (WorkstationConfig, Option<String>) {
     match fs::read(config_dir.join(CONFIG_FILE)) {
-        Err(_) => (WorkstationConfig::default(), false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (WorkstationConfig::default(), None),
+        Err(e) => (
+            WorkstationConfig::default(),
+            Some(format!(
+                "本机配置文件不可读(权限或 IO 问题): {e};已按未配置状态处理"
+            )),
+        ),
         Ok(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(cfg) => (cfg, false),
-            Err(_) => (WorkstationConfig::default(), true),
+            Ok(cfg) => (cfg, None),
+            Err(_) => (
+                WorkstationConfig::default(),
+                Some("本机配置文件损坏,已按未配置状态处理;请重新填写设置".to_string()),
+            ),
         },
     }
 }
