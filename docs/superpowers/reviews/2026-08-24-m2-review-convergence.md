@@ -105,3 +105,19 @@ canonicalize)、回收站源端(list/restore/empty/index 追加)未设闸、writ
 - 每命令全 NAS 扫描的性能(Claude M7):ProjectStats 缓存归 M3 前置。
 - sortedCount/delivering/done 状态折叠、绕缓存读能力模式上报(codex 14/15):M3 前置。
 - E2E 扩展:分类流冒烟(建项目→注入素材→分类→打包磁盘断言)本批补。
+
+## M2 收口记录(2026-08-24)
+
+- 终审复票二/三:**fable-5「可收口」+ gpt-5.6-sol(max)「可收口」**,双票均落在最终
+  HEAD(22762d3)。fable 亲自做了变异验证(回退 deliver_one 闸次序 → 新测试红,
+  还原复绿);codex 单点确认枚举零静默完全闭合。
+- 最终状态:Rust 102 测试、前端 376 测试、E2E 9 用例(M1 冒烟 3 + M2 分类流 6),
+  CI 五 job 全绿;clippy -D warnings 干净。
+- 评审全程:初审双路 → 修复波一~三 → 复验轮一双路 → 修复波二/三 → 复验轮二双路 →
+  修复波四/五 → 终审双票 → 终审修复波/波六 → 复票(共 4 轮修复、4 轮评审、
+  两次「宣称已修但替换静默失效」被评审揪出——教训:脚本化替换必须逐处 grep 复核,
+  或改用带匹配校验的编辑)。
+- 版本:v0.2.0(tag 触发 release workflow 生成 draft;**发布 draft 后 OTA 自动分发**)。
+- M3 前置批(承自本文各轮):交付后台线程化+进度/取消、跨机互斥与分类事件重放、
+  ProjectStats 缓存、IPC 缩略图懒取、命令层 IPC 集成测试、回收站索引压缩、
+  file_type 罕见 Err 注入测试。
