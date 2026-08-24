@@ -1,6 +1,7 @@
 //! Tauri 命令层:实现 `src/api/index.ts` 里标注的全部 invoke 契约。
 //! 错误统一映射为字符串消息(前端 toast 展示)。
 
+pub mod analysis_cmds;
 pub mod dto;
 #[cfg(all(test, not(windows)))]
 mod integration_tests;

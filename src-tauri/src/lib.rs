@@ -53,6 +53,7 @@ macro_rules! ocard_invoke_handler {
             $crate::commands::transcode_cmds::transcode_capabilities,
             $crate::commands::transcode_cmds::transcode_diagnostics,
             $crate::commands::transcode_cmds::start_proxy_transcode,
+            $crate::commands::analysis_cmds::start_analysis,
             $crate::commands::sorting_cmds::list_remote_activity,
         ]
     };

@@ -109,6 +109,9 @@ pub struct SortingAssetDto {
     /// 缩略图缓存已就绪(索引完成刷新判据——thumbnail 为 URL 后不能再用其存在性判断)。
     pub thumb_ready: bool,
     pub kind: &'static str,
+    /// 客观分析判定(未分析为 None;AI 只标注不动文件)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judgement: Option<crate::core::analysis::AssetJudgement>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_id: Option<String>,
 }
@@ -365,6 +368,10 @@ fn ensure_indexing<R: tauri::Runtime>(
 
 // ---------- 命令 ----------
 
+pub(crate) fn inbox_files_for_analysis(project_root: &Path) -> CmdResult<Vec<InboxFile>> {
+    inbox_rel_files(project_root)
+}
+
 fn inbox_rel_files(project_root: &Path) -> CmdResult<Vec<InboxFile>> {
     let inbox = project_root.join(project::PENDING_DIR_B);
     let mut files: Vec<InboxFile> = copy::scan_source(&inbox)
@@ -391,6 +398,7 @@ fn asset_dto(
     rel: &str,
     size: u64,
     mtime: u128,
+    judgement: Option<crate::core::analysis::AssetJudgement>,
 ) -> SortingAssetDto {
     let abs = project_root.join(rel.split('/').collect::<PathBuf>());
     let kind = media::classify(rel);
@@ -420,13 +428,14 @@ fn asset_dto(
         shot_at_fallback: shot_at.is_some().then_some(fallback).filter(|f| *f),
         thumbnail: thumb,
         thumb_ready,
+        judgement,
         kind: match kind {
             media::AssetKind::Photo => "photo",
             media::AssetKind::Raw => "raw",
             media::AssetKind::Video => "video",
             media::AssetKind::Other => "other",
         },
-        group_id: None, // 连拍分组归 M3 聚类,如实为 None
+        group_id: None, // 由 list_pending_assets 按 judgement 填充
     }
 }
 
@@ -440,14 +449,57 @@ pub fn list_pending_assets<R: tauri::Runtime>(
 ) -> CmdResult<AssetPageDto> {
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
-    let files = inbox_rel_files(&stats.root)?;
+    let mut files = inbox_rel_files(&stats.root)?;
     ensure_indexing(&app, &project_id, &stats.root, &files);
+
+    // 客观分析判定:特征缓存 + 查询时确定性聚类(计划 C5)。
+    // 有分析结果时列表改按拍摄时间排序——同组连续且不跨分页的结构保证。
+    let (features, _) = crate::core::analysis::load_features(&stats.root);
+    let judgements = if features.is_empty() {
+        Default::default()
+    } else {
+        let mut ordered: Vec<(
+            String,
+            Option<i64>,
+            Option<crate::core::analysis::FeatureRecord>,
+        )> = files
+            .iter()
+            .map(|(rel, size, mtime)| {
+                let f = features
+                    .get(&crate::core::analysis::src_fingerprint(rel, *size, *mtime))
+                    .cloned();
+                (rel.clone(), f.as_ref().and_then(|f| f.shot_at_epoch), f)
+            })
+            .collect();
+        ordered.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
+        let j = crate::core::analysis::judge(&ordered);
+        // 列表顺序与聚类顺序一致(时间序;未分析件按 None 排前,组不与其交错)
+        let order: std::collections::HashMap<&str, usize> = ordered
+            .iter()
+            .enumerate()
+            .map(|(i, (rel, _, _))| (rel.as_str(), i))
+            .collect();
+        files.sort_by_key(|(rel, _, _)| order.get(rel.as_str()).copied().unwrap_or(usize::MAX));
+        j
+    };
+
     let total = files.len();
     let items = files
         .iter()
         .skip(offset)
         .take(limit.min(200)) // 上限与前端页大小一致
-        .map(|(rel, size, mtime)| asset_dto(&stats.root, &project_id, rel, *size, *mtime))
+        .map(|(rel, size, mtime)| {
+            let mut dto = asset_dto(
+                &stats.root,
+                &project_id,
+                rel,
+                *size,
+                *mtime,
+                judgements.get(rel).cloned(),
+            );
+            dto.group_id = dto.judgement.as_ref().and_then(|j| j.group_id.clone());
+            dto
+        })
         .collect();
     Ok(AssetPageDto { items, total })
 }

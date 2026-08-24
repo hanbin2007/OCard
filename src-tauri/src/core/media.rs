@@ -238,6 +238,24 @@ fn write_jpeg(img: &image::DynamicImage, dir: &Path, cache: &Path) -> Option<Pat
     }
 }
 
+/// 从已解码整图写入共享缩略图缓存(分析流水线的单次解码复用;
+/// 已有有效缓存直接跳过)。返回缓存是否就绪。
+pub fn store_thumb_from_image(
+    project_root: &Path,
+    rel_path: &str,
+    size: u64,
+    mtime: u128,
+    img: &image::DynamicImage,
+) -> bool {
+    let dir = thumbs_dir(project_root);
+    let cache = dir.join(thumb_cache_name(rel_path, size, mtime));
+    if cache.is_file() && looks_like_valid_jpeg(&cache) {
+        return true;
+    }
+    let thumb = img.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE);
+    write_jpeg(&thumb, &dir, &cache).is_some()
+}
+
 /// 素材对应的缩略图缓存路径(存在与否由调用方检查)。
 pub fn cached_thumb_path(
     project_root: &Path,
