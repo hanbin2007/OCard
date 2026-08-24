@@ -148,8 +148,9 @@ describe("设备登记", () => {
 
     const alert = await screen.findByTestId("dev-delete-error");
     expect(alert.getAttribute("role")).toBe("alert");
-    expect(alert.textContent).toContain("NAS 只读");
-    expect(alert.textContent).toContain("登记表未改动");
+    // 直接展示后端消息，前端不再替后端断言"未改动"
+    expect(alert.textContent).toContain("NAS 只读，无法写入登记表");
+    expect(alert.textContent).not.toContain("登记表未改动");
     // 相机与其名下的卡都还在
     expect(screen.getAllByText(target.code).length).toBeGreaterThan(0);
     expect(screen.getByText("CFE-01")).toBeDefined();

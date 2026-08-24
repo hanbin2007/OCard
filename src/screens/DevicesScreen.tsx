@@ -372,10 +372,11 @@ export function DevicesScreen() {
                                   cameraId: camera.id,
                                 });
                               } catch (err) {
+                                // 直接展示后端消息：级联删除中断时它才知道真实状态
                                 setDeleteError(
                                   `删除相机 ${camera.model} 失败：${
                                     err instanceof Error ? err.message : String(err)
-                                  }。登记表未改动。`,
+                                  }`,
                                 );
                               }
                             },
@@ -438,7 +439,7 @@ export function DevicesScreen() {
                                   setDeleteError(
                                     `删除存储卡 ${card.label} 失败：${
                                       err instanceof Error ? err.message : String(err)
-                                    }。登记表未改动。`,
+                                    }`,
                                   );
                                 }
                               },

@@ -306,6 +306,7 @@ export interface NoticeDto {
  * `check_for_update` 的结果。
  * - ready：已在后台下载完成，重启生效
  * - uptodate：已是最新
+ * - busy：后台已有检查/下载在进行
  * - failed：下载/安装失败（详情走 app://notice）
  * - check-failed：检查本身失败（网络等）
  * - unsupported：当前安装方式不支持自动更新（如包管理器安装）
@@ -313,6 +314,7 @@ export interface NoticeDto {
 export type UpdateCheckResult =
   | "ready"
   | "uptodate"
+  | "busy"
   | "failed"
   | "check-failed"
   | "unsupported";

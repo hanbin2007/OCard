@@ -202,17 +202,23 @@ interface NoticeBucket {
 }
 
 /**
- * 摄入一条通知：同 code 连续重复折叠计数，否则新建条目。
- * `dedupe` 只在启动回放时开启——回放里可能混着已经实时收到过的那几条；
- * 实时事件不去重，否则同一毫秒的真实重复会被吃掉。
+ * 摄入一条通知。
+ *
+ * 两层机制要分清：
+ * - **同一条通知的双投递**（实时推送 + 启动回放拿到同一条）：靠会话级 seen 集
+ *   （`code@occurredAt`）识别，直接跳过。两条路径查的是同一个集合，
+ *   所以谁先到都一样，不会因为回放先归约就把后到的实时事件计成 ×2。
+ * - **不同时刻的重复告警**（同 code、不同 occurredAt）：折叠成一条并计数 ×N，
+ *   避免刷屏。
  */
 function ingestNotice(
   bucket: NoticeBucket,
   notice: NoticeDto,
-  options: { live: boolean; dedupe: boolean },
+  options: { live: boolean },
 ): NoticeBucket {
   const key = `${notice.code}@${notice.occurredAt}`;
-  if (options.dedupe && bucket.noticeKeys[key]) return bucket;
+  // 同一条通知无论从哪条路径先到，都只摄入一次
+  if (bucket.noticeKeys[key]) return bucket;
 
   const keys: Record<string, true> = { ...bucket.noticeKeys, [key]: true };
   const head = bucket.notices[0];
@@ -362,7 +368,7 @@ export function reducer(state: AppState, action: AppAction): AppState {
     case "noticeReceived":
       return {
         ...state,
-        ...ingestNotice(state, action.notice, { live: true, dedupe: false }),
+        ...ingestNotice(state, action.notice, { live: true }),
       };
 
     case "noticesReplayed": {
@@ -373,7 +379,7 @@ export function reducer(state: AppState, action: AppAction): AppState {
       let bucket: NoticeBucket = state;
       for (const notice of ordered) {
         // 回放不弹 toast，直接进铃铛
-        bucket = ingestNotice(bucket, notice, { live: false, dedupe: true });
+        bucket = ingestNotice(bucket, notice, { live: false });
       }
       return {
         ...state,

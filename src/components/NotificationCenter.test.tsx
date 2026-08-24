@@ -61,13 +61,14 @@ describe("通知中心", () => {
     );
   });
 
-  it("同 code 连续重复折叠为一条并计数 ×N，不刷屏", async () => {
+  it("同 code、不同时刻的重复告警折叠为一条并计数 ×N，不刷屏", async () => {
     const user = userEvent.setup();
     render(<App preloaded={preloaded} />);
 
-    send(notice());
-    send(notice());
-    send(notice());
+    // ×N 折叠针对的是「不同 occurredAt 的重复告警」，不是同一条的重复投递
+    send(notice({ occurredAt: "2026-08-24T10:00:00+08:00" }));
+    send(notice({ occurredAt: "2026-08-24T10:00:05+08:00" }));
+    send(notice({ occurredAt: "2026-08-24T10:00:09+08:00" }));
 
     // 即时呈现区只有一条
     await waitFor(() =>
@@ -358,6 +359,60 @@ describe("通知中心", () => {
     expect(items[0].getAttribute("data-code")).toBe("audit-lost");
     // 回放来的 error 同样要逐条确认
     expect(screen.getByTestId("notice-ack")).toBeDefined();
+
+    listSpy.mockRestore();
+  });
+
+  it("同一条通知的双投递只算一条（实时先到）", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    const dup = notice({ occurredAt: "2026-08-24T09:40:00+08:00" });
+    send(dup);
+    send(dup);
+
+    await user.click(screen.getByTestId("notice-bell"));
+    const items = screen.getAllByTestId("notice-item");
+    expect(items).toHaveLength(1);
+    expect(within(items[0]).queryByTestId("notice-count")).toBeNull();
+  });
+
+  it("反向时序：回放先归约、同一条的实时事件后到，仍是一条不带 ×2", async () => {
+    // ready 手动控制，确保回放先于实时事件落地
+    let markReady: (() => void) | null = null;
+    subSpy.mockImplementation((onNotice: (n: NoticeDto) => void) => {
+      emit = onNotice;
+      return {
+        dispose: () => {},
+        ready: new Promise<void>((resolve) => {
+          markReady = resolve;
+        }),
+      };
+    });
+
+    const replayed = notice({
+      code: "audit-outbox",
+      occurredAt: "2026-08-24T09:00:00+08:00",
+    });
+    const listSpy = vi.spyOn(api, "listNotices").mockResolvedValue([replayed]);
+
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    // 先让回放落地
+    await act(async () => {
+      markReady?.();
+    });
+    await waitFor(() => expect(listSpy).toHaveBeenCalledTimes(1));
+
+    // 同一条通知的实时推送后到——不能被计成 ×2
+    send(replayed);
+
+    await user.click(screen.getByTestId("notice-bell"));
+    const items = screen.getAllByTestId("notice-item");
+    expect(items).toHaveLength(1);
+    expect(within(items[0]).queryByTestId("notice-count")).toBeNull();
+    expect(screen.queryByText("×2")).toBeNull();
 
     listSpy.mockRestore();
   });

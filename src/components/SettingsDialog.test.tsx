@@ -197,7 +197,7 @@ describe("关于与更新", () => {
     spy.mockRestore();
   });
 
-  it("ready 时出现「重启并更新」主按钮", async () => {
+  it("ready 时出现「安装更新」主按钮", async () => {
     const spy = vi.spyOn(api, "checkForUpdate").mockResolvedValue("ready");
     const user = await openSettings();
 
@@ -208,12 +208,12 @@ describe("关于与更新", () => {
       expect(screen.getByTestId("settings-install-update")).toBeDefined(),
     );
     expect(screen.getByTestId("settings-install-update").textContent).toContain(
-      "重启并更新",
+      "安装更新",
     );
     spy.mockRestore();
   });
 
-  it("收到 update-ready 通知时也出现「重启并更新」（无需先手动检查）", async () => {
+  it("收到 update-ready 通知时也出现「安装更新」（无需先手动检查）", async () => {
     let emit: ((n: NoticeDto) => void) | null = null;
     const subSpy = vi
       .spyOn(api, "subscribeNotices")
@@ -284,6 +284,45 @@ describe("关于与更新", () => {
       finish?.();
     });
     await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+
+    checkSpy.mockRestore();
+    installSpy.mockRestore();
+  });
+
+  it("busy：后台已在检查/下载时给出稍候提示", async () => {
+    const spy = vi.spyOn(api, "checkForUpdate").mockResolvedValue("busy");
+    const user = await openSettings();
+
+    await user.click(screen.getByTestId("settings-check-update"));
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-update-result").textContent).toBe(
+        "后台正在检查或下载，请稍候再试",
+      ),
+    );
+    // busy 不等于就绪，不该出现安装按钮
+    expect(screen.queryByTestId("settings-install-update")).toBeNull();
+    spy.mockRestore();
+  });
+
+  it("安装成功后提示「已安装，重启应用后生效」", async () => {
+    const checkSpy = vi.spyOn(api, "checkForUpdate").mockResolvedValue("ready");
+    const installSpy = vi.spyOn(api, "installUpdate").mockResolvedValue(undefined);
+
+    const user = await openSettings();
+    await user.click(screen.getByTestId("settings-check-update"));
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-install-update")).toBeDefined(),
+    );
+
+    await user.click(screen.getByTestId("settings-install-update"));
+
+    // macOS/Linux 不会自动重启，必须说清楚还要手动重启
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-install-done").textContent).toBe(
+        "已安装，重启应用后生效",
+      ),
+    );
+    expect(screen.queryByTestId("settings-install-error")).toBeNull();
 
     checkSpy.mockRestore();
     installSpy.mockRestore();

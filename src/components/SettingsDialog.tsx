@@ -15,6 +15,7 @@ import { Field } from "./ui";
 /** 检查更新的结果文案；失败一律引导去通知中心看详情，不静默 */
 const UPDATE_RESULT_TEXT: Record<UpdateCheckResult, string> = {
   uptodate: "已是最新",
+  busy: "后台正在检查或下载，请稍候再试",
   // "ready" 现在的含义是「已下载待安装」，不是「重启就会自动装上」
   ready: "已下载，点击重启并更新安装",
   failed: "更新失败，详见通知",
@@ -38,6 +39,7 @@ export function SettingsDialog() {
   const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
+  const [installed, setInstalled] = useState(false);
 
   // 每次打开都以当前配置为准重置表单
   useEffect(() => {
@@ -73,6 +75,9 @@ export function SettingsDialog() {
     setInstallError(null);
     try {
       await api.installUpdate();
+      // macOS/Linux 不会自动重启（后端另发 update-installed 通知）；
+      // Windows 上进程会被安装器结束，看不到这行也无妨
+      setInstalled(true);
     } catch (err) {
       // 后端会给中文原因（如「有拷卡任务正在进行」），原样展示
       setInstallError(err instanceof Error ? err.message : String(err));
@@ -85,6 +90,8 @@ export function SettingsDialog() {
     if (checking) return;
     setChecking(true);
     setUpdateResult(null);
+    setInstalled(false);
+    setInstallError(null);
     try {
       setUpdateResult(await api.checkForUpdate());
     } catch {
@@ -210,7 +217,7 @@ export function SettingsDialog() {
                   disabled={installing}
                   onClick={installReadyUpdate}
                 >
-                  {installing ? "正在安装…" : "重启并更新"}
+                  {installing ? "正在安装…" : "安装更新"}
                 </button>
               ) : null}
               {updateResult ? (
@@ -223,6 +230,15 @@ export function SettingsDialog() {
                 </span>
               ) : null}
             </div>
+            {installed && !installError ? (
+              <span
+                className="text-xs muted"
+                data-testid="settings-install-done"
+                role="status"
+              >
+                已安装，重启应用后生效
+              </span>
+            ) : null}
             {installError ? (
               <span
                 className="field__error"
