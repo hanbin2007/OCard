@@ -1,3 +1,4 @@
+pub mod copy;
 pub mod error;
 pub mod hash;
 pub mod journal;
