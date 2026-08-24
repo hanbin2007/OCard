@@ -95,6 +95,53 @@ describe("回收站", () => {
     spy.mockRestore();
   });
 
+  it("#16 读取失败显示错误与重试，绝不渲染成「回收站是空的」", async () => {
+    const user = userEvent.setup();
+    const spy = vi
+      .spyOn(api, "listTrash")
+      .mockRejectedValueOnce(new Error("NAS 不可达"));
+
+    render(<App preloaded={preloaded} />);
+
+    const err = await screen.findByTestId("trash-load-error");
+    expect(err.textContent).toContain("NAS 不可达");
+    expect(err.textContent).toContain("这不代表回收站是空的");
+    expect(screen.queryByText("回收站是空的。")).toBeNull();
+    // 读不到时也不该让人去点「清空」
+    expect(screen.queryAllByTestId("trash-row")).toHaveLength(0);
+
+    spy.mockRestore();
+    await user.click(screen.getByTestId("trash-retry"));
+    await screen.findAllByTestId("trash-row");
+    expect(screen.queryByTestId("trash-load-error")).toBeNull();
+  });
+
+  it("#1 清空后重新拉取列表：失败项会保留在回收站里", async () => {
+    const user = userEvent.setup();
+    const empty = vi
+      .spyOn(api, "emptyTrash")
+      .mockResolvedValue({ removed: 1, failed: 1 });
+    // 清空后后端仍留着删不掉的那条
+    const list = vi
+      .spyOn(api, "listTrash")
+      .mockResolvedValueOnce(mockTrash)
+      .mockResolvedValue([mockTrash[1]]);
+
+    render(<App preloaded={preloaded} />);
+    await screen.findAllByTestId("trash-row");
+
+    await user.click(screen.getByTestId("trash-empty"));
+    await user.click(screen.getByRole("button", { name: "永久删除" }));
+
+    await waitFor(() => expect(empty).toHaveBeenCalledTimes(1));
+    // 关键：清空之后要重新拉，失败项如实留在列表里
+    await waitFor(() => expect(screen.getAllByTestId("trash-row")).toHaveLength(1));
+    expect(list.mock.calls.length).toBeGreaterThanOrEqual(2);
+
+    empty.mockRestore();
+    list.mockRestore();
+  });
+
   it("回收站为空时禁用清空按钮", async () => {
     const spy = vi.spyOn(api, "listTrash").mockResolvedValue([]);
     render(<App preloaded={preloaded} />);

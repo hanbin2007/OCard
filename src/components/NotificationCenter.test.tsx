@@ -83,6 +83,39 @@ describe("通知中心", () => {
     expect(within(items[0]).getByTestId("notice-count").textContent).toBe("×3");
   });
 
+  it("#5 后端合并过的通知按 repeats 显示 ×N，不重新数成 1", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    send(notice({ repeats: 7, occurredAt: "2026-08-24T10:00:00+08:00" }));
+
+    await waitFor(() => expect(screen.getByText("×7")).toBeDefined());
+    await user.click(screen.getByTestId("notice-bell"));
+    expect(screen.getByTestId("notice-count").textContent).toBe("×7");
+  });
+
+  it("#5 本地折叠与 repeats 叠加计数", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    send(notice({ repeats: 3, occurredAt: "2026-08-24T10:00:00+08:00" }));
+    send(notice({ repeats: 2, occurredAt: "2026-08-24T10:00:30+08:00" }));
+
+    await user.click(screen.getByTestId("notice-bell"));
+    expect(screen.getByTestId("notice-count").textContent).toBe("×5");
+  });
+
+  it("#5 缺省 repeats 视为 1", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    send(notice({ occurredAt: "2026-08-24T10:00:00+08:00" }));
+    send(notice({ occurredAt: "2026-08-24T10:00:30+08:00" }));
+
+    await user.click(screen.getByTestId("notice-bell"));
+    expect(screen.getByTestId("notice-count").textContent).toBe("×2");
+  });
+
   it("不同 code 各自成条，不会被折叠到一起", async () => {
     const user = userEvent.setup();
     render(<App preloaded={preloaded} />);

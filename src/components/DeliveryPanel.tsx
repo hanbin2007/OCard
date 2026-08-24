@@ -128,7 +128,10 @@ function DeliveryResult({
     );
   }
 
-  const { existing, errors } = classifyFailures(summary.failures);
+  const { nameCollisions, manifestErrors, errors } = classifyFailures(
+    summary.failures,
+  );
+  const undelivered = [...nameCollisions, ...errors];
 
   return (
     <div className="overlay" onClick={onClose}>
@@ -166,32 +169,55 @@ function DeliveryResult({
             </div>
           </div>
 
-          {/* 重跑跳过：明确说明这是安全策略，不是出错 */}
-          {existing.length > 0 ? (
-            <div className="notice" data-testid="delivery-existing">
-              <strong>{existing.length} 个文件此前已打包，本次跳过</strong>
+          {/* 已交付跳过：hash 校验一致，属于正常结果 */}
+          {summary.alreadyDelivered > 0 ? (
+            <div className="notice" data-testid="delivery-already">
+              <strong>
+                {summary.alreadyDelivered} 个文件此前已交付，内容一致，本次跳过
+              </strong>
               <span>
                 OCard 绝不覆盖已有交付文件，所以重复打包是安全的。
-                若需要重新生成，请先手动移走或改名旧的交付包。
               </span>
             </div>
           ) : null}
 
-          {/* 真失败：界面内直接列出，不只藏在铃铛里 */}
-          {errors.length > 0 ? (
-            <div className="notice notice--warn" role="alert" data-testid="delivery-errors">
-              <strong>{errors.length} 个文件打包失败</strong>
+          {/* 清单缺失：文件确实交付了，重跑即可补齐 */}
+          {manifestErrors.length > 0 ? (
+            <div className="notice notice--warn" data-testid="delivery-manifest-errors">
+              <strong>{manifestErrors.length} 个文件的清单条目缺失</strong>
+              <span>
+                文件本身已交付成功，只是没写进清单。重新执行一次打包即可补齐清单，
+                不会重复复制文件。
+              </span>
+            </div>
+          ) : null}
+
+          {/* 未交付：界面内直接列出，不只藏在铃铛里 */}
+          {undelivered.length > 0 ? (
+            <div className="notice notice--danger" role="alert" data-testid="delivery-errors">
+              <strong>{undelivered.length} 个文件未交付</strong>
+              {nameCollisions.length > 0 ? (
+                <span data-testid="delivery-collision-note">
+                  其中 {nameCollisions.length} 个是同名但内容不同——
+                  包内已有同名文件，OCard 不覆盖，请人工核对后再决定保留哪一份。
+                </span>
+              ) : null}
               <div className="delivery__failures">
-                {errors.slice(0, 8).map((failure) => (
+                {undelivered.slice(0, 8).map((failure) => (
                   <div className="delivery__failure" key={failure.assetId}>
                     <span className="mono text-2xs truncate" title={failure.assetId}>
                       {failure.assetId}
                     </span>
-                    <span className="text-2xs">{failure.message}</span>
+                    <span className="text-2xs">
+                      {failure.kind === "name-collision" ? "同名不同内容 · " : ""}
+                      {failure.message}
+                    </span>
                   </div>
                 ))}
-                {errors.length > 8 ? (
-                  <span className="text-2xs dim">其余 {errors.length - 8} 条见通知中心</span>
+                {undelivered.length > 8 ? (
+                  <span className="text-2xs dim">
+                    其余 {undelivered.length - 8} 条见通知中心
+                  </span>
                 ) : null}
               </div>
             </div>

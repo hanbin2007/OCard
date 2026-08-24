@@ -300,6 +300,8 @@ export interface NoticeDto {
   code: string;
   message: string;
   occurredAt: string;
+  /** 后端在 30s 窗口内合并同 code 的次数；缺省视为 1 */
+  repeats?: number;
 }
 
 /**
@@ -323,7 +325,11 @@ export type UpdateCheckResult =
  * 分类工作台（PRD §5.4，工况 B 主场）
  * ------------------------------------------------------------------ */
 
-export type SortingAssetKind = "photo" | "video" | "raw";
+/**
+ * 素材类型。`other` 是后端明确表达「既不是照片也不是视频」的那一类
+ * （如误入的 .txt），不再伪装成 video。
+ */
+export type SortingAssetKind = "photo" | "video" | "raw" | "other";
 
 /** 待分类素材。id 用项目内相对路径，天然稳定且与落盘一一对应。 */
 export interface SortingAsset {
@@ -399,6 +405,8 @@ export interface IndexingStatus {
   running: boolean;
   /** 索引失败的文件数：不阻断流程，但必须可见 */
   failed: number;
+  /** 索引期间被移走的文件数：信息性，不计入失败 */
+  missing: number;
 }
 
 export interface IndexProgressEvent extends IndexingStatus {
@@ -418,22 +426,27 @@ export interface DeliveryPackage {
 }
 
 /**
- * 打包失败项。
+ * 打包失败项。三种语义严重程度差别很大，界面必须分开呈现：
+ * - `name-collision`：同名但内容不同 → **未交付**，需人工核对，红色
+ * - `manifest-error`：文件已交付成功，只是清单没写上 → 重跑可补齐，黄色
+ * - `error`：其他真失败
  *
- * `kind` 用来把「重跑时目标已存在」与真正的错误分开——前者是零覆盖策略的
- * 正常结果，不是事故。后端暂未提供该字段时，前端按 message 兜底判定；
- * 建议后端补一个稳定机器码，别让界面靠字符串匹配猜语义。
+ * 「此前已交付且 hash 一致」不再是失败项，改由 `DeliverySummary.alreadyDelivered` 计数。
  */
+export type DeliveryFailureKind = "name-collision" | "error" | "manifest-error";
+
 export interface DeliveryFailure {
   assetId: string;
   message: string;
-  kind?: "already-exists" | "error";
+  kind?: DeliveryFailureKind;
 }
 
 export interface DeliverySummary {
   packages: DeliveryPackage[];
   totalFiles: number;
   totalBytes: number;
+  /** 重跑时已在包内且 hash 一致的数量——正常结果，不是失败 */
+  alreadyDelivered: number;
   failures: DeliveryFailure[];
   /** 交付根目录（含清单），绝对路径 */
   deliveryPath: string;

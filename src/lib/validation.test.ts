@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { NewProjectInput } from "../api/types";
 import {
   isAbsoluteNasRoot,
+  isReservedCategoryName,
   validateNewCamera,
   validateNewProject,
   validateStartCopy,
@@ -82,6 +83,25 @@ describe("validateNewProject", () => {
     expect(validateNewProject(project({ name: "CON" })).errors.name).toContain("保留");
     const cats = validateNewProject(project({ categories: ["NUL"] }));
     expect(cats.errors.categoryAt?.[0]).toContain("保留");
+  });
+
+  it("分类名不能与固定夹「待分类/精选/其他」重名", () => {
+    for (const name of ["待分类", "精选", "其他"]) {
+      const r = validateNewProject(project({ categories: [name] }));
+      expect(r.valid, name).toBe(false);
+      expect(r.errors.categoryAt?.[0]).toContain("固定夹重名");
+    }
+  });
+
+  it("也不能以固定夹名结尾（后端按序号+名字拼夹名会撞车）", () => {
+    const r = validateNewProject(project({ categories: ["领导精选"] }));
+    expect(r.valid).toBe(false);
+    expect(r.errors.categoryAt?.[0]).toContain("以它们结尾");
+  });
+
+  it("只是包含这些字但不结尾的正常分类不误伤", () => {
+    const r = validateNewProject(project({ categories: ["精选花絮", "其他项目组"] }));
+    expect(r.valid).toBe(true);
   });
 
   it("分类数量超上限被拦下", () => {
@@ -278,5 +298,19 @@ describe("validateWorkstation", () => {
     expect(
       validateWorkstation({ operator: "张三", nasRoot: "nas/projects" }).errors.nasRoot,
     ).toContain("绝对路径");
+  });
+});
+
+describe("isReservedCategoryName", () => {
+  it("相等或以固定夹名结尾都算冲突", () => {
+    expect(isReservedCategoryName("精选")).toBe(true);
+    expect(isReservedCategoryName("待分类")).toBe(true);
+    expect(isReservedCategoryName("领导精选")).toBe(true);
+  });
+
+  it("普通分类名不冲突", () => {
+    expect(isReservedCategoryName("开幕式")).toBe(false);
+    expect(isReservedCategoryName("精选花絮")).toBe(false);
+    expect(isReservedCategoryName("")).toBe(false);
   });
 });

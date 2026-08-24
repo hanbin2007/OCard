@@ -3,14 +3,25 @@
  * 看见对方在拷哪张卡、同卷名警告但不阻断、连续失败才说「暂不可用」。
  */
 
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import * as api from "../api";
 import { mockCameras, mockProjects, mockStorageCards, mockVolumes, mockWorkstation } from "../api/mock";
 import type { RemoteActivity } from "../api/types";
-import { REMOTE_FAILURE_THRESHOLD, REMOTE_POLL_MS } from "../hooks/useRemoteActivity";
+import {
+  REMOTE_FAILURE_THRESHOLD,
+  REMOTE_POLL_MS,
+  useRemoteActivity,
+} from "../hooks/useRemoteActivity";
 
 afterEach(() => {
   cleanup();
@@ -226,6 +237,55 @@ describe("同卷名警告", () => {
     await reachConfirm(user);
 
     expect(screen.queryByTestId("copy-same-volume-warning")).toBeNull();
+    spy.mockRestore();
+  });
+});
+
+describe("#20 切换项目重置状态", () => {
+  beforeEach(() => vi.useFakeTimers({ shouldAdvanceTime: true }));
+
+  it("上个项目的「暂不可用」不会带到新项目头上", async () => {
+    const spy = vi
+      .spyOn(api, "listRemoteActivity")
+      .mockRejectedValue(new Error("NAS 不可达"));
+
+    const { result, rerender } = renderHook(
+      ({ id }: { id: string }) => useRemoteActivity(id),
+      { initialProps: { id: "p-a" } },
+    );
+
+    for (let i = 1; i < REMOTE_FAILURE_THRESHOLD; i += 1) {
+      await waitFor(() => expect(spy).toHaveBeenCalledTimes(i));
+      await act(async () => {
+        vi.advanceTimersByTime(REMOTE_POLL_MS);
+      });
+    }
+    await waitFor(() => expect(result.current.unavailable).toBe(true));
+
+    // 换项目：让新项目的轮询悬着不返回，考察「首次成功之前」这段窗口——
+    // 若不显式重置，旧项目的「暂不可用」会一直挂在新项目头上
+    spy.mockImplementation(() => new Promise(() => {}));
+    rerender({ id: "p-b" });
+    expect(result.current.unavailable).toBe(false);
+
+    spy.mockRestore();
+  });
+
+  it("切到新项目后旧项目的活动列表不残留", async () => {
+    const spy = vi
+      .spyOn(api, "listRemoteActivity")
+      .mockResolvedValue([activity({ volume: "OLD_CARD" })]);
+
+    const { result, rerender } = renderHook(
+      ({ id }: { id: string }) => useRemoteActivity(id),
+      { initialProps: { id: "p-a" } },
+    );
+    await waitFor(() => expect(result.current.activities).toHaveLength(1));
+
+    // 同样考察新项目首次返回之前：旧项目的活动不能残留在界面上
+    spy.mockImplementation(() => new Promise(() => {}));
+    rerender({ id: "p-b" });
+    expect(result.current.activities).toHaveLength(0);
     spy.mockRestore();
   });
 });

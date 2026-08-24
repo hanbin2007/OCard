@@ -66,6 +66,40 @@ describe("分类工作台", () => {
     expect(banner.textContent).toContain("可以先分类已索引的部分");
   });
 
+  it("#4 已移走的文件计入 missing 且不算失败", async () => {
+    await renderSorting();
+    const banner = screen.getByTestId("sorting-indexing");
+    expect(banner.textContent).toContain("已跳过 2 个已移走的文件");
+    // missing 不能混进失败数
+    expect(banner.textContent).toContain("3 个失败");
+  });
+
+  it("#6 O 键与数字键都不会把 curated 传给 moveAssets", async () => {
+    const move = vi.spyOn(api, "moveAssets");
+    const curate = vi.spyOn(api, "curateAssets");
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "ArrowRight" });
+    fireEvent.keyDown(grid(), { key: "o" });
+    await waitFor(() => expect(move).toHaveBeenCalledTimes(1));
+    expect(move.mock.calls[0][2]).toBe("other");
+
+    // 等这批操作真正落定（busy 复位）后再按下一个键，否则会被忽略
+    await waitFor(() =>
+      expect(screen.getByTestId("sorting-remaining").textContent).toContain("1239"),
+    );
+
+    // 数字键只绑定 custom 分类，永远拿不到 curated
+    fireEvent.keyDown(grid(), { key: "ArrowRight" });
+    fireEvent.keyDown(grid(), { key: "1" });
+    await waitFor(() => expect(move).toHaveBeenCalledTimes(2));
+    expect(move.mock.calls.every((c) => c[2] !== "curated")).toBe(true);
+    expect(curate).not.toHaveBeenCalled();
+
+    move.mockRestore();
+    curate.mockRestore();
+  });
+
   it("未索引出缩略图的格子显示占位而不是空白", async () => {
     await renderSorting();
     expect(screen.getAllByTestId("asset-no-thumb").length).toBeGreaterThan(0);
@@ -284,6 +318,7 @@ describe("分类工作台", () => {
         total: 1240,
         running: false,
         failed: 3,
+        missing: 0,
         occurredAt: new Date().toISOString(),
       }),
     );
@@ -313,12 +348,128 @@ describe("分类工作台", () => {
         total: 5,
         running: false,
         failed: 0,
+        missing: 0,
         occurredAt: new Date().toISOString(),
       }),
     );
 
     expect(screen.getByTestId("sorting-indexing").textContent).toContain("1144/1240");
     spy.mockRestore();
+  });
+
+  it("#8 点击「精选」走复制语义（curateAssets），不是移动", async () => {
+    const user = userEvent.setup();
+    const curate = vi.spyOn(api, "curateAssets");
+    const move = vi.spyOn(api, "moveAssets");
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "ArrowRight" });
+    const before = screen.getByTestId("sorting-remaining").textContent;
+
+    const chip = screen
+      .getAllByTestId("sorting-category")
+      .find((c) => c.getAttribute("data-category") === "curated") as HTMLElement;
+    await user.click(chip);
+
+    await waitFor(() => expect(curate).toHaveBeenCalledTimes(1));
+    // 关键：绝不能调 moveAssets，否则素材被挪进精选、脱离分类流程
+    expect(move).not.toHaveBeenCalled();
+    // 复制语义：原件仍留在待分类
+    expect(screen.getByTestId("sorting-remaining").textContent).toBe(before);
+
+    curate.mockRestore();
+    move.mockRestore();
+  });
+
+  it("#8 点击普通分类仍走移动", async () => {
+    const user = userEvent.setup();
+    const move = vi.spyOn(api, "moveAssets");
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "ArrowRight" });
+    const chip = screen
+      .getAllByTestId("sorting-category")
+      .find((c) => c.getAttribute("data-category") === "cat-1") as HTMLElement;
+    await user.click(chip);
+
+    await waitFor(() => expect(move).toHaveBeenCalledTimes(1));
+    expect(move.mock.calls[0][2]).toBe("cat-1");
+    move.mockRestore();
+  });
+
+  it("#16 初始加载失败显示错误与重试，绝不渲染成「没有素材」", async () => {
+    const user = userEvent.setup();
+    const spy = vi
+      .spyOn(api, "listPendingAssets")
+      .mockRejectedValueOnce(new Error("NAS 不可达"));
+
+    render(<App preloaded={preloaded} />);
+
+    const err = await screen.findByTestId("sorting-load-error");
+    expect(err.textContent).toContain("NAS 不可达");
+    expect(err.textContent).toContain("这不代表素材不存在");
+    // 决不能出现空态文案
+    expect(screen.queryByText("待分类里没有素材了。")).toBeNull();
+
+    // 重试成功后正常渲染
+    spy.mockRestore();
+    await user.click(screen.getByTestId("sorting-retry"));
+    await screen.findAllByTestId("asset-cell");
+    expect(screen.queryByTestId("sorting-load-error")).toBeNull();
+  });
+
+  it("#13 索引推进后重拉当前页，让「索引中」的格子出图", async () => {
+    let emit: ((e: IndexProgressEvent) => void) | null = null;
+    const subSpy = vi
+      .spyOn(api, "subscribeIndexProgress")
+      .mockImplementation((onEvent: (e: IndexProgressEvent) => void) => {
+        emit = onEvent;
+        return { dispose: () => {}, ready: Promise.resolve() };
+      });
+
+    await renderSorting();
+    const listSpy = vi.spyOn(api, "listPendingAssets");
+
+    act(() =>
+      emit?.({
+        projectId: project.id,
+        indexed: 1240,
+        total: 1240,
+        running: false,
+        failed: 0,
+        missing: 0,
+        occurredAt: new Date().toISOString(),
+      }),
+    );
+
+    // 节流窗口过后重拉当前页
+    await waitFor(() => expect(listSpy).toHaveBeenCalled(), { timeout: 4000 });
+    expect(listSpy.mock.calls[0][1]).toBe(0);
+
+    listSpy.mockRestore();
+    subSpy.mockRestore();
+  }, 10000);
+
+  it("#13 索引监听建立失败要说出来", async () => {
+    const user = userEvent.setup();
+    const subSpy = vi
+      .spyOn(api, "subscribeIndexProgress")
+      .mockImplementation(
+        (
+          _onEvent: (e: IndexProgressEvent) => void,
+          onError?: (e: unknown) => void,
+        ) => {
+          onError?.(new Error("channel closed"));
+          return { dispose: () => {}, ready: Promise.resolve() };
+        },
+      );
+
+    await renderSorting();
+    await user.click(screen.getByTestId("notice-bell"));
+    expect(screen.getByTestId("notice-item").getAttribute("data-code")).toBe(
+      "index-listen-failed",
+    );
+    subSpy.mockRestore();
   });
 
   it("可以继续加载下一页", async () => {

@@ -94,30 +94,87 @@ describe("交付打包", () => {
     expect(total.textContent).toContain(String(mockDelivery.totalFiles));
   });
 
-  it("重跑跳过说成「此前已打包」并解释零覆盖，不当成事故", async () => {
+  it("重跑把 alreadyDelivered 当正常结果展示，不当成事故", async () => {
     const user = await openWorkbench();
+    const spy = vi.spyOn(api, "buildDelivery").mockResolvedValue({
+      ...mockDelivery,
+      alreadyDelivered: 24,
+      failures: [],
+    });
+
     await user.click(screen.getByTestId("delivery-open"));
     await user.click(screen.getByRole("button", { name: "开始打包" }));
 
     await screen.findByTestId("delivery-result");
     const headline = screen.getByTestId("delivery-headline");
-    expect(headline.textContent).toContain("此前已打包，本次跳过");
-    expect(headline.textContent).not.toContain("失败");
+    expect(headline.textContent).toContain("已交付跳过 24 个");
+    expect(headline.textContent).not.toContain("未交付");
 
-    const existing = screen.getByTestId("delivery-existing");
-    expect(existing.textContent).toContain("绝不覆盖已有交付文件");
-    expect(existing.textContent).toContain("重复打包是安全的");
-    // 只有「已存在」时不该出现真失败区块
+    const already = screen.getByTestId("delivery-already");
+    expect(already.textContent).toContain("内容一致，本次跳过");
+    expect(already.textContent).toContain("绝不覆盖已有交付文件");
+    // 纯重跑不该出现任何失败区块
     expect(screen.queryByTestId("delivery-errors")).toBeNull();
+    expect(screen.queryByTestId("delivery-manifest-errors")).toBeNull();
+    spy.mockRestore();
+  });
+
+  it("name-collision 红色标为「未交付」并提示人工核对", async () => {
+    const user = await openWorkbench();
+    const spy = vi.spyOn(api, "buildDelivery").mockResolvedValue({
+      ...mockDelivery,
+      alreadyDelivered: 0,
+      failures: [
+        { assetId: "5. 其他/DSC_9.JPG", message: "包内同名文件内容不同", kind: "name-collision" },
+      ],
+    });
+
+    await user.click(screen.getByTestId("delivery-open"));
+    await user.click(screen.getByRole("button", { name: "开始打包" }));
+    await screen.findByTestId("delivery-result");
+
+    const box = screen.getByTestId("delivery-errors");
+    expect(box.getAttribute("role")).toBe("alert");
+    expect(box.textContent).toContain("1 个文件未交付");
+    expect(box.textContent).toContain("同名不同内容");
+    expect(screen.getByTestId("delivery-collision-note").textContent).toContain(
+      "请人工核对",
+    );
+    spy.mockRestore();
+  });
+
+  it("manifest-error 单列为可重跑补齐，不算未交付", async () => {
+    const user = await openWorkbench();
+    const spy = vi.spyOn(api, "buildDelivery").mockResolvedValue({
+      ...mockDelivery,
+      alreadyDelivered: 0,
+      failures: [
+        { assetId: "5. 其他/DSC_8.JPG", message: "清单条目未写入", kind: "manifest-error" },
+      ],
+    });
+
+    await user.click(screen.getByTestId("delivery-open"));
+    await user.click(screen.getByRole("button", { name: "开始打包" }));
+    await screen.findByTestId("delivery-result");
+
+    const box = screen.getByTestId("delivery-manifest-errors");
+    expect(box.textContent).toContain("文件本身已交付成功");
+    expect(box.textContent).toContain("重新执行一次打包即可补齐");
+    // 清单缺失不该被算进「未交付」
+    expect(screen.queryByTestId("delivery-errors")).toBeNull();
+    expect(screen.getByTestId("delivery-headline").textContent).not.toContain(
+      "未交付",
+    );
+    spy.mockRestore();
   });
 
   it("真失败在界面内直接列出，不只藏在铃铛里", async () => {
     const user = await openWorkbench();
     const spy = vi.spyOn(api, "buildDelivery").mockResolvedValue({
       ...mockDelivery,
+      alreadyDelivered: 3,
       failures: [
         { assetId: "5. 其他/DSC_1.JPG", message: "磁盘空间不足", kind: "error" },
-        { assetId: "5. 其他/DSC_2.JPG", message: "目标已存在", kind: "already-exists" },
       ],
     });
 
@@ -129,9 +186,9 @@ describe("交付打包", () => {
     expect(errors.getAttribute("role")).toBe("alert");
     expect(errors.textContent).toContain("磁盘空间不足");
     expect(errors.textContent).toContain("DSC_1.JPG");
-    // 两类分开统计，不混为一谈
-    expect(errors.textContent).toContain("1 个文件打包失败");
-    expect(screen.getByTestId("delivery-existing").textContent).toContain("1 个文件");
+    // 未交付与「已交付跳过」分开统计，不混为一谈
+    expect(errors.textContent).toContain("1 个文件未交付");
+    expect(screen.getByTestId("delivery-already").textContent).toContain("3 个文件");
     spy.mockRestore();
   });
 

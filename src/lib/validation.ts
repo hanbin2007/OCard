@@ -18,6 +18,21 @@ export const PROJECT_NAME_MAX = 40;
 export const CATEGORY_NAME_MAX = 16;
 export const CATEGORY_MAX_COUNT = 20;
 
+/**
+ * 工况 B 的固定夹名。自定义分类不能叫这些，也不能以它们结尾——
+ * 后端按「序号 + 名字」拼夹名，重名会和固定夹撞在一起。
+ */
+export const RESERVED_CATEGORY_NAMES = ["待分类", "精选", "其他"];
+
+/** 是否与固定夹名冲突（相等或以其结尾） */
+export function isReservedCategoryName(raw: string): boolean {
+  const clean = sanitizeSegment(raw).replace(/\s+/g, "");
+  if (!clean) return false;
+  return RESERVED_CATEGORY_NAMES.some(
+    (reserved) => clean === reserved || clean.endsWith(reserved),
+  );
+}
+
 export interface NewProjectErrors {
   date?: string;
   name?: string;
@@ -76,6 +91,11 @@ export function validateNewProject(
       }
       if (isReservedName(clean)) {
         categoryAt[index] = "该名称是 Windows 保留设备名";
+        return;
+      }
+      if (isReservedCategoryName(clean)) {
+        categoryAt[index] =
+          "不能叫「待分类 / 精选 / 其他」，也不能以它们结尾（会与固定夹重名）";
         return;
       }
       // 用规范化键比对：大小写与空格差异在多数文件系统上仍然是同一个夹

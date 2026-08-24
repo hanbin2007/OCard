@@ -448,6 +448,7 @@ export const mockIndexing: IndexingStatus = {
   total: SORTING_TOTAL,
   running: true,
   failed: 3,
+  missing: 2,
 };
 
 /** 交付打包 mock：两个半天包 + 一条「重跑已存在」的失败 */
@@ -458,11 +459,12 @@ export const mockDelivery: DeliverySummary = {
   ],
   totalFiles: 769,
   totalBytes: 69 * 1024 ** 3,
+  alreadyDelivered: 24,
   failures: [
     {
       assetId: "6. 精选/已修/DSC_00931.JPG",
-      message: "目标已存在，已跳过（零覆盖）",
-      kind: "already-exists",
+      message: "包内已有同名文件但内容不同，未交付，请人工核对",
+      kind: "name-collision",
     },
   ],
   deliveryPath: "/Volumes/DIT-NAS/Projects/20260824_校运会/交付/20260824",

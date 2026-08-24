@@ -987,3 +987,12 @@
   display: grid;
   gap: 1px;
 }
+
+.notice--danger {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.notice--danger strong {
+  color: var(--danger);
+}

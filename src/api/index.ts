@@ -597,10 +597,12 @@ export function restoreFromTrash(
 }
 
 /** 清空回收站：**唯一真正物理删除**的入口，调用方必须已做不可逆确认 */
-export function emptyTrash(projectId: string): Promise<{ removed: number }> {
+export function emptyTrash(
+  projectId: string,
+): Promise<{ removed: number; failed: number }> {
   if (IS_TAURI) return ipc("empty_trash", { projectId });
   void projectId;
-  return reply({ removed: mockTrash.length });
+  return reply({ removed: mockTrash.length, failed: 0 });
 }
 
 /** 缩略图索引进度快照（事件推送之外的兜底） */

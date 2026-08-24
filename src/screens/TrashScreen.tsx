@@ -17,13 +17,19 @@ export function TrashScreen() {
   const [entries, setEntries] = useState<TrashEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
+  /** 读取失败绝不能渲染成「回收站是空的」——那会让人以为文件已经没了 */
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
 
   const reload = useCallback(async () => {
     if (!projectId) return;
     setLoading(true);
+    setLoadError(null);
     try {
       setEntries(await api.listTrash(projectId));
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : String(err));
+      setEntries([]);
     } finally {
       setLoading(false);
     }
@@ -137,6 +143,24 @@ export function TrashScreen() {
             </span>
           </div>
 
+          {loadError ? (
+            <div className="sorting__error" data-testid="trash-load-error">
+              <p className="text-sm" role="alert">
+                无法读取回收站：{loadError}
+              </p>
+              <p className="text-xs dim">
+                这不代表回收站是空的——请检查 NAS 是否可达后重试。
+              </p>
+              <button
+                type="button"
+                className="btn btn--primary btn--sm"
+                data-testid="trash-retry"
+                onClick={() => void reload()}
+              >
+                重试
+              </button>
+            </div>
+          ) : (
           <div className="list">
             <div className="list__head trash__head">
               <span>文件</span>
@@ -171,6 +195,7 @@ export function TrashScreen() {
               <EmptyState>回收站是空的。</EmptyState>
             ) : null}
           </div>
+          )}
         </div>
       </div>
 

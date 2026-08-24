@@ -26,6 +26,16 @@ import {
 import { useStore } from "../state/store";
 
 const PAGE_SIZE = 200;
+/** 索引事件驱动的重拉节流：索引中事件很密，不能每条都打一次 IPC */
+const INDEX_REFRESH_MIN_MS = 2000;
+
+/** 非照片类型的中性徽章文案；other = 后端明确的「其他类型」，不再伪装成视频 */
+const KIND_LABEL: Record<SortingAsset["kind"], string> = {
+  photo: "照片",
+  raw: "RAW",
+  video: "视频",
+  other: "其他类型",
+};
 const CELL_MIN_WIDTH = 148;
 const ROW_HEIGHT = 148;
 const GRID_GAP = 8;
@@ -37,12 +47,16 @@ export function SortingScreen() {
   const [assets, setAssets] = useState<SortingAsset[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
+  /** 初始加载失败：绝不能渲染成「没有素材」——那是把故障说成空目录 */
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [reloadToken, setReloadToken] = useState(0);
   const [categories, setCategories] = useState<SortingCategory[]>([]);
   const [indexing, setIndexing] = useState<{
     indexed: number;
     total: number;
     running: boolean;
     failed: number;
+    missing: number;
   } | null>(null);
 
   const [selection, setSelection] = useState<Selection>(emptySelection);
@@ -55,6 +69,13 @@ export function SortingScreen() {
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [busy, setBusy] = useState(false);
   const gridWrapRef = useRef<HTMLDivElement>(null);
+  const loadedCountRef = useRef(0);
+  const lastRefreshRef = useRef(0);
+  const lastIndexedRef = useRef(0);
+
+  useEffect(() => {
+    loadedCountRef.current = assets.length;
+  }, [assets.length]);
 
   const assetIds = useMemo(() => assets.map((a) => a.id), [assets]);
   const markedSet = useMemo(() => new Set(pendingDelete.marked), [pendingDelete.marked]);
@@ -69,6 +90,7 @@ export function SortingScreen() {
     if (!projectId) return;
     let cancelled = false;
     setLoading(true);
+    setLoadError(null);
     void (async () => {
       try {
         const [page, cats, status] = await Promise.all([
@@ -81,6 +103,12 @@ export function SortingScreen() {
         setTotal(page.total);
         setCategories(cats);
         setIndexing(status);
+      } catch (err) {
+        if (cancelled) return;
+        // 读不到就说读不到：把失败渲染成空目录会让人以为素材没了
+        setLoadError(err instanceof Error ? err.message : String(err));
+        setAssets([]);
+        setTotal(0);
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -88,21 +116,36 @@ export function SortingScreen() {
     return () => {
       cancelled = true;
     };
-  }, [projectId]);
+  }, [projectId, reloadToken]);
 
-  // 索引进度：索引中也能操作已索引部分，所以只更新进度条，不锁界面
-  useEffect(() => {
+
+  /**
+   * 重拉已经加载出来的那些素材（索引完成后让缩略图出图）。
+   * 按 PAGE_SIZE 分块取：一次要 600 会被后端 500 的上限截断，
+   * 那样反而会把用户已加载的素材悄悄弄丢。
+   */
+  const refreshLoadedAssets = useCallback(async () => {
     if (!projectId) return;
-    const sub = api.subscribeIndexProgress((event) => {
-      if (event.projectId !== projectId) return;
-      setIndexing({
-        indexed: event.indexed,
-        total: event.total,
-        running: event.running,
-        failed: event.failed,
-      });
-    });
-    return () => sub.dispose();
+    const want = Math.max(loadedCountRef.current, PAGE_SIZE);
+    lastRefreshRef.current = Date.now();
+    try {
+      const collected: SortingAsset[] = [];
+      let latestTotal = 0;
+      while (collected.length < want) {
+        const page = await api.listPendingAssets(
+          projectId,
+          collected.length,
+          PAGE_SIZE,
+        );
+        latestTotal = page.total;
+        collected.push(...page.items);
+        if (page.items.length < PAGE_SIZE) break;
+      }
+      setAssets(collected);
+      setTotal(latestTotal);
+    } catch {
+      // 刷新失败不打断分类：保留当前列表，下一次索引事件会再试
+    }
   }, [projectId]);
 
   const loadMore = useCallback(async () => {
@@ -128,6 +171,52 @@ export function SortingScreen() {
     },
     [dispatch],
   );
+
+  // 索引进度：索引中也能操作已索引部分，所以只更新进度条，不锁界面。
+  // indexed 增长时按 2s 节流重拉当前页——否则刚索引好的格子会一直停在「索引中」。
+  useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const sub = api.subscribeIndexProgress(
+      (event) => {
+        if (cancelled || event.projectId !== projectId) return;
+        setIndexing({
+          indexed: event.indexed,
+          total: event.total,
+          running: event.running,
+          failed: event.failed,
+          missing: event.missing,
+        });
+
+        if (event.indexed <= lastIndexedRef.current) return;
+        lastIndexedRef.current = event.indexed;
+        if (timer) clearTimeout(timer);
+        const elapsed = Date.now() - lastRefreshRef.current;
+        timer = setTimeout(
+          () => void refreshLoadedAssets(),
+          Math.max(0, INDEX_REFRESH_MIN_MS - elapsed),
+        );
+      },
+      (err) => {
+        if (cancelled) return;
+        notify(
+          "warning",
+          "index-listen-failed",
+          `索引进度监听未能建立：${
+            err instanceof Error ? err.message : String(err)
+          }。缩略图仍在后台生成，但界面不会自动刷新。`,
+        );
+      },
+    );
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      sub.dispose();
+    };
+  }, [projectId, refreshLoadedAssets, notify]);
 
   /**
    * 批量操作的统一收尾：成功的移出列表，失败的**如实留下并恢复选中态**，
@@ -169,10 +258,18 @@ export function SortingScreen() {
 
   /* ---------------- 动作 ---------------- */
 
+  // runCurate 定义在下面，用 ref 打通引用（两者都是稳定回调）
+  const runCurateRef = useRef<() => Promise<void>>(async () => {});
+
   const runAssign = useCallback(
     async (categoryId: string) => {
       const targets = actionTargets(selection);
       if (!projectId || targets.length === 0 || busy) return;
+      // 精选永远是复制语义，move 到 curated 会让素材卡在没有流程的位置
+      if (categories.find((c) => c.id === categoryId)?.kind === "curated") {
+        await runCurateRef.current();
+        return;
+      }
       setBusy(true);
       try {
         const result = await api.moveAssets(projectId, targets, categoryId);
@@ -188,7 +285,7 @@ export function SortingScreen() {
         setBusy(false);
       }
     },
-    [projectId, selection, busy, applyBulk, refreshCategories, notify],
+    [projectId, selection, busy, categories, applyBulk, refreshCategories, notify],
   );
 
   const runCurate = useCallback(async () => {
@@ -216,6 +313,8 @@ export function SortingScreen() {
       setBusy(false);
     }
   }, [projectId, selection, busy, refreshCategories, notify]);
+
+  runCurateRef.current = runCurate;
 
   const commitDelete = useCallback(async () => {
     if (!projectId) return;
@@ -396,7 +495,12 @@ export function SortingScreen() {
                 data-testid="sorting-category"
                 data-category={category.id}
                 disabled={category.kind === "inbox" || busy}
-                onClick={() => void runAssign(category.id)}
+                /* 精选是「复制进精选/待修」，不是移动——点击路径必须与 P 键一致 */
+                onClick={() =>
+                  category.kind === "curated"
+                    ? void runCurate()
+                    : void runAssign(category.id)
+                }
                 title={
                   category.kind === "custom"
                     ? `按 ${category.hotkey} 分到「${category.name}」`
@@ -413,7 +517,8 @@ export function SortingScreen() {
           </div>
 
           {/* 索引进度：索引中也能操作已索引部分 */}
-          {indexing && (indexing.running || indexing.failed > 0) ? (
+          {indexing &&
+          (indexing.running || indexing.failed > 0 || indexing.missing > 0) ? (
             <div className="sorting__indexing" data-testid="sorting-indexing">
               <ProgressBar
                 value={indexing.indexed}
@@ -427,6 +532,9 @@ export function SortingScreen() {
                   ? `正在生成缩略图 ${indexProgress}，可以先分类已索引的部分`
                   : `缩略图索引完成 ${indexProgress}`}
                 {indexing.failed > 0 ? ` · ${indexing.failed} 个失败` : ""}
+                {indexing.missing > 0
+                  ? ` · 已跳过 ${indexing.missing} 个已移走的文件`
+                  : ""}
               </span>
             </div>
           ) : null}
@@ -440,7 +548,24 @@ export function SortingScreen() {
             data-testid="sorting-grid-wrap"
             aria-label="待分类素材"
           >
-            {assets.length === 0 && !loading ? (
+            {loadError ? (
+              <div className="sorting__error" data-testid="sorting-load-error">
+                <p className="text-sm" role="alert">
+                  无法读取待分类素材：{loadError}
+                </p>
+                <p className="text-xs dim">
+                  这不代表素材不存在——请检查 NAS 是否可达后重试。
+                </p>
+                <button
+                  type="button"
+                  className="btn btn--primary btn--sm"
+                  data-testid="sorting-retry"
+                  onClick={() => setReloadToken((n) => n + 1)}
+                >
+                  重试
+                </button>
+              </div>
+            ) : assets.length === 0 && !loading ? (
               <EmptyState>待分类里没有素材了。</EmptyState>
             ) : (
               <VirtualGrid
@@ -614,7 +739,7 @@ function AssetCell({
         </span>
         <span className="asset__sub">
           {asset.kind !== "photo" ? (
-            <Badge tone="neutral">{asset.kind === "raw" ? "RAW" : "视频"}</Badge>
+            <Badge tone="neutral">{KIND_LABEL[asset.kind]}</Badge>
           ) : null}
           <span className="mono text-2xs dim">{formatBytes(asset.sizeBytes, 0)}</span>
         </span>

@@ -26,7 +26,11 @@ export function useRemoteActivity(projectId: string | null) {
     }
 
     let cancelled = false;
+    // 切项目相当于换了一份数据源：失败计数与「暂不可用」都要归零，
+    // 否则上一个项目的故障状态会挂在新项目头上
     failuresRef.current = 0;
+    setUnavailable(false);
+    setActivities([]);
 
     const poll = async () => {
       // 屏幕不活跃时不打扰 NAS
