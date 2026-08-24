@@ -471,6 +471,21 @@ pub fn trash_assets(
     let stats = find_project(&nas, &project_id)?;
     let op = operator(&app, &state);
     let res = bulk(sorting::trash_assets(&stats.root, &asset_ids, &op));
+    // 「文件滞留回收站」是数据位置异常(既不在原位也不在索引),升级为 error 通知
+    let stranded = res
+        .failed
+        .iter()
+        .filter(|f| f.message.contains("滞留"))
+        .count();
+    if stranded > 0 {
+        notify::error(
+            &app,
+            "trash-file-stranded",
+            format!(
+                "{stranded} 个文件移入回收站后索引写入失败且无法还原,滞留在回收站目录中;它们会显示为孤儿文件,需人工处理"
+            ),
+        );
+    }
     audit_bulk(
         &app,
         &state,

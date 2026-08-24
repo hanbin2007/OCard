@@ -1,0 +1,129 @@
+// M2 冒烟:工况B建项目 → 注入素材 → 分类移动 → 回收站两段删除 → 交付打包,
+// 全程对 NAS 目录做磁盘断言(真实 Tauri→IPC→磁盘链路,评审收口要求)。
+import { $, $$, browser, expect } from "@wdio/globals";
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
+
+const nasRoot = process.env.OCARD_E2E_NAS_ROOT;
+
+// 1×1 有效 JPEG:索引器可正常解码,不触发损坏告警
+const TINY_JPEG = Buffer.from(
+  "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD3+iiigD//2Q==",
+  "base64",
+);
+
+function projectRoot() {
+  const dirs = readdirSync(nasRoot).filter((d) => d.includes("E2E分类"));
+  expect(dirs.length).toBe(1);
+  return path.join(nasRoot, dirs[0]);
+}
+
+async function confirmDangerDialog() {
+  const btn = $(".dialog__actions .btn--danger-solid");
+  await btn.waitForClickable({ timeout: 10000 });
+  await btn.click();
+}
+
+async function clickProjectRow(text) {
+  const rows = await $$('[data-testid="project-row"]');
+  for (const row of rows) {
+    if ((await row.getText()).includes(text)) {
+      await row.click();
+      return;
+    }
+  }
+  throw new Error(`找不到项目行: ${text}`);
+}
+
+describe("OCard M2 分类工作台冒烟", () => {
+  it("新建工况B项目并注入待分类素材", async () => {
+    await $('[data-testid="nav-new-project"]').click();
+    await $('[data-testid="np-name"]').waitForExist();
+    await $('[data-testid="np-name"]').setValue("E2E分类");
+    await $('[data-testid="np-scenario-b"]').click();
+    await $('[data-testid="np-category-input"]').waitForExist();
+    await $('[data-testid="np-category-input"]').setValue("现场");
+    await $('[data-testid="np-submit"]').click();
+    await $('[data-testid="project-row"]').waitForExist({ timeout: 20000 });
+
+    const root = projectRoot();
+    expect(existsSync(path.join(root, "2. 现场"))).toBe(true);
+    expect(existsSync(path.join(root, "4. 精选/待修"))).toBe(true);
+
+    // 磁盘注入两张素材(模拟已拷卡)
+    const inbox = path.join(root, "1. 待分类", "0824上午_A7M4_A_ZS");
+    mkdirSync(inbox, { recursive: true });
+    writeFileSync(path.join(inbox, "e2e_a.jpg"), TINY_JPEG);
+    writeFileSync(path.join(inbox, "e2e_b.jpg"), TINY_JPEG);
+  });
+
+  it("分类移动:点分类条,文件真实落到分类夹", async () => {
+    await clickProjectRow("E2E分类");
+    await $('[data-testid="nav-sorting"]').click();
+    await $('[data-testid="asset-cell"]').waitForExist({ timeout: 30000 });
+
+    await $('[data-asset$="e2e_a.jpg"]').click();
+    await $('[data-testid="sorting-category"][data-category="2. 现场"]').click();
+
+    const root = projectRoot();
+    await browser.waitUntil(
+      () => existsSync(path.join(root, "2. 现场", "e2e_a.jpg")),
+      { timeout: 15000, timeoutMsg: "分类移动未落盘" },
+    );
+    expect(
+      existsSync(path.join(root, "1. 待分类/0824上午_A7M4_A_ZS/e2e_a.jpg")),
+    ).toBe(false);
+  });
+
+  it("两段式删除:标记→确认→文件进回收站,清空后物理删除", async () => {
+    await $('[data-asset$="e2e_b.jpg"]').waitForExist({ timeout: 15000 });
+    await $('[data-asset$="e2e_b.jpg"]').click();
+    await browser.keys("d"); // 标记待删除
+    await $('[data-testid="sorting-confirm-delete"]').waitForClickable();
+    await $('[data-testid="sorting-confirm-delete"]').click();
+    await confirmDangerDialog();
+
+    const root = projectRoot();
+    const trashDir = path.join(root, ".ocard", "trash");
+    await browser.waitUntil(
+      () =>
+        existsSync(trashDir) &&
+        readdirSync(trashDir).some((f) => f.endsWith("e2e_b.jpg")),
+      { timeout: 15000, timeoutMsg: "文件未进回收站" },
+    );
+    expect(
+      existsSync(path.join(root, "1. 待分类/0824上午_A7M4_A_ZS/e2e_b.jpg")),
+    ).toBe(false);
+
+    // 回收站列表可见 → 清空(唯一物理删除入口)
+    await $('[data-testid="sorting-open-trash"]').click();
+    await $('[data-testid="trash-row"]').waitForExist({ timeout: 15000 });
+    await $('[data-testid="trash-empty"]').click();
+    await confirmDangerDialog();
+    await browser.waitUntil(
+      () => !readdirSync(trashDir).some((f) => f.endsWith("e2e_b.jpg")),
+      { timeout: 15000, timeoutMsg: "清空回收站未物理删除" },
+    );
+    await $('[data-testid="trash-back"]').click();
+  });
+
+  it("交付打包:半天分包落盘,清单齐备,原件不动", async () => {
+    await $('[data-testid="delivery-open"]').waitForClickable({ timeout: 15000 });
+    await $('[data-testid="delivery-open"]').click();
+    await confirmDangerDialog();
+    await $('[data-testid="delivery-result"]').waitForExist({ timeout: 30000 });
+
+    const root = projectRoot();
+    const delivery = path.join(root, "交付");
+    expect(existsSync(path.join(delivery, "交付总清单.txt"))).toBe(true);
+    const packages = readdirSync(delivery).filter(
+      (d) => !d.startsWith(".") && !d.endsWith(".txt"),
+    );
+    expect(packages.length).toBeGreaterThan(0);
+    const pkg = path.join(delivery, packages[0]);
+    expect(existsSync(path.join(pkg, "清单.txt"))).toBe(true);
+    expect(existsSync(path.join(pkg, "2. 现场", "e2e_a.jpg"))).toBe(true);
+    // 原件不动
+    expect(existsSync(path.join(root, "2. 现场", "e2e_a.jpg"))).toBe(true);
+  });
+});
