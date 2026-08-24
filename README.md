@@ -10,8 +10,8 @@
 ## 开发
 
 ```bash
-npm install
-npm run tauri dev
+pnpm install
+pnpm tauri dev
 ```
 
 前置依赖：Node 22+、Rust stable；Linux 另需 `libwebkit2gtk-4.1-dev` 等系统库（见 `.github/workflows/ci.yml`）。
