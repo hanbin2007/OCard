@@ -30,7 +30,13 @@ import type {
   WorkstationInfo,
 } from "../api/types";
 
-export type RouteName = "projects" | "new-project" | "devices" | "copy";
+export type RouteName =
+  | "projects"
+  | "new-project"
+  | "devices"
+  | "copy"
+  | "sorting"
+  | "trash";
 
 /**
  * 通知中心条目：同 code 连续重复会折叠成一条并计数，避免刷屏。

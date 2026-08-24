@@ -318,3 +318,89 @@ export type UpdateCheckResult =
   | "failed"
   | "check-failed"
   | "unsupported";
+
+/* ------------------------------------------------------------------ *
+ * 分类工作台（PRD §5.4，工况 B 主场）
+ * ------------------------------------------------------------------ */
+
+export type SortingAssetKind = "photo" | "video" | "raw";
+
+/** 待分类素材。id 用项目内相对路径，天然稳定且与落盘一一对应。 */
+export interface SortingAsset {
+  /** 项目内相对路径，同时作为稳定 id */
+  id: string;
+  fileName: string;
+  sizeBytes: number;
+  /** EXIF DateTimeOriginal；取不到时为空（后端回退 mtime 时置 shotAtFallback） */
+  shotAt?: string;
+  /** true 表示 shotAt 来自 mtime 而非 EXIF，界面要标注「时间为推断值」 */
+  shotAtFallback?: boolean;
+  /**
+   * v1 用 base64 data URL 直接内联。
+   * 为空 = 尚未索引到 / 无可用预览，UI 显示占位而不是空白。
+   */
+  thumbnail?: string;
+  kind: SortingAssetKind;
+  /** 连拍组 id；同组的会折叠显示（PRD §5.4） */
+  groupId?: string;
+}
+
+export interface AssetPage {
+  items: SortingAsset[];
+  total: number;
+}
+
+/**
+ * 分类夹。固定项与自定义分类统一表达，前端不硬编码顺序。
+ * - inbox：`1. 待分类`
+ * - custom：建项目时定义的分类，绑定数字键 1–9
+ * - curated：`精选`（P 键，复制一份进「待修」）
+ * - other：`其他`（O 键）
+ */
+export type SortingCategoryKind = "inbox" | "custom" | "curated" | "other";
+
+export interface SortingCategory {
+  id: string;
+  /** 显示名，不含序号 */
+  name: string;
+  /** 落盘夹名，含序号，如 `2. 领导` */
+  folderName: string;
+  kind: SortingCategoryKind;
+  count: number;
+  /** 数字键绑定（1–9），仅 custom 有 */
+  hotkey?: number;
+}
+
+/**
+ * 批量操作结果。**必须能表达部分失败**——
+ * 一次移动 200 张时有 3 张失败，界面要精确恢复这 3 张的选中态。
+ */
+export interface BulkResult {
+  succeeded: string[];
+  failed: Array<{ assetId: string; message: string }>;
+}
+
+/** 回收站条目（`.ocard/trash`，两段式删除的第二段落点） */
+export interface TrashEntry {
+  id: string;
+  fileName: string;
+  sizeBytes: number;
+  /** 删除前的项目内相对路径，恢复时按此还原 */
+  originalPath: string;
+  trashedAt: string;
+  operator: string;
+}
+
+/** 缩略图索引进度（后端事件 `index://progress` 推送） */
+export interface IndexingStatus {
+  projectId: string;
+  indexed: number;
+  total: number;
+  running: boolean;
+  /** 索引失败的文件数：不阻断流程，但必须可见 */
+  failed: number;
+}
+
+export interface IndexProgressEvent extends IndexingStatus {
+  occurredAt: string;
+}

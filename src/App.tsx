@@ -6,6 +6,8 @@ import { CopyTaskScreen } from "./screens/CopyTaskScreen";
 import { DevicesScreen } from "./screens/DevicesScreen";
 import { NewProjectScreen } from "./screens/NewProjectScreen";
 import { ProjectsScreen } from "./screens/ProjectsScreen";
+import { SortingScreen } from "./screens/SortingScreen";
+import { TrashScreen } from "./screens/TrashScreen";
 import { StoreProvider, useStore, type AppState } from "./state/store";
 import { ThemeProvider } from "./state/theme";
 
@@ -104,6 +106,10 @@ function Routes() {
       return <DevicesScreen />;
     case "copy":
       return <CopyTaskScreen />;
+    case "sorting":
+      return <SortingScreen />;
+    case "trash":
+      return <TrashScreen />;
     case "projects":
     default:
       return <ProjectsScreen />;

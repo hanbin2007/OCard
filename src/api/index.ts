@@ -9,7 +9,11 @@
 import {
   mockCameras,
   mockCopyTasks,
+  mockCategories,
+  mockIndexing,
   mockInspection,
+  mockPendingAssets,
+  mockTrash,
   mockProjects,
   mockStorageCards,
   mockVolumes,
@@ -28,8 +32,14 @@ import type {
   CopyFileItem,
   CopyProgressEvent,
   CopyTask,
+  AssetPage,
+  BulkResult,
   CopyTaskPreview,
   FolderNode,
+  IndexingStatus,
+  IndexProgressEvent,
+  SortingCategory,
+  TrashEntry,
   NoticeDto,
   UpdateCheckResult,
   NewCameraInput,
@@ -500,4 +510,125 @@ export function installUpdate(): Promise<void> {
 export function checkForUpdate(): Promise<UpdateCheckResult> {
   if (IS_TAURI) return ipc("check_for_update");
   return reply("uptodate");
+}
+
+/* ------------------------------------------------------------------ *
+ * 分类工作台（PRD §5.4）
+ * ------------------------------------------------------------------ */
+
+/** 分页列出待分类素材（千张级，绝不一次全量过 IPC） */
+export function listPendingAssets(
+  projectId: string,
+  offset = 0,
+  limit = 200,
+): Promise<AssetPage> {
+  // TODO: tauri invoke("list_pending_assets", { projectId, offset, limit })
+  if (IS_TAURI) return ipc("list_pending_assets", { projectId, offset, limit });
+  return reply({
+    items: mockPendingAssets.slice(offset, offset + limit),
+    total: mockPendingAssets.length,
+  });
+}
+
+/** 分类夹清单（含固定项），带各自计数 */
+export function listCategories(projectId: string): Promise<SortingCategory[]> {
+  // TODO: tauri invoke("list_categories", { projectId })
+  if (IS_TAURI) return ipc("list_categories", { projectId });
+  void projectId;
+  return reply(mockCategories);
+}
+
+/** 移动到某个分类夹；返回逐条结果，部分失败必须能表达 */
+export function moveAssets(
+  projectId: string,
+  assetIds: string[],
+  categoryId: string,
+): Promise<BulkResult> {
+  // TODO: tauri invoke("move_assets", { projectId, assetIds, categoryId })
+  if (IS_TAURI) return ipc("move_assets", { projectId, assetIds, categoryId });
+  return reply({ succeeded: assetIds, failed: [] });
+}
+
+/** 标精选：复制一份进「精选/待修」，原件留在原处（PRD §5.4） */
+export function curateAssets(
+  projectId: string,
+  assetIds: string[],
+): Promise<BulkResult> {
+  // TODO: tauri invoke("curate_assets", { projectId, assetIds })
+  if (IS_TAURI) return ipc("curate_assets", { projectId, assetIds });
+  return reply({ succeeded: assetIds, failed: [] });
+}
+
+/**
+ * 移入项目内回收站。**这是两段式删除的第二段**——
+ * 第一段「标记」纯在前端，后端只接受人工确认过的批次，且绝不物理删除。
+ */
+export function trashAssets(
+  projectId: string,
+  assetIds: string[],
+): Promise<BulkResult> {
+  // TODO: tauri invoke("trash_assets", { projectId, assetIds })
+  if (IS_TAURI) return ipc("trash_assets", { projectId, assetIds });
+  return reply({ succeeded: assetIds, failed: [] });
+}
+
+export function listTrash(projectId: string): Promise<TrashEntry[]> {
+  // TODO: tauri invoke("list_trash", { projectId })
+  if (IS_TAURI) return ipc("list_trash", { projectId });
+  void projectId;
+  return reply(mockTrash);
+}
+
+export function restoreFromTrash(
+  projectId: string,
+  entryIds: string[],
+): Promise<BulkResult> {
+  // TODO: tauri invoke("restore_from_trash", { projectId, entryIds })
+  if (IS_TAURI) return ipc("restore_from_trash", { projectId, entryIds });
+  return reply({ succeeded: entryIds, failed: [] });
+}
+
+/** 清空回收站：**唯一真正物理删除**的入口，调用方必须已做不可逆确认 */
+export function emptyTrash(projectId: string): Promise<{ removed: number }> {
+  // TODO: tauri invoke("empty_trash", { projectId })
+  if (IS_TAURI) return ipc("empty_trash", { projectId });
+  void projectId;
+  return reply({ removed: mockTrash.length });
+}
+
+/** 缩略图索引进度快照（事件推送之外的兜底） */
+export function indexingStatus(projectId: string): Promise<IndexingStatus> {
+  // TODO: tauri invoke("indexing_status", { projectId })
+  if (IS_TAURI) return ipc("indexing_status", { projectId });
+  return reply({ ...mockIndexing, projectId });
+}
+
+/** 订阅索引进度事件（`index://progress`），与通知订阅同构 */
+export function subscribeIndexProgress(
+  onEvent: (event: IndexProgressEvent) => void,
+  onError?: (error: unknown) => void,
+): NoticeSubscription {
+  if (IS_TAURI) {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    const ready = listen<IndexProgressEvent>("index://progress", (e) => {
+      if (!disposed) onEvent(e.payload);
+    })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => {
+        if (!disposed) onError?.(err);
+        throw err;
+      });
+    return {
+      dispose: () => {
+        disposed = true;
+        unlisten?.();
+      },
+      ready,
+    };
+  }
+  return { dispose: () => {}, ready: Promise.resolve() };
 }

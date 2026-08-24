@@ -7,6 +7,8 @@ import { formatCompactDate } from "../lib/format";
 import {
   IconCamera,
   IconCard,
+  IconGrid,
+  IconTrash,
   IconMonitor,
   IconMoon,
   IconPlus,
@@ -23,6 +25,8 @@ const NAV: Array<{
   { route: "new-project", label: "新建项目", icon: IconPlus },
   { route: "devices", label: "设备登记", icon: IconCamera },
   { route: "copy", label: "拷卡任务", icon: IconCard },
+  { route: "sorting", label: "分类工作台", icon: IconGrid },
+  { route: "trash", label: "回收站", icon: IconTrash },
 ];
 
 const THEME_ICONS = {

@@ -5,6 +5,10 @@
 
 import type {
   CameraReg,
+  IndexingStatus,
+  SortingAsset,
+  SortingCategory,
+  TrashEntry,
   CopyFileItem,
   CopyTask,
   Project,
@@ -359,3 +363,89 @@ export const mockCopyTasks: CopyTask[] = [
     finishedAt: "2026-08-24T11:35:00+08:00",
   },
 ];
+
+/* ------------------------------------------------------------------ *
+ * 分类工作台 mock
+ * ------------------------------------------------------------------ */
+
+/** 生成一张纯色缩略图（data URL）；真实实现由 media_indexer 产出 JPEG base64 */
+function mockThumb(hue: number): string {
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="8" height="6">` +
+    `<rect width="8" height="6" fill="hsl(${hue} 30% 62%)"/></svg>`;
+  return `data:image/svg+xml;base64,${btoa(svg)}`;
+}
+
+const SORTING_TOTAL = 1240;
+
+/** 千张级素材：用来压虚拟滚动，不是摆设 */
+export const mockPendingAssets: SortingAsset[] = Array.from(
+  { length: SORTING_TOTAL },
+  (_, i) => {
+    const index = i + 1;
+    const isRaw = index % 7 === 0;
+    const isVideo = index % 23 === 0;
+    // 每 5 张一个连拍组，模拟运动会连拍
+    const groupIndex = Math.floor(i / 5);
+    const shot = new Date(Date.UTC(2026, 7, 24, 1, 0, 0) + i * 4000);
+    return {
+      id: `1. 待分类/0824上午_NikonZ9_E_CQ/DSC_${String(index).padStart(5, "0")}.${
+        isVideo ? "MP4" : isRaw ? "NEF" : "JPG"
+      }`,
+      fileName: `DSC_${String(index).padStart(5, "0")}.${
+        isVideo ? "MP4" : isRaw ? "NEF" : "JPG"
+      }`,
+      sizeBytes: (isVideo ? 240 : isRaw ? 52 : 9) * 1024 * 1024,
+      shotAt: shot.toISOString(),
+      // 每 11 张有一张取不到 EXIF，走 mtime 回退
+      shotAtFallback: index % 11 === 0,
+      // 每 13 张有一张还没索引出缩略图，界面要显示占位
+      thumbnail: index % 13 === 0 ? undefined : mockThumb((i * 37) % 360),
+      kind: isVideo ? "video" : isRaw ? "raw" : "photo",
+      groupId: `g-${groupIndex}`,
+    } satisfies SortingAsset;
+  },
+);
+
+export const mockCategories: SortingCategory[] = [
+  {
+    id: "inbox",
+    name: "待分类",
+    folderName: "1. 待分类",
+    kind: "inbox",
+    count: SORTING_TOTAL,
+  },
+  { id: "cat-1", name: "开幕式", folderName: "2. 开幕式", kind: "custom", count: 312, hotkey: 1 },
+  { id: "cat-2", name: "田赛", folderName: "3. 田赛", kind: "custom", count: 208, hotkey: 2 },
+  { id: "cat-3", name: "径赛", folderName: "4. 径赛", kind: "custom", count: 174, hotkey: 3 },
+  { id: "cat-4", name: "颁奖", folderName: "5. 颁奖", kind: "custom", count: 96, hotkey: 4 },
+  { id: "curated", name: "精选", folderName: "6. 精选", kind: "curated", count: 41 },
+  { id: "other", name: "其他", folderName: "7. 其他", kind: "other", count: 63 },
+];
+
+export const mockTrash: TrashEntry[] = [
+  {
+    id: ".ocard/trash/DSC_00412.JPG",
+    fileName: "DSC_00412.JPG",
+    sizeBytes: 9 * 1024 * 1024,
+    originalPath: "1. 待分类/0824上午_NikonZ9_E_CQ/DSC_00412.JPG",
+    trashedAt: "2026-08-24T13:20:00+08:00",
+    operator: "张涵斌",
+  },
+  {
+    id: ".ocard/trash/DSC_00587.JPG",
+    fileName: "DSC_00587.JPG",
+    sizeBytes: 9 * 1024 * 1024,
+    originalPath: "1. 待分类/0824上午_NikonZ9_E_CQ/DSC_00587.JPG",
+    trashedAt: "2026-08-24T13:22:00+08:00",
+    operator: "张涵斌",
+  },
+];
+
+export const mockIndexing: IndexingStatus = {
+  projectId: "p-2026-0824-sports",
+  indexed: 1144,
+  total: SORTING_TOTAL,
+  running: true,
+  failed: 3,
+};

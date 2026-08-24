@@ -120,6 +120,17 @@ export function IconRetry(props: IconProps) {
   );
 }
 
+export function IconGrid(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <rect x="2.2" y="2.2" width="5" height="5" rx="1" />
+      <rect x="8.8" y="2.2" width="5" height="5" rx="1" />
+      <rect x="2.2" y="8.8" width="5" height="5" rx="1" />
+      <rect x="8.8" y="8.8" width="5" height="5" rx="1" />
+    </Svg>
+  );
+}
+
 export function IconBell(props: IconProps) {
   return (
     <Svg {...props}>

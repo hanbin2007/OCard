@@ -6,6 +6,7 @@ pub mod hash;
 pub mod journal;
 pub mod machine;
 pub mod manifest;
+pub mod media;
 pub mod naming;
 pub mod paths;
 pub mod project;

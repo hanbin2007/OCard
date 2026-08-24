@@ -38,15 +38,38 @@ function expectAnchors(ids: string[]) {
 }
 
 describe("E2E 锚点", () => {
-  it("侧栏四个导航项 + 设置入口", () => {
+  it("侧栏导航项 + 设置入口 + 通知铃铛", () => {
     render(<App preloaded={{ ...base, route: "projects" }} />);
     expectAnchors([
       "nav-projects",
       "nav-new-project",
       "nav-devices",
       "nav-copy",
+      "nav-sorting",
+      "nav-trash",
       "settings-open",
+      "notice-bell",
     ]);
+  });
+
+  it("分类工作台锚点", async () => {
+    render(<App preloaded={{ ...base, route: "sorting" }} />);
+    await screen.findAllByTestId("asset-cell");
+    expectAnchors([
+      "sorting-categories",
+      "sorting-category",
+      "sorting-grid-wrap",
+      "sorting-remaining",
+      "sorting-open-trash",
+      "virtual-grid",
+      "asset-cell",
+    ]);
+  });
+
+  it("回收站锚点", async () => {
+    render(<App preloaded={{ ...base, route: "trash" }} />);
+    await screen.findAllByTestId("trash-row");
+    expectAnchors(["trash-row", "trash-restore", "trash-empty", "trash-back"]);
   });
 
   it("项目列表行", () => {
