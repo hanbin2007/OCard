@@ -434,8 +434,11 @@ export function subscribeCopyProgress(
  * 通知
  * ------------------------------------------------------------------ */
 
-/** 订阅句柄：`ready` 在监听真正注册完成后 settle，供调用方串行化后续动作 */
-export interface NoticeSubscription {
+/**
+ * 事件订阅句柄：`ready` 在监听真正注册完成后 settle，供调用方串行化后续动作。
+ * 通知通道与索引进度通道共用同一形态。
+ */
+export interface EventSubscription {
   dispose: () => void;
   /** listen() 注册完成后 resolve；注册失败则 reject */
   ready: Promise<void>;
@@ -451,7 +454,7 @@ export interface NoticeSubscription {
 export function subscribeNotices(
   onNotice: (notice: NoticeDto) => void,
   onError?: (error: unknown) => void,
-): NoticeSubscription {
+): EventSubscription {
   if (IS_TAURI) {
     let disposed = false;
     let unlisten: (() => void) | null = null;
@@ -516,23 +519,29 @@ export function checkForUpdate(): Promise<UpdateCheckResult> {
  * 分类工作台（PRD §5.4）
  * ------------------------------------------------------------------ */
 
-/** 分页列出待分类素材（千张级，绝不一次全量过 IPC） */
+/** 后端对单页条数的硬上限；超出会被静默截断，所以客户端先夹住 */
+export const MAX_ASSET_PAGE_LIMIT = 500;
+
+/**
+ * 分页列出待分类素材（千张级，绝不一次全量过 IPC）。
+ * limit 超过 500 时后端会截断，这里提前夹住——否则调用方会以为拿到了 600 条，
+ * 而按「已加载条数」推进的 offset 就会跳过中间那批。
+ */
 export function listPendingAssets(
   projectId: string,
   offset = 0,
   limit = 200,
 ): Promise<AssetPage> {
-  // TODO: tauri invoke("list_pending_assets", { projectId, offset, limit })
-  if (IS_TAURI) return ipc("list_pending_assets", { projectId, offset, limit });
+  const capped = Math.min(Math.max(1, limit), MAX_ASSET_PAGE_LIMIT);
+  if (IS_TAURI) return ipc("list_pending_assets", { projectId, offset, limit: capped });
   return reply({
-    items: mockPendingAssets.slice(offset, offset + limit),
+    items: mockPendingAssets.slice(offset, offset + capped),
     total: mockPendingAssets.length,
   });
 }
 
 /** 分类夹清单（含固定项），带各自计数 */
 export function listCategories(projectId: string): Promise<SortingCategory[]> {
-  // TODO: tauri invoke("list_categories", { projectId })
   if (IS_TAURI) return ipc("list_categories", { projectId });
   void projectId;
   return reply(mockCategories);
@@ -544,7 +553,6 @@ export function moveAssets(
   assetIds: string[],
   categoryId: string,
 ): Promise<BulkResult> {
-  // TODO: tauri invoke("move_assets", { projectId, assetIds, categoryId })
   if (IS_TAURI) return ipc("move_assets", { projectId, assetIds, categoryId });
   return reply({ succeeded: assetIds, failed: [] });
 }
@@ -554,7 +562,6 @@ export function curateAssets(
   projectId: string,
   assetIds: string[],
 ): Promise<BulkResult> {
-  // TODO: tauri invoke("curate_assets", { projectId, assetIds })
   if (IS_TAURI) return ipc("curate_assets", { projectId, assetIds });
   return reply({ succeeded: assetIds, failed: [] });
 }
@@ -567,13 +574,11 @@ export function trashAssets(
   projectId: string,
   assetIds: string[],
 ): Promise<BulkResult> {
-  // TODO: tauri invoke("trash_assets", { projectId, assetIds })
   if (IS_TAURI) return ipc("trash_assets", { projectId, assetIds });
   return reply({ succeeded: assetIds, failed: [] });
 }
 
 export function listTrash(projectId: string): Promise<TrashEntry[]> {
-  // TODO: tauri invoke("list_trash", { projectId })
   if (IS_TAURI) return ipc("list_trash", { projectId });
   void projectId;
   return reply(mockTrash);
@@ -583,14 +588,12 @@ export function restoreFromTrash(
   projectId: string,
   entryIds: string[],
 ): Promise<BulkResult> {
-  // TODO: tauri invoke("restore_from_trash", { projectId, entryIds })
   if (IS_TAURI) return ipc("restore_from_trash", { projectId, entryIds });
   return reply({ succeeded: entryIds, failed: [] });
 }
 
 /** 清空回收站：**唯一真正物理删除**的入口，调用方必须已做不可逆确认 */
 export function emptyTrash(projectId: string): Promise<{ removed: number }> {
-  // TODO: tauri invoke("empty_trash", { projectId })
   if (IS_TAURI) return ipc("empty_trash", { projectId });
   void projectId;
   return reply({ removed: mockTrash.length });
@@ -598,7 +601,6 @@ export function emptyTrash(projectId: string): Promise<{ removed: number }> {
 
 /** 缩略图索引进度快照（事件推送之外的兜底） */
 export function indexingStatus(projectId: string): Promise<IndexingStatus> {
-  // TODO: tauri invoke("indexing_status", { projectId })
   if (IS_TAURI) return ipc("indexing_status", { projectId });
   return reply({ ...mockIndexing, projectId });
 }
@@ -607,7 +609,7 @@ export function indexingStatus(projectId: string): Promise<IndexingStatus> {
 export function subscribeIndexProgress(
   onEvent: (event: IndexProgressEvent) => void,
   onError?: (error: unknown) => void,
-): NoticeSubscription {
+): EventSubscription {
   if (IS_TAURI) {
     let disposed = false;
     let unlisten: (() => void) | null = null;

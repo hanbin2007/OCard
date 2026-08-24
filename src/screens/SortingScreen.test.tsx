@@ -1,11 +1,20 @@
 /** 分类工作台：键盘流、两段式删除、部分失败的诚实处理。 */
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import * as api from "../api";
 import { mockCategories, mockProjects, mockWorkstation } from "../api/mock";
+import type { IndexProgressEvent } from "../api/types";
 
 afterEach(cleanup);
 
@@ -254,6 +263,62 @@ describe("分类工作台", () => {
 
     fireEvent.keyDown(document, { key: "Escape" });
     await waitFor(() => expect(screen.queryByTestId("asset-lightbox")).toBeNull());
+  });
+
+  it("索引事件到达时进度条实时更新（index://progress 接线）", async () => {
+    let emit: ((e: IndexProgressEvent) => void) | null = null;
+    const spy = vi
+      .spyOn(api, "subscribeIndexProgress")
+      .mockImplementation((onEvent: (e: IndexProgressEvent) => void) => {
+        emit = onEvent;
+        return { dispose: () => {}, ready: Promise.resolve() };
+      });
+
+    await renderSorting();
+    expect(screen.getByTestId("sorting-indexing").textContent).toContain("1144/1240");
+
+    act(() =>
+      emit?.({
+        projectId: project.id,
+        indexed: 1240,
+        total: 1240,
+        running: false,
+        failed: 3,
+        occurredAt: new Date().toISOString(),
+      }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("sorting-indexing").textContent).toContain(
+        "缩略图索引完成 1240/1240",
+      ),
+    );
+    spy.mockRestore();
+  });
+
+  it("别的项目的索引事件不会串台", async () => {
+    let emit: ((e: IndexProgressEvent) => void) | null = null;
+    const spy = vi
+      .spyOn(api, "subscribeIndexProgress")
+      .mockImplementation((onEvent: (e: IndexProgressEvent) => void) => {
+        emit = onEvent;
+        return { dispose: () => {}, ready: Promise.resolve() };
+      });
+
+    await renderSorting();
+    act(() =>
+      emit?.({
+        projectId: "p-other",
+        indexed: 5,
+        total: 5,
+        running: false,
+        failed: 0,
+        occurredAt: new Date().toISOString(),
+      }),
+    );
+
+    expect(screen.getByTestId("sorting-indexing").textContent).toContain("1144/1240");
+    spy.mockRestore();
   });
 
   it("可以继续加载下一页", async () => {

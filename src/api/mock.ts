@@ -385,8 +385,6 @@ export const mockPendingAssets: SortingAsset[] = Array.from(
     const index = i + 1;
     const isRaw = index % 7 === 0;
     const isVideo = index % 23 === 0;
-    // 每 5 张一个连拍组，模拟运动会连拍
-    const groupIndex = Math.floor(i / 5);
     const shot = new Date(Date.UTC(2026, 7, 24, 1, 0, 0) + i * 4000);
     return {
       id: `1. 待分类/0824上午_NikonZ9_E_CQ/DSC_${String(index).padStart(5, "0")}.${
@@ -402,7 +400,8 @@ export const mockPendingAssets: SortingAsset[] = Array.from(
       // 每 13 张有一张还没索引出缩略图，界面要显示占位
       thumbnail: index % 13 === 0 ? undefined : mockThumb((i * 37) % 360),
       kind: isVideo ? "video" : isRaw ? "raw" : "photo",
-      groupId: `g-${groupIndex}`,
+      // groupId 现阶段后端恒为空，连拍分组归 M3；groupBurst 已兼容缺省值
+      groupId: undefined,
     } satisfies SortingAsset;
   },
 );
