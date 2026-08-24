@@ -1,6 +1,9 @@
-//! 多工作站免锁协同:每台机器只追加写自己的
-//! `.ocard/journal/journal-<机器ID>.jsonl`,读取时合并所有机器的事件
-//! 按时间戳重放。SMB 上无跨平台可靠文件锁,此设计从根上避免并发写冲突。
+//! 多工作站免锁协同:每台机器只追加写自己的 `journal-<机器ID>.jsonl`,
+//! 读取时合并所有机器的事件按时间戳重放。SMB 上无跨平台可靠文件锁,
+//! 此设计从根上避免并发写冲突。
+//!
+//! 通用机制按「日志目录」工作;项目级日志在 `<项目>/.ocard/journal/`,
+//! 全 NAS 共享的登记表日志在 `<NAS根>/.ocard-registry/`(见 registry 模块)。
 
 use super::project::{JOURNAL_DIR, STATE_DIR};
 use super::Result;
@@ -14,7 +17,9 @@ use std::path::{Path, PathBuf};
 pub mod kind {
     pub const PROJECT_CREATED: &str = "project_created";
     pub const CAMERA_REGISTERED: &str = "camera_registered";
+    pub const CAMERA_DELETED: &str = "camera_deleted";
     pub const CARD_REGISTERED: &str = "card_registered";
+    pub const CARD_DELETED: &str = "card_deleted";
     pub const COPY_STARTED: &str = "copy_started";
     pub const COPY_COMPLETED: &str = "copy_completed";
     pub const COPY_FILE_FAILED: &str = "copy_file_failed";
@@ -47,32 +52,20 @@ impl Event {
     }
 }
 
-fn journal_dir(project_root: &Path) -> PathBuf {
-    project_root.join(STATE_DIR).join(JOURNAL_DIR)
-}
-
-fn machine_file(project_root: &Path, machine: &str) -> PathBuf {
-    journal_dir(project_root).join(format!("journal-{machine}.jsonl"))
-}
-
-/// 追加一条事件到本机日志文件(单行 JSON)。
-pub fn append(project_root: &Path, event: &Event) -> Result<()> {
-    let dir = journal_dir(project_root);
-    fs::create_dir_all(&dir)?;
+/// 追加一条事件到指定日志目录下本机的日志文件(单行 JSON)。
+pub fn append_in(dir: &Path, event: &Event) -> Result<()> {
+    fs::create_dir_all(dir)?;
     let mut line = serde_json::to_string(event)?;
     line.push('\n');
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(machine_file(project_root, &event.machine))?;
+    let file = dir.join(format!("journal-{}.jsonl", event.machine));
+    let mut f = OpenOptions::new().create(true).append(true).open(file)?;
     f.write_all(line.as_bytes())?;
     Ok(())
 }
 
-/// 合并读取所有工作站的事件,按时间戳排序。
-/// 解析失败的行跳过(容忍半行写入/版本差异),不让单行坏数据毁掉整个项目状态。
-pub fn read_all(project_root: &Path) -> Result<Vec<Event>> {
-    let dir = journal_dir(project_root);
+/// 合并读取目录下所有工作站的事件,按时间戳排序。
+/// 解析失败的行跳过(容忍半行写入/版本差异),不让单行坏数据毁掉整个状态。
+pub fn read_all_in(dir: &Path) -> Result<Vec<Event>> {
     let mut events = Vec::new();
     if !dir.exists() {
         return Ok(events);
@@ -93,47 +86,18 @@ pub fn read_all(project_root: &Path) -> Result<Vec<Event>> {
     Ok(events)
 }
 
-/// 从事件流折叠出登记表状态。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Registry {
-    pub cameras: Vec<CameraReg>,
-    pub cards: Vec<CardReg>,
+fn project_journal_dir(project_root: &Path) -> PathBuf {
+    project_root.join(STATE_DIR).join(JOURNAL_DIR)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CameraReg {
-    pub model: String,
-    pub position: char,
-    pub operator: String,
-    pub code: String,
+/// 项目级日志:追加。
+pub fn append(project_root: &Path, event: &Event) -> Result<()> {
+    append_in(&project_journal_dir(project_root), event)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CardReg {
-    pub label: String,
-    pub camera_code: String,
-}
-
-pub fn registry_state(events: &[Event]) -> Registry {
-    let mut reg = Registry::default();
-    for ev in events {
-        match ev.kind.as_str() {
-            kind::CAMERA_REGISTERED => {
-                if let Ok(cam) = serde_json::from_value::<CameraReg>(ev.data.clone()) {
-                    reg.cameras.retain(|c| c.code != cam.code);
-                    reg.cameras.push(cam);
-                }
-            }
-            kind::CARD_REGISTERED => {
-                if let Ok(card) = serde_json::from_value::<CardReg>(ev.data.clone()) {
-                    reg.cards.retain(|c| c.label != card.label);
-                    reg.cards.push(card);
-                }
-            }
-            _ => {}
-        }
-    }
-    reg
+/// 项目级日志:合并读取。
+pub fn read_all(project_root: &Path) -> Result<Vec<Event>> {
+    read_all_in(&project_journal_dir(project_root))
 }
 
 #[cfg(test)]
@@ -172,11 +136,9 @@ mod tests {
 
         let all = read_all(tmp.path()).unwrap();
         assert_eq!(all.len(), 3);
-        // 两台机器各有自己的日志文件
         let dir = tmp.path().join(".ocard/journal");
         assert!(dir.join("journal-mac-01.jsonl").exists());
         assert!(dir.join("journal-win-02.jsonl").exists());
-        // 时间戳有序
         assert!(all.windows(2).all(|w| w[0].ts <= w[1].ts));
     }
 
@@ -185,7 +147,6 @@ mod tests {
         let tmp = tempdir().unwrap();
         let e = Event::new("mac-01", "ZS", kind::CAMERA_REGISTERED, json!({}));
         append(tmp.path(), &e).unwrap();
-        // 注入半行坏数据(模拟断电/断连)
         let file = tmp.path().join(".ocard/journal/journal-mac-01.jsonl");
         let mut content = fs::read_to_string(&file).unwrap();
         content.push_str("{\"ts\": \"broken");
@@ -195,39 +156,19 @@ mod tests {
     }
 
     #[test]
-    fn registry_folds_with_last_write_wins() {
+    fn generic_dir_api_works_standalone() {
         let tmp = tempdir().unwrap();
-        let cam = |op: &str| json!({"model": "A7M4", "position": "A", "operator": op, "code": "A7M4_A_ZS"});
-        append(
-            tmp.path(),
-            &Event::new("m1", "ZS", kind::CAMERA_REGISTERED, cam("ZS")),
+        let dir = tmp.path().join("registry");
+        append_in(
+            &dir,
+            &Event::new("m1", "ZS", kind::CAMERA_REGISTERED, json!({"id": "c1"})),
         )
         .unwrap();
-        append(
-            tmp.path(),
-            &Event::new("m2", "LQ", kind::CAMERA_REGISTERED, cam("LQX")),
+        append_in(
+            &dir,
+            &Event::new("m2", "LQ", kind::CAMERA_REGISTERED, json!({"id": "c2"})),
         )
         .unwrap();
-        append(
-            tmp.path(),
-            &Event::new(
-                "m1",
-                "ZS",
-                kind::CARD_REGISTERED,
-                json!({"label": "SD01", "camera_code": "A7M4_A_ZS"}),
-            ),
-        )
-        .unwrap();
-
-        let reg = registry_state(&read_all(tmp.path()).unwrap());
-        assert_eq!(reg.cameras.len(), 1, "同编码相机后写胜");
-        assert_eq!(reg.cameras[0].operator, "LQX");
-        assert_eq!(
-            reg.cards,
-            vec![CardReg {
-                label: "SD01".into(),
-                camera_code: "A7M4_A_ZS".into()
-            }]
-        );
+        assert_eq!(read_all_in(&dir).unwrap().len(), 2);
     }
 }
