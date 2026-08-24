@@ -41,14 +41,14 @@ describe("OCard M2 分类工作台冒烟", () => {
     await $('[data-testid="np-name"]').waitForExist();
     await $('[data-testid="np-name"]').setValue("E2E分类");
     await $('[data-testid="np-scenario-b"]').click();
-    await $('[data-testid="np-category-input"]').waitForExist();
-    await $('[data-testid="np-category-input"]').setValue("现场");
+    // 采用向导预填的默认分类(领导/会场/花絮):
+    // 布局 = 1.待分类 / 2.领导 / 3.会场 / 4.花絮 / 5.精选 / 6.其他
     await $('[data-testid="np-submit"]').click();
     await $('[data-testid="project-row"]').waitForExist({ timeout: 20000 });
 
     const root = projectRoot();
-    expect(existsSync(path.join(root, "2. 现场"))).toBe(true);
-    expect(existsSync(path.join(root, "4. 精选/待修"))).toBe(true);
+    expect(existsSync(path.join(root, "2. 领导"))).toBe(true);
+    expect(existsSync(path.join(root, "5. 精选/待修"))).toBe(true);
 
     // 磁盘注入两张素材(模拟已拷卡)
     const inbox = path.join(root, "1. 待分类", "0824上午_A7M4_A_ZS");
@@ -63,11 +63,11 @@ describe("OCard M2 分类工作台冒烟", () => {
     await $('[data-testid="asset-cell"]').waitForExist({ timeout: 30000 });
 
     await $('[data-asset$="e2e_a.jpg"]').click();
-    await $('[data-testid="sorting-category"][data-category="2. 现场"]').click();
+    await $('[data-testid="sorting-category"][data-category="2. 领导"]').click();
 
     const root = projectRoot();
     await browser.waitUntil(
-      () => existsSync(path.join(root, "2. 现场", "e2e_a.jpg")),
+      () => existsSync(path.join(root, "2. 领导", "e2e_a.jpg")),
       { timeout: 15000, timeoutMsg: "分类移动未落盘" },
     );
     expect(
@@ -122,8 +122,8 @@ describe("OCard M2 分类工作台冒烟", () => {
     expect(packages.length).toBeGreaterThan(0);
     const pkg = path.join(delivery, packages[0]);
     expect(existsSync(path.join(pkg, "清单.txt"))).toBe(true);
-    expect(existsSync(path.join(pkg, "2. 现场", "e2e_a.jpg"))).toBe(true);
+    expect(existsSync(path.join(pkg, "2. 领导", "e2e_a.jpg"))).toBe(true);
     // 原件不动
-    expect(existsSync(path.join(root, "2. 现场", "e2e_a.jpg"))).toBe(true);
+    expect(existsSync(path.join(root, "2. 领导", "e2e_a.jpg"))).toBe(true);
   });
 });
