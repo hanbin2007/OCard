@@ -48,7 +48,7 @@ describe("进度监听（常驻单一 listener）", () => {
     spy.mockRestore();
   });
 
-  it("孤儿任务拉取失败后，新事件到来会再次重试", async () => {
+  it("同一孤儿的新事件不会叠加重叠请求，失败后仍由退避链补上", async () => {
     let emit: ((event: CopyProgressEvent) => void) | null = null;
     const subSpy = vi
       .spyOn(api, "subscribeCopyProgress")
@@ -57,13 +57,28 @@ describe("进度监听（常驻单一 listener）", () => {
         return () => {};
       });
 
-    const orphan: CopyTask = { ...mockCopyTasks[0], id: "t-orphan" };
+    const orphan: CopyTask = {
+      ...mockCopyTasks[0],
+      id: "t-orphan",
+      projectId: mockProjects[0].id,
+      volumeName: "RETRY_CARD",
+    };
     const getSpy = vi
       .spyOn(api, "getCopyTask")
       .mockRejectedValueOnce(new Error("NAS 抖动"))
       .mockResolvedValue(orphan);
 
-    render(<App preloaded={{ route: "copy", workstation: mockWorkstation }} />);
+    render(
+      <App
+        preloaded={{
+          route: "copy",
+          workstation: mockWorkstation,
+          projects: mockProjects,
+          selectedProjectId: mockProjects[0].id,
+          tasks: [],
+        }}
+      />,
+    );
 
     const event = (revision: number): CopyProgressEvent => ({
       taskId: "t-orphan",
@@ -76,17 +91,23 @@ describe("进度监听（常驻单一 listener）", () => {
       changedDestinations: [],
     });
 
-    // 第一条事件触发拉取，但后端失败
     act(() => emit?.(event(1)));
     await waitFor(() => expect(getSpy).toHaveBeenCalledTimes(1));
 
-    // 第二条事件（新 revision）必须再次触发拉取，而不是永远卡住
+    // 同一孤儿的后续事件不得再开一个并发请求（已排了退避重试）
     act(() => emit?.(event(2)));
-    await waitFor(() => expect(getSpy).toHaveBeenCalledTimes(2));
+    act(() => emit?.(event(3)));
+    expect(getSpy).toHaveBeenCalledTimes(1);
+
+    // 退避链自己把它补上
+    await waitFor(() => expect(screen.getByText("RETRY_CARD")).toBeDefined(), {
+      timeout: 6000,
+    });
+    expect(getSpy).toHaveBeenCalledTimes(2);
 
     getSpy.mockRestore();
     subSpy.mockRestore();
-  });
+  }, 10000);
 
   it("终态孤儿：唯一一条事件 + 首次拉取失败，退避后自动重试入列（不投第二条事件）", async () => {
     let emit: ((event: CopyProgressEvent) => void) | null = null;
@@ -146,6 +167,65 @@ describe("进度监听（常驻单一 listener）", () => {
     getSpy.mockRestore();
     subSpy.mockRestore();
   }, 10000);
+
+  it("慢响应（超过首个退避窗口）不被自己的重试机制丢弃，也不叠加请求", async () => {
+    let emit: ((event: CopyProgressEvent) => void) | null = null;
+    const subSpy = vi
+      .spyOn(api, "subscribeCopyProgress")
+      .mockImplementation((onEvent) => {
+        emit = onEvent;
+        return () => {};
+      });
+
+    const slow: CopyTask = {
+      ...mockCopyTasks[0],
+      id: "t-slow",
+      projectId: mockProjects[0].id,
+      volumeName: "SLOW_CARD",
+      state: "done",
+    };
+    // 响应耗时 3s > 首个退避窗口 2s：旧的固定节拍实现会把它当过期丢掉
+    const getSpy = vi
+      .spyOn(api, "getCopyTask")
+      .mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve(slow), 3000)),
+      );
+
+    render(
+      <App
+        preloaded={{
+          route: "copy",
+          workstation: mockWorkstation,
+          projects: mockProjects,
+          selectedProjectId: mockProjects[0].id,
+          tasks: [],
+        }}
+      />,
+    );
+
+    act(() =>
+      emit?.({
+        taskId: "t-slow",
+        revision: 1,
+        occurredAt: new Date().toISOString(),
+        copiedBytes: 100,
+        speedBytesPerSec: 0,
+        state: "done",
+        changedFiles: [],
+        changedDestinations: [],
+      }),
+    );
+
+    // 慢响应最终仍被消费，任务入列
+    await waitFor(() => expect(screen.getByText("SLOW_CARD")).toBeDefined(), {
+      timeout: 9000,
+    });
+    // 全程只有 1 次请求：绝不因为退避窗口到点就再打一发
+    expect(getSpy).toHaveBeenCalledTimes(1);
+
+    getSpy.mockRestore();
+    subSpy.mockRestore();
+  }, 15000);
 
   it("卸载时退订，不留悬空监听", () => {
     const dispose = vi.fn();

@@ -79,6 +79,9 @@ export type AppAction =
   | { type: "taskSnapshot"; task: CopyTask }
   | { type: "progressListenFailed"; error: string };
 
+/** 孤儿对账的退避档位：失败一次等 2s，再失败 5s，之后稳定在 10s */
+const ORPHAN_BACKOFF_MS = [2000, 5000, 10000];
+
 export const initialState: AppState = {
   route: "projects",
   loading: true,
@@ -381,55 +384,86 @@ export function StoreProvider({
    * 这个孤儿任务就永远不会被重试了。带上 revision 后，该任务的下一条新事件
    * 会改变 key，自然触发重试。
    */
-  const orphanKey = Object.entries(state.orphanProgress)
-    .map(([id, event]) => `${id}:${event.revision}`)
-    .sort()
-    .join(",");
+  const orphanIdsKey = Object.keys(state.orphanProgress).sort().join(",");
+  const orphanIdsRef = useRef<string[]>([]);
+  useEffect(() => {
+    orphanIdsRef.current = orphanIdsKey ? orphanIdsKey.split(",") : [];
+  }, [orphanIdsKey]);
+
+  /** 同一孤儿同时最多一个在途请求 */
+  const inFlightRef = useRef(new Set<string>());
+  /** 逐孤儿的失败次数，决定退避档位 */
+  const attemptRef = useRef(new Map<string, number>());
+  /** 逐孤儿已排期的下一次重试 */
+  const timersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const unmountedRef = useRef(false);
+
+  useEffect(() => {
+    unmountedRef.current = false;
+    const timers = timersRef.current;
+    return () => {
+      // 只有卸载才停：重试排期绝不打断在途请求
+      unmountedRef.current = true;
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
+    };
+  }, []);
 
   /**
-   * 拉取失败后的退避重试。
+   * 把孤儿任务的快照拉回来。
    *
-   * 只靠「下一条新事件」重试是不够的：终态任务（done/failed/paused）不会再有
-   * 下一条事件，如果它唯一那条事件的拉取失败了，这个任务就永远进不了列表。
-   * 所以这里按 2s → 5s → 10s 退避（之后稳定在 10s）持续对账，直到孤儿清空。
+   * 调度是**链式**的：一次尝试 settle 之后才排下一次，而不是固定节拍的计时器。
+   * 固定节拍会在响应慢于退避窗口时把在途请求当作过期丢掉——连成功的响应都被
+   * 自己的重试机制扔掉，还不断叠加重叠请求。这里的不变量是：
+   *   ① 慢而成功的响应一定被消费（只有组件卸载才忽略结果）；
+   *   ② 同一孤儿任意时刻最多一个在途请求。
    */
-  const [retryTick, setRetryTick] = useState(0);
-  const retryAttemptRef = useRef(0);
+  async function reconcileOrphan(id: string): Promise<void> {
+    if (unmountedRef.current) return;
+    if (inFlightRef.current.has(id)) return; // 已有在途，不叠加
+    if (timersRef.current.has(id)) return; // 已排期，等它触发
+    if (!orphanIdsRef.current.includes(id)) return; // 已经不是孤儿了
 
-  // 孤儿集合变化说明有新进展，重新从最短退避开始
-  useEffect(() => {
-    retryAttemptRef.current = 0;
-  }, [orphanKey]);
-
-  useEffect(() => {
-    if (!orphanKey) return;
-    const delays = [2000, 5000, 10000];
-    const delay = delays[Math.min(retryAttemptRef.current, delays.length - 1)];
-    const timer = setTimeout(() => {
-      retryAttemptRef.current += 1;
-      setRetryTick((n) => n + 1);
-    }, delay);
-    return () => clearTimeout(timer);
-  }, [orphanKey, retryTick]);
-
-  useEffect(() => {
-    if (!orphanKey) return;
-    let cancelled = false;
-    void (async () => {
-      for (const entry of orphanKey.split(",")) {
-        const id = entry.slice(0, entry.lastIndexOf(":"));
-        try {
-          const task = await api.getCopyTask(id);
-          if (!cancelled && task) dispatch({ type: "taskSnapshot", task });
-        } catch {
-          // 留在缓存里：上面的退避定时器会再来一次，不依赖新事件
-        }
+    inFlightRef.current.add(id);
+    let settled = false;
+    try {
+      const task = await api.getCopyTask(id);
+      if (unmountedRef.current) return;
+      if (task) {
+        settled = true;
+        attemptRef.current.delete(id);
+        dispatch({ type: "taskSnapshot", task });
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [orphanKey, retryTick]);
+    } catch {
+      // 失败：下面排退避重试
+    } finally {
+      inFlightRef.current.delete(id);
+    }
+
+    if (settled || unmountedRef.current) return;
+    if (!orphanIdsRef.current.includes(id)) return;
+
+    const attempt = attemptRef.current.get(id) ?? 0;
+    attemptRef.current.set(id, attempt + 1);
+    const delay =
+      ORPHAN_BACKOFF_MS[Math.min(attempt, ORPHAN_BACKOFF_MS.length - 1)];
+    const timer = setTimeout(() => {
+      timersRef.current.delete(id);
+      void reconcileOrphan(id);
+    }, delay);
+    timersRef.current.set(id, timer);
+  }
+
+  /**
+   * 收到不认识的 taskId 的事件时把快照拉回来。
+   * 依赖只用 id 集合：同一孤儿的新事件不该打断已经在跑的对账链，
+   * 而终态孤儿（不会再有下一条事件）由上面的链式退避兜底。
+   */
+  useEffect(() => {
+    if (!orphanIdsKey) return;
+    for (const id of orphanIdsKey.split(",")) void reconcileOrphan(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orphanIdsKey]);
 
   const value = useMemo(
     () => ({ state, dispatch, reload, refreshTask }),
