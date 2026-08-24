@@ -59,10 +59,20 @@ pub fn thumbs_dir(project_root: &Path) -> PathBuf {
     project_root.join(STATE_DIR).join(THUMBS_DIR)
 }
 
-/// 缓存键:相对路径 + 文件大小的 xxh3,内容变化自动失效。
-fn thumb_cache_name(rel_path: &str, size: u64) -> String {
-    let key = format!("{rel_path}\u{0}{size}");
+/// 缓存键:相对路径 + 大小 + mtime 的 xxh3——同名同大小替换(mtime 变)
+/// 也会失效重建(复验轮二:缓存键不含 mtime 会抵消指纹重索引的意义)。
+fn thumb_cache_name(rel_path: &str, size: u64, mtime_nanos: u128) -> String {
+    let key = format!("{rel_path}\u{0}{size}\u{0}{mtime_nanos}");
     format!("{:016x}.jpg", xxhash_rust::xxh3::xxh3_64(key.as_bytes()))
+}
+
+/// 文件 mtime 的纳秒表示(取不到按 0:键退化为路径+大小,仍安全)。
+pub fn mtime_nanos(meta: &fs::Metadata) -> u128 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 /// 提取 EXIF 拍摄时间的**墙钟**(DateTimeOriginal 优先,其次 DateTime)。
@@ -136,7 +146,7 @@ pub fn index_asset(project_root: &Path, asset_abs: &Path, rel_path: &str) -> Res
         exif_shot_at(asset_abs).or_else(|| meta.modified().ok().map(DateTime::<Utc>::from));
 
     let dir = thumbs_dir(project_root);
-    let cache = dir.join(thumb_cache_name(rel_path, meta.len()));
+    let cache = dir.join(thumb_cache_name(rel_path, meta.len(), mtime_nanos(&meta)));
     if cache.is_file() {
         // 缓存命中要验完整性:半截/损坏的缓存(断电、并发写事故)必须自愈,
         // 否则坏图永远占着缓存键(评审 M2)
@@ -229,8 +239,13 @@ fn write_jpeg(img: &image::DynamicImage, dir: &Path, cache: &Path) -> Option<Pat
 }
 
 /// 素材对应的缩略图缓存路径(存在与否由调用方检查)。
-pub fn cached_thumb_path(project_root: &Path, rel_path: &str, size: u64) -> PathBuf {
-    thumbs_dir(project_root).join(thumb_cache_name(rel_path, size))
+pub fn cached_thumb_path(
+    project_root: &Path,
+    rel_path: &str,
+    size: u64,
+    mtime_nanos: u128,
+) -> PathBuf {
+    thumbs_dir(project_root).join(thumb_cache_name(rel_path, size, mtime_nanos))
 }
 
 #[cfg(test)]
@@ -313,7 +328,8 @@ mod tests {
         let size = fs::metadata(&photo).unwrap().len();
 
         // 伪造一个损坏的缓存文件(无 JPEG 头尾)
-        let cache = cached_thumb_path(&project, "IMG_0002.jpg", size);
+        let mt = mtime_nanos(&fs::metadata(&photo).unwrap());
+        let cache = cached_thumb_path(&project, "IMG_0002.jpg", size, mt);
         fs::create_dir_all(cache.parent().unwrap()).unwrap();
         fs::write(&cache, b"truncated-garbage").unwrap();
 
@@ -343,12 +359,17 @@ mod tests {
     #[test]
     fn cache_key_changes_with_size() {
         assert_ne!(
-            thumb_cache_name("a.jpg", 100),
-            thumb_cache_name("a.jpg", 101)
+            thumb_cache_name("a.jpg", 100, 1),
+            thumb_cache_name("a.jpg", 101, 1)
         );
         assert_ne!(
-            thumb_cache_name("a.jpg", 100),
-            thumb_cache_name("b.jpg", 100)
+            thumb_cache_name("a.jpg", 100, 1),
+            thumb_cache_name("b.jpg", 100, 1)
+        );
+        // mtime 变 → 键变(同名同大小替换要失效)
+        assert_ne!(
+            thumb_cache_name("a.jpg", 100, 1),
+            thumb_cache_name("a.jpg", 100, 2)
         );
     }
 }

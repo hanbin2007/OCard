@@ -90,10 +90,11 @@ pub fn create_project(
         }
         // Windows 保留设备名(NAS 共享给 Windows 工作站时会建不出/打不开)
         let stem = c.split('.').next().unwrap_or(c).to_ascii_uppercase();
+        // COM1-COM9 / LPT1-LPT9 是保留名;COM0/LPT0 不是(复验 P2 误拒修正)
         let is_dev = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
             || ((stem.starts_with("COM") || stem.starts_with("LPT"))
                 && stem.len() == 4
-                && stem.as_bytes()[3].is_ascii_digit());
+                && (b'1'..=b'9').contains(&stem.as_bytes()[3]));
         if is_dev {
             return Err(CoreError::Invalid(format!(
                 "分类名「{c}」是 Windows 保留设备名,跨平台会不可用"

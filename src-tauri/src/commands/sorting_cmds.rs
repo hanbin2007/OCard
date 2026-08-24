@@ -23,6 +23,27 @@ fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+/// 交付互斥闸:打包进行中拒绝同项目的分类/回收站变更(不只靠前端禁用,
+/// 复验轮二 P1:直连 IPC 也要挡)。
+fn reject_if_delivering(state: &State<AppState>, project_id: &str) -> CmdResult<()> {
+    let guard = state.delivering.lock().unwrap();
+    if guard.as_deref() == Some(project_id) {
+        return Err("交付打包进行中,分类与回收站操作已暂停,请等打包完成".into());
+    }
+    Ok(())
+}
+
+/// fsx 最后回退(检查+改名)被使用过:发一次性告警(零静默,复验轮二 P1)。
+fn notify_if_unsafe_fallback(app: &AppHandle) {
+    if crate::core::fsx::take_unsafe_fallback_flag() {
+        notify::warn(
+            app,
+            "fsx-fallback-window",
+            "当前文件系统不支持原子防覆盖改名与硬链接,零覆盖保障退化为「复查后改名」,并发写入存在极小竞态窗口;建议确认 NAS 协议(SMB3/NFSv4)".into(),
+        );
+    }
+}
+
 // ---------- DTO ----------
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,6 +121,8 @@ pub struct IndexingStatusDto {
     pub failed: usize,
     /// 索引期间被移走/删除的文件数(信息性,不是失败)。
     pub missing: usize,
+    /// 索引轮次(重启 +1)。前端用它区分「新一轮」与「同轮重复事件」。
+    pub round: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,26 +143,25 @@ pub struct IndexState {
     /// 索引期间被移走/删除的文件(不算失败,不触发损坏告警,评审 M3)。
     pub missing: usize,
     pub running: bool,
-    /// 待分类清单指纹(相对路径+大小):文件改名/替换但总数不变时也要重索引(评审 M4)。
+    /// 待分类清单指纹(相对路径+大小+mtime):文件改名/替换但总数不变时也要重索引(评审 M4)。
     pub fingerprint: u64,
+    /// 索引轮次:每次重启 +1。前端跨轮事件(数值恰好相同也)靠它区分(复验轮二 P1)。
+    pub round: u64,
 }
 
+/// 待分类清单条目:相对路径、大小、mtime 纳秒(一次 stat,指纹与缓存键共用,
+/// 复验 P2:不做第二次全量 stat)。
+type InboxFile = (String, u64, u128);
+
 /// 待分类清单指纹:路径+大小+mtime。带 mtime 才能捕捉「同名同大小替换」
-/// (codex 复验 15);逐文件 stat 的成本在分页命令的量级内可接受。
-fn inbox_fingerprint(project_root: &Path, files: &[(String, u64)]) -> u64 {
+/// (codex 复验 15)。
+fn inbox_fingerprint(files: &[InboxFile]) -> u64 {
     let mut key = String::new();
-    for (rel, size) in files {
+    for (rel, size, mtime) in files {
         key.push_str(rel);
         key.push('\u{0}');
         key.push_str(&size.to_string());
         key.push('\u{0}');
-        let abs = project_root.join(rel.split('/').collect::<PathBuf>());
-        let mtime = std::fs::metadata(&abs)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
         key.push_str(&mtime.to_string());
         key.push('\n');
     }
@@ -160,6 +182,7 @@ fn emit_index_progress(app: &AppHandle, project_id: &str, st: &IndexState) {
                 running: st.running,
                 failed: st.failed,
                 missing: st.missing,
+                round: st.round,
             },
             occurred_at: Utc::now().to_rfc3339(),
         },
@@ -167,17 +190,12 @@ fn emit_index_progress(app: &AppHandle, project_id: &str, st: &IndexState) {
 }
 
 /// 需要时启动该项目的后台索引线程(幂等:已在跑则不重复)。
-fn ensure_indexing(
-    app: &AppHandle,
-    project_id: &str,
-    project_root: &Path,
-    files: &[(String, u64)],
-) {
+fn ensure_indexing(app: &AppHandle, project_id: &str, project_root: &Path, files: &[InboxFile]) {
     // 空清单不 spawn 线程:没活可干还发 0/0 事件纯属浪费(复验 P2)
     if files.is_empty() {
         return;
     }
-    let fingerprint = inbox_fingerprint(project_root, files);
+    let fingerprint = inbox_fingerprint(files);
     let mgr = app.state::<IndexManager>();
     {
         let mut map = mgr.0.lock().unwrap();
@@ -199,18 +217,19 @@ fn ensure_indexing(
             missing: 0,
             running: true,
             fingerprint,
+            round: st.round + 1,
         };
     }
     let app = app.clone();
     let project_id = project_id.to_string();
     let project_root = project_root.to_path_buf();
-    let files: Vec<(String, u64)> = files.to_vec();
+    let files: Vec<InboxFile> = files.to_vec();
     std::thread::spawn(move || {
         // 整体兜底:图像解码库对畸形文件可能 panic,索引线程死了必须可见,
         // 且状态要收尾(running=false),不能永远显示「索引中」(评审 M3)
         let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut last_emit = std::time::Instant::now();
-            for (rel, _) in &files {
+            for (rel, _, _) in &files {
                 let abs = project_root.join(rel.split('/').collect::<PathBuf>());
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     media::index_asset(&project_root, &abs, rel)
@@ -290,18 +309,27 @@ fn ensure_indexing(
 
 // ---------- 命令 ----------
 
-fn inbox_rel_files(project_root: &Path) -> CmdResult<Vec<(String, u64)>> {
+fn inbox_rel_files(project_root: &Path) -> CmdResult<Vec<InboxFile>> {
     let inbox = project_root.join(project::PENDING_DIR_B);
-    let mut files = copy::scan_source(&inbox).map_err(err)?;
-    // 相对路径补上「1. 待分类/」前缀,作为项目内稳定 id
-    for f in files.iter_mut() {
-        f.0 = format!("{}/{}", project::PENDING_DIR_B, f.0);
-    }
+    let mut files: Vec<InboxFile> = copy::scan_source(&inbox)
+        .map_err(err)?
+        .into_iter()
+        .map(|(rel, size)| {
+            // 相对路径补上「1. 待分类/」前缀,作为项目内稳定 id;
+            // mtime 在此一次取齐(指纹/缩略图缓存键共用)
+            let rel = format!("{}/{}", project::PENDING_DIR_B, rel);
+            let abs = project_root.join(rel.split('/').collect::<PathBuf>());
+            let mtime = std::fs::metadata(&abs)
+                .map(|m| media::mtime_nanos(&m))
+                .unwrap_or(0);
+            (rel, size, mtime)
+        })
+        .collect();
     files.sort();
     Ok(files)
 }
 
-fn asset_dto(project_root: &Path, rel: &str, size: u64) -> SortingAssetDto {
+fn asset_dto(project_root: &Path, rel: &str, size: u64, mtime: u128) -> SortingAssetDto {
     let abs = project_root.join(rel.split('/').collect::<PathBuf>());
     let kind = media::classify(rel);
     let exif_time = media::exif_shot_at(&abs);
@@ -312,7 +340,7 @@ fn asset_dto(project_root: &Path, rel: &str, size: u64) -> SortingAssetDto {
             .and_then(|m| m.modified().ok())
             .map(chrono::DateTime::<Utc>::from)
     });
-    let thumb_path = media::cached_thumb_path(project_root, rel, size);
+    let thumb_path = media::cached_thumb_path(project_root, rel, size, mtime);
     // 命中也要验完整性:半截缓存宁可占位也不端破图给界面(复验 P2)
     let thumb = (thumb_path.is_file() && media::looks_like_valid_jpeg(&thumb_path))
         .then(|| std::fs::read(&thumb_path).ok())
@@ -357,7 +385,7 @@ pub fn list_pending_assets(
         .iter()
         .skip(offset)
         .take(limit.min(200)) // 上限与前端页大小一致,守住缩略图 base64 的 IPC 体积
-        .map(|(rel, size)| asset_dto(&stats.root, rel, *size))
+        .map(|(rel, size, mtime)| asset_dto(&stats.root, rel, *size, *mtime))
         .collect();
     Ok(AssetPageDto { items, total })
 }
@@ -438,6 +466,7 @@ pub fn move_assets(
     asset_ids: Vec<String>,
     category_id: String,
 ) -> CmdResult<BulkResultDto> {
+    reject_if_delivering(&state, &project_id)?;
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
     // 分类夹白名单:必须是该项目已知分类;精选是复制语义,走 curate_assets,
@@ -456,6 +485,7 @@ pub fn move_assets(
         &asset_ids,
         &category_id,
     ));
+    notify_if_unsafe_fallback(&app);
     audit_bulk(
         &app,
         &state,
@@ -476,7 +506,9 @@ pub fn curate_assets(
 ) -> CmdResult<BulkResultDto> {
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
+    reject_if_delivering(&state, &project_id)?;
     let res = bulk(sorting::curate_assets(&stats.root, &stats.meta, &asset_ids));
+    notify_if_unsafe_fallback(&app);
     audit_bulk(
         &app,
         &state,
@@ -583,7 +615,21 @@ pub fn restore_from_trash(
 ) -> CmdResult<BulkResultDto> {
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
-    let res = bulk(sorting::restore_from_trash(&stats.root, &stats.meta, &entry_ids).map_err(err)?);
+    reject_if_delivering(&state, &project_id)?;
+    let restored =
+        sorting::restore_from_trash(&stats.root, &stats.meta, &entry_ids).map_err(err)?;
+    if restored.tombstone_errors > 0 {
+        notify::warn(
+            &app,
+            "trash-tombstone-failed",
+            format!(
+                "{} 条恢复记录的索引标记写入失败(文件已恢复原位,不影响数据);回收站列表可能短暂显示陈旧条目",
+                restored.tombstone_errors
+            ),
+        );
+    }
+    let res = bulk(restored.items);
+    notify_if_unsafe_fallback(&app);
     audit_bulk(
         &app,
         &state,
@@ -608,6 +654,7 @@ pub fn empty_trash(
     state: State<AppState>,
     project_id: String,
 ) -> CmdResult<EmptyTrashResultDto> {
+    reject_if_delivering(&state, &project_id)?;
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
     let out = sorting::empty_trash(&stats.root).map_err(err)?;
@@ -660,6 +707,7 @@ pub fn indexing_status(app: AppHandle, project_id: String) -> IndexingStatusDto 
         running: st.running,
         failed: st.failed,
         missing: st.missing,
+        round: st.round,
     }
 }
 
@@ -696,7 +744,17 @@ pub fn build_delivery(
 ) -> CmdResult<DeliverySummaryDto> {
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
-    let out = crate::core::packaging::build_delivery(&stats.root, &stats.meta).map_err(err)?;
+    {
+        let mut guard = state.delivering.lock().unwrap();
+        if guard.is_some() {
+            return Err("已有交付打包在进行中,请等它完成".into());
+        }
+        *guard = Some(project_id.clone());
+    }
+    let out = crate::core::packaging::build_delivery(&stats.root, &stats.meta);
+    *state.delivering.lock().unwrap() = None; // 无论成败都解除互斥
+    let out = out.map_err(err)?;
+    notify_if_unsafe_fallback(&app);
 
     // 包表用目标目录实况总量(重跑时不显示 0,codex 复验 P1)
     let packages: Vec<DeliveryPackageDto> = out

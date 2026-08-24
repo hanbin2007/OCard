@@ -72,18 +72,39 @@ pub fn resolve_in_project(project_root: &Path, rel: &str) -> std::result::Result
     // 项目内一个指向外部的链接会让 rename/copy/delete 实际作用在项目外。
     // 逐段检查已存在的成分;不存在的尾段(目标落位名)无链接可言。
     let mut cur = norm_root.clone();
-    if let Ok(below) = normalized.strip_prefix(&norm_root) {
-        for comp in below.components() {
-            cur.push(comp);
-            match fs::symlink_metadata(&cur) {
-                Ok(md) if md.file_type().is_symlink() => {
-                    return Err(format!("路径包含符号链接,拒绝操作: {rel}"));
-                }
-                _ => {}
+    let Ok(below) = normalized.strip_prefix(&norm_root) else {
+        // 理论不可达(上面已断言前缀),但安全闸失配必须拒绝而非放行(复验 P2)
+        return Err(format!("路径前缀解析异常,拒绝操作: {rel}"));
+    };
+    for comp in below.components() {
+        cur.push(comp);
+        match fs::symlink_metadata(&cur) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(format!("路径包含符号链接,拒绝操作: {rel}"));
             }
+            _ => {}
         }
     }
     Ok(normalized)
+}
+
+/// 目标目录落地闸(复验轮二 P0):写入前把**目录实体**canonicalize 后断言
+/// 仍在项目内——挡住「精选/待修」「.ocard/trash」等固定目录被整体替换成
+/// 指向项目外的符号链接。canonicalize→写入之间的极窄窗口是无锁共享盘的
+/// 固有边界,已声明。目录不存在时先创建。
+fn ensure_dir_in_project(project_root: &Path, dir: &Path) -> std::result::Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    let canon_root = fs::canonicalize(project_root).map_err(|e| format!("项目根解析失败: {e}"))?;
+    let canon = fs::canonicalize(dir).map_err(|e| format!("目录解析失败: {e}"))?;
+    let root_key = paths::comparison_key(&canon_root);
+    let key = paths::comparison_key(&canon);
+    if !key.starts_with(&root_key) {
+        return Err(format!(
+            "目录实际位置在项目外(疑似被符号链接替换),拒绝写入: {}",
+            dir.display()
+        ));
+    }
+    Ok(())
 }
 
 /// 素材命名空间闸:asset id 的首段必须是工况 B 布局中的可见文件夹。
@@ -223,12 +244,12 @@ fn file_name_of(rel: &str) -> &str {
 }
 
 /// 零覆盖移动:平台原子原语,目标存在即失败(评审 H4:不再 exists+rename)。
-fn move_no_replace(src: &Path, dst: &Path) -> std::result::Result<(), String> {
+fn move_no_replace(project_root: &Path, src: &Path, dst: &Path) -> std::result::Result<(), String> {
     if !src.is_file() {
         return Err("源文件不存在或不可读".into());
     }
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建目标夹失败: {e}"))?;
+        ensure_dir_in_project(project_root, parent)?;
     }
     fsx::rename_no_replace(src, dst).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -261,7 +282,7 @@ pub fn move_assets(
             let result = (|| -> std::result::Result<(), String> {
                 let src = resolve_asset_in_project(project_root, meta, id)?;
                 let dir = cat_dir.clone()?;
-                move_no_replace(&src, &dir.join(file_name_of(id)))
+                move_no_replace(project_root, &src, &dir.join(file_name_of(id)))
             })();
             ItemOutcome {
                 asset_id: id.clone(),
@@ -291,7 +312,7 @@ pub fn curate_assets(
                     return Err("源文件不存在或不可读".into());
                 }
                 let dst = dir.join(file_name_of(id));
-                fs::create_dir_all(&dir).map_err(|e| format!("创建待修夹失败: {e}"))?;
+                ensure_dir_in_project(project_root, &dir)?;
                 if dst.exists() {
                     return Err(format!(
                         "「待修」中已有同名文件,拒绝覆盖: {}",
@@ -458,11 +479,11 @@ pub fn trash_assets(
             let result = (|| -> std::result::Result<(), String> {
                 let src = resolve_asset_in_project(project_root, meta, id)?;
                 let meta = fs::metadata(&src).map_err(|_| "源文件不存在或不可读".to_string())?;
-                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                ensure_dir_in_project(project_root, &dir)?;
                 let rec_id = uuid::Uuid::new_v4().to_string();
                 let stored_as = format!("{rec_id}_{}", file_name_of(id));
                 let dst = dir.join(&stored_as);
-                move_no_replace(&src, &dst)?;
+                move_no_replace(project_root, &src, &dst)?;
                 let rec = TrashRecord {
                     id: rec_id,
                     file_name: file_name_of(id).to_string(),
@@ -491,34 +512,42 @@ pub fn trash_assets(
         .collect()
 }
 
+/// 恢复结果:逐项 + 墓碑写失败数(实体已回原位,行会被实存过滤隐藏,
+/// 但失败必须上报——纯追加索引的完整性靠墓碑,复验 P2)。
+#[derive(Debug, Default)]
+pub struct RestoreOutcome {
+    pub items: Vec<ItemOutcome>,
+    pub tombstone_errors: usize,
+}
+
 /// 恢复:按 originalPath 放回,零覆盖。
 /// originalPath 来自共享索引文件,按不可信输入过素材命名空间闸(评审 F1 + 复验 P0)。
-/// 恢复成功追加墓碑终结该行(失败可忽略:实体已回原位,陈旧行由实存过滤兜住)。
 pub fn restore_from_trash(
     project_root: &Path,
     meta: &project::ProjectMeta,
     entry_ids: &[String],
-) -> Result<Vec<ItemOutcome>> {
+) -> Result<RestoreOutcome> {
     let list = list_trash(project_root)?;
     let dir = trash_dir(project_root);
-    Ok(entry_ids
-        .iter()
-        .map(|eid| {
-            let result = match list.records.iter().find(|r| &r.id == eid) {
-                None => Err("回收站中找不到该条目".to_string()),
-                Some(rec) => resolve_asset_in_project(project_root, meta, &rec.original_path)
-                    .map_err(|e| format!("恢复目标路径非法(索引可能被篡改): {e}"))
-                    .and_then(|dst| move_no_replace(&dir.join(&rec.stored_as), &dst))
-                    .inspect(|_| {
-                        let _ = append_tombstone(project_root, eid);
-                    }),
-            };
-            ItemOutcome {
-                asset_id: eid.clone(),
-                result,
-            }
-        })
-        .collect())
+    let mut out = RestoreOutcome::default();
+    for eid in entry_ids {
+        let result = match list.records.iter().find(|r| &r.id == eid) {
+            None => Err("回收站中找不到该条目".to_string()),
+            Some(rec) => resolve_asset_in_project(project_root, meta, &rec.original_path)
+                .map_err(|e| format!("恢复目标路径非法(索引可能被篡改): {e}"))
+                .and_then(|dst| move_no_replace(project_root, &dir.join(&rec.stored_as), &dst))
+                .inspect(|_| {
+                    if append_tombstone(project_root, eid).is_err() {
+                        out.tombstone_errors += 1;
+                    }
+                }),
+        };
+        out.items.push(ItemOutcome {
+            asset_id: eid.clone(),
+            result,
+        });
+    }
+    Ok(out)
 }
 
 /// 清空回收站的结果。
@@ -717,7 +746,7 @@ mod tests {
         let list = list_trash(&root).unwrap();
         assert_eq!(list.records.len(), 1);
         let restored = restore_from_trash(&root, &meta, &[list.records[0].id.clone()]).unwrap();
-        let err = restored[0].result.as_ref().unwrap_err();
+        let err = restored.items[0].result.as_ref().unwrap_err();
         assert!(err.contains("非法"), "错误要点名路径非法: {err}");
         // 文件仍安全地留在回收站
         assert_eq!(list_trash(&root).unwrap().records.len(), 1);
@@ -870,7 +899,8 @@ mod tests {
 
         // 恢复:文件回原位,墓碑终结索引行
         let restored = restore_from_trash(&root, &meta, &[list.records[0].id.clone()]).unwrap();
-        assert!(restored[0].result.is_ok());
+        assert!(restored.items[0].result.is_ok());
+        assert_eq!(restored.tombstone_errors, 0);
         assert!(root.join(asset("c.jpg")).is_file());
         assert!(list_trash(&root).unwrap().records.is_empty());
         let text = fs::read_to_string(trash_dir(&root).join(TRASH_INDEX)).unwrap();
@@ -892,7 +922,7 @@ mod tests {
         fs::write(root.join(asset("a.jpg")), b"new").unwrap();
         let list = list_trash(&root).unwrap();
         let restored = restore_from_trash(&root, &meta, &[list.records[0].id.clone()]).unwrap();
-        assert!(restored[0]
+        assert!(restored.items[0]
             .result
             .as_ref()
             .unwrap_err()
@@ -988,6 +1018,53 @@ mod tests {
             vec![rec.stored_as.clone()],
             "被覆盖的原实体不许凭空隐身"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_target_dirs_are_refused() {
+        // 复验轮二 P0:目标目录(精选/待修、.ocard/trash)被换成指向项目外的
+        // 链接时,写入必须被 canonicalize 闸拒绝
+        let (tmp, root, meta) = setup_project();
+        let outside = tmp.path().join("外部落点");
+        fs::create_dir_all(&outside).unwrap();
+
+        // 精选/待修 → 链接
+        let curated_todo = root.join("4. 精选/待修");
+        fs::remove_dir_all(&curated_todo).ok();
+        std::os::unix::fs::symlink(&outside, &curated_todo).unwrap();
+        let out = curate_assets(&root, &meta, &[asset("a.jpg")]);
+        assert!(out[0].result.as_ref().unwrap_err().contains("项目外"));
+        assert!(
+            fs::read_dir(&outside).unwrap().next().is_none(),
+            "不许写进外部"
+        );
+
+        // .ocard/trash → 链接
+        let tdir = trash_dir(&root);
+        fs::create_dir_all(tdir.parent().unwrap()).unwrap();
+        fs::remove_dir_all(&tdir).ok();
+        std::os::unix::fs::symlink(&outside, &tdir).unwrap();
+        let out = trash_assets(&root, &meta, &[asset("a.jpg")], "ZS");
+        assert!(out[0].result.as_ref().unwrap_err().contains("项目外"));
+        assert!(root.join(asset("a.jpg")).is_file(), "源文件原地未动");
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn scenario_a_project_rejects_sorting_ops() {
+        // 复验轮二:工况 A 的拒绝分支要有测试钉住
+        let tmp = tempdir().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        let root = project::create_project(tmp.path(), date, "婚礼", Scenario::A, &[]).unwrap();
+        let meta = project::load_meta(&root).unwrap();
+        fs::write(root.join("2. 原始素材/x.jpg"), b"x").unwrap();
+        let ids = vec!["2. 原始素材/x.jpg".to_string()];
+        assert!(trash_assets(&root, &meta, &ids, "ZS")[0].result.is_err());
+        assert!(move_assets(&root, &meta, &ids, "2. 原始素材")[0]
+            .result
+            .is_err());
+        assert!(root.join("2. 原始素材/x.jpg").is_file());
     }
 
     #[test]

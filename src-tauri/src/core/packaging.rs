@@ -10,7 +10,11 @@
 //!   内容不同报 `name-collision`,绝不静默当成功(评审 H5);
 //! - 半天判定用 EXIF **墙钟**(相机表盘时间),不做时区换算(codex 评审 9);
 //! - 清单从目标包目录**实况**生成(重跑后口径正确,评审 M5);
-//!   清单写失败降级为失败项上报,**绝不丢弃已完成的复制结果**(评审 H1)。
+//!   清单写失败降级为失败项上报,**绝不丢弃已完成的复制结果**(评审 H1);
+//! - 分类夹内的子目录**扁平化**落包(包内按「包/分类/文件名」组织):
+//!   跨子目录同名会报 name-collision 由人工裁决,属声明行为;
+//! - 符号链接一律不交付(collect 不跟随,逐条警告);包目录落地前
+//!   canonicalize 断言在项目内。
 
 use super::project::{self, Scenario};
 use super::{fsx, hash, media, CoreError, Result};
@@ -64,6 +68,8 @@ fn is_hidden(name: &str) -> bool {
 }
 
 /// 收集一个目录下的全部文件(递归,忽略隐藏);不可读目录计入警告,不静默。
+/// **不跟随符号链接**(复验轮二 P0:链接目录会把收集范围递归到项目外),
+/// 链接条目跳过并警告。
 fn collect(dir: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -82,10 +88,15 @@ fn collect(dir: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf> {
                 continue;
             }
             let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else {
-                out.push(p);
+            // DirEntry::file_type 不解析链接:链接一律不进包
+            match e.file_type() {
+                Ok(t) if t.is_symlink() => {
+                    warnings.push(format!("跳过符号链接(不交付): {}", p.display()));
+                }
+                Ok(t) if t.is_dir() => stack.push(p),
+                Ok(t) if t.is_file() => out.push(p),
+                Ok(_) => warnings.push(format!("跳过非常规文件: {}", p.display())),
+                Err(e) => warnings.push(format!("无法读取条目 {}: {e}", p.display())),
             }
         }
     }
@@ -94,8 +105,10 @@ fn collect(dir: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf> {
 }
 
 /// 单文件落包:staging 复制 + hash 校验 + 原子改名;已存在时 hash 裁决。
-/// 返回 Ok(true)=新复制,Ok(false)=已交付(hash 一致跳过)。
+/// 目标目录经 canonicalize 断言在项目内(复验轮二 P0:交付目录被换成
+/// 符号链接不许把包写出项目)。返回 Ok(true)=新复制,Ok(false)=已交付。
 fn deliver_one(
+    project_root: &Path,
     src: &Path,
     dst_dir: &Path,
     dst: &Path,
@@ -117,6 +130,19 @@ fn deliver_one(
         return verdict_existing(src, dst);
     }
     fs::create_dir_all(dst_dir).map_err(|e| ("error", format!("创建包目录失败: {e}")))?;
+    let canon_root =
+        fs::canonicalize(project_root).map_err(|e| ("error", format!("项目根解析失败: {e}")))?;
+    let canon_dir =
+        fs::canonicalize(dst_dir).map_err(|e| ("error", format!("包目录解析失败: {e}")))?;
+    if !canon_dir.starts_with(&canon_root) {
+        return Err((
+            "error",
+            format!(
+                "包目录实际位置在项目外(疑似被符号链接替换),拒绝写入: {}",
+                dst_dir.display()
+            ),
+        ));
+    }
     let tmp = dst_dir.join(format!(".{}.deliverypart", uuid::Uuid::new_v4()));
     if let Err(e) = fs::copy(src, &tmp) {
         let _ = fs::remove_file(&tmp);
@@ -220,7 +246,7 @@ pub fn build_delivery(project_root: &Path, meta: &project::ProjectMeta) -> Resul
             let dst_dir = delivery_root.join(&package).join(category);
             let dst = dst_dir.join(file.file_name().unwrap_or_default());
 
-            match deliver_one(&file, &dst_dir, &dst) {
+            match deliver_one(project_root, &file, &dst_dir, &dst) {
                 Ok(newly_copied) => {
                     if !out.packages.contains(&package) {
                         out.packages.push(package.clone());
@@ -442,6 +468,68 @@ mod tests {
         assert_eq!(
             fs::read(root.join("2. 开幕式/a.jpg")).unwrap(),
             vec![1u8; 100]
+        );
+    }
+
+    #[test]
+    fn reserved_manifest_names_are_rejected_not_swallowed() {
+        // codex 复验 P0 的测试补钉:源文件叫 清单.txt / 交付总清单.txt 必须报错
+        let (_t, root, meta) = setup();
+        fs::write(root.join("2. 开幕式/清单.txt"), b"user file").unwrap();
+        fs::write(root.join("2. 开幕式/交付总清单.txt"), b"user file 2").unwrap();
+        let out = build_delivery(&root, &meta).unwrap();
+        let reserved: Vec<_> = out
+            .failures
+            .iter()
+            .filter(|f| f.2.contains("保留名"))
+            .collect();
+        assert_eq!(reserved.len(), 2, "{:?}", out.failures);
+        // 未被静默交付
+        let pkg = &out.packages[0];
+        let pkg_manifest = root.join(DELIVERY_DIR).join(pkg).join("2. 开幕式/清单.txt");
+        assert!(
+            !pkg_manifest.exists() || fs::read(&pkg_manifest).unwrap() != b"user file",
+            "用户的 清单.txt 不许混进包内清单位置"
+        );
+    }
+
+    #[test]
+    fn package_totals_reflect_reality_on_rerun() {
+        // 复验 P2 测试补钉:重跑后包表是实况总量,不是本轮新复制数(0)
+        let (_t, root, meta) = setup();
+        build_delivery(&root, &meta).unwrap();
+        let again = build_delivery(&root, &meta).unwrap();
+        assert_eq!(again.files.len(), 0);
+        let total_files: usize = again.package_totals.iter().map(|(_, n, _)| n).sum();
+        assert_eq!(
+            total_files, 3,
+            "包表要报实况 3 个文件: {:?}",
+            again.package_totals
+        );
+        let total_bytes: u64 = again.package_totals.iter().map(|(_, _, b)| b).sum();
+        assert_eq!(total_bytes, 600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_dir_in_category_is_skipped_with_warning() {
+        // 复验轮二 P0:collect 不跟随链接,不把项目外内容卷进交付
+        let (tmp, root, meta) = setup();
+        let outside = tmp.path().join("外部");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.jpg"), b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("2. 开幕式/link")).unwrap();
+
+        let out = build_delivery(&root, &meta).unwrap();
+        assert!(
+            out.warnings.iter().any(|w| w.contains("符号链接")),
+            "跳过链接必须有警告: {:?}",
+            out.warnings
+        );
+        let all: Vec<_> = out.files.iter().map(|f| f.source_rel.clone()).collect();
+        assert!(
+            !all.iter().any(|r| r.contains("secret")),
+            "链接内容不许进包"
         );
     }
 

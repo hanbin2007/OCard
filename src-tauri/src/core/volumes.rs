@@ -121,6 +121,15 @@ mod uid_tests {
     }
 
     #[test]
+    fn empty_shell_file_yields_none_not_panic() {
+        // 复验:竞选落败读到空壳(胜者写入失败残留)→ 重试后返回 None,
+        // 每次都会伴随上层的可见警告,不静默
+        let tmp = tempdir().unwrap();
+        std::fs::write(tmp.path().join(VOLUME_UID_FILE), b"").unwrap();
+        assert!(ensure_volume_uid(tmp.path()).is_none());
+    }
+
+    #[test]
     fn missing_or_garbage_is_none() {
         let tmp = tempdir().unwrap();
         assert!(read_volume_uid(tmp.path()).is_none());

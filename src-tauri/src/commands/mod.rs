@@ -22,6 +22,9 @@ pub struct AppState {
     pub tasks: TaskManager,
     /// 通知积压:堵住「前端监听就绪前发出的通知永久丢失」的窗口。
     pub notices: std::sync::Mutex<Vec<notify::NoticeDto>>,
+    /// 交付打包进行中的项目 id:本机分类/回收站变更命令在此期间一律拒绝
+    /// (复验轮二 P1:互斥不能只靠前端禁用按钮,直连 IPC 也要挡)。
+    pub delivering: std::sync::Mutex<Option<String>>,
 }
 
 type CmdResult<T> = std::result::Result<T, String>;

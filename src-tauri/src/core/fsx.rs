@@ -9,6 +9,17 @@
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 「最后回退(复查+rename)被真实使用」标记。该回退只在文件系统既不支持
+/// 平台原子原语也不支持硬链接时触发,存在检查-改名窗口(NAS 上可达网络往返
+/// 量级)。零静默原则:上层取走标记后必须给用户一次可见警告。
+static UNSAFE_FALLBACK_USED: AtomicBool = AtomicBool::new(false);
+
+/// 取走「最后回退被使用」标记(swap 语义,取走即清零)。
+pub fn take_unsafe_fallback_flag() -> bool {
+    UNSAFE_FALLBACK_USED.swap(false, Ordering::Relaxed)
+}
 
 /// 原子防覆盖改名:目标已存在时失败(`AlreadyExists`),绝不替换。
 pub fn rename_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
@@ -23,7 +34,9 @@ pub fn rename_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
                 Err(io::Error::new(io::ErrorKind::AlreadyExists, le))
             }
             Err(_) => {
-                // 最后回退:复查+rename(微秒级窗口,入口检查已夹住长窗口)
+                // 最后回退:复查+rename。窗口在本地盘是微秒级,在不支持
+                // 原语/硬链接的网络盘上可达网络往返量级——置标记让上层告警
+                UNSAFE_FALLBACK_USED.store(true, Ordering::Relaxed);
                 if dst.exists() {
                     return Err(io::Error::from(io::ErrorKind::AlreadyExists));
                 }
