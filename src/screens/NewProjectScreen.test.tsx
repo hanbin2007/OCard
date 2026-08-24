@@ -53,7 +53,7 @@ describe("新建项目向导", () => {
   it("切到工况 A 预览换成六个固定夹", async () => {
     const user = userEvent.setup();
     setup();
-    await user.click(screen.getByRole("button", { name: /工况 A/ }));
+    await user.click(screen.getByRole("radio", { name: /工况 A/ }));
     expect(screen.getByText("6. 成片")).toBeDefined();
     expect(screen.queryByText("1. 待分类")).toBeNull();
   });
@@ -62,7 +62,7 @@ describe("新建项目向导", () => {
     const user = userEvent.setup();
     setup();
     expect(screen.getByRole("button", { name: "添加分类" })).toBeDefined();
-    await user.click(screen.getByRole("button", { name: /工况 A/ }));
+    await user.click(screen.getByRole("radio", { name: /工况 A/ }));
     expect(screen.queryByRole("button", { name: "添加分类" })).toBeNull();
   });
 
@@ -70,7 +70,7 @@ describe("新建项目向导", () => {
     const user = userEvent.setup();
     setup();
     await user.click(screen.getByRole("button", { name: "添加分类" }));
-    await user.type(screen.getByLabelText("第 4 个分类名"), "颁奖");
+    await user.type(screen.getByLabelText("第 5 号分类名"), "颁奖");
     expect(screen.getByText("5. 颁奖")).toBeDefined();
     expect(screen.getByText("6. 精选")).toBeDefined();
     expect(screen.getByText("7. 其他")).toBeDefined();
@@ -79,7 +79,7 @@ describe("新建项目向导", () => {
   it("删除分类后编号收拢", async () => {
     const user = userEvent.setup();
     setup();
-    await user.click(screen.getByRole("button", { name: "删除第 1 个分类" }));
+    await user.click(screen.getByRole("button", { name: "删除第 2 号分类" }));
     expect(screen.getByText("2. 会场")).toBeDefined();
     expect(screen.queryByText("2. 领导")).toBeNull();
   });

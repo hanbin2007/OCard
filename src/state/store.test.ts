@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type { CameraReg, Project, StorageCard } from "../api/types";
+import type {
+  CameraReg,
+  CopyProgressEvent,
+  Project,
+  StorageCard,
+} from "../api/types";
 import { initialState, reducer } from "./store";
 
 const project: Project = {
@@ -36,6 +41,44 @@ const card: StorageCard = {
   capacityBytes: 512 * 1024 ** 3,
   createdAt: "2026-08-24T10:00:00+08:00",
 };
+
+const runningTask = {
+  id: "t-1",
+  projectId: "p-new",
+  volumeId: "v",
+  volumeName: "V",
+  cameraId: "cam-1",
+  cameraCode: "NikonZ9_E_CQ",
+  note: "n",
+  targetFolder: "f",
+  destinations: [
+    { id: "d-1", kind: "nas" as const, path: "/nas", state: "writing" as const, writtenBytes: 0 },
+  ],
+  files: [
+    { id: "f-1", path: "a/DSC_1.NEF", name: "DSC_1.NEF", sizeBytes: 10, status: "pending" as const },
+    { id: "f-2", path: "a/DSC_2.NEF", name: "DSC_2.NEF", sizeBytes: 10, status: "pending" as const },
+  ],
+  totalBytes: 100,
+  copiedBytes: 10,
+  speedBytesPerSec: 1,
+  state: "running" as const,
+  operator: "张涵斌",
+  startedAt: "2026-08-24T10:00:00+08:00",
+};
+
+function progressEvent(overrides: Partial<CopyProgressEvent> = {}): CopyProgressEvent {
+  return {
+    taskId: "t-1",
+    revision: 1,
+    occurredAt: "2026-08-24T10:00:01+08:00",
+    copiedBytes: 50,
+    speedBytesPerSec: 8,
+    state: "running",
+    changedFiles: [],
+    changedDestinations: [],
+    ...overrides,
+  };
+}
 
 describe("reducer", () => {
   it("navigate 切换路由", () => {
@@ -107,22 +150,72 @@ describe("reducer", () => {
     };
     const next = reducer(seeded, {
       type: "taskProgress",
-      taskId: "t-1",
-      copiedBytes: 50,
-      speedBytesPerSec: 8,
+      event: progressEvent({ copiedBytes: 50, speedBytesPerSec: 8, revision: 1 }),
     });
     expect(next.tasks[0].copiedBytes).toBe(50);
     expect(next.tasks[0].speedBytesPerSec).toBe(8);
     expect(next.tasks[0].note).toBe("n");
   });
 
-  it("未知项目的进度事件不影响现有任务", () => {
+  it("未知任务的进度事件不影响现有任务", () => {
     const next = reducer(initialState, {
       type: "taskProgress",
-      taskId: "missing",
-      copiedBytes: 1,
-      speedBytesPerSec: 1,
+      event: progressEvent({ taskId: "missing" }),
     });
     expect(next.tasks).toEqual([]);
+  });
+
+  it("丢弃乱序/过期的进度事件", () => {
+    const seeded = { ...initialState, tasks: [runningTask] };
+    const advanced = reducer(seeded, {
+      type: "taskProgress",
+      event: progressEvent({ revision: 5, copiedBytes: 80 }),
+    });
+    expect(advanced.tasks[0].copiedBytes).toBe(80);
+
+    // 迟到的 revision=3 不能把进度拉回去
+    const stale = reducer(advanced, {
+      type: "taskProgress",
+      event: progressEvent({ revision: 3, copiedBytes: 20 }),
+    });
+    expect(stale.tasks[0].copiedBytes).toBe(80);
+  });
+
+  it("进度事件把逐文件与逐目的地增量合并进任务", () => {
+    const seeded = { ...initialState, tasks: [runningTask] };
+    const next = reducer(seeded, {
+      type: "taskProgress",
+      event: progressEvent({
+        revision: 2,
+        changedFiles: [{ id: "f-1", status: "verified", hash: "abc123" }],
+        changedDestinations: [{ id: "d-1", state: "done", writtenBytes: 100 }],
+      }),
+    });
+    expect(next.tasks[0].files[0].status).toBe("verified");
+    expect(next.tasks[0].files[0].hash).toBe("abc123");
+    // 未出现在事件里的文件保持原样
+    expect(next.tasks[0].files[1].status).toBe("pending");
+    expect(next.tasks[0].destinations[0].state).toBe("done");
+  });
+
+  it("bootstrap 失败落到错误态，重新加载时清掉错误", () => {
+    const failed = reducer(initialState, { type: "loadFailed", error: "NAS 未挂载" });
+    expect(failed.loading).toBe(false);
+    expect(failed.error).toBe("NAS 未挂载");
+
+    const retrying = reducer(failed, { type: "loadStarted" });
+    expect(retrying.loading).toBe(true);
+    expect(retrying.error).toBeNull();
+  });
+
+  it("切换项目时任务选中跟着切，不串台", () => {
+    const seeded = {
+      ...initialState,
+      projects: [project],
+      tasks: [runningTask, { ...runningTask, id: "t-other", projectId: "p-other" }],
+      selectedTaskId: "t-other",
+    };
+    const next = reducer(seeded, { type: "selectProject", projectId: "p-new" });
+    expect(next.selectedTaskId).toBe("t-1");
   });
 });

@@ -72,13 +72,18 @@ button {
   cursor: pointer;
 }
 
-/* 焦点：键盘优先，只在键盘导航时显示焦点环 */
-:focus {
-  outline: none;
+/* 焦点：键盘优先，只在键盘导航时显示焦点环。
+   只有确认支持 :focus-visible 才抹掉默认环，否则旧 WebKitGTK 会彻底失去焦点指示。 */
+@supports selector(:focus-visible) {
+  :focus {
+    outline: none;
+  }
 }
 
+/* 焦点环用实色 --accent（浅 4.9:1 / 深 6.0:1），满足 WCAG 2.2 SC 2.4.11 的 3:1；
+   半透明的 --accent-ring 只够 1.6:1，仅用于 box-shadow 光晕。 */
 :focus-visible {
-  outline: 2px solid var(--accent-ring);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
   border-radius: var(--radius-sm);
 }

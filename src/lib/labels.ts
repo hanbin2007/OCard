@@ -50,7 +50,7 @@ export const COPY_FILE_STATUS_LABEL: Record<CopyFileStatus, string> = {
 
 export const COPY_FILE_STATUS_TONE: Record<CopyFileStatus, BadgeTone> = {
   pending: "neutral",
-  copied: "accent",
+  copied: "neutral",
   verified: "ok",
   failed: "danger",
 };

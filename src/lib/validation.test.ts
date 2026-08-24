@@ -70,6 +70,18 @@ describe("validateNewProject", () => {
     expect(result.errors.categoryAt?.[1]).toBe("分类名不能为空");
   });
 
+  it("大小写/空格不同但实为同一个夹的分类算重复", () => {
+    const result = validateNewProject(project({ categories: ["Leader", "leader"] }));
+    expect(result.valid).toBe(false);
+    expect(result.errors.categoryAt?.[1]).toBe("分类名重复");
+  });
+
+  it("Windows 保留设备名做项目名或分类名被拦下", () => {
+    expect(validateNewProject(project({ name: "CON" })).errors.name).toContain("保留");
+    const cats = validateNewProject(project({ categories: ["NUL"] }));
+    expect(cats.errors.categoryAt?.[0]).toContain("保留");
+  });
+
   it("分类数量超上限被拦下", () => {
     const many = Array.from({ length: 21 }, (_, i) => `分类${i}`);
     const result = validateNewProject(project({ categories: many }));
@@ -122,6 +134,7 @@ describe("validateStartCopy", () => {
     volumeId: "vol-1",
     cameraId: "cam-1",
     note: "上午田赛",
+    targetPrefix: "0824上午",
     destinations: ["/Volumes/NAS", "/Volumes/T7"],
   };
 
@@ -146,6 +159,20 @@ describe("validateStartCopy", () => {
       destinations: ["/Volumes/NAS", "/Volumes/NAS"],
     });
     expect(result.errors.destinations).toBe("目的地路径重复");
+  });
+
+  it("只有大小写/结尾斜杠差异的目的地也算重复（否则等于只备份了一份）", () => {
+    const result = validateStartCopy({
+      ...base,
+      destinations: ["/Volumes/NAS/", "/volumes/nas"],
+    });
+    expect(result.errors.destinations).toBe("目的地路径重复");
+  });
+
+  it("缺目标夹前缀被拦下", () => {
+    const result = validateStartCopy({ ...base, targetPrefix: "  " });
+    expect(result.valid).toBe(false);
+    expect(result.errors.targetPrefix).toBeTruthy();
   });
 
   it("未选源卷与相机分别报错", () => {

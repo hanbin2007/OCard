@@ -1,5 +1,6 @@
 /** 屏 1：项目列表（列表 + 详情，↑/↓ 键盘导航）。 */
 
+import { useEffect } from "react";
 import { FolderTreeView } from "../components/FolderTreeView";
 import { TopBar } from "../components/TopBar";
 import { Badge, EmptyState, Kbd, ProgressBar } from "../components/ui";
@@ -26,6 +27,13 @@ export function ProjectsScreen() {
     onSelect: (projectId) => dispatch({ type: "selectProject", projectId }),
     idPrefix: "project",
   });
+
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    const row = document.getElementById(`project-${selectedProjectId}`);
+    // 老 WebView / jsdom 里可能没有这个方法，不能让它把渲染打断
+    row?.scrollIntoView?.({ block: "nearest" });
+  }, [selectedProjectId]);
 
   return (
     <>
@@ -56,6 +64,9 @@ export function ProjectsScreen() {
                   <span>状态</span>
                 </div>
 
+                {projects.length === 0 ? (
+                  <EmptyState>还没有项目，先新建一个。</EmptyState>
+                ) : (
                 <div {...nav.containerProps} aria-label="项目列表">
                   {projects.map((project) => (
                     <div
@@ -63,9 +74,11 @@ export function ProjectsScreen() {
                       className="list__row projects__row"
                       {...nav.getItemProps(project.id)}
                     >
-                      <span className="projects__name truncate">
+                      <span className="projects__name truncate" title={project.name}>
                         {project.name}
-                        <span className="projects__folder">{project.folderName}</span>
+                        <span className="projects__folder" title={project.folderName}>
+                          {project.folderName}
+                        </span>
                       </span>
 
                       <span className="projects__cell">
@@ -93,7 +106,7 @@ export function ProjectsScreen() {
                           }
                           tone={project.status === "done" ? "ok" : "accent"}
                           thin
-                          label={`${project.name} 进度`}
+                          decorative
                         />
                         <span className="projects__cell text-xs">
                           {progressLabel(
@@ -112,10 +125,8 @@ export function ProjectsScreen() {
                     </div>
                   ))}
 
-                  {projects.length === 0 ? (
-                    <EmptyState>还没有项目，先新建一个。</EmptyState>
-                  ) : null}
                 </div>
+                )}
               </div>
 
               <div className="hint-bar">
@@ -156,7 +167,9 @@ export function ProjectsScreen() {
                         </div>
                         <div className="dl__row">
                           <span className="dl__key">项目夹</span>
-                          <span className="dl__val mono">{selected.folderName}</span>
+                          <span className="dl__val mono" title={selected.folderName}>
+                            {selected.folderName}
+                          </span>
                         </div>
                         <div className="dl__row">
                           <span className="dl__key">备份</span>

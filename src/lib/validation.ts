@@ -5,9 +5,12 @@
 import type { NewCameraInput, NewProjectInput } from "../api/types";
 import {
   hasIllegalChars,
+  isReservedName,
   isValidAlias,
   isValidCompactDate,
   isValidPosition,
+  normalizeKey,
+  normalizePathKey,
   sanitizeSegment,
 } from "./naming";
 
@@ -49,6 +52,8 @@ export function validateNewProject(
     errors.name = "项目名不能只由空白或句点组成";
   } else if (name.length > PROJECT_NAME_MAX) {
     errors.name = `项目名不超过 ${PROJECT_NAME_MAX} 个字符`;
+  } else if (isReservedName(name)) {
+    errors.name = "该名称是 Windows 保留设备名，换一个";
   }
 
   if (input.scenario === "B") {
@@ -69,12 +74,18 @@ export function validateNewProject(
         categoryAt[index] = `分类名不超过 ${CATEGORY_NAME_MAX} 个字符`;
         return;
       }
-      const prev = seen.get(clean);
+      if (isReservedName(clean)) {
+        categoryAt[index] = "该名称是 Windows 保留设备名";
+        return;
+      }
+      // 用规范化键比对：大小写与空格差异在多数文件系统上仍然是同一个夹
+      const key = normalizeKey(raw);
+      const prev = seen.get(key);
       if (prev !== undefined) {
         categoryAt[index] = "分类名重复";
         return;
       }
-      seen.set(clean, index);
+      seen.set(key, index);
     });
 
     if (input.categories.length === 0) {
@@ -127,7 +138,7 @@ export function validateNewCamera(
   if (
     Object.keys(errors).length === 0 &&
     currentCode &&
-    existingCodes.includes(currentCode)
+    existingCodes.some((code) => normalizeKey(code) === normalizeKey(currentCode))
   ) {
     errors.position = "该编码已登记（同型号 + 同机位 + 同代称）";
   }
@@ -140,6 +151,7 @@ export interface StartCopyErrors {
   volumeId?: string;
   cameraId?: string;
   note?: string;
+  targetPrefix?: string;
   destinations?: string;
 }
 
@@ -147,6 +159,7 @@ export function validateStartCopy(input: {
   volumeId: string;
   cameraId: string;
   note: string;
+  targetPrefix: string;
   destinations: string[];
 }): ValidationResult<StartCopyErrors> {
   const errors: StartCopyErrors = {};
@@ -155,10 +168,19 @@ export function validateStartCopy(input: {
   if (!input.cameraId) errors.cameraId = "请选择该卡对应的相机";
   if (!input.note.trim()) errors.note = "内容备注必填（规范要求「适当记录」）";
 
+  const prefix = input.targetPrefix.trim();
+  if (!prefix) {
+    errors.targetPrefix = "请填写目标夹前缀（日期或时段）";
+  } else if (hasIllegalChars(prefix)) {
+    errors.targetPrefix = "前缀含非法字符";
+  }
+
   const paths = input.destinations.map((p) => p.trim()).filter(Boolean);
+  const keys = paths.map(normalizePathKey);
   if (paths.length === 0) {
     errors.destinations = "至少需要一个目的地";
-  } else if (new Set(paths).size !== paths.length) {
+  } else if (new Set(keys).size !== keys.length) {
+    // 大小写/结尾斜杠不同但指向同一个目录，等于只备份了一份
     errors.destinations = "目的地路径重复";
   }
 

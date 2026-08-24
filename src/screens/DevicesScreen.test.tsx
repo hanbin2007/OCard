@@ -2,6 +2,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 import App from "../App";
+import { mockCameras, mockStorageCards } from "../api/mock";
 
 afterEach(cleanup);
 
@@ -54,7 +55,8 @@ describe("设备登记", () => {
     expect(
       await screen.findByRole("button", { name: "删除相机 Nikon Z9" }),
     ).toBeDefined();
-    expect(screen.getByText("NikonZ9_E_CQ")).toBeDefined();
+    // 列表行 + 登记回执各出现一次
+    expect(screen.getAllByText("NikonZ9_E_CQ").length).toBeGreaterThan(0);
     // 提交后表单清空，预览回到占位
     expect(codePreview()).toBe("型号_机位_代称");
   });
@@ -70,6 +72,58 @@ describe("设备登记", () => {
     const alerts = screen.getAllByRole("alert").map((el) => el.textContent);
     expect(alerts.some((t) => t?.includes("机位"))).toBe(true);
     expect(screen.queryByText("SonyA7M4_A_LM")).toBeNull();
+  });
+
+  it("删除相机要二次确认，并说明级联影响", async () => {
+    const user = userEvent.setup();
+    render(
+      <App
+        preloaded={{
+          ...preloaded,
+          cameras: mockCameras,
+          cards: mockStorageCards,
+        }}
+      />,
+    );
+
+    const target = mockCameras[0];
+    const ownedCards = mockStorageCards.filter((c) => c.cameraId === target.id).length;
+
+    await user.click(
+      screen.getByRole("button", { name: `删除相机 ${target.model}` }),
+    );
+
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog.textContent).toContain(target.code);
+    expect(dialog.textContent).toContain(`${ownedCards} 张卡`);
+
+    // 取消后相机还在
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.getAllByText(target.code).length).toBeGreaterThan(0);
+  });
+
+  it("确认后相机与其名下的卡一并移除", async () => {
+    const user = userEvent.setup();
+    render(
+      <App
+        preloaded={{
+          ...preloaded,
+          cameras: mockCameras,
+          cards: mockStorageCards,
+        }}
+      />,
+    );
+
+    const target = mockCameras[0];
+    await user.click(
+      screen.getByRole("button", { name: `删除相机 ${target.model}` }),
+    );
+    await user.click(screen.getByRole("button", { name: "删除相机" }));
+
+    expect(screen.queryAllByText(target.code)).toHaveLength(0);
+    // 名下的卡也一并消失
+    expect(screen.queryByText("CFE-01")).toBeNull();
   });
 
   it("存储卡未选相机时拦下", async () => {

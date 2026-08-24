@@ -244,7 +244,10 @@
 }
 
 .segmented__item {
-  padding: var(--space-1) var(--space-3);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-1) var(--space-2);
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -255,6 +258,7 @@
     color var(--transition);
 }
 
+.segmented__item[aria-checked="true"],
 .segmented__item[aria-pressed="true"] {
   background: var(--panel);
   color: var(--text-primary);
@@ -279,9 +283,11 @@
   border-color: var(--border-strong);
 }
 
+/* 选中态走灰阶 + 加深边框，强调色只留给主按钮/进度条/焦点环 */
+.choice[aria-checked="true"],
 .choice[aria-pressed="true"] {
-  border-color: var(--accent);
-  background: var(--accent-soft);
+  border-color: var(--border-focus);
+  background: var(--selected);
 }
 
 .choice__title {
@@ -310,6 +316,9 @@
   font-size: var(--text-2xs);
   font-weight: var(--weight-medium);
   white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .badge--ok {
@@ -329,7 +338,7 @@
 
 .badge--accent {
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-strong);
 }
 
 .badge--mono {
@@ -397,7 +406,9 @@
   transition: background var(--transition);
 }
 
-.list__row:first-child {
+.list__row:first-child,
+/* 表头自带 border-bottom，紧跟其后的首行不能再加 border-top，否则叠成 2px */
+.list__head + .list__row {
   border-top: 0;
 }
 
@@ -461,6 +472,8 @@
   font-size: var(--text-xs);
   line-height: 1.9;
   color: var(--text-secondary);
+  /* 长分类名/长项目夹名横向滚动，不被卡片静默裁掉 */
+  overflow-x: auto;
 }
 
 .tree__node {
@@ -604,6 +617,87 @@
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
   color: var(--text-tertiary);
+}
+
+/* ---------- 确认对话框 ---------- */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: var(--space-6);
+  background: var(--overlay);
+}
+
+.dialog {
+  width: 100%;
+  max-width: 420px;
+  padding: var(--space-5);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--panel);
+}
+
+.dialog__title {
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+}
+
+.dialog__message {
+  margin-top: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  line-height: var(--leading-normal);
+}
+
+.dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-5);
+}
+
+.btn--danger-solid {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--on-danger);
+}
+
+.btn--danger-solid:hover:not(:disabled) {
+  background: var(--danger);
+  border-color: var(--danger);
+  opacity: 0.9;
+}
+
+/* 提示条：用于「本卡可格式化」这类必须被看见的流程节点 */
+.notice {
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--panel);
+  font-size: var(--text-sm);
+}
+
+.notice strong {
+  font-weight: var(--weight-semibold);
+}
+
+.notice span {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.notice--ok {
+  border-color: var(--ok);
+  background: var(--ok-soft);
+}
+
+.notice--ok strong {
+  color: var(--ok);
 }
 
 .hint-bar {

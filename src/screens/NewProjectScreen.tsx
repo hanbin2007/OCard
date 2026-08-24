@@ -13,6 +13,8 @@ import { buildProjectFolderName } from "../lib/naming";
 import { validateNewProject } from "../lib/validation";
 import { useStore } from "../state/store";
 
+const FORM_ID = "new-project-form";
+
 /** `YYYY-MM-DD`（date input）→ `YYYYMMDD` */
 export function toCompactDate(isoDate: string): string {
   return isoDate.replace(/-/g, "");
@@ -25,49 +27,71 @@ function todayIso(): string {
   return `${now.getFullYear()}-${mm}-${dd}`;
 }
 
+interface CategoryDraft {
+  id: string;
+  value: string;
+}
+
+let categorySeq = 0;
+function newCategory(value = ""): CategoryDraft {
+  categorySeq += 1;
+  return { id: `category-${categorySeq}`, value };
+}
+
 export function NewProjectScreen() {
   const { state, dispatch } = useStore();
   const [isoDate, setIsoDate] = useState(todayIso);
   const [name, setName] = useState("");
   const [scenario, setScenario] = useState<Scenario>("B");
-  const [categories, setCategories] = useState<string[]>(DEFAULT_B_CATEGORIES);
+  // 用稳定 id 作 key：删中间行时按下标复用 DOM 会串焦点、串输入法组字
+  const [categories, setCategories] = useState<CategoryDraft[]>(() =>
+    DEFAULT_B_CATEGORIES.map((c) => newCategory(c)),
+  );
   const [submitted, setSubmitted] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const date = toCompactDate(isoDate);
-  const input = { name, date, scenario, categories };
+  const categoryValues = useMemo(() => categories.map((c) => c.value), [categories]);
+
   const { valid, errors } = useMemo(
-    () => validateNewProject(input),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [name, date, scenario, categories],
+    () => validateNewProject({ name, date, scenario, categories: categoryValues }),
+    [name, date, scenario, categoryValues],
   );
   const showErrors = submitted;
 
   const tree = useMemo(
-    () => buildFolderTree(scenario, categories),
-    [scenario, categories],
+    () => buildFolderTree(scenario, categoryValues),
+    [scenario, categoryValues],
   );
   const folderName = buildProjectFolderName(date, name);
   const nasRoot = state.workstation?.nasRoot ?? "<NAS 根路径>";
 
-  function updateCategory(index: number, value: string) {
-    setCategories((prev) => prev.map((c, i) => (i === index ? value : c)));
-  }
-
-  function removeCategory(index: number) {
-    setCategories((prev) => prev.filter((_, i) => i !== index));
+  function focusFirstError() {
+    // 提交按钮在右上角、错误在左侧表单里，不移动焦点很容易被当成卡死
+    const target = errors.date
+      ? "project-date"
+      : errors.name
+        ? "project-name"
+        : errors.categoryAt
+          ? categories[Number(Object.keys(errors.categoryAt)[0])]?.id
+          : undefined;
+    if (target) document.getElementById(target)?.focus();
   }
 
   async function submit() {
     setSubmitted(true);
-    if (!valid || busy) return;
+    if (!valid) {
+      focusFirstError();
+      return;
+    }
+    if (busy) return;
     setBusy(true);
     try {
       const project = await api.createProject({
         name: name.trim(),
         date,
         scenario,
-        categories: scenario === "B" ? categories.map((c) => c.trim()) : [],
+        categories: scenario === "B" ? categoryValues.map((c) => c.trim()) : [],
       });
       dispatch({ type: "projectCreated", project });
     } finally {
@@ -80,6 +104,7 @@ export function NewProjectScreen() {
       <TopBar
         title="新建项目"
         subtitle={nasRoot}
+        subtitleMono
         actions={
           <>
             <button
@@ -89,10 +114,11 @@ export function NewProjectScreen() {
             >
               取消
             </button>
+            {/* form 属性让顶栏按钮真正提交左侧表单 */}
             <button
-              type="button"
+              type="submit"
+              form={FORM_ID}
               className="btn btn--primary btn--pill"
-              onClick={submit}
               disabled={busy}
             >
               {busy ? "创建中…" : "创建项目"}
@@ -105,6 +131,7 @@ export function NewProjectScreen() {
         <div className="content__inner">
           <div className="wizard">
             <form
+              id={FORM_ID}
               className="stack stack--lg"
               onSubmit={(e) => {
                 e.preventDefault();
@@ -153,17 +180,25 @@ export function NewProjectScreen() {
 
               <div className="card">
                 <div className="card__head">
-                  <span className="card__title">工况</span>
+                  <span className="card__title" id="scenario-label">
+                    工况
+                  </span>
                   <span className="card__hint">决定建夹模板与后续流程</span>
                 </div>
                 <div className="card__body">
-                  <div className="wizard__choices">
+                  {/* 二选一是 radio 语义，不是两个互不相干的开关 */}
+                  <div
+                    className="wizard__choices"
+                    role="radiogroup"
+                    aria-labelledby="scenario-label"
+                  >
                     {(["A", "B"] as Scenario[]).map((value) => (
                       <button
                         key={value}
                         type="button"
                         className="choice"
-                        aria-pressed={scenario === value}
+                        role="radio"
+                        aria-checked={scenario === value}
                         onClick={() => setScenario(value)}
                       >
                         <span className="choice__title">{SCENARIO_LABEL[value]}</span>
@@ -185,7 +220,7 @@ export function NewProjectScreen() {
                       <button
                         type="button"
                         className="btn btn--sm"
-                        onClick={() => setCategories((prev) => [...prev, ""])}
+                        onClick={() => setCategories((prev) => [...prev, newCategory()])}
                       >
                         <IconPlus />
                         添加分类
@@ -194,31 +229,63 @@ export function NewProjectScreen() {
                   </div>
                   <div className="card__body">
                     <div className="stack stack--sm">
-                      {categories.map((category, index) => (
-                        <div className="category-row" key={index}>
-                          <span className="category-row__index">{index + 2}.</span>
-                          <input
-                            className={`input${
-                              showErrors && errors.categoryAt?.[index]
-                                ? " input--invalid"
-                                : ""
-                            }`}
-                            type="text"
-                            value={category}
-                            placeholder="分类名，如：颁奖"
-                            aria-label={`第 ${index + 1} 个分类名`}
-                            onChange={(e) => updateCategory(index, e.currentTarget.value)}
-                          />
-                          <button
-                            type="button"
-                            className="btn btn--ghost btn--icon"
-                            aria-label={`删除第 ${index + 1} 个分类`}
-                            onClick={() => removeCategory(index)}
-                          >
-                            <IconTrash />
-                          </button>
-                        </div>
-                      ))}
+                      {categories.map((category, index) => {
+                        // 屏幕上的编号 = 建夹后的编号（待分类占 1），读屏器用同一个数字
+                        const displayIndex = index + 2;
+                        const itemError = showErrors
+                          ? errors.categoryAt?.[index]
+                          : undefined;
+                        return (
+                          <div key={category.id}>
+                            <div className="category-row">
+                              <span className="category-row__index">{displayIndex}.</span>
+                              <input
+                                id={category.id}
+                                className={`input${itemError ? " input--invalid" : ""}`}
+                                type="text"
+                                value={category.value}
+                                placeholder="分类名，如：颁奖"
+                                aria-label={`第 ${displayIndex} 号分类名`}
+                                aria-invalid={itemError ? true : undefined}
+                                aria-describedby={
+                                  itemError ? `${category.id}-error` : undefined
+                                }
+                                onChange={(e) => {
+                                  const value = e.currentTarget.value;
+                                  setCategories((prev) =>
+                                    prev.map((c) =>
+                                      c.id === category.id ? { ...c, value } : c,
+                                    ),
+                                  );
+                                }}
+                              />
+                              <button
+                                type="button"
+                                className="btn btn--ghost btn--icon"
+                                aria-label={`删除第 ${displayIndex} 号分类`}
+                                onClick={() =>
+                                  setCategories((prev) =>
+                                    prev.filter((c) => c.id !== category.id),
+                                  )
+                                }
+                              >
+                                <IconTrash />
+                              </button>
+                            </div>
+                            {itemError ? (
+                              <div className="category-row__error">
+                                <span
+                                  className="field__error"
+                                  id={`${category.id}-error`}
+                                  role="alert"
+                                >
+                                  {itemError}
+                                </span>
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
 
                       {categories.length === 0 ? (
                         <p className="text-sm dim">还没有分类，至少添加一个。</p>
@@ -243,7 +310,7 @@ export function NewProjectScreen() {
                 </div>
                 <div className="card__body">
                   <div className="stack">
-                    <div className="preview__path">
+                    <div className="preview__path" title={`${nasRoot}/${folderName}`}>
                       {nasRoot}/{folderName || "YYYYMMDD_项目名"}
                     </div>
                     <FolderTreeView

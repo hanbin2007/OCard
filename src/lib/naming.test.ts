@@ -8,8 +8,11 @@ import {
   hasIllegalChars,
   inferTimeSlot,
   isValidAlias,
+  isReservedName,
   isValidCompactDate,
   isValidPosition,
+  normalizeKey,
+  normalizePathKey,
   sanitizeSegment,
 } from "./naming";
 
@@ -136,5 +139,46 @@ describe("inferTimeSlot", () => {
 
   it("非法时间戳返回空串", () => {
     expect(inferTimeSlot("not-a-date")).toBe("");
+  });
+});
+
+describe("isReservedName", () => {
+  it("识别 Windows 保留设备名（不分大小写）", () => {
+    expect(isReservedName("CON")).toBe(true);
+    expect(isReservedName("nul")).toBe(true);
+    expect(isReservedName("COM1")).toBe(true);
+    expect(isReservedName("LPT9")).toBe(true);
+  });
+
+  it("带扩展名的保留名同样非法", () => {
+    expect(isReservedName("aux.txt")).toBe(true);
+  });
+
+  it("普通名字不误伤", () => {
+    expect(isReservedName("校运会")).toBe(false);
+    expect(isReservedName("CONTROL")).toBe(false);
+    expect(isReservedName("COM10")).toBe(false);
+  });
+});
+
+describe("normalizeKey", () => {
+  it("大小写与空格差异折叠成同一个键", () => {
+    expect(normalizeKey("A7M4")).toBe(normalizeKey("a7m4"));
+    expect(normalizeKey("领导 合影")).toBe(normalizeKey("领导合影"));
+  });
+
+  it("不同名字仍是不同的键", () => {
+    expect(normalizeKey("领导")).not.toBe(normalizeKey("会场"));
+  });
+});
+
+describe("normalizePathKey", () => {
+  it("统一分隔符、去掉结尾斜杠、折叠大小写", () => {
+    expect(normalizePathKey("/Volumes/NAS/")).toBe(normalizePathKey("/volumes/nas"));
+    expect(normalizePathKey("D:\\Backup\\")).toBe(normalizePathKey("d:/backup"));
+  });
+
+  it("不把不同目录折叠到一起（分隔符不能被删掉）", () => {
+    expect(normalizePathKey("/a/b")).not.toBe(normalizePathKey("/ab"));
   });
 });

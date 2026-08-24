@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import * as api from "../api";
+import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { IconTrash } from "../components/Icon";
 import { TopBar } from "../components/TopBar";
 import { Badge, EmptyState, Field } from "../components/ui";
@@ -28,6 +29,10 @@ export function DevicesScreen() {
   const [cardCapacity, setCardCapacity] = useState(512);
   const [cardSerial, setCardSerial] = useState("");
   const [cardSubmitted, setCardSubmitted] = useState(false);
+  const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
+  /** 登记成功后的回执，避免「表单清空」被读成「没提交上」 */
+  const [lastCamera, setLastCamera] = useState<string | null>(null);
+  const [lastCard, setLastCard] = useState<string | null>(null);
 
   const code = useMemo(
     () => buildCameraCode(model, position, alias),
@@ -62,6 +67,7 @@ export function DevicesScreen() {
       note,
     });
     dispatch({ type: "cameraCreated", camera });
+    setLastCamera(camera.code);
     setModel("");
     setPosition("");
     setAlias("");
@@ -79,6 +85,7 @@ export function DevicesScreen() {
       serial: cardSerial,
     });
     dispatch({ type: "cardCreated", card });
+    setLastCard(card.label);
     setCardLabel("");
     setCardSerial("");
     setCardSubmitted(false);
@@ -105,7 +112,13 @@ export function DevicesScreen() {
                   <span className="card__title">登记相机</span>
                 </div>
                 <div className="card__body">
-                  <div className="stack stack--lg">
+                  <form
+                    className="stack stack--lg"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      void addCamera();
+                    }}
+                  >
                     <Field
                       label="型号"
                       htmlFor="cam-model"
@@ -185,10 +198,16 @@ export function DevicesScreen() {
                       </span>
                     </div>
 
-                    <button type="button" className="btn btn--primary" onClick={addCamera}>
+                    {lastCamera ? (
+                      <p className="text-xs" role="status">
+                        已登记 <span className="mono">{lastCamera}</span>
+                      </p>
+                    ) : null}
+
+                    <button type="submit" className="btn btn--primary">
                       登记相机
                     </button>
-                  </div>
+                  </form>
                 </div>
               </div>
 
@@ -198,7 +217,13 @@ export function DevicesScreen() {
                   <span className="card__hint">一卡一机</span>
                 </div>
                 <div className="card__body">
-                  <div className="stack stack--lg">
+                  <form
+                    className="stack stack--lg"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      void addCard();
+                    }}
+                  >
                     <Field
                       label="卡面标签"
                       htmlFor="card-label"
@@ -266,10 +291,16 @@ export function DevicesScreen() {
                       </Field>
                     </div>
 
-                    <button type="button" className="btn" onClick={addCard}>
+                    {lastCard ? (
+                      <p className="text-xs" role="status">
+                        已登记 <span className="mono">{lastCard}</span>
+                      </p>
+                    ) : null}
+
+                    <button type="submit" className="btn">
                       登记存储卡
                     </button>
-                  </div>
+                  </form>
                 </div>
               </div>
             </div>
@@ -304,8 +335,19 @@ export function DevicesScreen() {
                         className="btn btn--ghost btn--icon btn--sm"
                         aria-label={`删除相机 ${camera.model}`}
                         onClick={() => {
-                          void api.deleteCamera(camera.id);
-                          dispatch({ type: "cameraRemoved", cameraId: camera.id });
+                          const owned = cardCountByCamera.get(camera.id) ?? 0;
+                          setConfirm({
+                            title: `删除相机 ${camera.model}（${camera.code}）？`,
+                            message:
+                              owned > 0
+                                ? `其名下 ${owned} 张卡的登记会一并移除。登记表全项目共享，删除后无法撤销。`
+                                : "登记表全项目共享，删除后无法撤销。",
+                            confirmLabel: "删除相机",
+                            onConfirm: () => {
+                              void api.deleteCamera(camera.id);
+                              dispatch({ type: "cameraRemoved", cameraId: camera.id });
+                            },
+                          });
                         }}
                       >
                         <IconTrash />
@@ -350,10 +392,17 @@ export function DevicesScreen() {
                           type="button"
                           className="btn btn--ghost btn--icon btn--sm"
                           aria-label={`删除存储卡 ${card.label}`}
-                          onClick={() => {
-                            void api.deleteStorageCard(card.id);
-                            dispatch({ type: "cardRemoved", cardId: card.id });
-                          }}
+                          onClick={() =>
+                            setConfirm({
+                              title: `删除存储卡 ${card.label}？`,
+                              message: "登记表全项目共享，删除后无法撤销。",
+                              confirmLabel: "删除存储卡",
+                              onConfirm: () => {
+                                void api.deleteStorageCard(card.id);
+                                dispatch({ type: "cardRemoved", cardId: card.id });
+                              },
+                            })
+                          }
                         >
                           <IconTrash />
                         </button>
@@ -369,6 +418,8 @@ export function DevicesScreen() {
           </div>
         </div>
       </div>
+
+      <ConfirmDialog request={confirm} onCancel={() => setConfirm(null)} />
     </>
   );
 }

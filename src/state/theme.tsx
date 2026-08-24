@@ -8,6 +8,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useState,
   type ReactNode,
@@ -65,14 +66,18 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     return () => mql.removeEventListener("change", onChange);
   }, []);
 
-  useEffect(() => {
+  // DOM 属性在绘制前落地，避免首帧先显示系统主题再闪到手动主题
+  useLayoutEffect(() => {
     const root = document.documentElement;
     if (mode === "system") root.removeAttribute("data-theme");
     else root.setAttribute("data-theme", mode);
+  }, [mode]);
+
+  useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, mode);
     } catch {
-      // 忽略写入失败
+      // 隐私模式/禁用存储时忽略写入失败
     }
   }, [mode]);
 

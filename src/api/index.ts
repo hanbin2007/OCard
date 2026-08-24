@@ -9,6 +9,7 @@
 import {
   mockCameras,
   mockCopyTasks,
+  mockInspection,
   mockProjects,
   mockStorageCards,
   mockVolumes,
@@ -23,6 +24,7 @@ import {
 } from "../lib/naming";
 import type {
   CameraReg,
+  CopyFileItem,
   CopyProgressEvent,
   CopyTask,
   FolderNode,
@@ -34,6 +36,7 @@ import type {
   StartCopyInput,
   StorageCard,
   Volume,
+  VolumeInspection,
   WorkstationInfo,
 } from "./types";
 
@@ -194,11 +197,8 @@ export function startCopyTask(input: StartCopyInput): Promise<CopyTask> {
   const template = mockCopyTasks[0];
   const volume = mockVolumes.find((v) => v.id === input.volumeId);
   const camera = mockCameras.find((c) => c.id === input.cameraId);
-  const project = mockProjects.find((p) => p.id === input.projectId);
-  const prefix =
-    project?.scenario === "A"
-      ? project.date
-      : inferTimeSlot(new Date().toISOString());
+  // 前缀由人工确认后传入，不在这里按当前时钟臆测
+  const prefix = input.targetPrefix;
 
   const task: CopyTask = {
     ...template,
@@ -247,30 +247,90 @@ export function retryCopyFile(taskId: string, fileId: string): Promise<void> {
   return reply(undefined);
 }
 
+/** 分页取任务文件明细（千张素材不可一次全量过 IPC） */
+export function listCopyFiles(
+  taskId: string,
+  offset = 0,
+  limit = 200,
+): Promise<{ items: CopyFileItem[]; total: number }> {
+  // TODO: tauri invoke("list_copy_files", { taskId, offset, limit })
+  const files = mockCopyTasks.find((t) => t.id === taskId)?.files ?? [];
+  return reply({ items: files.slice(offset, offset + limit), total: files.length });
+}
+
+/** 探查源卷：素材时间范围 + 建议时段前缀（PRD §5.3「从素材时间戳自动推断，可改」） */
+export function inspectVolume(volumeId: string): Promise<VolumeInspection> {
+  // TODO: tauri invoke("inspect_volume", { volumeId })
+  const volume = mockVolumes.find((v) => v.id === volumeId);
+  return reply({
+    volumeId,
+    fileCount: mockInspection.fileCount,
+    totalBytes: volume?.usedBytes ?? 0,
+    earliestShotAt: mockInspection.earliestShotAt,
+    latestShotAt: mockInspection.latestShotAt,
+    // 时段按最早一张素材的拍摄时间推断，不是按当前时钟
+    suggestedPrefix: inferTimeSlot(mockInspection.earliestShotAt),
+  });
+}
+
 /**
- * 订阅拷卡进度。
- * 真实实现走 tauri event（`listen("copy://progress")`）；
- * 这里用定时器产出等价形状的事件，便于 UI 壳阶段联调。
+ * 订阅全部进行中任务的进度。
+ *
+ * 真实实现是 `listen("copy://progress")`（返回 Promise<UnlistenFn>），
+ * 这里把它包成可同步调用的 disposer，并处理「组件先卸载、unlisten 后返回」。
+ * 终态（done/failed）后自行停止，不留悬空定时器。
  */
 export function subscribeCopyProgress(
-  taskId: string,
+  taskIds: string[],
   onEvent: (event: CopyProgressEvent) => void,
 ): () => void {
   // TODO: tauri invoke -> @tauri-apps/api/event listen("copy://progress")
-  const task = mockCopyTasks.find((t) => t.id === taskId);
-  if (!task || task.state !== "running") return () => {};
+  const tracked = mockCopyTasks.filter(
+    (t) => taskIds.includes(t.id) && t.state === "running",
+  );
+  if (tracked.length === 0) return () => {};
 
-  let copied = task.copiedBytes;
+  const progress = new Map(tracked.map((t) => [t.id, t.copiedBytes]));
+  const revisions = new Map(tracked.map((t) => [t.id, 0]));
+  let disposed = false;
+
   const timer = setInterval(() => {
-    copied = Math.min(task.totalBytes, copied + task.speedBytesPerSec);
-    onEvent({
-      taskId,
-      copiedBytes: copied,
-      speedBytesPerSec: task.speedBytesPerSec,
-      state: copied >= task.totalBytes ? "verifying" : "running",
-      changedFiles: [],
-    });
+    if (disposed) return;
+    let stillRunning = false;
+
+    for (const task of tracked) {
+      const copied = Math.min(
+        task.totalBytes,
+        (progress.get(task.id) ?? 0) + task.speedBytesPerSec,
+      );
+      progress.set(task.id, copied);
+      const revision = (revisions.get(task.id) ?? 0) + 1;
+      revisions.set(task.id, revision);
+
+      const done = copied >= task.totalBytes;
+      if (!done) stillRunning = true;
+
+      onEvent({
+        taskId: task.id,
+        revision,
+        occurredAt: new Date().toISOString(),
+        copiedBytes: copied,
+        speedBytesPerSec: done ? 0 : task.speedBytesPerSec,
+        state: done ? "verifying" : "running",
+        changedFiles: [],
+        changedDestinations: task.destinations.map((d) => ({
+          id: d.id,
+          state: done ? ("verifying" as const) : d.state,
+          writtenBytes: copied,
+        })),
+      });
+    }
+
+    if (!stillRunning) clearInterval(timer);
   }, 1000);
 
-  return () => clearInterval(timer);
+  return () => {
+    disposed = true;
+    clearInterval(timer);
+  };
 }

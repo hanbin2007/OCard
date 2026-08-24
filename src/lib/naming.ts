@@ -26,6 +26,43 @@ export function hasIllegalChars(raw: string): boolean {
   return /[\\/:*?"<>|]/.test(raw) || /\p{Cc}/u.test(raw);
 }
 
+/** Windows 保留设备名，做文件夹名会直接创建失败（不分大小写，带扩展名也算） */
+const RESERVED_NAMES = new Set([
+  "CON",
+  "PRN",
+  "AUX",
+  "NUL",
+  ...Array.from({ length: 9 }, (_, i) => `COM${i + 1}`),
+  ...Array.from({ length: 9 }, (_, i) => `LPT${i + 1}`),
+]);
+
+export function isReservedName(raw: string): boolean {
+  const base = sanitizeSegment(raw).split(".")[0]?.toUpperCase() ?? "";
+  return RESERVED_NAMES.has(base);
+}
+
+/**
+ * 比较用的规范化键：Unicode NFC + 清洗 + 去空格 + 大小写折叠。
+ * 分类重名、相机编码撞车、目的地去重都必须用同一把尺子——
+ * macOS/Windows 文件系统默认大小写不敏感，`领导` 和 `领导 `、`A7M4` 和 `a7m4` 会撞车。
+ */
+export function normalizeKey(raw: string): string {
+  return sanitizeSegment(raw.normalize("NFC")).replace(/\s+/g, "").toLowerCase();
+}
+
+/**
+ * 路径比较键：不能套用 normalizeKey（它会把分隔符也删掉，`/a/b` 与 `/ab` 会撞车）。
+ * 这里只统一分隔符、去掉结尾分隔符、NFC 并折叠大小写。
+ */
+export function normalizePathKey(raw: string): string {
+  return raw
+    .normalize("NFC")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
+
 /**
  * 相机编码：型号去空格 + 机位 + 使用者代称，下划线分隔。
  * 例：`DJI Ronin 4D` / `b` / `zs` → `DJIRonin4D_B_ZS`

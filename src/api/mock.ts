@@ -278,6 +278,13 @@ const taskFiles: CopyFileItem[] = [
   file(12, "AVCHD_INDEX.BDM", 24 * MB, "pending"),
 ];
 
+/** 源卷探查的 mock：假定卡内素材拍摄于当天上午 */
+export const mockInspection = {
+  earliestShotAt: "2026-08-24T08:41:00+08:00",
+  latestShotAt: "2026-08-24T11:07:00+08:00",
+  fileCount: 12,
+};
+
 export const mockCopyTasks: CopyTask[] = [
   {
     id: "task-0824-a7m4",

@@ -82,6 +82,8 @@
   --accent-hover: #2a63bb;
   --accent-soft: rgba(47, 111, 208, 0.1);
   --accent-ring: rgba(47, 111, 208, 0.35);
+  /* 压在 --accent-soft 上的文字，需比 --accent 更深才够 4.5:1 */
+  --accent-strong: #255ba8;
   /* 强调色上的文字，两主题一致 */
   --on-accent: #ffffff;
 
@@ -92,6 +94,9 @@
   --warn-soft: rgba(138, 98, 22, 0.1);
   --danger: #b3352b;
   --danger-soft: rgba(179, 53, 43, 0.1);
+  --on-danger: #ffffff;
+
+  --overlay: rgba(13, 13, 13, 0.45);
 
   color-scheme: light;
 }
@@ -122,7 +127,9 @@
     --accent-hover: #6d9bf3;
     --accent-soft: rgba(91, 141, 239, 0.14);
     --accent-ring: rgba(91, 141, 239, 0.4);
-    --on-accent: #ffffff;
+    --accent-strong: #8fb4f7;
+    /* #5b8def 上用白字只有 3.18:1，改近黑字得 5.9:1 */
+    --on-accent: #0d0d0d;
 
     --ok: #5fb083;
     --ok-soft: rgba(95, 176, 131, 0.14);
@@ -130,6 +137,9 @@
     --warn-soft: rgba(203, 161, 74, 0.14);
     --danger: #e0776d;
     --danger-soft: rgba(224, 119, 109, 0.14);
+    --on-danger: #0d0d0d;
+
+    --overlay: rgba(0, 0, 0, 0.6);
 
     color-scheme: dark;
   }
@@ -160,7 +170,9 @@
   --accent-hover: #6d9bf3;
   --accent-soft: rgba(91, 141, 239, 0.14);
   --accent-ring: rgba(91, 141, 239, 0.4);
-  --on-accent: #ffffff;
+  --accent-strong: #8fb4f7;
+  /* #5b8def 上用白字只有 3.18:1，改近黑字得 5.9:1 */
+  --on-accent: #0d0d0d;
 
   --ok: #5fb083;
   --ok-soft: rgba(95, 176, 131, 0.14);
@@ -168,6 +180,9 @@
   --warn-soft: rgba(203, 161, 74, 0.14);
   --danger: #e0776d;
   --danger-soft: rgba(224, 119, 109, 0.14);
+  --on-danger: #0d0d0d;
+
+  --overlay: rgba(0, 0, 0, 0.6);
 
   color-scheme: dark;
 }

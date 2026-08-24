@@ -25,19 +25,35 @@ const NAV: Array<{
   { route: "copy", label: "拷卡任务", icon: IconCard },
 ];
 
-function ThemeButton() {
-  const { mode, cycleMode } = useTheme();
-  const Icon = mode === "light" ? IconSun : mode === "dark" ? IconMoon : IconMonitor;
+const THEME_ICONS = {
+  system: IconMonitor,
+  light: IconSun,
+  dark: IconMoon,
+} as const;
+
+/** 三态一眼可见，不用点一下才知道会变成什么 */
+function ThemeSwitch() {
+  const { mode, setMode } = useTheme();
   return (
-    <button
-      type="button"
-      className="btn btn--ghost btn--icon btn--sm"
-      onClick={cycleMode}
-      title={`主题：${THEME_LABELS[mode]}（点击切换）`}
-      aria-label={`主题：${THEME_LABELS[mode]}，点击切换`}
-    >
-      <Icon />
-    </button>
+    <div className="segmented" role="radiogroup" aria-label="主题">
+      {(Object.keys(THEME_ICONS) as Array<keyof typeof THEME_ICONS>).map((value) => {
+        const Icon = THEME_ICONS[value];
+        return (
+          <button
+            key={value}
+            type="button"
+            className="segmented__item"
+            role="radio"
+            aria-checked={mode === value}
+            title={THEME_LABELS[value]}
+            aria-label={THEME_LABELS[value]}
+            onClick={() => setMode(value)}
+          >
+            <Icon size={14} />
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -111,7 +127,7 @@ export function Sidebar() {
             ? `${state.workstation.operator} · ${state.workstation.machineId}`
             : "未连接工作站"}
         </span>
-        <ThemeButton />
+        <ThemeSwitch />
       </div>
     </aside>
   );

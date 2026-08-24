@@ -124,17 +124,29 @@ export interface Volume {
 /** 逐文件哈希状态（PRD §5.3） */
 export type CopyFileStatus = "pending" | "copied" | "verified" | "failed";
 
+/** 单个文件在单个目的地上的落地结果：NAS 成功而备份盘失败必须能表达出来 */
+export interface CopyFileTargetResult {
+  destinationId: string;
+  status: CopyFileStatus;
+  /** 回读目标算出的哈希，与源哈希比对 */
+  targetHash?: string;
+  error?: string;
+}
+
 export interface CopyFileItem {
   id: string;
   /** 源卡内相对路径 */
   path: string;
   name: string;
   sizeBytes: number;
+  /** 汇总状态：所有目的地都 verified 才是 verified，任一 failed 即 failed */
   status: CopyFileStatus;
-  /** xxHash3-64，16 位十六进制；未算出时为空 */
+  /** 源侧 xxHash3-64，16 位十六进制；未算出时为空 */
   hash?: string;
-  /** status === 'failed' 时的原因 */
+  /** status === 'failed' 时的汇总原因 */
   error?: string;
+  /** 逐目的地结果；省略表示各目的地与汇总状态一致 */
+  targets?: CopyFileTargetResult[];
 }
 
 export type DestinationKind = "nas" | "local" | "external";
@@ -147,6 +159,10 @@ export interface CopyDestination {
   path: string;
   state: DestinationState;
   writtenBytes: number;
+  /** 已回读校验通过的字节数 */
+  verifiedBytes?: number;
+  /** state === 'error' 时的原因（如 NAS 断连） */
+  error?: string;
 }
 
 export type CopyTaskState =
@@ -172,12 +188,20 @@ export interface CopyTask {
   /** 目标子文件夹名，如 `20260824_DJIRonin4D_B_ZS` 或 `0824上午_A7M4_A_LM` */
   targetFolder: string;
   destinations: CopyDestination[];
+  /**
+   * 文件明细。注意：一张卡上千文件，Rust 侧不要在 `list_copy_tasks` 里全量返回，
+   * 列表接口只回摘要（files 传空数组），明细走分页的 `list_copy_files`。
+   */
   files: CopyFileItem[];
+  /** 文件总数（files 被分页截断时仍然准确） */
+  fileCount?: number;
   totalBytes: number;
   copiedBytes: number;
   /** 实时速度，字节/秒 */
   speedBytesPerSec: number;
   state: CopyTaskState;
+  /** 已合并到的进度事件序号，用于丢弃乱序事件 */
+  progressRevision?: number;
   /** 操作人（当前登记的 DIT） */
   operator: string;
   startedAt: string;
@@ -190,20 +214,46 @@ export interface StartCopyInput {
   volumeId: string;
   cameraId: string;
   note: string;
+  /**
+   * 目标夹前缀：工况 A 为 `YYYYMMDD`，工况 B 为时段标签（如 `0824上午`）。
+   * 由素材时间戳推断出默认值后交人工确认，故必须由前端显式传入（PRD §5.3）。
+   */
+  targetPrefix: string;
   /** 目的地路径列表，至少一个 */
   destinations: Array<{ kind: DestinationKind; path: string }>;
   /** 拷完自动转代理（工况 A，PRD §5.6） */
   autoProxy?: boolean;
 }
 
+/** 源卷探查结果：用于推断工况 B 的时段并给出素材规模预估 */
+export interface VolumeInspection {
+  volumeId: string;
+  fileCount: number;
+  totalBytes: number;
+  /** 素材最早/最晚拍摄时间（ISO 8601），空卡时为空 */
+  earliestShotAt?: string;
+  latestShotAt?: string;
+  /** 由 earliestShotAt 推断出的建议时段标签，人工可改 */
+  suggestedPrefix: string;
+}
+
 /** 拷卡进度事件；Rust 侧经 tauri event 推送 */
 export interface CopyProgressEvent {
   taskId: string;
+  /** 单调递增序号，用于丢弃乱序/过期事件 */
+  revision: number;
+  occurredAt: string;
   copiedBytes: number;
   speedBytesPerSec: number;
   state: CopyTaskState;
   /** 本次增量变化的文件 */
-  changedFiles: Array<Pick<CopyFileItem, "id" | "status" | "hash" | "error">>;
+  changedFiles: Array<
+    Pick<CopyFileItem, "id" | "status" | "hash" | "error" | "targets">
+  >;
+  /** 本次增量变化的目的地 */
+  changedDestinations: Array<
+    Pick<CopyDestination, "id" | "state" | "writtenBytes" | "verifiedBytes" | "error">
+  >;
 }
 
 /** 当前工作站身份（PRD §6.3） */
