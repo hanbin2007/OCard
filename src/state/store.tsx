@@ -403,7 +403,11 @@ export function reducer(state: AppState, action: AppAction): AppState {
       return { ...state, notices: state.notices.filter((n) => n.id !== action.id) };
 
     case "noticesCleared":
-      return { ...state, notices: [] };
+      // 「清除已读」绝不能顺手抹掉尚未确认的 error——那等于绕过确认
+      return {
+        ...state,
+        notices: state.notices.filter((n) => n.level === "error" && !n.read),
+      };
 
     case "noticesPanelToggled": {
       const open = !state.noticesOpen;
@@ -474,7 +478,9 @@ export function StoreProvider({
    * 但 error 仍需逐条确认。
    */
   useEffect(() => {
-    const dispose = api.subscribeNotices(
+    let cancelled = false;
+
+    const subscription = api.subscribeNotices(
       (notice) => dispatch({ type: "noticeReceived", notice }),
       (err) =>
         dispatch({
@@ -491,8 +497,7 @@ export function StoreProvider({
         }),
     );
 
-    let cancelled = false;
-    void (async () => {
+    async function replayBacklog() {
       try {
         const backlog = await api.listNotices();
         if (!cancelled && backlog.length > 0) {
@@ -513,14 +518,23 @@ export function StoreProvider({
           },
         });
       }
-    })();
+    }
+
+    // 严格串行：监听注册完成之后才去取积压。
+    // 反过来的话，「取数完成 → 注册完成」之间产生的通知两头都收不到。
+    // 注册失败（ready reject）时监听虽然没建起来，积压仍然值得补回来，
+    // 失败本身已由上面的 onError 报给用户，所以这里 settle 即继续。
+    void subscription.ready
+      .catch(() => undefined)
+      .then(() => {
+        if (!cancelled) return replayBacklog();
+      });
 
     return () => {
       cancelled = true;
-      dispose();
+      subscription.dispose();
     };
   }, []);
-
 
   useEffect(() => {
     if (skipBootstrap) return;

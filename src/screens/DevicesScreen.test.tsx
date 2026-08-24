@@ -1,6 +1,7 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as api from "../api";
 import App from "../App";
 import { mockCameras, mockStorageCards } from "../api/mock";
 
@@ -121,9 +122,61 @@ describe("设备登记", () => {
     );
     await user.click(screen.getByRole("button", { name: "删除相机" }));
 
-    expect(screen.queryAllByText(target.code)).toHaveLength(0);
+    // 等后端确认删除后本地列表才更新
+    await waitFor(() => expect(screen.queryAllByText(target.code)).toHaveLength(0));
     // 名下的卡也一并消失
     expect(screen.queryByText("CFE-01")).toBeNull();
+  });
+
+  it("后端拒绝删除时条目仍在，并显示错误（不谎报成功）", async () => {
+    const user = userEvent.setup();
+    const spy = vi
+      .spyOn(api, "deleteCamera")
+      .mockRejectedValue(new Error("NAS 只读，无法写入登记表"));
+
+    render(
+      <App
+        preloaded={{ ...preloaded, cameras: mockCameras, cards: mockStorageCards }}
+      />,
+    );
+
+    const target = mockCameras[0];
+    await user.click(
+      screen.getByRole("button", { name: `删除相机 ${target.model}` }),
+    );
+    await user.click(screen.getByRole("button", { name: "删除相机" }));
+
+    const alert = await screen.findByTestId("dev-delete-error");
+    expect(alert.getAttribute("role")).toBe("alert");
+    expect(alert.textContent).toContain("NAS 只读");
+    expect(alert.textContent).toContain("登记表未改动");
+    // 相机与其名下的卡都还在
+    expect(screen.getAllByText(target.code).length).toBeGreaterThan(0);
+    expect(screen.getByText("CFE-01")).toBeDefined();
+
+    spy.mockRestore();
+  });
+
+  it("后端拒绝删除存储卡时同样不移除条目", async () => {
+    const user = userEvent.setup();
+    const spy = vi
+      .spyOn(api, "deleteStorageCard")
+      .mockRejectedValue(new Error("NAS 断连"));
+
+    render(
+      <App
+        preloaded={{ ...preloaded, cameras: mockCameras, cards: mockStorageCards }}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "删除存储卡 CFE-01" }));
+    await user.click(screen.getByRole("button", { name: "删除存储卡" }));
+
+    const alert = await screen.findByTestId("dev-delete-error");
+    expect(alert.textContent).toContain("NAS 断连");
+    expect(screen.getByText("CFE-01")).toBeDefined();
+
+    spy.mockRestore();
   });
 
   it("存储卡未选相机时拦下", async () => {

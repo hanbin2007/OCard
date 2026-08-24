@@ -15,7 +15,8 @@ import { Field } from "./ui";
 /** 检查更新的结果文案；失败一律引导去通知中心看详情，不静默 */
 const UPDATE_RESULT_TEXT: Record<UpdateCheckResult, string> = {
   uptodate: "已是最新",
-  ready: "更新已就绪，重启生效",
+  // "ready" 现在的含义是「已下载待安装」，不是「重启就会自动装上」
+  ready: "已下载，点击重启并更新安装",
   failed: "更新失败，详见通知",
   "check-failed": "检查失败，详见通知",
   unsupported: "当前安装方式不支持自动更新",
@@ -35,6 +36,8 @@ export function SettingsDialog() {
   const [version, setVersion] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
   const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [installError, setInstallError] = useState<string | null>(null);
 
   // 每次打开都以当前配置为准重置表单
   useEffect(() => {
@@ -64,6 +67,20 @@ export function SettingsDialog() {
     };
   }, [settingsOpen]);
 
+  async function installReadyUpdate() {
+    if (installing) return;
+    setInstalling(true);
+    setInstallError(null);
+    try {
+      await api.installUpdate();
+    } catch (err) {
+      // 后端会给中文原因（如「有拷卡任务正在进行」），原样展示
+      setInstallError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setInstalling(false);
+    }
+  }
+
   async function checkUpdate() {
     if (checking) return;
     setChecking(true);
@@ -88,6 +105,10 @@ export function SettingsDialog() {
   }, [settingsOpen, dispatch]);
 
   if (!settingsOpen) return null;
+
+  // 已下载待安装：本次检查返回 ready，或后端此前推过 update-ready 通知
+  const updateReady =
+    updateResult === "ready" || state.notices.some((n) => n.code === "update-ready");
 
   const { valid, errors } = validateWorkstation({ operator, nasRoot });
 
@@ -181,6 +202,17 @@ export function SettingsDialog() {
               >
                 {checking ? "检查中…" : "检查更新"}
               </button>
+              {updateReady ? (
+                <button
+                  type="button"
+                  className="btn btn--primary btn--sm"
+                  data-testid="settings-install-update"
+                  disabled={installing}
+                  onClick={installReadyUpdate}
+                >
+                  {installing ? "正在安装…" : "重启并更新"}
+                </button>
+              ) : null}
               {updateResult ? (
                 <span
                   className="text-xs muted"
@@ -191,6 +223,15 @@ export function SettingsDialog() {
                 </span>
               ) : null}
             </div>
+            {installError ? (
+              <span
+                className="field__error"
+                data-testid="settings-install-error"
+                role="alert"
+              >
+                {installError}
+              </span>
+            ) : null}
           </div>
 
           {saveError ? (

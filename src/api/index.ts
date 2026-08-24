@@ -424,19 +424,28 @@ export function subscribeCopyProgress(
  * 通知
  * ------------------------------------------------------------------ */
 
+/** 订阅句柄：`ready` 在监听真正注册完成后 settle，供调用方串行化后续动作 */
+export interface NoticeSubscription {
+  dispose: () => void;
+  /** listen() 注册完成后 resolve；注册失败则 reject */
+  ready: Promise<void>;
+}
+
 /**
  * 订阅后端通知（降级/失败必须可见，不允许静默 fail-open）。
- * 与进度订阅一样：常驻单一监听，包成可同步调用的 disposer，
- * 并把 listen 自身的失败上报——连通知通道都建不起来时更不能装作没事。
+ *
+ * 与进度订阅同构：常驻单一监听，可同步调用的 disposer，处理「卸载早于 listen 返回」。
+ * 额外暴露 `ready`——回放必须等监听真正注册完成后再发起，否则「注册完成前、
+ * 回放取数之后」这段窗口里产生的通知两头都收不到，照样丢信。
  */
 export function subscribeNotices(
   onNotice: (notice: NoticeDto) => void,
   onError?: (error: unknown) => void,
-): () => void {
+): NoticeSubscription {
   if (IS_TAURI) {
     let disposed = false;
     let unlisten: (() => void) | null = null;
-    listen<NoticeDto>("app://notice", (e) => {
+    const ready = listen<NoticeDto>("app://notice", (e) => {
       if (!disposed) onNotice(e.payload);
     })
       .then((fn) => {
@@ -445,14 +454,18 @@ export function subscribeNotices(
       })
       .catch((err) => {
         if (!disposed) onError?.(err);
+        throw err;
       });
-    return () => {
-      disposed = true;
-      unlisten?.();
+    return {
+      dispose: () => {
+        disposed = true;
+        unlisten?.();
+      },
+      ready,
     };
   }
   // 浏览器/测试环境没有后端推送；测试通过 spy 注入通知
-  return () => {};
+  return { dispose: () => {}, ready: Promise.resolve() };
 }
 
 /**
@@ -472,6 +485,15 @@ export function listNotices(): Promise<NoticeDto[]> {
 export function getAppVersion(): Promise<string> {
   if (IS_TAURI) return getVersion();
   return reply("0.1.0");
+}
+
+/**
+ * 安装已下载好的更新并重启。
+ * 有拷卡任务在跑时后端会拒绝，并返回中文原因——直接展示给用户。
+ */
+export function installUpdate(): Promise<void> {
+  if (IS_TAURI) return ipc("install_update");
+  return reply(undefined);
 }
 
 /** 手动检查更新；失败详情由后端经 app://notice 推送 */

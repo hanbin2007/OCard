@@ -18,7 +18,8 @@ beforeEach(() => {
   emit = null;
   subSpy = vi.spyOn(api, "subscribeNotices").mockImplementation((onNotice) => {
     emit = onNotice;
-    return () => {};
+    // ready 走微任务异步 resolve，贴近 listen() 的真实握手
+    return { dispose: () => {}, ready: Promise.resolve() };
   });
 });
 
@@ -200,6 +201,50 @@ describe("通知中心", () => {
     expect(screen.getByText("暂无通知。")).toBeDefined();
   });
 
+  it("未确认 error 的逐条清除按钮禁用（提示先确认）", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    send(notice({ level: "error", code: "audit-lost", message: "审计链缺口" }));
+    await user.click(screen.getByTestId("notice-bell"));
+
+    const dismiss = screen.getByTestId("notice-dismiss") as HTMLButtonElement;
+    expect(dismiss.disabled).toBe(true);
+    expect(dismiss.title).toBe("先确认");
+
+    // 确认之后才允许清除
+    await user.click(screen.getByTestId("notice-ack"));
+    expect((screen.getByTestId("notice-dismiss") as HTMLButtonElement).disabled).toBe(
+      false,
+    );
+  });
+
+  it("「清除已读」不会抹掉未确认的 error", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    send(notice({ level: "warning", code: "audit-outbox" }));
+    send(notice({ level: "error", code: "audit-lost", message: "审计链缺口" }));
+    send(notice({ level: "info", code: "update-ready", message: "更新就绪" }));
+
+    await user.click(screen.getByTestId("notice-bell"));
+    expect(screen.getAllByTestId("notice-item")).toHaveLength(3);
+    expect(screen.getByTestId("notice-clear-all").textContent).toBe("清除已读");
+
+    await user.click(screen.getByTestId("notice-clear-all"));
+
+    // warning / info 被清掉，未确认的 error 留下且徽标仍红
+    const items = screen.getAllByTestId("notice-item");
+    expect(items).toHaveLength(1);
+    expect(items[0].getAttribute("data-code")).toBe("audit-lost");
+    expect(screen.getByTestId("notice-unread").textContent).toBe("1");
+
+    // 确认后再清就清得掉了
+    await user.click(screen.getByTestId("notice-ack"));
+    await user.click(screen.getByTestId("notice-clear-all"));
+    expect(screen.queryAllByTestId("notice-item")).toHaveLength(0);
+  });
+
   it("铃铛在其他屏幕同样可达", async () => {
     const user = userEvent.setup();
     render(<App preloaded={{ ...preloaded, route: "devices" }} />);
@@ -353,11 +398,73 @@ describe("通知中心", () => {
     listSpy.mockRestore();
   });
 
+  it("回放严格等到监听注册完成之后才发起", async () => {
+    // 用一个手动控制的 ready，模拟 listen() 尚未 resolve 的窗口
+    let markReady: (() => void) | null = null;
+    subSpy.mockImplementation((onNotice: (n: NoticeDto) => void) => {
+      emit = onNotice;
+      return {
+        dispose: () => {},
+        ready: new Promise<void>((resolve) => {
+          markReady = resolve;
+        }),
+      };
+    });
+
+    const listSpy = vi
+      .spyOn(api, "listNotices")
+      .mockResolvedValue([
+        notice({ code: "audit-outbox", occurredAt: "2026-08-24T09:00:00+08:00" }),
+      ]);
+
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    // 监听还没注册完，绝不能提前取积压——否则中间窗口的通知两头都收不到
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(listSpy).not.toHaveBeenCalled();
+
+    // 注册完成后才发起回放
+    await act(async () => {
+      markReady?.();
+    });
+    await waitFor(() => expect(listSpy).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByTestId("notice-bell"));
+    expect(screen.getByTestId("notice-item").getAttribute("data-code")).toBe(
+      "audit-outbox",
+    );
+
+    listSpy.mockRestore();
+  });
+
+  it("监听注册失败时仍会补取积压（失败本身另行报错）", async () => {
+    subSpy.mockImplementation(
+      (onNotice: (n: NoticeDto) => void, onError?: (e: unknown) => void) => {
+        emit = onNotice;
+        const err = new Error("listen refused");
+        onError?.(err);
+        return { dispose: () => {}, ready: Promise.reject(err) };
+      },
+    );
+    const listSpy = vi
+      .spyOn(api, "listNotices")
+      .mockResolvedValue([notice({ code: "audit-outbox" })]);
+
+    render(<App preloaded={preloaded} />);
+
+    await waitFor(() => expect(listSpy).toHaveBeenCalledTimes(1));
+    listSpy.mockRestore();
+  });
+
   it("通知通道本身建不起来也要说出来", async () => {
     subSpy.mockImplementation(
       (_onNotice: (n: NoticeDto) => void, onError?: (e: unknown) => void) => {
-        onError?.(new Error("channel refused"));
-        return () => {};
+        const err = new Error("channel refused");
+        onError?.(err);
+        return { dispose: () => {}, ready: Promise.reject(err) };
       },
     );
 

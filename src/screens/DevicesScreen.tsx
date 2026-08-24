@@ -30,6 +30,8 @@ export function DevicesScreen() {
   const [cardSerial, setCardSerial] = useState("");
   const [cardSubmitted, setCardSubmitted] = useState(false);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
+  /** 删除失败必须说出来——不能乐观移除后让界面谎报成功 */
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   /** 登记成功后的回执，避免「表单清空」被读成「没提交上」 */
   const [lastCamera, setLastCamera] = useState<string | null>(null);
   const [lastCard, setLastCard] = useState<string | null>(null);
@@ -313,6 +315,12 @@ export function DevicesScreen() {
             </div>
 
             <div className="stack stack--lg">
+              {deleteError ? (
+                <div className="notice notice--warn" role="alert" data-testid="dev-delete-error">
+                  <strong>{deleteError}</strong>
+                </div>
+              ) : null}
+
               <section>
                 <div className="section__head">
                   <h2 className="section__title">相机</h2>
@@ -354,9 +362,22 @@ export function DevicesScreen() {
                                 ? `其名下 ${owned} 张卡的登记会一并移除。登记表全项目共享，删除后无法撤销。`
                                 : "登记表全项目共享，删除后无法撤销。",
                             confirmLabel: "删除相机",
-                            onConfirm: () => {
-                              void api.deleteCamera(camera.id);
-                              dispatch({ type: "cameraRemoved", cameraId: camera.id });
+                            onConfirm: async () => {
+                              // 等后端确实删掉了再动本地列表
+                              setDeleteError(null);
+                              try {
+                                await api.deleteCamera(camera.id);
+                                dispatch({
+                                  type: "cameraRemoved",
+                                  cameraId: camera.id,
+                                });
+                              } catch (err) {
+                                setDeleteError(
+                                  `删除相机 ${camera.model} 失败：${
+                                    err instanceof Error ? err.message : String(err)
+                                  }。登记表未改动。`,
+                                );
+                              }
                             },
                           });
                         }}
@@ -408,9 +429,18 @@ export function DevicesScreen() {
                               title: `删除存储卡 ${card.label}？`,
                               message: "登记表全项目共享，删除后无法撤销。",
                               confirmLabel: "删除存储卡",
-                              onConfirm: () => {
-                                void api.deleteStorageCard(card.id);
-                                dispatch({ type: "cardRemoved", cardId: card.id });
+                              onConfirm: async () => {
+                                setDeleteError(null);
+                                try {
+                                  await api.deleteStorageCard(card.id);
+                                  dispatch({ type: "cardRemoved", cardId: card.id });
+                                } catch (err) {
+                                  setDeleteError(
+                                    `删除存储卡 ${card.label} 失败：${
+                                      err instanceof Error ? err.message : String(err)
+                                    }。登记表未改动。`,
+                                  );
+                                }
                               },
                             })
                           }

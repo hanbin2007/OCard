@@ -11,7 +11,8 @@ export interface ConfirmRequest {
   /** 说清影响范围，例如级联删除多少张卡 */
   message: string;
   confirmLabel: string;
-  onConfirm: () => void;
+  /** 可返回 Promise：调用方需要等后端结果再更新本地状态 */
+  onConfirm: () => void | Promise<void>;
 }
 
 export function ConfirmDialog({
@@ -59,7 +60,7 @@ export function ConfirmDialog({
             type="button"
             className="btn btn--danger-solid"
             onClick={() => {
-              request.onConfirm();
+              void request.onConfirm();
               onCancel();
             }}
           >

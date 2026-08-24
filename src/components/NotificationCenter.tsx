@@ -177,7 +177,7 @@ export function NoticeBell() {
                 data-testid="notice-clear-all"
                 onClick={() => dispatch({ type: "noticesCleared" })}
               >
-                全部清除
+                清除已读
               </button>
             ) : null}
           </div>
@@ -228,6 +228,11 @@ export function NoticeBell() {
                     className="btn btn--ghost btn--icon btn--sm"
                     data-testid="notice-dismiss"
                     aria-label={`清除通知 ${entry.code}`}
+                    /* 未确认的 error 不许直接清掉：必须先确认 */
+                    disabled={entry.level === "error" && !entry.read}
+                    title={
+                      entry.level === "error" && !entry.read ? "先确认" : "清除"
+                    }
                     onClick={() => dispatch({ type: "noticeDismissed", id: entry.id })}
                   >
                     <IconClose />

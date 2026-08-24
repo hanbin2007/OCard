@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import * as api from "../api";
 import { mockProjects, mockWorkstation } from "../api/mock";
+import type { NoticeDto } from "../api/types";
 
 // mock 回退会就地改写 mockWorkstation，测完还原，避免同文件内互相污染
 const original = { ...mockWorkstation };
@@ -182,7 +183,7 @@ describe("关于与更新", () => {
     await user.click(screen.getByTestId("settings-check-update"));
     await waitFor(() =>
       expect(screen.getByTestId("settings-update-result").textContent).toBe(
-        "更新已就绪，重启生效",
+        "已下载，点击重启并更新安装",
       ),
     );
 
@@ -194,6 +195,98 @@ describe("关于与更新", () => {
       ),
     );
     spy.mockRestore();
+  });
+
+  it("ready 时出现「重启并更新」主按钮", async () => {
+    const spy = vi.spyOn(api, "checkForUpdate").mockResolvedValue("ready");
+    const user = await openSettings();
+
+    expect(screen.queryByTestId("settings-install-update")).toBeNull();
+    await user.click(screen.getByTestId("settings-check-update"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-install-update")).toBeDefined(),
+    );
+    expect(screen.getByTestId("settings-install-update").textContent).toContain(
+      "重启并更新",
+    );
+    spy.mockRestore();
+  });
+
+  it("收到 update-ready 通知时也出现「重启并更新」（无需先手动检查）", async () => {
+    let emit: ((n: NoticeDto) => void) | null = null;
+    const subSpy = vi
+      .spyOn(api, "subscribeNotices")
+      .mockImplementation((onNotice: (n: NoticeDto) => void) => {
+        emit = onNotice;
+        return { dispose: () => {}, ready: Promise.resolve() };
+      });
+
+    const user = userEvent.setup();
+    render(<App preloaded={configured} />);
+
+    act(() =>
+      emit?.({
+        level: "info",
+        code: "update-ready",
+        message: "已在后台更新到 v0.2.0",
+        occurredAt: "2026-08-24T10:00:00+08:00",
+      }),
+    );
+
+    await user.click(screen.getByTestId("settings-open"));
+    expect(screen.getByTestId("settings-install-update")).toBeDefined();
+
+    subSpy.mockRestore();
+  });
+
+  it("安装被后端拒绝时原样显示中文原因", async () => {
+    const checkSpy = vi.spyOn(api, "checkForUpdate").mockResolvedValue("ready");
+    const installSpy = vi
+      .spyOn(api, "installUpdate")
+      .mockRejectedValue(new Error("有拷卡任务正在进行，请等待完成后再更新"));
+
+    const user = await openSettings();
+    await user.click(screen.getByTestId("settings-check-update"));
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-install-update")).toBeDefined(),
+    );
+
+    await user.click(screen.getByTestId("settings-install-update"));
+
+    const alert = await screen.findByTestId("settings-install-error");
+    expect(alert.getAttribute("role")).toBe("alert");
+    expect(alert.textContent).toContain("有拷卡任务正在进行");
+
+    checkSpy.mockRestore();
+    installSpy.mockRestore();
+  });
+
+  it("安装期间按钮禁用并显示进行中", async () => {
+    const checkSpy = vi.spyOn(api, "checkForUpdate").mockResolvedValue("ready");
+    let finish: (() => void) | null = null;
+    const installSpy = vi
+      .spyOn(api, "installUpdate")
+      .mockImplementation(() => new Promise<void>((r) => (finish = r)));
+
+    const user = await openSettings();
+    await user.click(screen.getByTestId("settings-check-update"));
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-install-update")).toBeDefined(),
+    );
+
+    const button = screen.getByTestId("settings-install-update");
+    await user.click(button);
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    expect(button.textContent).toContain("正在安装");
+
+    await act(async () => {
+      finish?.();
+    });
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+
+    checkSpy.mockRestore();
+    installSpy.mockRestore();
   });
 
   it("检查失败时引导去通知中心，不静默", async () => {
