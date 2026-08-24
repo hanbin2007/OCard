@@ -407,6 +407,12 @@ export interface IndexingStatus {
   failed: number;
   /** 索引期间被移走的文件数：信息性，不计入失败 */
   missing: number;
+  /**
+   * 索引轮次，每次重启索引 +1。
+   * 「新一轮」必须靠它判定——靠 indexed 数值猜会在「两轮恰好停在同一数值」时失效，
+   * 也无法区分「还没开始」与「刚跑完」。
+   */
+  round: number;
 }
 
 export interface IndexProgressEvent extends IndexingStatus {

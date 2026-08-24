@@ -159,6 +159,14 @@ describe("isReservedName", () => {
     expect(isReservedName("CONTROL")).toBe(false);
     expect(isReservedName("COM10")).toBe(false);
   });
+
+  it("与后端同源：COM0 / LPT0 是合法名字，不在保留名单内", () => {
+    expect(isReservedName("COM0")).toBe(false);
+    expect(isReservedName("LPT0")).toBe(false);
+    // 边界另一侧仍要拒
+    expect(isReservedName("COM9")).toBe(true);
+    expect(isReservedName("LPT9")).toBe(true);
+  });
 });
 
 describe("normalizeKey", () => {

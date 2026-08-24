@@ -3,6 +3,7 @@
 import {
   act,
   cleanup,
+  fireEvent,
   render,
   screen,
   waitFor,
@@ -84,6 +85,89 @@ describe("交付打包", () => {
     await waitFor(() =>
       expect(screen.queryByTestId("sorting-delivery-lock")).toBeNull(),
     );
+    spy.mockRestore();
+  });
+
+  it("#3 打包期间禁止离开分类屏，结果面板不会被导航走", async () => {
+    const user = await openWorkbench();
+    let finish: ((s: DeliverySummary) => void) | undefined;
+    const spy = vi
+      .spyOn(api, "buildDelivery")
+      .mockImplementation(
+        () =>
+          new Promise<DeliverySummary>((resolve) => {
+            finish = resolve;
+          }),
+      );
+
+    await user.click(screen.getByTestId("delivery-open"));
+    await user.click(screen.getByRole("button", { name: "开始打包" }));
+    await screen.findByTestId("sorting-delivery-lock");
+
+    expect(
+      (screen.getByTestId("sorting-open-trash") as HTMLButtonElement).disabled,
+    ).toBe(true);
+
+    await act(async () => {
+      finish?.(mockDelivery);
+    });
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId("sorting-open-trash") as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    spy.mockRestore();
+  });
+
+  it("#3 打包期间键盘分类被挡住", async () => {
+    const user = await openWorkbench();
+    let finish: ((s: DeliverySummary) => void) | undefined;
+    const buildSpy = vi
+      .spyOn(api, "buildDelivery")
+      .mockImplementation(
+        () =>
+          new Promise<DeliverySummary>((resolve) => {
+            finish = resolve;
+          }),
+      );
+    const moveSpy = vi.spyOn(api, "moveAssets");
+
+    await user.click(screen.getByTestId("delivery-open"));
+    await user.click(screen.getByRole("button", { name: "开始打包" }));
+    await screen.findByTestId("sorting-delivery-lock");
+
+    const gridWrap = screen.getByTestId("sorting-grid-wrap");
+    fireEvent.keyDown(gridWrap, { key: "ArrowRight" });
+    fireEvent.keyDown(gridWrap, { key: "1" });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(moveSpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      finish?.(mockDelivery);
+    });
+    buildSpy.mockRestore();
+    moveSpy.mockRestore();
+  });
+
+  it("#3 打包失败也会复位互斥锁，不把分类屏永久锁死", async () => {
+    const user = await openWorkbench();
+    const spy = vi
+      .spyOn(api, "buildDelivery")
+      .mockRejectedValue(new Error("NAS 只读"));
+
+    await user.click(screen.getByTestId("delivery-open"));
+    await user.click(screen.getByRole("button", { name: "开始打包" }));
+
+    await screen.findByTestId("delivery-error");
+    // 失败路径同样要解锁
+    expect(screen.queryByTestId("sorting-delivery-lock")).toBeNull();
+    expect(
+      (screen.getByTestId("sorting-open-trash") as HTMLButtonElement).disabled,
+    ).toBe(false);
+    const chip = screen
+      .getAllByTestId("sorting-category")
+      .find((c) => c.getAttribute("data-category") === "cat-1") as HTMLButtonElement;
+    expect(chip.disabled).toBe(false);
     spy.mockRestore();
   });
 

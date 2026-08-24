@@ -5,7 +5,7 @@ import type {
   Project,
   StorageCard,
 } from "../api/types";
-import { initialState, reducer } from "./store";
+import { initialState, reducer, repeatDelta } from "./store";
 
 const project: Project = {
   id: "p-new",
@@ -360,5 +360,36 @@ describe("reducer", () => {
     };
     const next = reducer(seeded, { type: "selectProject", projectId: "p-new" });
     expect(next.selectedTaskId).toBe("t-1");
+  });
+});
+
+describe("repeatDelta（通知计数增量）", () => {
+  it("无 repeats 视为普通一条", () => {
+    expect(repeatDelta(1, undefined)).toBe(1);
+    expect(repeatDelta(5, undefined)).toBe(1);
+  });
+
+  it("同一窗口内累计推进只补差值", () => {
+    expect(repeatDelta(1, 2)).toBe(1);
+    expect(repeatDelta(2, 3)).toBe(1);
+    expect(repeatDelta(1, 5)).toBe(4);
+  });
+
+  it("跨窗口回落时按新窗口净增量补，不倒退", () => {
+    // 新窗口从 2 开始：这条代表窗口内第 2 次，净增 1
+    expect(repeatDelta(3, 2)).toBe(1);
+    // 新窗口的第 1 次通常不带 repeats；若带 1 则净增 0（已由无 repeats 那条计过）
+    expect(repeatDelta(3, 1)).toBe(0);
+  });
+
+  it("真实序列 [无,2,3,无,2] 累计为 5", () => {
+    const seq: Array<number | undefined> = [undefined, 2, 3, undefined, 2];
+    let count = 0;
+    let last = 1;
+    for (const r of seq) {
+      count += repeatDelta(last, r);
+      last = r ?? 1;
+    }
+    expect(count).toBe(5);
   });
 });

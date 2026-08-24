@@ -83,29 +83,32 @@ describe("通知中心", () => {
     expect(within(items[0]).getByTestId("notice-count").textContent).toBe("×3");
   });
 
-  it("#14 repeats 是累计值：单调序列 1,2,3 显示 ×3 而不是累加", async () => {
+  it("#14 真实序列 [无,2,3,无,2] 计为 ×5（跨窗口不倒退）", async () => {
     const user = userEvent.setup();
     render(<App preloaded={preloaded} />);
 
-    // 后端在 30s 窗口内逐次上报累计次数
+    // 后端 30s 窗口内累计上报，窗口过期后从头再来
+    send(notice({ occurredAt: "2026-08-24T10:00:00+08:00" }));
+    send(notice({ repeats: 2, occurredAt: "2026-08-24T10:00:05+08:00" }));
+    send(notice({ repeats: 3, occurredAt: "2026-08-24T10:00:11+08:00" }));
+    send(notice({ occurredAt: "2026-08-24T10:00:40+08:00" }));
+    send(notice({ repeats: 2, occurredAt: "2026-08-24T10:00:46+08:00" }));
+
+    await waitFor(() => expect(screen.getByText("×5")).toBeDefined());
+    await user.click(screen.getByTestId("notice-bell"));
+    expect(screen.getByTestId("notice-count").textContent).toBe("×5");
+  });
+
+  it("#14 同一窗口内累计推进只补差值（1,2,3 → ×3）", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
     send(notice({ repeats: 1, occurredAt: "2026-08-24T10:00:00+08:00" }));
     send(notice({ repeats: 2, occurredAt: "2026-08-24T10:00:05+08:00" }));
     send(notice({ repeats: 3, occurredAt: "2026-08-24T10:00:11+08:00" }));
 
-    await waitFor(() => expect(screen.getByText("×3")).toBeDefined());
     await user.click(screen.getByTestId("notice-bell"));
     expect(screen.getByTestId("notice-count").textContent).toBe("×3");
-  });
-
-  it("#14 单条带 repeats 直接显示该累计值", async () => {
-    const user = userEvent.setup();
-    render(<App preloaded={preloaded} />);
-
-    send(notice({ repeats: 7, occurredAt: "2026-08-24T10:00:00+08:00" }));
-
-    await waitFor(() => expect(screen.getByText("×7")).toBeDefined());
-    await user.click(screen.getByTestId("notice-bell"));
-    expect(screen.getByTestId("notice-count").textContent).toBe("×7");
   });
 
   it("#14 不带 repeats 的旧路径仍按本地折叠 +1", async () => {

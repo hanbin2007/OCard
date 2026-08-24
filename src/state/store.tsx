@@ -50,6 +50,8 @@ export interface NoticeEntry {
   firstAt: string;
   lastAt: string;
   count: number;
+  /** 上一条事件带的 repeats（后端窗口内累计值）；无 repeats 的路径记为 1 */
+  lastRepeats: number;
   read: boolean;
   live: boolean;
 }
@@ -201,6 +203,18 @@ function mergeSnapshot(local: CopyTask | undefined, snapshot: CopyTask): CopyTas
   };
 }
 
+/**
+ * 一条新事件相对上一条应当增加多少计数。
+ * - 无 repeats：普通一条，+1
+ * - repeats 增长（同一窗口内累计推进）：只补差值
+ * - repeats 回落（后端换了新窗口，从 None/2 重新开始）：按新窗口的净增量补
+ */
+export function repeatDelta(lastRepeats: number, repeats: number | undefined): number {
+  if (repeats === undefined) return 1;
+  if (repeats > lastRepeats) return repeats - lastRepeats;
+  return Math.max(0, repeats - 1);
+}
+
 interface NoticeBucket {
   notices: NoticeEntry[];
   noticeSeq: number;
@@ -235,8 +249,12 @@ function ingestNotice(
   if (bucket.noticeKeys[key]) return bucket;
 
   const keys: Record<string, true> = { ...bucket.noticeKeys, [key]: true };
-  // repeats 是后端在 30s 窗口内的**累计值**（1→2→3），不是增量。
-  // 折叠时必须用它**替换**计数；当作增量累加会把 1,2,3 显示成 ×6。
+  /*
+   * repeats 是后端 30s 窗口内的**累计值**，窗口过期后新窗口从头再来
+   * （典型序列：无, 2, 3, 无, 2）。所以既不能当增量累加（1,2,3 → ×6），
+   * 也不能直接替换（跨窗口会把 ×5 打回 ×2）。
+   * 正确做法是按「相对上一条 repeats 的增量」累加。
+   */
   const repeats = notice.repeats;
   const head = bucket.notices[0];
   if (head && head.code === notice.code && head.level === notice.level) {
@@ -245,7 +263,8 @@ function ingestNotice(
     const newer = isNewerThan(notice.occurredAt, head.lastAt);
     const merged: NoticeEntry = {
       ...head,
-      count: repeats !== undefined ? Math.max(1, repeats) : head.count + 1,
+      count: head.count + repeatDelta(head.lastRepeats, repeats),
+      lastRepeats: repeats ?? 1,
       firstAt: isNewerThan(head.firstAt, notice.occurredAt)
         ? notice.occurredAt
         : head.firstAt,
@@ -268,7 +287,8 @@ function ingestNotice(
     message: notice.message,
     firstAt: notice.occurredAt,
     lastAt: notice.occurredAt,
-    count: repeats !== undefined ? Math.max(1, repeats) : 1,
+    count: Math.max(1, repeats ?? 1),
+    lastRepeats: repeats ?? 1,
     read: false,
     live: options.live,
   };

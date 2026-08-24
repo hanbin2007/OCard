@@ -59,6 +59,7 @@ export function SortingScreen() {
     running: boolean;
     failed: number;
     missing: number;
+    round: number;
   } | null>(null);
 
   const [selection, setSelection] = useState<Selection>(emptySelection);
@@ -76,7 +77,11 @@ export function SortingScreen() {
   const loadedCountRef = useRef(0);
   const lastRefreshRef = useRef(0);
   /** 上一条索引事件的快照，用于判定「增长 / 重启 / 完成」；随 projectId 重置 */
-  const lastEventRef = useRef<{ indexed: number; running: boolean } | null>(null);
+  const lastEventRef = useRef<{
+    indexed: number;
+    running: boolean;
+    round: number;
+  } | null>(null);
   /** 收尾对账只做一次，避免自我循环 */
   const reconciledRef = useRef(false);
   const assetsRef = useRef<SortingAsset[]>([]);
@@ -133,7 +138,7 @@ export function SortingScreen() {
 
   /**
    * 重拉已经加载出来的那些素材（索引完成后让缩略图出图）。
-   * 按 PAGE_SIZE 分块取：一次要 600 会被后端 500 的上限截断，
+   * 按 PAGE_SIZE 分块取：一次要更多会被后端 200 的页上限截断，
    * 那样反而会把用户已加载的素材悄悄弄丢。
    */
   const refreshLoadedAssets = useCallback(async () => {
@@ -234,18 +239,25 @@ export function SortingScreen() {
           running: event.running,
           failed: event.failed,
           missing: event.missing,
+          round: event.round,
         });
 
         const prev = lastEventRef.current;
-        lastEventRef.current = { indexed: event.indexed, running: event.running };
+        const roundChanged = prev !== null && event.round !== prev.round;
+        lastEventRef.current = {
+          indexed: event.indexed,
+          running: event.running,
+          round: event.round,
+        };
+        // 新一轮开始：收尾对账重新武装，否则上一轮烧掉的 ref 会让这一轮永不补刷
+        if (roundChanged) reconciledRef.current = false;
         if (!prev) {
           scheduleRefresh();
           return;
         }
         const grew = event.indexed > prev.indexed;
-        const restarted = event.indexed < prev.indexed; // 新一轮索引
         const finished = prev.running && !event.running;
-        if (grew || restarted || finished) scheduleRefresh();
+        if (grew || roundChanged || finished) scheduleRefresh();
       },
       (err) => {
         if (cancelled) return;
@@ -268,10 +280,16 @@ export function SortingScreen() {
           const status = await api.indexingStatus(projectId);
           if (cancelled) return;
           setIndexing(status);
+          const prev = lastEventRef.current;
+          if (prev && prev.round !== status.round) reconciledRef.current = false;
           lastEventRef.current = {
             indexed: status.indexed,
             running: status.running,
+            round: status.round,
           };
+          // 注册期间索引可能已经整轮跑完、收尾事件就此丢失，
+          // 所以这里不能只更新进度条，必须主动补一次页刷新
+          if (!status.running) scheduleRefresh();
         } catch (err) {
           if (cancelled) return;
           notify(
@@ -298,6 +316,9 @@ export function SortingScreen() {
   useEffect(() => {
     if (!projectId || loading || reconciledRef.current) return;
     if (!indexing || indexing.running) return;
+    // total === 0 表示索引 map 里还没有这个项目的条目——索引根本没开始。
+    // 此时若烧掉 reconciledRef，真正跑完那一轮就再也补不回来了。
+    if (indexing.total <= 0) return;
     if (!assetsRef.current.some((a) => !a.thumbnail)) return;
     reconciledRef.current = true;
     void refreshLoadedAssets();
@@ -572,6 +593,9 @@ export function SortingScreen() {
               type="button"
               className="btn btn--sm"
               data-testid="sorting-open-trash"
+              /* 打包期间不许离开本屏：结果面板不能静默蒸发 */
+              disabled={deliveryWorking}
+              title={deliveryWorking ? "打包进行中，请稍候" : "回收站"}
               onClick={() => dispatch({ type: "navigate", route: "trash" })}
             >
               回收站

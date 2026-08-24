@@ -13,7 +13,12 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import * as api from "../api";
-import { mockCategories, mockProjects, mockWorkstation } from "../api/mock";
+import {
+  mockCategories,
+  mockPendingAssets,
+  mockProjects,
+  mockWorkstation,
+} from "../api/mock";
 import type { IndexProgressEvent } from "../api/types";
 
 afterEach(cleanup);
@@ -319,6 +324,7 @@ describe("分类工作台", () => {
         running: false,
         failed: 3,
         missing: 0,
+        round: 1,
         occurredAt: new Date().toISOString(),
       }),
     );
@@ -349,6 +355,7 @@ describe("分类工作台", () => {
         running: false,
         failed: 0,
         missing: 0,
+        round: 1,
         occurredAt: new Date().toISOString(),
       }),
     );
@@ -438,6 +445,7 @@ describe("分类工作台", () => {
         running: false,
         failed: 0,
         missing: 0,
+        round: 1,
         occurredAt: new Date().toISOString(),
       }),
     );
@@ -472,7 +480,7 @@ describe("分类工作台", () => {
     subSpy.mockRestore();
   });
 
-  it("#13a 新一轮索引（indexed 归 0）的事件不会被跨轮单调过滤挡掉", async () => {
+  it("#13a 新一轮索引按 round 判定：数值归零也照样触发刷新", async () => {
     let emit: ((e: IndexProgressEvent) => void) | null = null;
     const subSpy = vi
       .spyOn(api, "subscribeIndexProgress")
@@ -484,29 +492,69 @@ describe("分类工作台", () => {
     await renderSorting();
     const listSpy = vi.spyOn(api, "listPendingAssets");
 
-    const ev = (indexed: number, running: boolean): IndexProgressEvent => ({
+    const ev = (
+      indexed: number,
+      running: boolean,
+      round: number,
+    ): IndexProgressEvent => ({
       projectId: project.id,
       indexed,
       total: 1240,
       running,
       failed: 0,
       missing: 0,
+      round,
       occurredAt: new Date().toISOString(),
     });
 
-    // 第一轮索引跑完，水位到 1240
-    act(() => emit?.(ev(1240, false)));
+    // 第一轮跑完，水位到 1240
+    act(() => emit?.(ev(1240, false, 1)));
     await waitFor(() => expect(listSpy).toHaveBeenCalled(), { timeout: 4000 });
     const afterFirstRound = listSpy.mock.calls.length;
 
-    // 后端重启索引：indexed 归 0。**只发这一条**——
-    // 若用「indexed 必须大于历史水位」过滤，这条会被吞掉，缩略图永不出图
-    act(() => emit?.(ev(0, true)));
+    // 第二轮开始：indexed 归 0 且 round+1。**只发这一条**——
+    // 若还按「indexed 必须大于历史水位」过滤，这条会被吞掉，缩略图永不出图
+    act(() => emit?.(ev(0, true, 2)));
 
     await waitFor(
       () => expect(listSpy.mock.calls.length).toBeGreaterThan(afterFirstRound),
       { timeout: 4000 },
     );
+
+    listSpy.mockRestore();
+    subSpy.mockRestore();
+  }, 15000);
+
+  it("#13a 同一轮内数值恰好相同不误判为新一轮", async () => {
+    let emit: ((e: IndexProgressEvent) => void) | null = null;
+    const subSpy = vi
+      .spyOn(api, "subscribeIndexProgress")
+      .mockImplementation((onEvent: (e: IndexProgressEvent) => void) => {
+        emit = onEvent;
+        return { dispose: () => {}, ready: Promise.resolve() };
+      });
+
+    await renderSorting();
+
+    const ev = (indexed: number, round: number): IndexProgressEvent => ({
+      projectId: project.id,
+      indexed,
+      total: 1240,
+      running: true,
+      failed: 0,
+      missing: 0,
+      round,
+      occurredAt: new Date().toISOString(),
+    });
+
+    act(() => emit?.(ev(600, 1)));
+    await waitFor(() => expect(screen.getByTestId("sorting-indexing")).toBeDefined());
+
+    const listSpy = vi.spyOn(api, "listPendingAssets");
+    // 同轮、同数值的重复事件（心跳）不该触发刷新
+    act(() => emit?.(ev(600, 1)));
+    await new Promise((r) => setTimeout(r, 2500));
+    expect(listSpy).not.toHaveBeenCalled();
 
     listSpy.mockRestore();
     subSpy.mockRestore();
@@ -535,6 +583,7 @@ describe("分类工作台", () => {
         running: true,
         failed: 0,
         missing: 0,
+        round: 1,
       })
       .mockResolvedValue({
         projectId: project.id,
@@ -543,6 +592,7 @@ describe("分类工作台", () => {
         running: false,
         failed: 0,
         missing: 0,
+        round: 1,
       });
 
     await renderSorting();
@@ -555,6 +605,120 @@ describe("分类工作台", () => {
     // ready 之后必须补拉状态并刷新当前页
     await waitFor(() => expect(statusSpy.mock.calls.length).toBeGreaterThan(1));
     await waitFor(() => expect(listSpy).toHaveBeenCalled(), { timeout: 4000 });
+
+    listSpy.mockRestore();
+    statusSpy.mockRestore();
+    subSpy.mockRestore();
+  }, 15000);
+
+  it("#13 竞态：首个 indexingStatus 返回 running:false/total:0（索引尚未开始）不烧掉收尾对账", async () => {
+    // 剧本：初始 Promise.all 里 indexingStatus 抢先返回「map 无条目」的空状态，
+    // 随后索引才真正开始并在 sub.ready 前跑完 —— 收尾事件丢失。
+    let markReady: (() => void) | undefined;
+    const subSpy = vi
+      .spyOn(api, "subscribeIndexProgress")
+      .mockImplementation(() => ({
+        dispose: () => {},
+        ready: new Promise<void>((resolve) => {
+          markReady = resolve;
+        }),
+      }));
+
+    const statusSpy = vi
+      .spyOn(api, "indexingStatus")
+      // ① 项目首次打开：索引 map 里还没有条目
+      .mockResolvedValueOnce({
+        projectId: project.id,
+        indexed: 0,
+        total: 0,
+        running: false,
+        failed: 0,
+        missing: 0,
+        round: 0,
+      })
+      // ② ready 时索引已经整轮跑完
+      .mockResolvedValue({
+        projectId: project.id,
+        indexed: 1240,
+        total: 1240,
+        running: false,
+        failed: 0,
+        missing: 0,
+        round: 1,
+      });
+
+    await renderSorting();
+    // total=0 时不该显示进度条，也不该把 reconciledRef 提前烧掉
+    expect(screen.queryByTestId("sorting-indexing")).toBeNull();
+
+    const listSpy = vi.spyOn(api, "listPendingAssets");
+    await act(async () => {
+      markReady?.();
+    });
+
+    // ready 兜底必须补一次页刷新——否则格子永久停在「索引中」，
+    // 而且既没有进度条也没有任何提示（就是复验点名的那个静默失效）
+    await waitFor(() => expect(listSpy).toHaveBeenCalled(), { timeout: 4000 });
+    expect(listSpy.mock.calls[0][1]).toBe(0);
+
+    listSpy.mockRestore();
+    statusSpy.mockRestore();
+    subSpy.mockRestore();
+  }, 15000);
+
+  it("#13 ready 兜底必须自己补刷：当前页都有缩略图时收尾对账不会代劳", async () => {
+    // 隔离 ready 那条补刷路径——让当前页所有格子都已有缩略图，
+    // 收尾对账因此不满足条件，能否刷新完全取决于 ready 兜底自己 scheduleRefresh
+    const allThumbs = mockPendingAssets.slice(0, 200).map((a) => ({
+      ...a,
+      thumbnail: a.thumbnail ?? "data:image/svg+xml;base64,AAAA",
+    }));
+    const listSpy = vi
+      .spyOn(api, "listPendingAssets")
+      .mockResolvedValue({ items: allThumbs, total: 1240 });
+
+    let markReady: (() => void) | undefined;
+    const subSpy = vi
+      .spyOn(api, "subscribeIndexProgress")
+      .mockImplementation(() => ({
+        dispose: () => {},
+        ready: new Promise<void>((resolve) => {
+          markReady = resolve;
+        }),
+      }));
+
+    const statusSpy = vi
+      .spyOn(api, "indexingStatus")
+      .mockResolvedValueOnce({
+        projectId: project.id,
+        indexed: 900,
+        total: 1240,
+        running: true,
+        failed: 0,
+        missing: 0,
+        round: 1,
+      })
+      .mockResolvedValue({
+        projectId: project.id,
+        indexed: 1240,
+        total: 1240,
+        running: false,
+        failed: 0,
+        missing: 0,
+        round: 1,
+      });
+
+    await renderSorting();
+    const callsBefore = listSpy.mock.calls.length;
+
+    await act(async () => {
+      markReady?.();
+    });
+
+    await waitFor(
+      () => expect(listSpy.mock.calls.length).toBeGreaterThan(callsBefore),
+      { timeout: 4000 },
+    );
 
     listSpy.mockRestore();
     statusSpy.mockRestore();
@@ -608,6 +772,7 @@ describe("分类工作台", () => {
         running: false,
         failed: 0,
         missing: 0,
+        round: 1,
         occurredAt: new Date().toISOString(),
       }),
     );

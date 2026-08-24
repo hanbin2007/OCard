@@ -37,13 +37,9 @@ export function DeliveryButton({
     try {
       const result = await api.buildDelivery(projectId);
       setSummary(result);
-      setPhase("done");
-      onWorkingChange?.(false);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setError(message);
-      setPhase("done");
-      onWorkingChange?.(false);
       dispatch({
         type: "noticeReceived",
         notice: {
@@ -53,6 +49,11 @@ export function DeliveryButton({
           occurredAt: new Date().toISOString(),
         },
       });
+    } finally {
+      // 单点复位：无论成功还是失败，互斥锁与阶段都在这里收口，
+      // 免得某条分支漏掉复位、把分类屏永久锁死
+      setPhase("done");
+      onWorkingChange?.(false);
     }
   }
 

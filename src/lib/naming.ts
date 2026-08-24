@@ -26,7 +26,10 @@ export function hasIllegalChars(raw: string): boolean {
   return /[\\/:*?"<>|]/.test(raw) || /\p{Cc}/u.test(raw);
 }
 
-/** Windows 保留设备名，做文件夹名会直接创建失败（不分大小写，带扩展名也算） */
+/**
+ * Windows 保留设备名，做文件夹名会直接创建失败（不分大小写，带扩展名也算）。
+ * 与后端同源：只拒 COM1–COM9 / LPT1–LPT9，**COM0 与 LPT0 是合法名字**。
+ */
 const RESERVED_NAMES = new Set([
   "CON",
   "PRN",

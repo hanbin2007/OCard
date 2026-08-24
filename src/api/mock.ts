@@ -449,6 +449,7 @@ export const mockIndexing: IndexingStatus = {
   running: true,
   failed: 3,
   missing: 2,
+  round: 1,
 };
 
 /** 交付打包 mock：两个半天包（fileCount/bytes 为包内实况总量）+ 一条同名冲突 */
