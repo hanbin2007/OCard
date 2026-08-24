@@ -43,6 +43,8 @@ const GRID_GAP = 8;
 export function SortingScreen() {
   const { state, dispatch } = useStore();
   const project = state.projects.find((p) => p.id === state.selectedProjectId) ?? null;
+  /** 交付打包进行中（全局态）：分类、删除链路、导航都要据此禁用 */
+  const deliveryWorking = state.deliveryWorking;
 
   const [assets, setAssets] = useState<SortingAsset[]>([]);
   const [total, setTotal] = useState(0);
@@ -71,8 +73,7 @@ export function SortingScreen() {
   const [columns, setColumns] = useState(6);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [busy, setBusy] = useState(false);
-  /** 交付打包进行中：同一批文件不能一边打包一边被分类挪走 */
-  const [deliveryWorking, setDeliveryWorking] = useState(false);
+
   const gridWrapRef = useRef<HTMLDivElement>(null);
   const loadedCountRef = useRef(0);
   const lastRefreshRef = useRef(0);
@@ -85,6 +86,7 @@ export function SortingScreen() {
   /** 收尾对账只做一次，避免自我循环 */
   const reconciledRef = useRef(false);
   const assetsRef = useRef<SortingAsset[]>([]);
+  const deliveryWorkingRef = useRef(false);
   const notifyRef = useRef<
     (level: "warning" | "error", code: string, message: string) => void
   >(() => {});
@@ -201,6 +203,7 @@ export function SortingScreen() {
   );
 
   notifyRef.current = notify;
+  deliveryWorkingRef.current = deliveryWorking;
 
   /**
    * 索引进度订阅。
@@ -359,7 +362,18 @@ export function SortingScreen() {
 
   const refreshCategories = useCallback(async () => {
     if (!projectId) return;
-    setCategories(await api.listCategories(projectId));
+    try {
+      setCategories(await api.listCategories(projectId));
+    } catch (err) {
+      // 计数静默陈旧会让人以为分类没生效，必须说出来
+      notifyRef.current(
+        "warning",
+        "categories-refresh-failed",
+        `刷新分类计数失败：${
+          err instanceof Error ? err.message : String(err)
+        }。分类操作本身已完成，但顶部计数可能不是最新的。`,
+      );
+    }
   }, [projectId]);
 
   /* ---------------- 动作 ---------------- */
@@ -432,7 +446,8 @@ export function SortingScreen() {
   runCurateRef.current = runCurate;
 
   const commitDelete = useCallback(async () => {
-    if (!projectId) return;
+    // 双保险：即使对话框以某种方式被触发，打包期间也绝不下发删除
+    if (!projectId || deliveryWorkingRef.current) return;
     dispatchDelete({ type: "commitStarted" });
     try {
       const result = await api.trashAssets(projectId, pendingDelete.marked);
@@ -460,7 +475,7 @@ export function SortingScreen() {
   }, [projectId, pendingDelete.marked, applyBulk, notify]);
 
   function requestDeleteConfirm() {
-    if (pendingDelete.marked.length === 0) return;
+    if (pendingDelete.marked.length === 0 || deliveryWorking) return;
     dispatchDelete({ type: "requestConfirm" });
     setConfirm({
       title: `把 ${pendingDelete.marked.length} 个文件移入回收站？`,
@@ -533,6 +548,8 @@ export function SortingScreen() {
           void runCurate();
           return;
         case "markDelete":
+          // 打包期间不许新增待删标记：后端 OpsMutex 也会拒，但 UI 要先行拦下并说明
+          if (deliveryWorking) return;
           dispatchDelete({ type: "mark", assetIds: actionTargets(selection) });
           return;
         case "unmarkDelete":
@@ -548,6 +565,7 @@ export function SortingScreen() {
       selection,
       columns,
       cursorIndex,
+      deliveryWorking,
       runAssign,
       runCurate,
     ],
@@ -587,7 +605,9 @@ export function SortingScreen() {
             </span>
             <DeliveryButton
               projectId={project.id}
-              onWorkingChange={setDeliveryWorking}
+              onWorkingChange={(working) =>
+                dispatch({ type: "deliveryWorkingChanged", working })
+              }
             />
             <button
               type="button"
@@ -793,6 +813,10 @@ export function SortingScreen() {
                 type="button"
                 className="btn btn--sm btn--danger-solid"
                 data-testid="sorting-confirm-delete"
+                disabled={deliveryWorking}
+                title={
+                  deliveryWorking ? "交付打包进行中，暂不能移入回收站" : undefined
+                }
                 onClick={requestDeleteConfirm}
               >
                 确认移入回收站

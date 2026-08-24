@@ -122,6 +122,55 @@ describe("通知中心", () => {
     expect(screen.getByTestId("notice-count").textContent).toBe("×2");
   });
 
+  it("#3 A,B,A 交错序列里同 code 仍折叠为一条 ×2", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    send(notice({ code: "audit-outbox", occurredAt: "2026-08-24T10:00:00+08:00" }));
+    send(
+      notice({
+        code: "project-meta-corrupt",
+        message: "元数据损坏",
+        occurredAt: "2026-08-24T10:00:05+08:00",
+      }),
+    );
+    send(notice({ code: "audit-outbox", occurredAt: "2026-08-24T10:00:11+08:00" }));
+
+    await user.click(screen.getByTestId("notice-bell"));
+    const items = screen.getAllByTestId("notice-item");
+    // 只该有两条：audit-outbox（×2）与 project-meta-corrupt
+    expect(items).toHaveLength(2);
+    const outbox = items.find(
+      (i) => i.getAttribute("data-code") === "audit-outbox",
+    ) as HTMLElement;
+    expect(within(outbox).getByTestId("notice-count").textContent).toBe("×2");
+  });
+
+  it("#3 交错时 repeats 也只计入一次，不重复累加", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    send(notice({ code: "audit-outbox", occurredAt: "2026-08-24T10:00:00+08:00" }));
+    send(
+      notice({
+        code: "audit-lost",
+        level: "error",
+        message: "审计链缺口",
+        occurredAt: "2026-08-24T10:00:03+08:00",
+      }),
+    );
+    send(
+      notice({ code: "audit-outbox", repeats: 3, occurredAt: "2026-08-24T10:00:07+08:00" }),
+    );
+
+    await user.click(screen.getByTestId("notice-bell"));
+    const outbox = screen
+      .getAllByTestId("notice-item")
+      .find((i) => i.getAttribute("data-code") === "audit-outbox") as HTMLElement;
+    // 1（首条）+ (3-1)=2 → ×3
+    expect(within(outbox).getByTestId("notice-count").textContent).toBe("×3");
+  });
+
   it("不同 code 各自成条，不会被折叠到一起", async () => {
     const user = userEvent.setup();
     render(<App preloaded={preloaded} />);

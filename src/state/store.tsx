@@ -81,6 +81,11 @@ export interface AppState {
   noticesOpen: boolean;
   /** 生成稳定 id 用，保持 reducer 纯函数 */
   noticeSeq: number;
+  /**
+   * 交付打包进行中。全局态：侧栏导航、删除链路都要据此禁用——
+   * 打包中导航离开会让结果面板（含未交付明细）静默蒸发。
+   */
+  deliveryWorking: boolean;
   /** 已摄入通知的 `code@occurredAt`，供启动回放去重 */
   noticeKeys: Record<string, true>;
 }
@@ -115,7 +120,8 @@ export type AppAction =
   | { type: "noticeDismissed"; id: string }
   | { type: "noticesCleared" }
   | { type: "noticesPanelToggled" }
-  | { type: "noticesPanelClosed" };
+  | { type: "noticesPanelClosed" }
+  | { type: "deliveryWorkingChanged"; working: boolean };
 
 /** 孤儿对账的退避档位：失败一次等 2s，再失败 5s，之后稳定在 10s */
 const ORPHAN_BACKOFF_MS = [2000, 5000, 10000];
@@ -138,6 +144,7 @@ export const initialState: AppState = {
   noticesOpen: false,
   noticeSeq: 0,
   noticeKeys: {},
+  deliveryWorking: false,
 };
 
 /** 把增量事件合并进文件列表；未在事件里出现的文件保持原样 */
@@ -209,6 +216,9 @@ function mergeSnapshot(local: CopyTask | undefined, snapshot: CopyTask): CopyTas
  * - repeats 增长（同一窗口内累计推进）：只补差值
  * - repeats 回落（后端换了新窗口，从 None/2 重新开始）：按新窗口的净增量补
  */
+/** 折叠时回看的条数（与后端 backlog 的 rev().take(64) 同思路，取更保守的 20） */
+const FOLD_LOOKBACK = 20;
+
 export function repeatDelta(lastRepeats: number, repeats: number | undefined): number {
   if (repeats === undefined) return 1;
   if (repeats > lastRepeats) return repeats - lastRepeats;
@@ -256,8 +266,13 @@ function ingestNotice(
    * 正确做法是按「相对上一条 repeats 的增量」累加。
    */
   const repeats = notice.repeats;
-  const head = bucket.notices[0];
-  if (head && head.code === notice.code && head.level === notice.level) {
+  // 只比对最新一条会在「A,B,A」这种交错序列里把同 code 拆成两条，
+  // repeats 也会因此重复计入。改为回看最近 FOLD_LOOKBACK 条。
+  const foldIndex = bucket.notices
+    .slice(0, FOLD_LOOKBACK)
+    .findIndex((n) => n.code === notice.code && n.level === notice.level);
+  const head = foldIndex >= 0 ? bucket.notices[foldIndex] : undefined;
+  if (head) {
     // 回放拿到的是**更旧**的同 code 告警时，只加计数、把窗口向前延伸，
     // 绝不能把 lastAt/message 回写成旧值（那等于让界面时间倒流）
     const newer = isNewerThan(notice.occurredAt, head.lastAt);
@@ -273,8 +288,10 @@ function ingestNotice(
       read: false,
       live: options.live || head.live,
     };
+    // 合并后移到最前：它的 lastAt 已是最新，顺序仍然是时间倒序
+    const rest = bucket.notices.filter((_, i) => i !== foldIndex);
     return {
-      notices: [merged, ...bucket.notices.slice(1)],
+      notices: [merged, ...rest],
       noticeSeq: bucket.noticeSeq,
       noticeKeys: keys,
     };
@@ -475,6 +492,9 @@ export function reducer(state: AppState, action: AppAction): AppState {
     case "noticesPanelClosed":
       return { ...state, noticesOpen: false };
 
+    case "deliveryWorkingChanged":
+      return { ...state, deliveryWorking: action.working };
+
     case "settingsOpened":
       return { ...state, settingsOpen: true };
 
@@ -646,8 +666,23 @@ export function StoreProvider({
 
   /** 拉一次任务快照与后端对账（start/resume/retry 之后调用） */
   const refreshTask = useCallback(async (taskId: string) => {
-    const task = await api.getCopyTask(taskId);
-    if (task) dispatch({ type: "taskSnapshot", task });
+    try {
+      const task = await api.getCopyTask(taskId);
+      if (task) dispatch({ type: "taskSnapshot", task });
+    } catch (err) {
+      // 快照拉不回来 = 界面上的任务状态可能已经过期，必须说出来
+      dispatch({
+        type: "noticeReceived",
+        notice: {
+          level: "warning",
+          code: "task-refresh-failed",
+          message: `刷新拷卡任务状态失败：${
+            err instanceof Error ? err.message : String(err)
+          }。当前显示的进度可能不是最新的。`,
+          occurredAt: new Date().toISOString(),
+        },
+      });
+    }
   }, []);
 
   /**

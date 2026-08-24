@@ -178,6 +178,34 @@ describe("拷卡任务面板", () => {
   });
 });
 
+describe("#4 任务快照刷新失败", () => {
+  it("拉不回快照要发通知，不让界面静默显示过期进度", async () => {
+    const user = userEvent.setup();
+    const pauseSpy = vi.spyOn(api, "pauseCopyTask").mockResolvedValue(undefined);
+    const getSpy = vi
+      .spyOn(api, "getCopyTask")
+      .mockRejectedValue(new Error("NAS 断连"));
+
+    render(<App preloaded={preloaded} />);
+    await screen.findByText("C0001.MP4");
+
+    // 挂起后会 refreshTask 对账，此处让它失败
+    await user.click(screen.getByRole("button", { name: "挂起" }));
+
+    await user.click(screen.getByTestId("notice-bell"));
+    await waitFor(() =>
+      expect(
+        screen
+          .getAllByTestId("notice-item")
+          .some((n) => n.getAttribute("data-code") === "task-refresh-failed"),
+      ).toBe(true),
+    );
+
+    pauseSpy.mockRestore();
+    getSpy.mockRestore();
+  }, 10000);
+});
+
 describe("目标夹已存在（TARGET_EXISTS）", () => {
   /** 走到确认屏并等后端解析完成 */
   async function reachConfirm(user: ReturnType<typeof userEvent.setup>) {

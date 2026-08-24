@@ -171,6 +171,113 @@ describe("交付打包", () => {
     spy.mockRestore();
   });
 
+  it("#1 打包期间 D 键标删无效（UI 先行拦下，不靠后端报错）", async () => {
+    const user = await openWorkbench();
+    let finish: ((s: DeliverySummary) => void) | undefined;
+    const spy = vi
+      .spyOn(api, "buildDelivery")
+      .mockImplementation(
+        () =>
+          new Promise<DeliverySummary>((resolve) => {
+            finish = resolve;
+          }),
+      );
+
+    const gridWrap = screen.getByTestId("sorting-grid-wrap");
+    fireEvent.keyDown(gridWrap, { key: "ArrowRight" });
+
+    await user.click(screen.getByTestId("delivery-open"));
+    await user.click(screen.getByRole("button", { name: "开始打包" }));
+    await screen.findByTestId("sorting-delivery-lock");
+
+    fireEvent.keyDown(gridWrap, { key: "d" });
+    // 待删清单不该出现
+    expect(screen.queryByTestId("sorting-pending-delete")).toBeNull();
+
+    await act(async () => {
+      finish?.(mockDelivery);
+    });
+    spy.mockRestore();
+  });
+
+  it("#1 打包期间「确认移入回收站」按钮禁用且不下发删除", async () => {
+    const user = await openWorkbench();
+    const trashSpy = vi.spyOn(api, "trashAssets");
+
+    // 先在非打包期标记一条
+    const gridWrap = screen.getByTestId("sorting-grid-wrap");
+    fireEvent.keyDown(gridWrap, { key: "ArrowRight" });
+    fireEvent.keyDown(gridWrap, { key: "d" });
+    expect(screen.getByTestId("sorting-pending-delete")).toBeDefined();
+
+    let finish: ((s: DeliverySummary) => void) | undefined;
+    const spy = vi
+      .spyOn(api, "buildDelivery")
+      .mockImplementation(
+        () =>
+          new Promise<DeliverySummary>((resolve) => {
+            finish = resolve;
+          }),
+      );
+    await user.click(screen.getByTestId("delivery-open"));
+    await user.click(screen.getByRole("button", { name: "开始打包" }));
+    await screen.findByTestId("sorting-delivery-lock");
+
+    const confirmBtn = screen.getByTestId(
+      "sorting-confirm-delete",
+    ) as HTMLButtonElement;
+    expect(confirmBtn.disabled).toBe(true);
+    fireEvent.click(confirmBtn);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(trashSpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      finish?.(mockDelivery);
+    });
+    // 打包结束后恢复可用
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId("sorting-confirm-delete") as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    spy.mockRestore();
+    trashSpy.mockRestore();
+  });
+
+  it("#2 打包期间侧栏导航被锁住，结果面板不会被导航走", async () => {
+    const user = await openWorkbench();
+    let finish: ((s: DeliverySummary) => void) | undefined;
+    const spy = vi
+      .spyOn(api, "buildDelivery")
+      .mockImplementation(
+        () =>
+          new Promise<DeliverySummary>((resolve) => {
+            finish = resolve;
+          }),
+      );
+
+    await user.click(screen.getByTestId("delivery-open"));
+    await user.click(screen.getByRole("button", { name: "开始打包" }));
+    await screen.findByTestId("sorting-delivery-lock");
+
+    const navProjects = screen.getByTestId("nav-projects") as HTMLButtonElement;
+    expect(navProjects.disabled).toBe(true);
+    expect(navProjects.title).toContain("交付打包进行中");
+    fireEvent.click(navProjects);
+    // 仍停留在分类屏
+    expect(screen.getByTestId("sorting-grid-wrap")).toBeDefined();
+
+    await act(async () => {
+      finish?.(mockDelivery);
+    });
+    await waitFor(() =>
+      expect((screen.getByTestId("nav-projects") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    spy.mockRestore();
+  });
+
   it("#4 表头说明包内为实况总量", async () => {
     const user = await openWorkbench();
     await user.click(screen.getByTestId("delivery-open"));

@@ -393,3 +393,15 @@ describe("repeatDelta（通知计数增量）", () => {
     expect(count).toBe(5);
   });
 });
+
+describe("打包互斥全局态", () => {
+  it("deliveryWorkingChanged 落到全局 state", () => {
+    const on = reducer(initialState, {
+      type: "deliveryWorkingChanged",
+      working: true,
+    });
+    expect(on.deliveryWorking).toBe(true);
+    const off = reducer(on, { type: "deliveryWorkingChanged", working: false });
+    expect(off.deliveryWorking).toBe(false);
+  });
+});

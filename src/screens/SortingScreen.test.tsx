@@ -791,6 +791,28 @@ describe("分类工作台", () => {
     subSpy.mockRestore();
   }, 15000);
 
+  it("#4 分类计数刷新失败要发通知，不静默陈旧", async () => {
+    const user = userEvent.setup();
+    await renderSorting();
+
+    const spy = vi
+      .spyOn(api, "listCategories")
+      .mockRejectedValue(new Error("NAS 断连"));
+
+    fireEvent.keyDown(grid(), { key: "ArrowRight" });
+    fireEvent.keyDown(grid(), { key: "1" });
+
+    await user.click(screen.getByTestId("notice-bell"));
+    await waitFor(() =>
+      expect(
+        screen
+          .getAllByTestId("notice-item")
+          .some((n) => n.getAttribute("data-code") === "categories-refresh-failed"),
+      ).toBe(true),
+    );
+    spy.mockRestore();
+  }, 10000);
+
   it("可以继续加载下一页", async () => {
     const user = userEvent.setup();
     await renderSorting();

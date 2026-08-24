@@ -86,6 +86,13 @@ export function Sidebar() {
                   data-testid={`nav-${route}`}
                   className="nav-item"
                   aria-current={state.route === route ? "page" : undefined}
+                  /* 打包期间锁住导航：离开会让结果面板（含未交付明细）静默蒸发 */
+                  disabled={state.deliveryWorking}
+                  title={
+                    state.deliveryWorking
+                      ? "交付打包进行中，完成后才能切换页面"
+                      : undefined
+                  }
                   onClick={() => dispatch({ type: "navigate", route })}
                 >
                   <Icon className="nav-item__icon" />
@@ -108,6 +115,12 @@ export function Sidebar() {
                 type="button"
                 className="sidebar__project"
                 aria-current={project.id === state.selectedProjectId}
+                disabled={state.deliveryWorking}
+                title={
+                  state.deliveryWorking
+                    ? "交付打包进行中，完成后才能切换项目"
+                    : undefined
+                }
                 onClick={() => {
                   dispatch({ type: "selectProject", projectId: project.id });
                   dispatch({ type: "navigate", route: "projects" });
