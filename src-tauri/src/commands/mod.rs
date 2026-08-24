@@ -399,20 +399,11 @@ pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
-/// 校验源卷与目的地(评审 H5/P1-5):卷白名单、绝对路径、拒绝源目标嵌套。
-/// 一切比较基于词法归一后的路径。
-fn validate_copy_paths(source_root: &Path, dest_targets: &[PathBuf]) -> CmdResult<()> {
+/// 源与目的地布局校验(纯函数,可测):绝对路径、拒绝源目标嵌套、拒绝重复目的地。
+/// 一切比较基于词法归一后的路径。开拷与**每次续传/重绑**都必须过这道闸
+/// (codex 终验 P0:重绑后的新源挂载点可能是某目的地的祖先,不复核会写回源卡)。
+fn validate_dest_layout(source_root: &Path, dest_targets: &[PathBuf]) -> CmdResult<()> {
     let source_root = normalize_lexical(source_root);
-    let known = volumes::list_volumes();
-    if !known
-        .iter()
-        .any(|v| normalize_lexical(&v.mount_point) == source_root)
-    {
-        return Err(format!(
-            "源卷不在当前挂载卷列表中: {}",
-            source_root.display()
-        ));
-    }
     let normalized: Vec<PathBuf> = dest_targets.iter().map(|t| normalize_lexical(t)).collect();
     for t in &normalized {
         if !t.is_absolute() {
@@ -434,6 +425,22 @@ fn validate_copy_paths(source_root: &Path, dest_targets: &[PathBuf]) -> CmdResul
         }
     }
     Ok(())
+}
+
+/// 校验源卷与目的地(评审 H5/P1-5):卷白名单 + 布局校验。
+fn validate_copy_paths(source_root: &Path, dest_targets: &[PathBuf]) -> CmdResult<()> {
+    let source_root_n = normalize_lexical(source_root);
+    let known = volumes::list_volumes();
+    if !known
+        .iter()
+        .any(|v| normalize_lexical(&v.mount_point) == source_root_n)
+    {
+        return Err(format!(
+            "源卷不在当前挂载卷列表中: {}",
+            source_root_n.display()
+        ));
+    }
+    validate_dest_layout(source_root, dest_targets)
 }
 
 /// 目标夹已存在且非空 → 需要人工确认(评审 F1 的第一道闸)。
@@ -615,6 +622,10 @@ pub fn resume_copy_task(app: AppHandle, state: State<AppState>, task_id: String)
             .collect();
         let recorded = handle.source_root.lock().unwrap().clone();
         let resolved = tasks::resolve_resume_source(&recorded, &m.source_label, &vols)?;
+        // 重绑后的源挂载点必须与固定目的地重新做布局校验(codex 终验 P0:
+        // 重插的卡可能挂到某目的地的祖先路径,不复核会把素材写回源卡)。
+        // 同时覆盖旧 manifest 携带的病态目的地字符串(`..` 等)。
+        validate_dest_layout(&resolved, &handle.dest_targets)?;
         {
             let mut src = handle.source_root.lock().unwrap();
             *src = resolved.clone();
@@ -675,7 +686,13 @@ pub fn rebuild_tasks(state: &AppState) {
             continue;
         };
         for m in manifests.into_iter().filter(|m| !m.completed) {
-            let dest_targets: Vec<PathBuf> = m.destinations.iter().map(PathBuf::from).collect();
+            // 归一后再用:旧 manifest 可能携带 `..` 等病态目的地字符串(codex 终验 #6);
+            // 续传时还会经 validate_dest_layout 与重绑后的源做嵌套复核
+            let dest_targets: Vec<PathBuf> = m
+                .destinations
+                .iter()
+                .map(|d| normalize_lexical(Path::new(d)))
+                .collect();
             if dest_targets.is_empty() {
                 continue; // 旧格式 manifest,无法重建
             }
@@ -820,6 +837,37 @@ mod tests {
             PathBuf::from("/a/c")
         );
         assert_eq!(normalize_lexical(Path::new("/a/b/")), PathBuf::from("/a/b"));
+    }
+
+    #[test]
+    fn dest_layout_rejects_rebound_source_ancestor() {
+        // codex 终验 P0 场景:重绑后的源挂载点是备份目的地的祖先(盘符漂移)
+        let src = PathBuf::from("/mnt/f");
+        let dests = vec![PathBuf::from("/mnt/f/Backup/target")];
+        assert!(super::validate_dest_layout(&src, &dests)
+            .unwrap_err()
+            .contains("嵌套"));
+        // 反向嵌套同样拒绝
+        let src2 = PathBuf::from("/mnt/f/card");
+        let dests2 = vec![PathBuf::from("/mnt/f")];
+        assert!(super::validate_dest_layout(&src2, &dests2).is_err());
+        // `..` 别名伪装的同位置也拦得住
+        let dests3 = vec![PathBuf::from("/mnt/../mnt/f/x")];
+        assert!(super::validate_dest_layout(&PathBuf::from("/mnt/f"), &dests3).is_err());
+        // 相对路径拒绝
+        assert!(super::validate_dest_layout(&src, &[PathBuf::from("relative/x")]).is_err());
+        // 重复目的地拒绝
+        assert!(super::validate_dest_layout(
+            &PathBuf::from("/mnt/card"),
+            &[PathBuf::from("/nas/t"), PathBuf::from("/nas/../nas/t")]
+        )
+        .is_err());
+        // 正常不相交布局通过
+        assert!(super::validate_dest_layout(
+            &PathBuf::from("/mnt/card"),
+            &[PathBuf::from("/nas/t"), PathBuf::from("/backup/t")]
+        )
+        .is_ok());
     }
 
     #[test]
