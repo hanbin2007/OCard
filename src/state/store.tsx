@@ -136,6 +136,28 @@ function applyProgress(task: CopyTask, event: CopyProgressEvent): CopyTask {
   };
 }
 
+/**
+ * 快照对账要单调：in-flight 的 getCopyTask 可能比本地已归约到的事件更旧，
+ * 直接覆盖会把进度回踩。比 revision，旧快照只补本地没有的字段。
+ */
+function mergeSnapshot(local: CopyTask | undefined, snapshot: CopyTask): CopyTask {
+  if (!local) return snapshot;
+  const localRev = local.progressRevision ?? -1;
+  const snapRev = snapshot.progressRevision ?? -1;
+  if (localRev <= snapRev) return snapshot;
+  // 快照较旧：进度类字段保留本地事件推进出来的值，其余以快照为准
+  return {
+    ...snapshot,
+    progressRevision: local.progressRevision,
+    copiedBytes: local.copiedBytes,
+    speedBytesPerSec: local.speedBytesPerSec,
+    state: local.state,
+    files: local.files.length > 0 ? local.files : snapshot.files,
+    destinations:
+      local.destinations.length > 0 ? local.destinations : snapshot.destinations,
+  };
+}
+
 export function reducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case "navigate":
@@ -193,12 +215,19 @@ export function reducer(state: AppState, action: AppAction): AppState {
     case "cardRemoved":
       return { ...state, cards: state.cards.filter((c) => c.id !== action.cardId) };
 
-    case "taskStarted":
+    case "taskStarted": {
+      // 任务可能在 start 返回前就已经发过事件：把缓存消费掉，别留两份状态来源
+      const buffered = state.orphanProgress[action.task.id];
+      const started = buffered ? applyProgress(action.task, buffered) : action.task;
+      const rest = { ...state.orphanProgress };
+      delete rest[action.task.id];
       return {
         ...state,
-        tasks: [action.task, ...state.tasks],
-        selectedTaskId: action.task.id,
+        tasks: [started, ...state.tasks],
+        selectedTaskId: started.id,
+        orphanProgress: rest,
       };
+    }
 
     case "taskProgress": {
       const { event } = action;
@@ -221,10 +250,12 @@ export function reducer(state: AppState, action: AppAction): AppState {
     }
 
     case "taskSnapshot": {
-      // 快照对账：以后端为准，再把期间缓存的事件补上
+      // 先与本地已归约的进度对齐（保证单调），再把期间缓存的事件补上
+      const local = state.tasks.find((t) => t.id === action.task.id);
+      const reconciled = mergeSnapshot(local, action.task);
       const buffered = state.orphanProgress[action.task.id];
-      const merged = buffered ? applyProgress(action.task, buffered) : action.task;
-      const exists = state.tasks.some((t) => t.id === merged.id);
+      const merged = buffered ? applyProgress(reconciled, buffered) : reconciled;
+      const exists = local !== undefined;
       const rest = { ...state.orphanProgress };
       delete rest[merged.id];
       return {
@@ -342,25 +373,36 @@ export function StoreProvider({
     if (task) dispatch({ type: "taskSnapshot", task });
   }, []);
 
-  // 收到了不认识的 taskId 的事件：把快照拉回来补上
-  const orphanIds = Object.keys(state.orphanProgress).join(",");
+  /**
+   * 收到了不认识的 taskId 的事件：把快照拉回来补上。
+   *
+   * key 带上 revision——只用 id 做依赖的话，一次拉取失败后 key 不再变化，
+   * 这个孤儿任务就永远不会被重试了。带上 revision 后，该任务的下一条新事件
+   * 会改变 key，自然触发重试。
+   */
+  const orphanKey = Object.entries(state.orphanProgress)
+    .map(([id, event]) => `${id}:${event.revision}`)
+    .sort()
+    .join(",");
+
   useEffect(() => {
-    if (!orphanIds) return;
+    if (!orphanKey) return;
     let cancelled = false;
     void (async () => {
-      for (const id of orphanIds.split(",")) {
+      for (const entry of orphanKey.split(",")) {
+        const id = entry.slice(0, entry.lastIndexOf(":"));
         try {
           const task = await api.getCopyTask(id);
           if (!cancelled && task) dispatch({ type: "taskSnapshot", task });
         } catch {
-          // 拉不到就留在缓存里，下一条事件会再触发一次
+          // 拉不到就留在缓存里，该任务的下一条事件会再触发一次拉取
         }
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [orphanIds]);
+  }, [orphanKey]);
 
   const value = useMemo(
     () => ({ state, dispatch, reload, refreshTask }),

@@ -257,6 +257,53 @@ describe("reducer", () => {
     expect(next.tasks[0].copiedBytes).toBe(70);
   });
 
+  it("过期快照不回踩已归约的进度（对账必须单调）", () => {
+    // 本地已被 revision=9 的事件推进到 90 字节
+    const seeded = { ...initialState, tasks: [runningTask] };
+    const advanced = reducer(seeded, {
+      type: "taskProgress",
+      event: progressEvent({ revision: 9, copiedBytes: 90, state: "verifying" }),
+    });
+    expect(advanced.tasks[0].copiedBytes).toBe(90);
+
+    // 一个更旧的快照（in-flight 的 getCopyTask）后到
+    const stale = reducer(advanced, {
+      type: "taskSnapshot",
+      task: { ...runningTask, copiedBytes: 10, state: "running", progressRevision: 3 },
+    });
+    expect(stale.tasks[0].copiedBytes).toBe(90);
+    expect(stale.tasks[0].state).toBe("verifying");
+    expect(stale.tasks[0].progressRevision).toBe(9);
+  });
+
+  it("较新的快照仍然以后端为准", () => {
+    const seeded = { ...initialState, tasks: [runningTask] };
+    const advanced = reducer(seeded, {
+      type: "taskProgress",
+      event: progressEvent({ revision: 2, copiedBytes: 20 }),
+    });
+    const fresh = reducer(advanced, {
+      type: "taskSnapshot",
+      task: { ...runningTask, copiedBytes: 88, state: "done", progressRevision: 12 },
+    });
+    expect(fresh.tasks[0].copiedBytes).toBe(88);
+    expect(fresh.tasks[0].state).toBe("done");
+  });
+
+  it("taskStarted 会消费掉该任务的孤儿缓存，不留两份状态来源", () => {
+    // start 返回前就先收到了这个任务的事件
+    const buffered = reducer(initialState, {
+      type: "taskProgress",
+      event: progressEvent({ taskId: "t-1", revision: 6, copiedBytes: 60 }),
+    });
+    expect(buffered.orphanProgress["t-1"]).toBeDefined();
+
+    const started = reducer(buffered, { type: "taskStarted", task: runningTask });
+    expect(started.tasks[0].copiedBytes).toBe(60);
+    expect(started.tasks[0].progressRevision).toBe(6);
+    expect(started.orphanProgress["t-1"]).toBeUndefined();
+  });
+
   it("监听建立失败会落到 progressError", () => {
     const next = reducer(initialState, {
       type: "progressListenFailed",

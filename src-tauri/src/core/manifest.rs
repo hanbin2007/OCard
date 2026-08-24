@@ -18,6 +18,14 @@ pub struct ManifestEntry {
     pub verified: bool,
 }
 
+/// 开拷前锁定的计划清单项(评审复核 P0:清单必须持久化,
+/// 暂停期间源文件消失时续传必须发现「计划内未拷」而非静默漏拷)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlannedFile {
+    pub rel_path: String,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CopyManifest {
     pub id: String,
@@ -32,6 +40,9 @@ pub struct CopyManifest {
     /// 目的地路径(展示用,同时支撑项目统计里的目的地数)。
     #[serde(default)]
     pub destinations: Vec<String>,
+    /// 开拷时刻的完整源清单(不可变);续传/重建以它为准判断「计划内未完成」。
+    #[serde(default)]
+    pub planned: Vec<PlannedFile>,
     pub created_at: DateTime<Utc>,
     pub completed: bool,
     pub entries: Vec<ManifestEntry>,
@@ -53,6 +64,7 @@ impl CopyManifest {
             operator: operator.into(),
             note: note.into(),
             destinations: Vec::new(),
+            planned: Vec::new(),
             created_at: Utc::now(),
             completed: false,
             entries: Vec::new(),

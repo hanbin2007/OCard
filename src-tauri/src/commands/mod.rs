@@ -66,7 +66,8 @@ fn project_dto(stats: &catalog::ProjectStats, running: bool) -> ProjectDto {
         bytes_copied: stats.bytes_copied,
         asset_count: stats.asset_count,
         sorted_count: 0,
-        destination_count: stats.destination_max.max(1),
+        // 如实报告:没拷过就是 0 个目的地,不虚报(复核 #14)
+        destination_count: stats.destination_max,
         updated_at: stats.updated_at.to_rfc3339(),
     }
 }
@@ -372,20 +373,45 @@ pub fn list_copy_files(
     })
 }
 
+/// 词法归一:消解 `.` 与 `..` 组件(复核 P0:`/Volumes/../Volumes/CARD`
+/// 这类别名能绕过 starts_with 嵌套检查写回源卡)。不触碰文件系统、不解析符号链接。
+pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(Component::ParentDir);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// 校验源卷与目的地(评审 H5/P1-5):卷白名单、绝对路径、拒绝源目标嵌套。
+/// 一切比较基于词法归一后的路径。
 fn validate_copy_paths(source_root: &Path, dest_targets: &[PathBuf]) -> CmdResult<()> {
+    let source_root = normalize_lexical(source_root);
     let known = volumes::list_volumes();
-    if !known.iter().any(|v| v.mount_point == source_root) {
+    if !known
+        .iter()
+        .any(|v| normalize_lexical(&v.mount_point) == source_root)
+    {
         return Err(format!(
             "源卷不在当前挂载卷列表中: {}",
             source_root.display()
         ));
     }
-    for t in dest_targets {
+    let normalized: Vec<PathBuf> = dest_targets.iter().map(|t| normalize_lexical(t)).collect();
+    for t in &normalized {
         if !t.is_absolute() {
             return Err(format!("目的地必须是绝对路径: {}", t.display()));
         }
-        if t.starts_with(source_root) || source_root.starts_with(t) {
+        if t.starts_with(&source_root) || source_root.starts_with(t) {
             return Err(format!(
                 "目的地与源卷互相嵌套,拒绝执行(会写回源卡): {}",
                 t.display()
@@ -393,8 +419,8 @@ fn validate_copy_paths(source_root: &Path, dest_targets: &[PathBuf]) -> CmdResul
         }
     }
     // 两个目的地指向同一实际位置也拒绝
-    for (i, a) in dest_targets.iter().enumerate() {
-        for b in dest_targets.iter().skip(i + 1) {
+    for (i, a) in normalized.iter().enumerate() {
+        for b in normalized.iter().skip(i + 1) {
             if a == b {
                 return Err(format!("两个目的地指向同一位置: {}", a.display()));
             }
@@ -497,6 +523,8 @@ pub fn start_copy_task(
     )
     .map_err(err)?;
 
+    // 落盘路径本身也用归一形式,存储/展示/校验三者一致
+    let dest_targets: Vec<PathBuf> = dest_targets.iter().map(|t| normalize_lexical(t)).collect();
     validate_copy_paths(&source_root, &dest_targets)?;
     check_existing_target(&dest_targets, input.confirm_existing_target)?;
 
@@ -509,6 +537,14 @@ pub fn start_copy_task(
     m.destinations = dest_targets
         .iter()
         .map(|p| p.display().to_string())
+        .collect();
+    // 持久化完整计划清单:续传/重建以它兜底,源文件消失必须被发现(复核 P0)
+    m.planned = files
+        .iter()
+        .map(|(rel, size)| manifest::PlannedFile {
+            rel_path: rel.clone(),
+            size: *size,
+        })
         .collect();
     manifest::save(&stats.root, &m).map_err(err)?;
 
@@ -580,8 +616,16 @@ pub fn resume_copy_task(app: AppHandle, state: State<AppState>, task_id: String)
             let mut snap = handle.snapshot.lock().unwrap();
             snap.volume_id = resolved.display().to_string();
         }
-        // 刷新清单:源卡内容可能在暂停期间变化,快照与引擎必须消费同一份新清单
-        let files = copy::scan_source(&resolved).map_err(err)?;
+        // 刷新清单:源卡内容可能在暂停期间变化,快照与引擎必须消费同一份新清单。
+        // 与持久化的计划清单取并集:计划内但已从源消失的文件必须进清单
+        // (引擎会因打不开源文件将其记为失败,绝不静默漏拷,复核 P0)。
+        let mut files = copy::scan_source(&resolved).map_err(err)?;
+        for p in &m.planned {
+            if !files.iter().any(|(rel, _)| rel == &p.rel_path) {
+                files.push((p.rel_path.clone(), p.size));
+            }
+        }
+        files.sort();
         let mut snap = handle.snapshot.lock().unwrap();
         let old: std::collections::HashMap<String, &'static str> = snap
             .files
@@ -634,25 +678,51 @@ pub fn rebuild_tasks(state: &AppState) {
                 .find(|v| v.name == m.source_label)
                 .map(|v| v.mount_point.clone())
                 .unwrap_or_default();
-            let files: Vec<CopyFileItemDto> = m
-                .entries
-                .iter()
-                .map(|e| CopyFileItemDto {
-                    id: e.rel_path.clone(),
-                    path: e.rel_path.clone(),
-                    name: e
-                        .rel_path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(&e.rel_path)
-                        .to_string(),
-                    size_bytes: e.size,
-                    status: if e.verified { "verified" } else { "pending" },
-                    hash: (!e.xxh3.is_empty()).then(|| e.xxh3.clone()),
-                    error: None,
-                    targets: None,
-                })
-                .collect();
+            // 重建以完整计划清单为准(entries 只含已处理过的文件,复核 P0);
+            // 旧格式 manifest 无 planned 时退回 entries
+            let files: Vec<CopyFileItemDto> = if m.planned.is_empty() {
+                m.entries
+                    .iter()
+                    .map(|e| CopyFileItemDto {
+                        id: e.rel_path.clone(),
+                        path: e.rel_path.clone(),
+                        name: e
+                            .rel_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&e.rel_path)
+                            .to_string(),
+                        size_bytes: e.size,
+                        status: if e.verified { "verified" } else { "pending" },
+                        hash: (!e.xxh3.is_empty()).then(|| e.xxh3.clone()),
+                        error: None,
+                        targets: None,
+                    })
+                    .collect()
+            } else {
+                m.planned
+                    .iter()
+                    .map(|p| CopyFileItemDto {
+                        id: p.rel_path.clone(),
+                        path: p.rel_path.clone(),
+                        name: p
+                            .rel_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&p.rel_path)
+                            .to_string(),
+                        size_bytes: p.size,
+                        status: if m.is_done(&p.rel_path, p.size) {
+                            "verified"
+                        } else {
+                            "pending"
+                        },
+                        hash: None,
+                        error: None,
+                        targets: None,
+                    })
+                    .collect()
+            };
             let copied: u64 = m
                 .entries
                 .iter()
@@ -723,4 +793,24 @@ pub fn retry_copy_file(
     _file_id: String,
 ) -> CmdResult<()> {
     resume_copy_task(app, state, task_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_lexical;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn normalize_resolves_dot_and_dotdot_aliases() {
+        // 复核 P0:`..` 别名绕过嵌套检查写回源卡
+        assert_eq!(
+            normalize_lexical(Path::new("/Volumes/../Volumes/CARD")),
+            PathBuf::from("/Volumes/CARD")
+        );
+        assert_eq!(
+            normalize_lexical(Path::new("/a/./b/../c")),
+            PathBuf::from("/a/c")
+        );
+        assert_eq!(normalize_lexical(Path::new("/a/b/")), PathBuf::from("/a/b"));
+    }
 }

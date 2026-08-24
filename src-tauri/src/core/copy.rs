@@ -145,6 +145,8 @@ pub fn run_copy(
     let mut reports = Vec::with_capacity(files.len());
     let mut bytes_copied = 0u64;
     let mut paused = false;
+    // 连续 IO 失败视为基础设施故障(NAS 断连),转入暂停而非全部标失败(评审复核 P1)
+    let mut consecutive_io = 0usize;
     let total = files.len();
 
     for (index, (rel, size)) in files.iter().enumerate() {
@@ -179,6 +181,7 @@ pub fn run_copy(
                 },
             ) {
                 Ok(xxh3) => {
+                    consecutive_io = 0;
                     m.upsert(ManifestEntry {
                         rel_path: rel.clone(),
                         size: *size,
@@ -189,6 +192,11 @@ pub fn run_copy(
                     FileStatus::Copied
                 }
                 Err(e) => {
+                    if matches!(e, super::CoreError::Io(_)) {
+                        consecutive_io += 1;
+                    } else {
+                        consecutive_io = 0;
+                    }
                     m.upsert(ManifestEntry {
                         rel_path: rel.clone(),
                         size: *size,
@@ -210,6 +218,10 @@ pub fn run_copy(
             size: *size,
             status,
         });
+        if consecutive_io >= 3 {
+            paused = true;
+            break;
+        }
     }
 
     let all_verified = !paused
@@ -345,17 +357,9 @@ fn copy_one(
                 )));
             }
         }
-        // 全部通过,统一落位。改名前复查目标是否被并发写入者占据;
-        // 注意 rename 本身会覆盖,此复查与 rename 之间仍有微秒级窗口——
-        // 长窗口已被入口 pre_existing 检查夹住,原子化(RENAME_EXCL)记 M2。
+        // 全部通过,原子防覆盖落位
         for (part, &i) in parts.iter().zip(&missing) {
-            if finals[i].exists() {
-                return Err(super::CoreError::Invalid(format!(
-                    "目标在拷贝期间被其他任务写入,拒绝覆盖: {}",
-                    finals[i].display()
-                )));
-            }
-            fs::rename(part, &finals[i])?;
+            finalize_no_replace(part, &finals[i])?;
         }
         Ok(src_hash)
     })();
@@ -366,6 +370,32 @@ fn copy_one(
         }
     }
     result
+}
+
+/// 原子防覆盖落位(评审复核 P0:`rename` 会替换已存在目标,check→rename 有竞态窗口)。
+/// 优先 `hard_link`:目标已存在时原子失败,不可能覆盖;成功后删除 part 名。
+/// 文件系统不支持硬链接(部分 SMB/exFAT)时回退「存在性复查 + rename」,
+/// 该回退窗口为微秒级且长窗口已被入口 pre_existing 检查夹住。
+fn finalize_no_replace(part: &Path, fin: &Path) -> Result<()> {
+    match fs::hard_link(part, fin) {
+        Ok(()) => {
+            fs::remove_file(part)?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(super::CoreError::Invalid(
+            format!("目标在拷贝期间被其他任务写入,拒绝覆盖: {}", fin.display()),
+        )),
+        Err(_) => {
+            if fin.exists() {
+                return Err(super::CoreError::Invalid(format!(
+                    "目标在拷贝期间被其他任务写入,拒绝覆盖: {}",
+                    fin.display()
+                )));
+            }
+            fs::rename(part, fin)?;
+            Ok(())
+        }
+    }
 }
 
 /// 把 `/` 分隔的相对路径转为本平台路径。
@@ -725,5 +755,85 @@ mod tests {
                 .count(),
             2
         );
+    }
+}
+
+#[cfg(test)]
+mod review_regression_tests {
+    use super::*;
+    use crate::core::manifest::{self, CopyManifest};
+    use tempfile::tempdir;
+
+    fn make_card(root: &Path) {
+        fs::create_dir_all(root.join("DCIM")).unwrap();
+        fs::write(root.join("DCIM/IMG_0001.JPG"), vec![1u8; 3000]).unwrap();
+        fs::write(root.join("DCIM/IMG_0002.JPG"), vec![2u8; 5000]).unwrap();
+        fs::write(root.join("CLIP0001.MP4"), vec![3u8; 9000]).unwrap();
+    }
+
+    fn setup() -> (tempfile::TempDir, CopyRequest, CopyManifest, PathBuf) {
+        let tmp = tempdir().unwrap();
+        let card = tmp.path().join("card");
+        make_card(&card);
+        let req = CopyRequest {
+            source_root: card,
+            destinations: vec![
+                tmp.path().join("nas/target"),
+                tmp.path().join("backup/target"),
+            ],
+            task_tag: "regr".into(),
+        };
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let m = CopyManifest::new("target", "card", "X_A_Y", "ZS", "");
+        (tmp, req, m, project)
+    }
+
+    #[test]
+    fn leftover_own_part_is_cleaned_and_recopied() {
+        // 复核 #17:同任务崩溃残留的 part 不阻塞重拷,且不残留
+        let (_tmp, req, mut m, project) = setup();
+        let part_name = format!("CLIP0001.MP4.{}{}", req.task_tag, PART_SUFFIX);
+        fs::create_dir_all(&req.destinations[0]).unwrap();
+        fs::write(req.destinations[0].join(&part_name), b"stale junk").unwrap();
+
+        let files = scan_source(&req.source_root).unwrap();
+        let out = run_copy(&req, &files, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(out.all_verified);
+        assert!(!req.destinations[0].join(&part_name).exists());
+        assert_eq!(
+            fs::read(req.destinations[0].join("CLIP0001.MP4")).unwrap(),
+            vec![3u8; 9000]
+        );
+    }
+
+    #[test]
+    fn vanished_planned_file_fails_not_silently_skipped() {
+        // 复核 P0:计划内文件从源消失(续传场景)必须显式失败,绝不 all_verified
+        let (_tmp, req, mut m, project) = setup();
+        let mut files = scan_source(&req.source_root).unwrap();
+        files.push(("GONE.MP4".to_string(), 4242));
+        files.sort();
+
+        let out = run_copy(&req, &files, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let gone = out.files.iter().find(|f| f.rel_path == "GONE.MP4").unwrap();
+        assert!(matches!(gone.status, FileStatus::Failed(_)));
+        assert!(!out.all_verified, "有计划内文件缺失绝不能给可格式化信号");
+    }
+
+    #[test]
+    fn consecutive_io_failures_pause_instead_of_failing_all() {
+        // 复核 P1:目的地不可写(NAS 断连形态)→ 连续 IO 失败转入暂停
+        let (tmp, mut req, mut m, project) = setup();
+        let blocked = tmp.path().join("blocked-parent");
+        fs::write(&blocked, b"i am a file").unwrap();
+        req.destinations = vec![blocked.join("sub")];
+
+        let files = scan_source(&req.source_root).unwrap();
+        let out = run_copy(&req, &files, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(out.paused, "连续 IO 失败应转入可续传的暂停,而非终态 failed");
+        assert!(!out.all_verified);
+        let saved = manifest::load(&project, &m.id).unwrap();
+        assert!(!saved.completed);
     }
 }

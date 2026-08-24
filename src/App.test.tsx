@@ -1,11 +1,12 @@
 /** 外壳：加载态、NAS 断连的错误态与重试、地标结构。 */
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import * as api from "./api";
 import { mockCopyTasks } from "./api/mock";
+import type { CopyProgressEvent, CopyTask } from "./api/types";
 import { mockProjects, mockWorkstation } from "./api/mock";
 
 afterEach(cleanup);
@@ -46,6 +47,46 @@ describe("进度监听（常驻单一 listener）", () => {
     expect(alert.textContent).toContain("进度监听未能建立");
     expect(alert.textContent).toContain("event channel closed");
     spy.mockRestore();
+  });
+
+  it("孤儿任务拉取失败后，新事件到来会再次重试", async () => {
+    let emit: ((event: CopyProgressEvent) => void) | null = null;
+    const subSpy = vi
+      .spyOn(api, "subscribeCopyProgress")
+      .mockImplementation((onEvent) => {
+        emit = onEvent;
+        return () => {};
+      });
+
+    const orphan: CopyTask = { ...mockCopyTasks[0], id: "t-orphan" };
+    const getSpy = vi
+      .spyOn(api, "getCopyTask")
+      .mockRejectedValueOnce(new Error("NAS 抖动"))
+      .mockResolvedValue(orphan);
+
+    render(<App preloaded={{ route: "copy", workstation: mockWorkstation }} />);
+
+    const event = (revision: number): CopyProgressEvent => ({
+      taskId: "t-orphan",
+      revision,
+      occurredAt: new Date().toISOString(),
+      copiedBytes: revision * 10,
+      speedBytesPerSec: 10,
+      state: "running",
+      changedFiles: [],
+      changedDestinations: [],
+    });
+
+    // 第一条事件触发拉取，但后端失败
+    act(() => emit?.(event(1)));
+    await waitFor(() => expect(getSpy).toHaveBeenCalledTimes(1));
+
+    // 第二条事件（新 revision）必须再次触发拉取，而不是永远卡住
+    act(() => emit?.(event(2)));
+    await waitFor(() => expect(getSpy).toHaveBeenCalledTimes(2));
+
+    getSpy.mockRestore();
+    subSpy.mockRestore();
   });
 
   it("卸载时退订，不留悬空监听", () => {

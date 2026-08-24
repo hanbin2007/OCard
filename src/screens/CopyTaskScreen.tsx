@@ -37,6 +37,9 @@ interface DestDraft {
   path: string;
 }
 
+/** 文件明细每页条数 */
+const PAGE_SIZE = 200;
+
 let destSeq = 0;
 function newDest(kind: DestinationKind, path = ""): DestDraft {
   destSeq += 1;
@@ -121,43 +124,76 @@ export function CopyTaskScreen() {
   }, [volumeId, project]);
 
 
-  const PAGE_SIZE = 200;
+  /** 进度事件驱动的重拉节流：拷贝中每 ~200ms 一条事件，不能每条都打一次 IPC */
+  const REFRESH_MIN_MS = 2000;
+  const loadedCountRef = useRef(0);
+  const lastRefreshRef = useRef(0);
 
-  /** 拉一页文件明细并合并（offset=0 表示重新加载） */
-  const loadFiles = useCallback(
-    async (taskId: string, offset: number) => {
-      setFilesLoading(true);
-      try {
-        const page = await api.listCopyFiles(taskId, offset, PAGE_SIZE);
-        setFileTotal(page.total);
-        setFiles((prev) => (offset === 0 ? page.items : [...prev, ...page.items]));
-      } finally {
-        setFilesLoading(false);
-      }
-    },
-    [],
-  );
+  /** 追加下一页 */
+  const loadMoreFiles = useCallback(async (taskId: string, offset: number) => {
+    setFilesLoading(true);
+    try {
+      const page = await api.listCopyFiles(taskId, offset, PAGE_SIZE);
+      setFileTotal(page.total);
+      setFiles((prev) => [...prev, ...page.items]);
+    } finally {
+      setFilesLoading(false);
+    }
+  }, []);
 
-  // 选中任务变化时重新拉第一页；任务进度推进时也刷新，保证状态列跟得上
+  /**
+   * 重拉「已经加载出来的那些」——从 0 拉到已加载条数，而不是固定回到第一页。
+   * 否则用户点了几次「加载更多」，一条进度事件就把它们全丢了。
+   */
+  const refreshLoadedFiles = useCallback(async (taskId: string) => {
+    const limit = Math.max(loadedCountRef.current, PAGE_SIZE);
+    lastRefreshRef.current = Date.now();
+    const page = await api.listCopyFiles(taskId, 0, limit);
+    setFiles(page.items);
+    setFileTotal(page.total);
+  }, []);
+
+  // 切换任务：重置并拉第一页（只认 taskId，不受进度事件影响）
   const taskId = task?.id ?? null;
-  const taskRevision = task?.progressRevision ?? 0;
   useEffect(() => {
     if (!taskId) {
       setFiles([]);
       setFileTotal(0);
+      loadedCountRef.current = 0;
       return;
     }
     let cancelled = false;
+    setFiles([]);
+    loadedCountRef.current = 0;
     void (async () => {
       const page = await api.listCopyFiles(taskId, 0, PAGE_SIZE);
       if (cancelled) return;
       setFiles(page.items);
       setFileTotal(page.total);
+      lastRefreshRef.current = Date.now();
     })();
     return () => {
       cancelled = true;
     };
-  }, [taskId, taskRevision]);
+  }, [taskId]);
+
+  // 进度推进时刷新状态列，但按 REFRESH_MIN_MS 节流并保住已加载的页数
+  const taskRevision = task?.progressRevision ?? 0;
+  useEffect(() => {
+    if (!taskId || taskRevision === 0) return;
+    const elapsed = Date.now() - lastRefreshRef.current;
+    // 事件密集时定时器被不断重建，但 delay 随 elapsed 单调递减，不会饿死
+    const timer = setTimeout(
+      () => void refreshLoadedFiles(taskId),
+      Math.max(0, REFRESH_MIN_MS - elapsed),
+    );
+    return () => clearTimeout(timer);
+  }, [taskId, taskRevision, refreshLoadedFiles]);
+
+  // 让节流回调读得到最新的已加载条数
+  useEffect(() => {
+    loadedCountRef.current = files.length;
+  }, [files.length]);
 
   /** 真正提交；confirmExisting 为 true 时表示用户已在对话框里同意继续 */
   async function submitStart(confirmExisting: boolean) {
@@ -235,6 +271,11 @@ export function CopyTaskScreen() {
     for (const f of files) counts[f.status] += 1;
     return counts;
   }, [files]);
+
+  // 总数以后端为准（task.fileCount），列表接口的 total 兜底
+  const totalFiles = task?.fileCount ?? fileTotal;
+  /** 明细是否已全部加载——没全载就不能给出全量「已校验」断言 */
+  const fullyLoaded = totalFiles > 0 && files.length >= totalFiles;
 
   const volume = volumes.find((v) => v.id === volumeId) ?? null;
 
@@ -699,9 +740,13 @@ export function CopyTaskScreen() {
                             </div>
                           </div>
                           <div>
-                            <div className="stat__label">已校验</div>
+                            <div className="stat__label">
+                              {fullyLoaded ? "已校验" : "文件明细"}
+                            </div>
                             <div className="stat__value" data-testid="copy-verified-stat">
-                              {fileSummary.verified}/{files.length}
+                              {fullyLoaded
+                                ? `${fileSummary.verified}/${totalFiles}`
+                                : `已加载 ${files.length}/${totalFiles}`}
                             </div>
                           </div>
                           <div>
@@ -766,7 +811,7 @@ export function CopyTaskScreen() {
                     <div className="section__head">
                       <h2 className="section__title">文件</h2>
                       <span className="card__hint">
-                        共 {fileTotal} 个（已加载 {files.length}）· 待拷{" "}
+                        共 {totalFiles} 个（已加载 {files.length}）· 以下为已加载部分：待拷{" "}
                         {fileSummary.pending} · 已拷 {fileSummary.copied} · 已校验{" "}
                         {fileSummary.verified} · 失败 {fileSummary.failed}
                       </span>
@@ -805,7 +850,7 @@ export function CopyTaskScreen() {
                                     void api
                                       .retryCopyFile(task.id, f.id)
                                       .then(() => refreshTask(task.id))
-                                      .then(() => loadFiles(task.id, 0));
+                                      .then(() => refreshLoadedFiles(task.id));
                                   }}
                                 >
                                   <IconRetry />
@@ -820,18 +865,18 @@ export function CopyTaskScreen() {
                       </div>
                     </div>
 
-                    {files.length < fileTotal ? (
+                    {files.length < totalFiles ? (
                       <div className="hint-bar">
                         <button
                           type="button"
                           className="btn btn--sm"
                           data-testid="copy-load-more-files"
                           disabled={filesLoading}
-                          onClick={() => void loadFiles(task.id, files.length)}
+                          onClick={() => void loadMoreFiles(task.id, files.length)}
                         >
                           {filesLoading
                             ? "加载中…"
-                            : `加载更多（还有 ${fileTotal - files.length} 个）`}
+                            : `加载更多（还有 ${totalFiles - files.length} 个）`}
                         </button>
                       </div>
                     ) : null}

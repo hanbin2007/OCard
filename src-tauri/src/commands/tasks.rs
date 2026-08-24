@@ -79,7 +79,7 @@ pub fn spawn_worker(app: AppHandle, handle: Arc<TaskHandle>) {
     }
     std::thread::spawn(move || {
         let outcome = run_worker(&app, &handle);
-        if let Err(e) = outcome {
+        if let Err(e) = &outcome {
             let mut snap = handle.snapshot.lock().unwrap();
             // IO 类错误(NAS 抖动/断连)是可恢复的暂停,不是死路(评审 H4)
             if matches!(e, crate::core::CoreError::Io(_)) {
@@ -88,12 +88,16 @@ pub fn spawn_worker(app: AppHandle, handle: Arc<TaskHandle>) {
                 snap.state = "failed";
                 snap.finished_at = Some(Utc::now().to_rfc3339());
             }
-            let ev = final_event(&mut snap, Vec::new());
             drop(snap);
-            let _ = app.emit(PROGRESS_EVENT, &ev);
             eprintln!("拷卡任务中断: {e}");
         }
+        // 终态事件在 running=false 之后发(复核 P1-9):此刻点「继续」已能启动新 worker;
+        // 事件读的是实时快照,若新 worker 已接手则发出的就是其当前状态,不会回退 UI
         handle.running.store(false, Ordering::SeqCst);
+        let mut snap = handle.snapshot.lock().unwrap();
+        let ev = final_event(&mut snap, Vec::new());
+        drop(snap);
+        let _ = app.emit(PROGRESS_EVENT, &ev);
     });
 }
 
@@ -135,6 +139,7 @@ pub fn append_audit(
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
     let _ = std::fs::create_dir_all(outbox_dir);
+    let mut outboxed = false;
     if let Ok(mut line) = serde_json::to_string(ev) {
         line.push('\n');
         use std::io::Write;
@@ -143,10 +148,17 @@ pub fn append_audit(
             .append(true)
             .open(outbox_dir.join("journal-outbox.jsonl"))
         {
-            let _ = f.write_all(line.as_bytes());
+            outboxed = f.write_all(line.as_bytes()).is_ok();
         }
     }
-    eprintln!("审计事件未能写入项目 journal,已落本机 outbox: {}", ev.kind);
+    if outboxed {
+        eprintln!("审计事件未能写入项目 journal,已落本机 outbox: {}", ev.kind);
+    } else {
+        eprintln!(
+            "警告:审计事件写项目 journal 与本机 outbox 均失败: {}",
+            ev.kind
+        );
+    }
 }
 
 fn run_worker(app: &AppHandle, handle: &TaskHandle) -> crate::core::Result<()> {
@@ -256,9 +268,7 @@ fn run_worker(app: &AppHandle, handle: &TaskHandle) -> crate::core::Result<()> {
             d.state = dest_state;
             d.written_bytes = written;
         }
-        let ev = final_event(&mut snap, Vec::new());
-        drop(snap);
-        let _ = app.emit(PROGRESS_EVENT, &ev);
+        // 终态事件由 spawn_worker 在 running=false 之后统一发出(复核 P1-9)
     }
 
     for f in &outcome.files {

@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api";
@@ -13,6 +13,7 @@ import {
   mockWorkstation,
 } from "../api/mock";
 import { inferTimeSlot } from "../lib/naming";
+import type { CopyProgressEvent } from "../api/types";
 
 afterEach(cleanup);
 
@@ -298,5 +299,146 @@ describe("文件明细分页", () => {
     );
 
     expect(await screen.findByText(/本卡可格式化/)).toBeDefined();
+  });
+});
+
+describe("分页与进度事件互不打架", () => {
+  const TOTAL = 500;
+
+  /** 生成第 offset..offset+limit 条合成文件 */
+  function page(offset: number, limit: number) {
+    const items = Array.from({ length: Math.min(limit, TOTAL - offset) }, (_, i) => ({
+      id: `f-${offset + i}`,
+      path: `DCIM/100/IMG_${offset + i}.NEF`,
+      name: `IMG_${offset + i}.NEF`,
+      sizeBytes: 1024,
+      status: "verified" as const,
+      hash: "aaaaaaaaaaaaaaaa",
+    }));
+    return { items, total: TOTAL };
+  }
+
+  function setupPagedTask() {
+    const listSpy = vi
+      .spyOn(api, "listCopyFiles")
+      .mockImplementation(async (_taskId, offset = 0, limit = 200) =>
+        page(offset, limit),
+      );
+
+    // 抓住 store 建立的常驻监听回调，用它手工投递进度事件
+    let emit: ((event: CopyProgressEvent) => void) | null = null;
+    const subSpy = vi
+      .spyOn(api, "subscribeCopyProgress")
+      .mockImplementation((onEvent) => {
+        emit = onEvent;
+        return () => {};
+      });
+
+    const runningTask = { ...mockCopyTasks[0], fileCount: TOTAL, files: [] };
+    render(
+      <App
+        preloaded={{
+          ...preloaded,
+          tasks: [runningTask],
+          selectedTaskId: runningTask.id,
+        }}
+      />,
+    );
+
+    return {
+      listSpy,
+      subSpy,
+      taskId: runningTask.id,
+      fire: (revision: number) =>
+        act(() => {
+          emit?.({
+            taskId: runningTask.id,
+            revision,
+            occurredAt: new Date().toISOString(),
+            copiedBytes: revision * 1000,
+            speedBytesPerSec: 1000,
+            state: "running",
+            changedFiles: [],
+            changedDestinations: [],
+          });
+        }),
+    };
+  }
+
+  it("进度事件不会把「加载更多」拿到的页丢掉", async () => {
+    const { listSpy, subSpy, fire } = setupPagedTask();
+
+    await screen.findByText("IMG_0.NEF");
+    expect(screen.getByTestId("copy-verified-stat").textContent).toBe("已加载 200/500");
+
+    await userEvent.setup().click(screen.getByTestId("copy-load-more-files"));
+    await waitFor(() =>
+      expect(screen.getByTestId("copy-verified-stat").textContent).toBe("已加载 400/500"),
+    );
+
+    // 连发多条进度事件：既不能立刻重拉，更不能把已加载的 400 条打回 200
+    fire(1);
+    fire(2);
+    fire(3);
+    expect(screen.getByTestId("copy-verified-stat").textContent).toBe("已加载 400/500");
+
+    // 节流窗口过后只重拉一次，且拉的是 0..已加载条数（而不是固定第一页）
+    await waitFor(
+      () => {
+        const refetch = listSpy.mock.calls.find(
+          (c) => c[1] === 0 && (c[2] ?? 0) >= 400,
+        );
+        expect(refetch).toBeDefined();
+      },
+      { timeout: 4000 },
+    );
+    expect(screen.getByTestId("copy-verified-stat").textContent).toBe("已加载 400/500");
+
+    listSpy.mockRestore();
+    subSpy.mockRestore();
+  });
+
+  it("密集事件被节流，不是一条事件一次 IPC", async () => {
+    const { listSpy, subSpy, fire } = setupPagedTask();
+    await screen.findByText("IMG_0.NEF");
+
+    const before = listSpy.mock.calls.length;
+    for (let i = 1; i <= 10; i += 1) fire(i);
+
+    // 10 条事件在节流窗口内不产生任何新的 IPC
+    expect(listSpy.mock.calls.length).toBe(before);
+
+    listSpy.mockRestore();
+    subSpy.mockRestore();
+  });
+
+  it("未全载时只说「已加载 M/共 N」，不给出全量已校验断言", async () => {
+    const { listSpy, subSpy } = setupPagedTask();
+    await screen.findByText("IMG_0.NEF");
+
+    const stat = screen.getByTestId("copy-verified-stat");
+    // 200 条全是 verified，但绝不能显示成「200/200 已校验」
+    expect(stat.textContent).toBe("已加载 200/500");
+    expect(stat.textContent).not.toContain("200/200");
+
+    listSpy.mockRestore();
+    subSpy.mockRestore();
+  });
+
+  it("全部载完后才给出「已校验 x/总数」", async () => {
+    const listSpy = vi
+      .spyOn(api, "listCopyFiles")
+      .mockResolvedValue({ items: page(0, 3).items.slice(0, 3), total: 3 });
+
+    const task = { ...mockCopyTasks[0], fileCount: 3, files: [] };
+    render(
+      <App preloaded={{ ...preloaded, tasks: [task], selectedTaskId: task.id }} />,
+    );
+
+    await screen.findByText("IMG_0.NEF");
+    expect(screen.getByTestId("copy-verified-stat").textContent).toBe("3/3");
+    expect(screen.queryByTestId("copy-load-more-files")).toBeNull();
+
+    listSpy.mockRestore();
   });
 });
