@@ -8,6 +8,7 @@
 
 import {
   mockCancelJob,
+  mockStartProxyTranscode,
   mockGetJob,
   mockListJobs,
   mockStartDelivery,
@@ -16,7 +17,10 @@ import {
 import {
   mockCameras,
   mockCopyTasks,
+  mockCapabilities,
   mockCategories,
+  mockDiagnostics,
+  mockFfmpegStatus,
   mockIndexing,
   mockInspection,
   mockPendingAssets,
@@ -42,8 +46,12 @@ import type {
   AssetPage,
   BulkResult,
   CopyTaskPreview,
+  FfmpegStatus,
   JobSnapshot,
   RemoteActivity,
+  StartProxyInput,
+  TranscodeCapabilities,
+  TranscodeJob,
   FolderNode,
   IndexingStatus,
   IndexProgressEvent,
@@ -734,4 +742,38 @@ export function subscribeJobProgress(
   }
   const dispose = mockSubscribeJobs(onEvent);
   return { dispose, ready: Promise.resolve() };
+}
+
+/* ------------------------------------------------------------------ *
+ * 转码（M3 W5/W6）
+ * ------------------------------------------------------------------ */
+
+/** ffmpeg sidecar 状态；missing 时整个转码入口都要禁用并说明原因 */
+export function ffmpegStatus(): Promise<FfmpegStatus> {
+  if (IS_TAURI) return ipc("ffmpeg_status");
+  return reply(mockFfmpegStatus);
+}
+
+/**
+ * 硬件编码能力矩阵。
+ * status = "probing" 时调用方需轮询，直到 ready / failed 才停——
+ * 这两个是仅有的终态，别把 idle 也当成终态。
+ */
+export function transcodeCapabilities(
+  refresh = false,
+): Promise<TranscodeCapabilities> {
+  if (IS_TAURI) return ipc("transcode_capabilities", { refresh });
+  return reply(mockCapabilities(refresh));
+}
+
+/** 诊断导出（不含任何素材路径） */
+export function transcodeDiagnostics(): Promise<Record<string, unknown>> {
+  if (IS_TAURI) return ipc("transcode_diagnostics");
+  return reply(mockDiagnostics);
+}
+
+/** 发起代理转码作业（kind = "transcode"，进度走既有 job://progress） */
+export function startProxyTranscode(input: StartProxyInput): Promise<TranscodeJob> {
+  if (IS_TAURI) return ipc("start_proxy_transcode", { input });
+  return reply(mockStartProxyTranscode(input.projectId));
 }

@@ -7,7 +7,7 @@
 
 import { useEffect, useState } from "react";
 import * as api from "../api";
-import type { DeliverySummary, JobSnapshot } from "../api/types";
+import type { DeliveryJob, DeliverySummary } from "../api/types";
 import { formatBytes } from "../lib/format";
 import { classifyFailures, deliveryHeadline } from "../lib/delivery";
 import { selectLatestDeliveryJob, useStore } from "../state/store";
@@ -144,7 +144,7 @@ function DeliveryProgress({
   cancelling,
   onCancel,
 }: {
-  job: JobSnapshot;
+  job: DeliveryJob;
   cancelling: boolean;
   onCancel: () => void;
 }) {
@@ -207,7 +207,7 @@ function DeliveryResult({
   error,
   onClose,
 }: {
-  job: JobSnapshot | null;
+  job: DeliveryJob | null;
   error: string | null;
   onClose: () => void;
 }) {

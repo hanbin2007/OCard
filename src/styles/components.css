@@ -996,3 +996,8 @@
 .notice--danger strong {
   color: var(--danger);
 }
+
+.caps__head,
+.caps__row {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}

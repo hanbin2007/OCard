@@ -7,6 +7,7 @@ import { DevicesScreen } from "./screens/DevicesScreen";
 import { NewProjectScreen } from "./screens/NewProjectScreen";
 import { ProjectsScreen } from "./screens/ProjectsScreen";
 import { SortingScreen } from "./screens/SortingScreen";
+import { TranscodeScreen } from "./screens/TranscodeScreen";
 import { TrashScreen } from "./screens/TrashScreen";
 import { StoreProvider, useStore, type AppState } from "./state/store";
 import { ThemeProvider } from "./state/theme";
@@ -110,6 +111,8 @@ function Routes() {
       return <SortingScreen />;
     case "trash":
       return <TrashScreen />;
+    case "transcode":
+      return <TranscodeScreen />;
     case "projects":
     default:
       return <ProjectsScreen />;

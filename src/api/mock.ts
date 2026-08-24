@@ -5,6 +5,9 @@
 
 import type {
   CameraReg,
+  CapabilityReport,
+  FfmpegStatus,
+  TranscodeCapabilities,
   DeliverySummary,
   IndexingStatus,
   SortingAsset,
@@ -471,4 +474,60 @@ export const mockDelivery: DeliverySummary = {
     },
   ],
   deliveryPath: "/Volumes/DIT-NAS/Projects/20260824_校运会/交付/20260824",
+};
+
+/* ------------------------------------------------------------------ *
+ * 转码 mock
+ * ------------------------------------------------------------------ */
+
+const mockFfmpegInfo = {
+  version: "7.1",
+  ffmpegPath: "/Applications/OCard.app/Contents/Resources/ffmpeg",
+  ffprobePath: "/Applications/OCard.app/Contents/Resources/ffprobe",
+};
+
+export const mockFfmpegStatus: FfmpegStatus = {
+  status: "ready",
+  info: mockFfmpegInfo,
+};
+
+const readyReport: CapabilityReport = {
+  ffmpeg: mockFfmpegInfo,
+  winners: {
+    "h264-encode": "h264_videotoolbox",
+    "hevc-encode": "hevc_videotoolbox",
+    "hevc-10bit": "hevc_videotoolbox",
+  },
+  probes: [
+    ["h264-encode", "h264_videotoolbox", true],
+    ["h264-encode", "libx264", true],
+    ["hevc-encode", "hevc_videotoolbox", true],
+    ["hevc-10bit", "hevc_nvenc", false],
+    ["hevc-10bit", "hevc_videotoolbox", true],
+  ],
+  probedAt: "2026-08-24T09:00:00+08:00",
+};
+
+let capabilityProbing = false;
+
+/** mock：refresh 会进入一次 probing，再次调用才 ready——用来验证轮询终止条件 */
+export function mockCapabilities(refresh: boolean): TranscodeCapabilities {
+  if (refresh) {
+    capabilityProbing = true;
+    return { status: "probing" };
+  }
+  if (capabilityProbing) {
+    capabilityProbing = false;
+    return { status: "ready", report: readyReport };
+  }
+  return { status: "ready", report: readyReport };
+}
+
+export const mockDiagnostics: Record<string, unknown> = {
+  app: "OCard",
+  platform: "darwin",
+  ffmpeg: mockFfmpegInfo,
+  winners: readyReport.winners,
+  probes: readyReport.probes,
+  probedAt: readyReport.probedAt,
 };

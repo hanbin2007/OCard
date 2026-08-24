@@ -18,7 +18,7 @@ import App from "../App";
 import * as api from "../api";
 import { mockDelivery, mockProjects, mockWorkstation } from "../api/mock";
 import { resetMockJobs } from "../api/mockJobs";
-import type { DeliverySummary, JobSnapshot } from "../api/types";
+import type { DeliveryJob, DeliverySummary, JobSnapshot } from "../api/types";
 
 /** 收集 store 建立的作业订阅回调，供测试手工投递事件 */
 let jobEmitters: Array<(job: JobSnapshot) => void> = [];
@@ -51,7 +51,7 @@ const preloaded = {
   selectedProjectId: mockProjects[0].id,
 };
 
-function deliveryJob(over: Partial<JobSnapshot> = {}): JobSnapshot {
+function deliveryJob(over: Partial<DeliveryJob> = {}): DeliveryJob {
   return {
     id: "job-test",
     kind: "delivery",

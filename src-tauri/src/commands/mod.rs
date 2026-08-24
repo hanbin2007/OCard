@@ -3,6 +3,7 @@
 
 pub mod analysis_cmds;
 pub mod dto;
+pub mod finalcut_cmds;
 #[cfg(all(test, not(windows)))]
 mod integration_tests;
 pub mod notify;

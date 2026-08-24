@@ -495,19 +495,9 @@ export type JobKind = "delivery" | "transcode" | "analyze";
 
 export type JobState = "queued" | "running" | "done" | "failed" | "cancelled";
 
-/**
- * 后台作业快照。
- *
- * `revision` 单调递增，用于乱序保护——沿 `copy://progress` 的既有模式。
- * 终态语义：
- * - `done`：`result` 为该 kind 的结果（delivery = DeliverySummary）
- * - `failed`：`error` 为原因
- * - `cancelled`：**result 为空**。取消时后端仍按实况写清单（目录绝不处于
- *   无清单的说谎态），已完成量看 `done`/`total`，详情由 `job-cancelled` 通知给出。
- */
-export interface JobSnapshot {
+/** 作业快照的公共字段 */
+interface JobBase {
   id: string;
-  kind: JobKind;
   projectId: string;
   state: JobState;
   done: number;
@@ -515,10 +505,103 @@ export interface JobSnapshot {
   bytesDone: number;
   /** 当前正在处理的文件名等进度描述 */
   message?: string;
+  /** 单调递增，用于乱序保护——沿 `copy://progress` 的既有模式 */
   revision: number;
   startedAt: string;
   finishedAt?: string;
-  /** kind = "delivery" 且 state = "done" 时为 DeliverySummary；未来 kind 会扩这个联合 */
-  result?: DeliverySummary;
   error?: string;
+}
+
+/**
+ * 后台作业快照，**按 kind 判别的联合类型**。
+ *
+ * 终态语义：
+ * - `done`：`result` 是该 kind 对应的结果类型
+ * - `failed`：`error` 为原因
+ * - `cancelled`：`result` 为空；已完成量看 `done`/`total`
+ */
+export interface DeliveryJob extends JobBase {
+  kind: "delivery";
+  result?: DeliverySummary;
+}
+
+export interface TranscodeJob extends JobBase {
+  kind: "transcode";
+  result?: ProxyResult;
+}
+
+export interface AnalyzeJob extends JobBase {
+  kind: "analyze";
+  /** M3 后续波次落地；先留空，别退化成 unknown 的裸用 */
+  result?: never;
+}
+
+export type JobSnapshot = DeliveryJob | TranscodeJob | AnalyzeJob;
+
+/** 判别辅助：拿到具体 kind 才能安全读 result */
+export function isDeliveryJob(job: JobSnapshot): job is DeliveryJob {
+  return job.kind === "delivery";
+}
+
+export function isTranscodeJob(job: JobSnapshot): job is TranscodeJob {
+  return job.kind === "transcode";
+}
+
+/* ------------------------------------------------------------------ *
+ * 转码（M3 W5/W6）
+ * ------------------------------------------------------------------ */
+
+export interface FfmpegInfo {
+  version: string;
+  ffmpegPath: string;
+  ffprobePath: string;
+}
+
+/** sidecar 探测结果：missing 时整个转码入口都要禁用并说明原因 */
+export type FfmpegStatus =
+  | { status: "ready"; info: FfmpegInfo }
+  | { status: "missing"; error: string };
+
+/** 一次能力探测：[能力, 编码器, 是否可用] */
+export type CapabilityProbe = [string, string, boolean];
+
+export interface CapabilityReport {
+  ffmpeg: FfmpegInfo;
+  /** 每种能力最终选中的编码器 */
+  winners: Record<string, string>;
+  probes: CapabilityProbe[];
+  probedAt: string;
+}
+
+/** 能力矩阵。probing 时需要轮询直到 ready / failed */
+export interface TranscodeCapabilities {
+  status: "idle" | "probing" | "ready" | "failed";
+  report?: CapabilityReport;
+  error?: string;
+}
+
+export interface ProxySkipped {
+  rel: string;
+  reason: string;
+}
+
+export interface ProxyFailure {
+  rel: string;
+  message: string;
+}
+
+/** 代理转码作业的结果（kind = "transcode" 且 done 时） */
+export interface ProxyResult {
+  converted: number;
+  alreadyTranscoded: number;
+  skipped: ProxySkipped[];
+  failures: ProxyFailure[];
+  usedEncoder: string;
+  outputDir: string;
+}
+
+export interface StartProxyInput {
+  projectId: string;
+  cameraFolders?: string[];
+  forceAll?: boolean;
 }

@@ -350,6 +350,99 @@ describe("关于与更新", () => {
   });
 });
 
+describe("转码能力", () => {
+  async function openSettings2() {
+    const user = userEvent.setup();
+    render(<App preloaded={configured} />);
+    await user.click(screen.getByTestId("settings-open"));
+    return user;
+  }
+
+  it("ready 时显示 ffmpeg 版本与能力矩阵", async () => {
+    await openSettings2();
+    await waitFor(() => expect(screen.getByTestId("settings-ffmpeg-ok")).toBeDefined());
+    expect(screen.getByTestId("settings-ffmpeg-ok").textContent).toContain("7.1");
+
+    const winners = await screen.findAllByTestId("caps-winner");
+    expect(winners.length).toBeGreaterThan(0);
+    expect(winners[0].textContent).toContain("h264_videotoolbox");
+    expect(screen.getAllByTestId("caps-probe").length).toBeGreaterThan(0);
+  });
+
+  it("missing 时红色禁用态：重新探测按钮不可点", async () => {
+    const spy = vi
+      .spyOn(api, "ffmpegStatus")
+      .mockResolvedValue({ status: "missing", error: "sidecar 未随包分发" });
+
+    await openSettings2();
+    const banner = await screen.findByTestId("settings-ffmpeg-missing");
+    expect(banner.getAttribute("role")).toBe("alert");
+    expect(banner.textContent).toContain("sidecar 未随包分发");
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId("settings-reprobe") as HTMLButtonElement).disabled,
+      ).toBe(true),
+    );
+    spy.mockRestore();
+  });
+
+  it("重新探测：probing 期间轮询，直到 ready 才停", async () => {
+    const spy = vi
+      .spyOn(api, "transcodeCapabilities")
+      .mockResolvedValueOnce({ status: "ready", report: undefined })
+      .mockResolvedValueOnce({ status: "probing" })
+      .mockResolvedValueOnce({ status: "probing" })
+      .mockResolvedValue({
+        status: "ready",
+        report: {
+          ffmpeg: { version: "7.1", ffmpegPath: "/a", ffprobePath: "/b" },
+          winners: { "h264-encode": "libx264" },
+          probes: [["h264-encode", "libx264", true]],
+          probedAt: "2026-08-24T09:00:00+08:00",
+        },
+      });
+
+    const user = await openSettings2();
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+    await user.click(screen.getByTestId("settings-reprobe"));
+
+    // 轮询到 ready 才停：最终显示矩阵且按钮恢复
+    await waitFor(() =>
+      expect(screen.getAllByTestId("caps-winner")[0].textContent).toContain("libx264"),
+    );
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId("settings-reprobe") as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    // 第一次是 refresh=true，之后是轮询 refresh=false
+    expect(spy.mock.calls.some((c) => c[0] === true)).toBe(true);
+    spy.mockRestore();
+  }, 15000);
+
+  it("探测失败显示原因", async () => {
+    const spy = vi
+      .spyOn(api, "transcodeCapabilities")
+      .mockResolvedValue({ status: "failed", error: "探测超时" });
+
+    await openSettings2();
+    const err = await screen.findByTestId("settings-caps-failed");
+    expect(err.textContent).toContain("探测超时");
+    spy.mockRestore();
+  });
+
+  it("导出诊断给出 JSON", async () => {
+    const user = await openSettings2();
+    await user.click(screen.getByTestId("settings-diagnostics"));
+
+    const out = (await screen.findByTestId(
+      "settings-diagnostics-output",
+    )) as HTMLTextAreaElement;
+    expect(out.value).toContain("ffmpeg");
+    expect(out.value).toContain("probes");
+  });
+});
+
 describe("首跑引导", () => {
   it("NAS 根路径为空时显示引导，而不是直接进项目列表", () => {
     render(<App preloaded={firstRun} />);

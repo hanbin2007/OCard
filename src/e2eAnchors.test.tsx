@@ -47,6 +47,7 @@ describe("E2E 锚点", () => {
       "nav-copy",
       "nav-sorting",
       "nav-trash",
+      "nav-transcode",
       "settings-open",
       "notice-bell",
     ]);

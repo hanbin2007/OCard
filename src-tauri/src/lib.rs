@@ -54,6 +54,10 @@ macro_rules! ocard_invoke_handler {
             $crate::commands::transcode_cmds::transcode_diagnostics,
             $crate::commands::transcode_cmds::start_proxy_transcode,
             $crate::commands::analysis_cmds::start_analysis,
+            $crate::commands::finalcut_cmds::check_final_cuts,
+            $crate::commands::finalcut_cmds::curated_flow_hints,
+            $crate::commands::finalcut_cmds::get_delivery_status,
+            $crate::commands::finalcut_cmds::set_delivery_status,
             $crate::commands::sorting_cmds::list_remote_activity,
         ]
     };

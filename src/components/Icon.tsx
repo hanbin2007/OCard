@@ -120,6 +120,15 @@ export function IconRetry(props: IconProps) {
   );
 }
 
+export function IconFilm(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <rect x="2" y="3" width="12" height="10" rx="1.4" />
+      <path d="M5.2 3v10M10.8 3v10M2 8h12" />
+    </Svg>
+  );
+}
+
 export function IconGrid(props: IconProps) {
   return (
     <Svg {...props}>

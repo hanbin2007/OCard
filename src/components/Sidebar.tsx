@@ -7,6 +7,7 @@ import { formatCompactDate } from "../lib/format";
 import {
   IconCamera,
   IconCard,
+  IconFilm,
   IconGrid,
   IconTrash,
   IconMonitor,
@@ -26,6 +27,7 @@ const NAV: Array<{
   { route: "devices", label: "设备登记", icon: IconCamera },
   { route: "copy", label: "拷卡任务", icon: IconCard },
   { route: "sorting", label: "分类工作台", icon: IconGrid },
+  { route: "transcode", label: "代理转码", icon: IconFilm },
   { route: "trash", label: "回收站", icon: IconTrash },
 ];
 
@@ -64,6 +66,11 @@ function ThemeSwitch() {
 export function Sidebar() {
   const { state, dispatch } = useStore();
   const deliveryWorking = selectDeliveryWorking(state);
+  const selectedProject = state.projects.find(
+    (p) => p.id === state.selectedProjectId,
+  );
+  // 代理转码是工况 A 概念，工况 B 项目下不给入口
+  const transcodeAvailable = selectedProject?.scenario === "A";
   const counts: Partial<Record<RouteName, number>> = {
     projects: state.projects.length,
     devices: state.cameras.length,
@@ -88,11 +95,16 @@ export function Sidebar() {
                   className="nav-item"
                   aria-current={state.route === route ? "page" : undefined}
                   /* 打包期间锁住导航：离开会让结果面板（含未交付明细）静默蒸发 */
-                  disabled={deliveryWorking}
+                  disabled={
+                    deliveryWorking ||
+                    (route === "transcode" && !transcodeAvailable)
+                  }
                   title={
                     deliveryWorking
                       ? "交付打包进行中，完成后才能切换页面"
-                      : undefined
+                      : route === "transcode" && !transcodeAvailable
+                        ? "代理转码只适用于工况 A 项目"
+                        : undefined
                   }
                   onClick={() => dispatch({ type: "navigate", route })}
                 >

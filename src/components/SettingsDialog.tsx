@@ -5,12 +5,16 @@
  * 操作人则随每条审计事件落盘，支撑「双岗互相监督」。
  */
 
-import { useEffect, useRef, useState } from "react";
-import type { UpdateCheckResult } from "../api/types";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  FfmpegStatus,
+  TranscodeCapabilities,
+  UpdateCheckResult,
+} from "../api/types";
 import * as api from "../api";
 import { validateWorkstation } from "../lib/validation";
 import { useStore } from "../state/store";
-import { Field } from "./ui";
+import { Badge, Field } from "./ui";
 
 /** 检查更新的结果文案；失败一律引导去通知中心看详情，不静默 */
 const UPDATE_RESULT_TEXT: Record<UpdateCheckResult, string> = {
@@ -40,6 +44,10 @@ export function SettingsDialog() {
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
   const [installed, setInstalled] = useState(false);
+  const [ffmpeg, setFfmpeg] = useState<FfmpegStatus | null>(null);
+  const [caps, setCaps] = useState<TranscodeCapabilities | null>(null);
+  const [probing, setProbing] = useState(false);
+  const [diagnostics, setDiagnostics] = useState<string | null>(null);
 
   // 每次打开都以当前配置为准重置表单
   useEffect(() => {
@@ -50,6 +58,52 @@ export function SettingsDialog() {
     setSaveError(null);
     operatorRef.current?.focus();
   }, [settingsOpen, workstation]);
+
+  /** 轮询直到 ready / failed——只有这两个是终态，idle 不是 */
+  const pollCapabilities = useCallback(async (refresh: boolean) => {
+    setProbing(true);
+    try {
+      let result = await api.transcodeCapabilities(refresh);
+      setCaps(result);
+      let guard = 0;
+      while (result.status === "probing" && guard < 30) {
+        guard += 1;
+        await new Promise((r) => setTimeout(r, 200));
+        result = await api.transcodeCapabilities(false);
+        setCaps(result);
+      }
+    } catch (err) {
+      setCaps({
+        status: "failed",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setProbing(false);
+    }
+  }, []);
+
+  // 打开时取一次 ffmpeg 状态与能力矩阵
+  useEffect(() => {
+    if (!settingsOpen) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const status = await api.ffmpegStatus();
+        if (!cancelled) setFfmpeg(status);
+      } catch (err) {
+        if (!cancelled) {
+          setFfmpeg({
+            status: "missing",
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      if (!cancelled) await pollCapabilities(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [settingsOpen, pollCapabilities]);
 
   // 打开时取一次版本号
   useEffect(() => {
@@ -83,6 +137,17 @@ export function SettingsDialog() {
       setInstallError(err instanceof Error ? err.message : String(err));
     } finally {
       setInstalling(false);
+    }
+  }
+
+  async function exportDiagnostics() {
+    try {
+      const data = await api.transcodeDiagnostics();
+      setDiagnostics(JSON.stringify(data, null, 2));
+    } catch (err) {
+      setDiagnostics(
+        `导出失败：${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
@@ -191,6 +256,95 @@ export function SettingsDialog() {
               onChange={(e) => setNasRoot(e.currentTarget.value)}
             />
           </Field>
+
+          <div className="settings-about" data-testid="settings-transcode">
+            <div className="settings-about__head">
+              <span className="field__label">转码能力</span>
+              {ffmpeg?.status === "ready" ? (
+                <span className="settings-about__version" data-testid="settings-ffmpeg-ok">
+                  ffmpeg {ffmpeg.info.version}
+                </span>
+              ) : null}
+            </div>
+
+            {ffmpeg?.status === "missing" ? (
+              <div
+                className="notice notice--danger"
+                role="alert"
+                data-testid="settings-ffmpeg-missing"
+              >
+                <strong>ffmpeg 组件缺失，转码功能不可用</strong>
+                <span>{ffmpeg.error}</span>
+              </div>
+            ) : null}
+
+            {caps?.status === "ready" && caps.report ? (
+              <div className="stack stack--sm" data-testid="settings-caps">
+                <div className="list">
+                  <div className="list__head caps__head">
+                    <span>能力</span>
+                    <span>选中编码器</span>
+                  </div>
+                  {Object.entries(caps.report.winners).map(([cap, encoder]) => (
+                    <div className="list__row caps__row" key={cap} data-testid="caps-winner">
+                      <span className="mono text-xs">{cap}</span>
+                      <span className="mono text-xs">{encoder}</span>
+                    </div>
+                  ))}
+                </div>
+                <details>
+                  <summary className="text-xs dim">
+                    探测明细（{caps.report.probes.length} 项）
+                  </summary>
+                  <div className="stack stack--sm">
+                    {caps.report.probes.map(([cap, encoder, ok]) => (
+                      <div className="row-inline text-2xs" key={`${cap}-${encoder}`} data-testid="caps-probe">
+                        <span className="mono">{cap}</span>
+                        <span className="mono dim">{encoder}</span>
+                        <Badge tone={ok ? "ok" : "neutral"}>{ok ? "可用" : "不可用"}</Badge>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              </div>
+            ) : null}
+
+            {caps?.status === "failed" ? (
+              <span className="field__error" role="alert" data-testid="settings-caps-failed">
+                能力探测失败：{caps.error}
+              </span>
+            ) : null}
+
+            <div className="row-inline">
+              <button
+                type="button"
+                className="btn btn--sm"
+                data-testid="settings-reprobe"
+                disabled={probing || ffmpeg?.status === "missing"}
+                onClick={() => void pollCapabilities(true)}
+              >
+                {probing ? "探测中…" : "重新探测"}
+              </button>
+              <button
+                type="button"
+                className="btn btn--sm"
+                data-testid="settings-diagnostics"
+                onClick={exportDiagnostics}
+              >
+                导出诊断
+              </button>
+            </div>
+
+            {diagnostics ? (
+              <textarea
+                className="textarea mono"
+                data-testid="settings-diagnostics-output"
+                readOnly
+                rows={6}
+                value={diagnostics}
+              />
+            ) : null}
+          </div>
 
           <div className="settings-about">
             <div className="settings-about__head">

@@ -178,6 +178,58 @@ describe("拷卡任务面板", () => {
   });
 });
 
+describe("autoProxy（工况 A）", () => {
+  const projectA = mockProjects.find((p) => p.scenario === "A")!;
+  const preloadedA = {
+    ...preloaded,
+    selectedProjectId: projectA.id,
+    tasks: [],
+  };
+
+  it("工况 B 项目不显示「拷完自动转代理」", async () => {
+    render(<App preloaded={preloaded} />);
+    await screen.findByText("C0001.MP4");
+    expect(screen.queryByTestId("copy-auto-proxy")).toBeNull();
+  });
+
+  it("工况 A 项目显示勾选项，勾上后随 StartCopyInput 传给后端", async () => {
+    const user = userEvent.setup();
+    const spy = vi.spyOn(api, "startCopyTask");
+
+    render(<App preloaded={preloadedA} />);
+    const checkbox = (await screen.findByTestId(
+      "copy-auto-proxy",
+    )) as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+    await user.click(checkbox);
+
+    await user.click(screen.getByRole("radio", { name: "选择源卷 SONY_A7M4" }));
+    await waitFor(() =>
+      expect((screen.getByLabelText(/目标夹/) as HTMLInputElement).value).not.toBe(""),
+    );
+    await user.type(screen.getByLabelText("内容备注"), "发布会主机位");
+    await user.type(screen.getByLabelText("第 2 个目的地路径"), "/backup/ocard");
+    await user.click(screen.getByRole("button", { name: "开始拷卡" }));
+
+    // 双确认屏要如实显示这项
+    await waitFor(() =>
+      expect(screen.getByTestId("confirm-auto-proxy").textContent).toContain(
+        "是，拷完自动派发转码作业",
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("confirm-target-folder").textContent).not.toBe(
+        "解析中…",
+      ),
+    );
+    await user.click(screen.getByTestId("copy-confirm-start"));
+
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+    expect(spy.mock.calls[0][0].autoProxy).toBe(true);
+    spy.mockRestore();
+  }, 15000);
+});
+
 describe("#4 任务快照刷新失败", () => {
   it("拉不回快照要发通知，不让界面静默显示过期进度", async () => {
     const user = userEvent.setup();

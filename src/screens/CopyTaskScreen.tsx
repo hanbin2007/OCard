@@ -78,6 +78,8 @@ export function CopyTaskScreen() {
     newDest("external"),
   ]);
   const [submitted, setSubmitted] = useState(false);
+  /** 工况 A：拷完自动派发代理转码作业（PRD §5.6） */
+  const [autoProxy, setAutoProxy] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
@@ -216,6 +218,8 @@ export function CopyTaskScreen() {
         note,
         targetPrefix,
         destinations: dests.map(({ kind, path }) => ({ kind, path })),
+        // 仅工况 A 有代理转码概念，工况 B 不传这个标志
+        ...(project.scenario === "A" ? { autoProxy } : {}),
         ...(confirmExisting ? { confirmExistingTarget: true } : {}),
       };
       const started = await api.startCopyTask(input);
@@ -362,6 +366,14 @@ export function CopyTaskScreen() {
                           <span className="dl__key">备注</span>
                           <span className="dl__val">{note}</span>
                         </div>
+                        {project.scenario === "A" ? (
+                          <div className="dl__row">
+                            <span className="dl__key">拷完转代理</span>
+                            <span className="dl__val" data-testid="confirm-auto-proxy">
+                              {autoProxy ? "是，拷完自动派发转码作业" : "否"}
+                            </span>
+                          </div>
+                        ) : null}
                         <div className="dl__row">
                           <span className="dl__key">实际落盘</span>
                           <span className="dl__val" data-testid="confirm-destinations">
@@ -562,6 +574,18 @@ export function CopyTaskScreen() {
                           onChange={(e) => setNote(e.currentTarget.value)}
                         />
                       </Field>
+
+                      {project.scenario === "A" ? (
+                        <label className="row-inline text-sm">
+                          <input
+                            type="checkbox"
+                            data-testid="copy-auto-proxy"
+                            checked={autoProxy}
+                            onChange={(e) => setAutoProxy(e.currentTarget.checked)}
+                          />
+                          拷完自动转代理（转入「4. 转码素材」）
+                        </label>
+                      ) : null}
 
                       <div className="field">
                         <span className="field__label">目的地</span>

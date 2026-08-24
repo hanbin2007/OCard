@@ -22,14 +22,17 @@ import type {
   CopyFileItem,
   CopyProgressEvent,
   CopyTask,
+  DeliveryJob,
   JobSnapshot,
   NoticeDto,
   NoticeLevel,
   Project,
   StorageCard,
+  TranscodeJob,
   Volume,
   WorkstationInfo,
 } from "../api/types";
+import { isDeliveryJob, isTranscodeJob } from "../api/types";
 
 export type RouteName =
   | "projects"
@@ -37,7 +40,8 @@ export type RouteName =
   | "devices"
   | "copy"
   | "sorting"
-  | "trash";
+  | "trash"
+  | "transcode";
 
 /**
  * 通知中心条目：同 code 连续重复会折叠成一条并计数，避免刷屏。
@@ -878,9 +882,23 @@ export function selectDeliveryWorking(state: AppState): boolean {
 export function selectLatestDeliveryJob(
   state: AppState,
   projectId: string,
-): JobSnapshot | null {
+): DeliveryJob | null {
   const candidates = state.jobs.filter(
-    (job) => job.kind === "delivery" && job.projectId === projectId,
+    (job): job is DeliveryJob => isDeliveryJob(job) && job.projectId === projectId,
+  );
+  if (candidates.length === 0) return null;
+  return candidates.reduce((latest, job) =>
+    job.startedAt >= latest.startedAt ? job : latest,
+  );
+}
+
+/** 该项目最近一个转码作业 */
+export function selectLatestTranscodeJob(
+  state: AppState,
+  projectId: string,
+): TranscodeJob | null {
+  const candidates = state.jobs.filter(
+    (job): job is TranscodeJob => isTranscodeJob(job) && job.projectId === projectId,
   );
   if (candidates.length === 0) return null;
   return candidates.reduce((latest, job) =>
