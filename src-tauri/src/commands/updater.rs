@@ -71,7 +71,7 @@ async fn do_check_and_download(app: &AppHandle, manual: bool) -> String {
                         app,
                         "update-ready",
                         format!(
-                            "v{version} 已在后台下载完成;到设置中点「重启并更新」安装(不会打断拷卡)"
+                            "v{version} 已在后台下载完成;到设置中点「安装更新」完成安装(不会打断拷卡)"
                         ),
                     );
                     "ready".into()

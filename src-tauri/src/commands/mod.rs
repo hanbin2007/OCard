@@ -702,7 +702,8 @@ pub fn resume_copy_task(app: AppHandle, state: State<AppState>, task_id: String)
 /// 启动时从各项目未完成的 manifest 重建 paused 任务(评审 H3/P0-3):
 /// 崩溃/重启后任务不再消失,可从任务列表续传。
 pub fn rebuild_tasks(app: &AppHandle, state: &AppState) {
-    let Some(nas) = config::load(&state.config_dir).nas_root else {
+    // 经统一入口:配置损坏/权限错误也要上报(codex 六轮:此处曾漏)
+    let Some(nas) = load_config(app, state).nas_root else {
         return;
     };
     let scan = match catalog::scan(&nas) {
