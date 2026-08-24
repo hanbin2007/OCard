@@ -2,6 +2,7 @@
 //! 错误统一映射为字符串消息(前端 toast 展示)。
 
 pub mod dto;
+pub mod notify;
 pub mod tasks;
 
 use crate::core::{catalog, config, copy, journal, manifest, project, registry, volumes};
@@ -75,6 +76,7 @@ fn project_dto(stats: &catalog::ProjectStats, running: bool) -> ProjectDto {
 fn find_project(nas: &Path, project_id: &str) -> CmdResult<catalog::ProjectStats> {
     catalog::scan(nas)
         .map_err(err)?
+        .projects
         .into_iter()
         .find(|p| p.folder_name == project_id)
         .ok_or_else(|| format!("项目不存在: {project_id}"))
@@ -115,8 +117,28 @@ pub fn set_workstation_info(
 
 // ---------- 项目 ----------
 
+/// 上报登记表 journal 健康度(UX 原则:容错跳过必须让用户看见)。
+fn notice_registry_health(app: &AppHandle, load: &registry::RegistryLoad) {
+    if load.skipped_lines > 0 || load.unreadable_files > 0 {
+        notify::warn(
+            app,
+            "registry-journal-degraded",
+            format!(
+                "登记表日志存在损坏数据:已跳过 {} 行、{} 个文件。登记内容可能不完整,请检查 NAS 上的 .ocard-registry",
+                load.skipped_lines, load.unreadable_files
+            ),
+        );
+    }
+}
+
+fn notice_catalog_warnings(app: &AppHandle, warnings: &[String]) {
+    for w in warnings {
+        notify::warn(app, "project-meta-corrupt", w.clone());
+    }
+}
+
 #[tauri::command]
-pub fn list_projects(state: State<AppState>) -> CmdResult<Vec<ProjectDto>> {
+pub fn list_projects(app: AppHandle, state: State<AppState>) -> CmdResult<Vec<ProjectDto>> {
     let nas = nas_root(&state)?;
     let running: Vec<String> = state
         .tasks
@@ -125,27 +147,38 @@ pub fn list_projects(state: State<AppState>) -> CmdResult<Vec<ProjectDto>> {
         .filter(|t| t.state == "running")
         .map(|t| t.project_id)
         .collect();
-    Ok(catalog::scan(&nas)
-        .map_err(err)?
+    let scan = catalog::scan(&nas).map_err(err)?;
+    notice_catalog_warnings(&app, &scan.warnings);
+    Ok(scan
+        .projects
         .iter()
         .map(|s| project_dto(s, running.contains(&s.folder_name)))
         .collect())
 }
 
 #[tauri::command]
-pub fn get_project(state: State<AppState>, project_id: String) -> CmdResult<Option<ProjectDto>> {
-    Ok(list_projects(state)?
+pub fn get_project(
+    app: AppHandle,
+    state: State<AppState>,
+    project_id: String,
+) -> CmdResult<Option<ProjectDto>> {
+    Ok(list_projects(app, state)?
         .into_iter()
         .find(|p| p.id == project_id))
 }
 
 #[tauri::command]
-pub fn create_project(state: State<AppState>, input: NewProjectInput) -> CmdResult<ProjectDto> {
+pub fn create_project(
+    app: AppHandle,
+    state: State<AppState>,
+    input: NewProjectInput,
+) -> CmdResult<ProjectDto> {
     let nas = nas_root(&state)?;
     let date = parse_compact_date(&input.date)?;
     let root = project::create_project(&nas, date, &input.name, input.scenario, &input.categories)
         .map_err(err)?;
     tasks::append_audit(
+        &app,
         &root,
         &state.config_dir,
         &journal::Event::new(
@@ -198,8 +231,10 @@ pub fn preview_folder_tree(
 // ---------- 登记表 ----------
 
 #[tauri::command]
-pub fn list_cameras(state: State<AppState>) -> CmdResult<Vec<registry::CameraReg>> {
-    Ok(registry::load(&nas_root(&state)?).map_err(err)?.cameras)
+pub fn list_cameras(app: AppHandle, state: State<AppState>) -> CmdResult<Vec<registry::CameraReg>> {
+    let load = registry::load(&nas_root(&state)?).map_err(err)?;
+    notice_registry_health(&app, &load);
+    Ok(load.registry.cameras)
 }
 
 #[tauri::command]
@@ -231,8 +266,13 @@ pub fn delete_camera(state: State<AppState>, camera_id: String) -> CmdResult<()>
 }
 
 #[tauri::command]
-pub fn list_storage_cards(state: State<AppState>) -> CmdResult<Vec<registry::StorageCard>> {
-    Ok(registry::load(&nas_root(&state)?).map_err(err)?.cards)
+pub fn list_storage_cards(
+    app: AppHandle,
+    state: State<AppState>,
+) -> CmdResult<Vec<registry::StorageCard>> {
+    let load = registry::load(&nas_root(&state)?).map_err(err)?;
+    notice_registry_health(&app, &load);
+    Ok(load.registry.cards)
 }
 
 #[tauri::command]
@@ -270,7 +310,7 @@ pub fn list_volumes(state: State<AppState>) -> Vec<VolumeDto> {
     let cards = nas_root(&state)
         .ok()
         .and_then(|nas| registry::load(&nas).ok())
-        .map(|r| r.cards)
+        .map(|r| r.registry.cards)
         .unwrap_or_default();
     volumes::list_volumes()
         .into_iter()
@@ -418,7 +458,7 @@ pub fn preview_copy_task(
 ) -> CmdResult<serde_json::Value> {
     let nas = nas_root(&state)?;
     let stats = find_project(&nas, &input.project_id)?;
-    let reg = registry::load(&nas).map_err(err)?;
+    let reg = registry::load(&nas).map_err(err)?.registry;
     let camera = reg
         .cameras
         .iter()
@@ -453,7 +493,7 @@ pub fn start_copy_task(
     }
     let nas = nas_root(&state)?;
     let stats = find_project(&nas, &input.project_id)?;
-    let reg = registry::load(&nas).map_err(err)?;
+    let reg = registry::load(&nas).map_err(err)?.registry;
     let camera = reg
         .cameras
         .iter()
@@ -511,6 +551,7 @@ pub fn start_copy_task(
     manifest::save(&stats.root, &m).map_err(err)?;
 
     tasks::append_audit(
+        &app,
         &stats.root,
         &state.config_dir,
         &journal::Event::new(
@@ -620,16 +661,34 @@ pub fn resume_copy_task(app: AppHandle, state: State<AppState>, task_id: String)
 
 /// 启动时从各项目未完成的 manifest 重建 paused 任务(评审 H3/P0-3):
 /// 崩溃/重启后任务不再消失,可从任务列表续传。
-pub fn rebuild_tasks(state: &AppState) {
+pub fn rebuild_tasks(app: &AppHandle, state: &AppState) {
     let Some(nas) = config::load(&state.config_dir).nas_root else {
         return;
     };
-    let Ok(projects) = catalog::scan(&nas) else {
-        return;
+    let scan = match catalog::scan(&nas) {
+        Ok(s) => s,
+        Err(e) => {
+            notify::warn(
+                app,
+                "rebuild-scan-failed",
+                format!("启动时扫描项目失败,未完成的拷卡任务未能重建: {e}"),
+            );
+            return;
+        }
     };
+    notice_catalog_warnings(app, &scan.warnings);
+    let projects = scan.projects;
     let vols = volumes::list_volumes();
     for p in projects {
         let Ok(manifests) = manifest::list(&p.root) else {
+            notify::warn(
+                app,
+                "rebuild-manifest-unreadable",
+                format!(
+                    "项目「{}」的拷卡清单不可读,其中未完成任务未能重建",
+                    p.folder_name
+                ),
+            );
             continue;
         };
         for m in manifests.into_iter().filter(|m| !m.completed) {

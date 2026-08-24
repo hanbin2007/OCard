@@ -26,9 +26,18 @@ pub struct ProjectStats {
     pub updated_at: DateTime<Utc>,
 }
 
-/// 扫描 NAS 根下的全部项目(仅一级子目录)。无法解析的目录跳过。
-pub fn scan(nas_root: &Path) -> Result<Vec<ProjectStats>> {
-    let mut out = Vec::new();
+/// 扫描结果:项目列表 + 需要上报用户的告警(UX 原则:跳过不允许静默)。
+#[derive(Debug, Default)]
+pub struct CatalogScan {
+    pub projects: Vec<ProjectStats>,
+    /// 疑似项目但元数据损坏/不可读的目录(有 .ocard 却解析失败)。
+    pub warnings: Vec<String>,
+}
+
+/// 扫描 NAS 根下的全部项目(仅一级子目录)。
+/// 普通目录(无 .ocard)正常跳过;**有 .ocard 但元数据坏掉的目录进 warnings**。
+pub fn scan(nas_root: &Path) -> Result<CatalogScan> {
+    let mut out = CatalogScan::default();
     if !nas_root.exists() {
         return Ok(out);
     }
@@ -38,6 +47,14 @@ pub fn scan(nas_root: &Path) -> Result<Vec<ProjectStats>> {
             continue;
         }
         let Ok(meta) = project::load_meta(&path) else {
+            if path.join(project::STATE_DIR).exists() {
+                out.warnings.push(format!(
+                    "目录「{}」含 .ocard 状态但项目元数据损坏或不可读,已跳过",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                ));
+            }
             continue;
         };
         let manifests = manifest::list(&path).unwrap_or_default();
@@ -65,7 +82,7 @@ pub fn scan(nas_root: &Path) -> Result<Vec<ProjectStats>> {
             .map(|m| m.destinations.len())
             .max()
             .unwrap_or(0);
-        out.push(ProjectStats {
+        out.projects.push(ProjectStats {
             folder_name: path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -81,7 +98,7 @@ pub fn scan(nas_root: &Path) -> Result<Vec<ProjectStats>> {
             updated_at,
         });
     }
-    out.sort_by(|a, b| {
+    out.projects.sort_by(|a, b| {
         b.meta
             .date
             .cmp(&a.meta.date)
@@ -131,7 +148,7 @@ mod tests {
         m.completed = false;
         manifest::save(&p1, &m).unwrap();
 
-        let stats = scan(tmp.path()).unwrap();
+        let stats = scan(tmp.path()).unwrap().projects;
         assert_eq!(stats.len(), 2);
         // 按日期倒序:校运会(0824)在前
         assert_eq!(stats[0].folder_name, "20260824_校运会");

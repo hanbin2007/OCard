@@ -63,15 +63,27 @@ pub fn append_in(dir: &Path, event: &Event) -> Result<()> {
     Ok(())
 }
 
+/// 合并读取的结果与健康度。容错跳过的坏数据**必须**上报给用户
+/// (UX 原则:fail-open 不允许无提示),调用方据此发通知。
+#[derive(Debug, Default)]
+pub struct JournalRead {
+    pub events: Vec<Event>,
+    /// 解析失败被跳过的行数(半行写入/版本差异/损坏)。
+    pub skipped_lines: usize,
+    /// 读取失败被跳过的日志文件数。
+    pub unreadable_files: usize,
+}
+
 /// 合并读取目录下所有工作站的事件。
 /// 容错:非 UTF-8 字节 lossy 处理、解析失败的行跳过、单个文件读取失败跳过——
-/// 任何坏数据都不毁掉整个状态(SMB 断连可能撕开多字节字符)。
+/// 任何坏数据都不毁掉整个状态(SMB 断连可能撕开多字节字符),但计数上报。
 /// 排序确定化:主键时间戳,并列时按 (机器文件名, 文件内行号) 裁决,
 /// 保证任意工作站折叠出同一结果。
-pub fn read_all_in(dir: &Path) -> Result<Vec<Event>> {
+pub fn read_all_in(dir: &Path) -> Result<JournalRead> {
     let mut keyed: Vec<(chrono::DateTime<Utc>, String, usize, Event)> = Vec::new();
+    let mut out = JournalRead::default();
     if !dir.exists() {
-        return Ok(Vec::new());
+        return Ok(out);
     }
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
@@ -84,17 +96,20 @@ pub fn read_all_in(dir: &Path) -> Result<Vec<Event>> {
             continue;
         }
         let Ok(bytes) = fs::read(&path) else {
-            continue; // 单文件读取失败不中断整目录
+            out.unreadable_files += 1;
+            continue; // 单文件读取失败不中断整目录,但计数上报
         };
         let text = String::from_utf8_lossy(&bytes);
         for (idx, line) in text.lines().enumerate() {
-            if let Ok(ev) = serde_json::from_str::<Event>(line) {
-                keyed.push((ev.ts, name.clone(), idx, ev));
+            match serde_json::from_str::<Event>(line) {
+                Ok(ev) => keyed.push((ev.ts, name.clone(), idx, ev)),
+                Err(_) => out.skipped_lines += 1,
             }
         }
     }
     keyed.sort_by(|a, b| (a.0, &a.1, a.2).cmp(&(b.0, &b.1, b.2)));
-    Ok(keyed.into_iter().map(|(_, _, _, e)| e).collect())
+    out.events = keyed.into_iter().map(|(_, _, _, e)| e).collect();
+    Ok(out)
 }
 
 fn project_journal_dir(project_root: &Path) -> PathBuf {
@@ -107,7 +122,7 @@ pub fn append(project_root: &Path, event: &Event) -> Result<()> {
 }
 
 /// 项目级日志:合并读取。
-pub fn read_all(project_root: &Path) -> Result<Vec<Event>> {
+pub fn read_all(project_root: &Path) -> Result<JournalRead> {
     read_all_in(&project_journal_dir(project_root))
 }
 
@@ -145,7 +160,7 @@ mod tests {
         )
         .unwrap();
 
-        let all = read_all(tmp.path()).unwrap();
+        let all = read_all(tmp.path()).unwrap().events;
         assert_eq!(all.len(), 3);
         let dir = tmp.path().join(".ocard/journal");
         assert!(dir.join("journal-mac-01.jsonl").exists());
@@ -163,7 +178,9 @@ mod tests {
         content.push_str("{\"ts\": \"broken");
         fs::write(&file, content).unwrap();
 
-        assert_eq!(read_all(tmp.path()).unwrap().len(), 1);
+        let r = read_all(tmp.path()).unwrap();
+        assert_eq!(r.events.len(), 1);
+        assert_eq!(r.skipped_lines, 1, "坏行必须被计数上报,不允许静默");
     }
 
     #[test]
@@ -180,6 +197,6 @@ mod tests {
             &Event::new("m2", "LQ", kind::CAMERA_REGISTERED, json!({"id": "c2"})),
         )
         .unwrap();
-        assert_eq!(read_all_in(&dir).unwrap().len(), 2);
+        assert_eq!(read_all_in(&dir).unwrap().events.len(), 2);
     }
 }

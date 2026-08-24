@@ -18,7 +18,7 @@ pub fn run() {
                 tasks: Default::default(),
             });
             // 崩溃/重启后从未完成的 manifest 重建可续传任务
-            commands::rebuild_tasks(&app.state::<AppState>());
+            commands::rebuild_tasks(app.handle(), &app.state::<AppState>());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

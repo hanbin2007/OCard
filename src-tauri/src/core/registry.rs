@@ -84,7 +84,7 @@ pub fn delete_camera(
     camera_id: &str,
 ) -> Result<()> {
     // 级联:该相机名下的卡一并写删除事件,避免折叠后出现孤儿卡(评审 P1-12)
-    let reg = load(nas_root)?;
+    let reg = load(nas_root)?.registry;
     for card in reg.cards.iter().filter(|c| c.camera_id == camera_id) {
         let ev = Event::new(
             machine,
@@ -116,7 +116,12 @@ pub fn register_card(
         return Err(CoreError::Invalid("卡标签不能为空".into()));
     }
     // 引用校验:卡必须挂在已登记的相机上(评审 P1-12)
-    if !load(nas_root)?.cameras.iter().any(|c| c.id == camera_id) {
+    if !load(nas_root)?
+        .registry
+        .cameras
+        .iter()
+        .any(|c| c.id == camera_id)
+    {
         return Err(CoreError::Invalid(format!("相机未登记: {camera_id}")));
     }
     let card = StorageCard {
@@ -147,11 +152,19 @@ pub fn delete_card(nas_root: &Path, machine: &str, operator: &str, card_id: &str
     journal::append_in(&registry_dir(nas_root), &ev)
 }
 
+/// 登记表读取结果:折叠状态 + journal 健康度(坏数据计数必须上报,UX 原则)。
+#[derive(Debug)]
+pub struct RegistryLoad {
+    pub registry: Registry,
+    pub skipped_lines: usize,
+    pub unreadable_files: usize,
+}
+
 /// 读取并折叠当前登记表(同 id 后写胜;删除事件移除)。
-pub fn load(nas_root: &Path) -> Result<Registry> {
-    let events = journal::read_all_in(&registry_dir(nas_root))?;
+pub fn load(nas_root: &Path) -> Result<RegistryLoad> {
+    let read = journal::read_all_in(&registry_dir(nas_root))?;
     let mut reg = Registry::default();
-    for ev in events {
+    for ev in read.events {
         match ev.kind.as_str() {
             kind::CAMERA_REGISTERED => {
                 if let Ok(cam) = serde_json::from_value::<CameraReg>(ev.data) {
@@ -178,7 +191,11 @@ pub fn load(nas_root: &Path) -> Result<Registry> {
             _ => {}
         }
     }
-    Ok(reg)
+    Ok(RegistryLoad {
+        registry: reg,
+        skipped_lines: read.skipped_lines,
+        unreadable_files: read.unreadable_files,
+    })
 }
 
 fn single_position_char(position: &str) -> Result<char> {
@@ -215,7 +232,7 @@ mod tests {
         )
         .unwrap();
 
-        let reg = load(tmp.path()).unwrap();
+        let reg = load(tmp.path()).unwrap().registry;
         assert_eq!(reg.cameras, vec![cam]);
         assert_eq!(reg.cards, vec![card]);
     }
@@ -228,7 +245,7 @@ mod tests {
         delete_camera(tmp.path(), "m2", "LQ", &cam.id).unwrap();
         delete_card(tmp.path(), "m1", "ZS", &card.id).unwrap();
 
-        let reg = load(tmp.path()).unwrap();
+        let reg = load(tmp.path()).unwrap().registry;
         assert!(reg.cameras.is_empty());
         assert!(reg.cards.is_empty());
     }

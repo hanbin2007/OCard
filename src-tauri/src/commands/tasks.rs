@@ -150,7 +150,9 @@ pub fn prepare_resume(
 }
 
 /// journal 追加带重试;彻底失败时写本机 outbox 兜底,绝不静默丢审计(评审 P1-7)。
+/// 任何降级都向 UI 发用户可见通知(UX 原则:fail-open 不允许无提示)。
 pub fn append_audit(
+    app: &AppHandle,
     project_root: &std::path::Path,
     outbox_dir: &std::path::Path,
     ev: &journal::Event,
@@ -175,11 +177,22 @@ pub fn append_audit(
         }
     }
     if outboxed {
-        eprintln!("审计事件未能写入项目 journal,已落本机 outbox: {}", ev.kind);
+        super::notify::warn(
+            app,
+            "audit-outbox",
+            format!(
+                "审计事件「{}」未能写入项目日志(NAS 可能不可达),已暂存本机,恢复后需人工合并 outbox",
+                ev.kind
+            ),
+        );
     } else {
-        eprintln!(
-            "警告:审计事件写项目 journal 与本机 outbox 均失败: {}",
-            ev.kind
+        super::notify::error(
+            app,
+            "audit-lost",
+            format!(
+                "审计事件「{}」写项目日志与本机暂存均失败,审计链出现缺口",
+                ev.kind
+            ),
         );
     }
 }
@@ -297,6 +310,7 @@ fn run_worker(app: &AppHandle, handle: &TaskHandle) -> crate::core::Result<()> {
     for f in &outcome.files {
         if let copy::FileStatus::Failed(e) = &f.status {
             append_audit(
+                app,
                 &handle.project_root,
                 &handle.config_dir,
                 &journal::Event::new(
@@ -310,6 +324,7 @@ fn run_worker(app: &AppHandle, handle: &TaskHandle) -> crate::core::Result<()> {
     }
     if !outcome.paused {
         append_audit(
+            app,
             &handle.project_root,
             &handle.config_dir,
             &journal::Event::new(
