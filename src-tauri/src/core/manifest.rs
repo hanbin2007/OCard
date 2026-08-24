@@ -29,6 +29,9 @@ pub struct CopyManifest {
     pub operator: String,
     /// 摄影师+DIT 双确认的内容备注。
     pub note: String,
+    /// 目的地路径(展示用,同时支撑项目统计里的目的地数)。
+    #[serde(default)]
+    pub destinations: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub completed: bool,
     pub entries: Vec<ManifestEntry>,
@@ -49,6 +52,7 @@ impl CopyManifest {
             camera_code: camera_code.into(),
             operator: operator.into(),
             note: note.into(),
+            destinations: Vec::new(),
             created_at: Utc::now(),
             completed: false,
             entries: Vec::new(),

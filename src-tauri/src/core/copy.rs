@@ -45,6 +45,8 @@ pub struct CopyOutcome {
     pub bytes_copied: u64,
     /// 全部文件均已验证(含续传跳过的)。为 true 才提示「本卡可格式化」。
     pub all_verified: bool,
+    /// 因暂停请求提前停止(文件边界处停,manifest 可续传)。
+    pub paused: bool,
 }
 
 #[derive(Debug)]
@@ -58,10 +60,19 @@ pub enum Progress<'a> {
         index: usize,
         total: usize,
     },
+    /// 单文件内的增量字节(每个读写块回调一次,大文件进度靠它)。
+    BytesCopied { rel_path: &'a str, delta: u64 },
     FileFinished {
         rel_path: &'a str,
         status: &'a FileStatus,
     },
+}
+
+/// 进度回调的返回值:在文件边界处响应暂停请求。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyControl {
+    Continue,
+    Pause,
 }
 
 /// 扫描源:递归列出全部普通文件(相对路径统一 `/` 分隔)。
@@ -100,35 +111,51 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> Result<()> {
 }
 
 /// 执行拷卡。`project_root` 用于逐文件持久化 manifest(断点续传依据)。
+/// 回调返回 [`CopyControl::Pause`] 时在当前文件完成后停下,manifest 保证可续传。
 pub fn run_copy(
     req: &CopyRequest,
     m: &mut CopyManifest,
     project_root: &Path,
-    mut progress: impl FnMut(Progress),
+    mut progress: impl FnMut(Progress) -> CopyControl,
 ) -> Result<CopyOutcome> {
     assert!(!req.destinations.is_empty(), "至少需要一个目的地");
     let files = scan_source(&req.source_root)?;
     let total_bytes: u64 = files.iter().map(|(_, s)| *s).sum();
-    progress(Progress::Scanned {
+    let mut control = progress(Progress::Scanned {
         total_files: files.len(),
         total_bytes,
     });
 
     let mut reports = Vec::with_capacity(files.len());
     let mut bytes_copied = 0u64;
+    let mut paused = false;
     let total = files.len();
 
     for (index, (rel, size)) in files.iter().enumerate() {
-        progress(Progress::FileStarted {
+        if control == CopyControl::Pause {
+            paused = true;
+            break;
+        }
+        control = progress(Progress::FileStarted {
             rel_path: rel,
             index,
             total,
         });
+        if control == CopyControl::Pause {
+            paused = true;
+            break;
+        }
 
         let status = if m.is_done(rel, *size) {
             FileStatus::SkippedResume
         } else {
-            match copy_one(&req.source_root, rel, &req.destinations) {
+            match copy_one(&req.source_root, rel, &req.destinations, &mut |delta| {
+                // 块级进度只上报,不在文件中途暂停
+                let _ = progress(Progress::BytesCopied {
+                    rel_path: rel,
+                    delta,
+                });
+            }) {
                 Ok(xxh3) => {
                     m.upsert(ManifestEntry {
                         rel_path: rel.clone(),
@@ -152,7 +179,7 @@ pub fn run_copy(
         };
         // 逐文件落盘,任意时刻中断都可续传
         manifest::save(project_root, m)?;
-        progress(Progress::FileFinished {
+        control = progress(Progress::FileFinished {
             rel_path: rel,
             status: &status,
         });
@@ -163,7 +190,9 @@ pub fn run_copy(
         });
     }
 
-    let all_verified = !reports.is_empty()
+    let all_verified = !paused
+        && reports.len() == total
+        && !reports.is_empty()
         && reports
             .iter()
             .all(|r| !matches!(r.status, FileStatus::Failed(_)));
@@ -174,12 +203,19 @@ pub fn run_copy(
         files: reports,
         bytes_copied,
         all_verified,
+        paused,
     })
 }
 
 /// 拷贝单个文件到全部目的地:读一次源、边读边算哈希、写 N 份临时文件,
 /// 逐目的地回读校验,全部通过后统一改名。返回源文件 xxh3。
-fn copy_one(source_root: &Path, rel: &str, destinations: &[PathBuf]) -> Result<String> {
+/// `on_chunk` 在每个读写块后回调增量字节数。
+fn copy_one(
+    source_root: &Path,
+    rel: &str,
+    destinations: &[PathBuf],
+    on_chunk: &mut dyn FnMut(u64),
+) -> Result<String> {
     let src_path = source_root.join(rel_to_native(rel));
     let mut src = File::open(&src_path)?;
 
@@ -217,6 +253,7 @@ fn copy_one(source_root: &Path, rel: &str, destinations: &[PathBuf]) -> Result<S
             for w in &mut writers {
                 w.write_all(&buf[..n])?;
             }
+            on_chunk(n as u64);
         }
         for mut w in writers {
             w.flush()?;
@@ -311,7 +348,11 @@ mod tests {
     fn copies_to_all_destinations_with_verify() {
         let (_tmp, req, mut m, project) = setup();
         let mut events = 0usize;
-        let out = run_copy(&req, &mut m, &project, |_| events += 1).unwrap();
+        let out = run_copy(&req, &mut m, &project, |_| {
+            events += 1;
+            CopyControl::Continue
+        })
+        .unwrap();
 
         assert!(out.all_verified);
         assert_eq!(out.files.len(), 3);
@@ -346,10 +387,10 @@ mod tests {
     #[test]
     fn resume_skips_verified_files() {
         let (_tmp, req, mut m, project) = setup();
-        run_copy(&req, &mut m, &project, |_| {}).unwrap();
+        run_copy(&req, &mut m, &project, |_| CopyControl::Continue).unwrap();
 
         // 第二次执行:全部续传跳过,拷贝字节为 0
-        let out = run_copy(&req, &mut m, &project, |_| {}).unwrap();
+        let out = run_copy(&req, &mut m, &project, |_| CopyControl::Continue).unwrap();
         assert!(out
             .files
             .iter()
@@ -361,11 +402,11 @@ mod tests {
     #[test]
     fn source_change_invalidates_resume() {
         let (_tmp, req, mut m, project) = setup();
-        run_copy(&req, &mut m, &project, |_| {}).unwrap();
+        run_copy(&req, &mut m, &project, |_| CopyControl::Continue).unwrap();
         // 源文件变大(模拟同名不同内容)
         fs::write(req.source_root.join("CLIP0001.MP4"), vec![9u8; 12000]).unwrap();
 
-        let out = run_copy(&req, &mut m, &project, |_| {}).unwrap();
+        let out = run_copy(&req, &mut m, &project, |_| CopyControl::Continue).unwrap();
         let clip = out
             .files
             .iter()
@@ -381,7 +422,7 @@ mod tests {
         // 目标位置被同名目录占据 → 该文件写入失败,其余文件应不受影响
         fs::create_dir_all(req.destinations[0].join("CLIP0001.MP4")).unwrap();
 
-        let out = run_copy(&req, &mut m, &project, |_| {}).unwrap();
+        let out = run_copy(&req, &mut m, &project, |_| CopyControl::Continue).unwrap();
         let clip = out
             .files
             .iter()
@@ -404,5 +445,60 @@ mod tests {
             .unwrap();
         assert!(!e.verified);
         assert!(!saved.completed);
+    }
+
+    #[test]
+    fn bytes_progress_covers_all_copied_bytes() {
+        let (_tmp, req, mut m, project) = setup();
+        let mut bytes = 0u64;
+        run_copy(&req, &mut m, &project, |p| {
+            if let Progress::BytesCopied { delta, .. } = p {
+                bytes += delta;
+            }
+            CopyControl::Continue
+        })
+        .unwrap();
+        assert_eq!(bytes, 17000);
+    }
+
+    #[test]
+    fn pause_stops_at_file_boundary_and_resume_finishes() {
+        let (_tmp, req, mut m, project) = setup();
+        // 第一个文件完成后请求暂停
+        let mut finished = 0usize;
+        let out = run_copy(&req, &mut m, &project, |p| {
+            if matches!(p, Progress::FileFinished { .. }) {
+                finished += 1;
+                if finished >= 1 {
+                    return CopyControl::Pause;
+                }
+            }
+            CopyControl::Continue
+        })
+        .unwrap();
+        assert!(out.paused);
+        assert!(!out.all_verified);
+        assert_eq!(out.files.len(), 1);
+        let saved = manifest::load(&project, &m.id).unwrap();
+        assert!(!saved.completed);
+
+        // 续传:剩余文件补齐,已拷的跳过
+        let out2 = run_copy(&req, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(!out2.paused);
+        assert!(out2.all_verified);
+        assert_eq!(
+            out2.files
+                .iter()
+                .filter(|f| f.status == FileStatus::SkippedResume)
+                .count(),
+            1
+        );
+        assert_eq!(
+            out2.files
+                .iter()
+                .filter(|f| f.status == FileStatus::Copied)
+                .count(),
+            2
+        );
     }
 }
