@@ -52,6 +52,7 @@ macro_rules! ocard_invoke_handler {
             $crate::commands::transcode_cmds::ffmpeg_status,
             $crate::commands::transcode_cmds::transcode_capabilities,
             $crate::commands::transcode_cmds::transcode_diagnostics,
+            $crate::commands::transcode_cmds::start_proxy_transcode,
             $crate::commands::sorting_cmds::list_remote_activity,
         ]
     };
@@ -77,6 +78,31 @@ pub fn run() {
             });
             // sidecar 缺失立即可见(零静默 ffmpeg-missing)
             commands::transcode_cmds::notify_ffmpeg_missing_on_startup(app.handle());
+            // auto_proxy 意图补投递(at-least-once:整批成功才置位,skip 语义容忍重复)
+            {
+                let app_handle = app.handle().clone();
+                let state = app.state::<AppState>();
+                let config_dir = state.config_dir.clone();
+                let machine_id = state.machine_id.clone();
+                std::thread::spawn(move || {
+                    let (cfg, _) = core::config::load_checked(&config_dir);
+                    let Some(nas) = cfg.nas_root else { return };
+                    let Ok(scan) = core::catalog::scan_cached(&nas) else { return };
+                    for p in scan.projects {
+                        let Ok(listing) = core::manifest::list(&p.root) else { continue };
+                        for m in listing.manifests {
+                            commands::transcode_cmds::dispatch_auto_proxy(
+                                &app_handle,
+                                &p.root,
+                                &machine_id,
+                                &config_dir,
+                                &cfg.operator,
+                                &m,
+                            );
+                        }
+                    }
+                });
+            }
             // 崩溃/重启后从未完成的 manifest 重建可续传任务
             commands::rebuild_tasks(app.handle(), &app.state::<AppState>());
             // 静默 OTA:后台周期检查、签名校验、静默安装,重启生效

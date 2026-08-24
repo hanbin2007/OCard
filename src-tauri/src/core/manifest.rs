@@ -48,6 +48,13 @@ pub struct CopyManifest {
     pub source_uid: Option<String>,
     pub created_at: DateTime<Utc>,
     pub completed: bool,
+    /// 拷完自动转代理意图(M3 T1.5;intent ID 即 manifest id)。
+    #[serde(default)]
+    pub auto_proxy: bool,
+    /// 自动转代理整批完成标记(at-least-once 补投递的去重依据;
+    /// 只有整批成功后置位,不宣称 exactly-once——skip 语义容忍重复)。
+    #[serde(default)]
+    pub proxy_completed: bool,
     pub entries: Vec<ManifestEntry>,
 }
 
@@ -71,6 +78,8 @@ impl CopyManifest {
             source_uid: None,
             created_at: Utc::now(),
             completed: false,
+            auto_proxy: false,
+            proxy_completed: false,
             entries: Vec::new(),
         }
     }

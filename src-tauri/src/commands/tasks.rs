@@ -113,6 +113,20 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
         }
         // 拷贝路径也消费 fsx 回退标记(终审:告警不能只挂在分类命令上)
         super::sorting_cmds::notify_if_unsafe_fallback(&app);
+        // 拷完自动转代理(M3 T1.5):任务 done 且 manifest 带意图 → 派发作业
+        if outcome.is_ok() && handle.snapshot.lock().unwrap().state == "done" {
+            if let Ok(m) = manifest::load(&handle.project_root, &handle.manifest_id) {
+                let (cfg, _) = crate::core::config::load_checked(&handle.config_dir);
+                super::transcode_cmds::dispatch_auto_proxy(
+                    &app,
+                    &handle.project_root,
+                    &handle.machine_id,
+                    &handle.config_dir,
+                    &cfg.operator,
+                    &m,
+                );
+            }
+        }
         if let Err(e) = &outcome {
             let mut snap = handle.snapshot.lock().unwrap();
             // IO 类错误(NAS 抖动/断连)是可恢复的暂停,不是死路(评审 H4)

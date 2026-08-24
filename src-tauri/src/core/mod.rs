@@ -16,6 +16,7 @@ pub mod paths;
 pub mod project;
 pub mod registry;
 pub mod sorting;
+pub mod transcode;
 pub mod volumes;
 
 pub use error::{CoreError, Result};

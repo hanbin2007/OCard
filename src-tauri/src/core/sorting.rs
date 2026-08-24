@@ -127,6 +127,27 @@ pub fn resolve_asset_in_project(
     resolve_in_project(project_root, rel)
 }
 
+/// 工况 A 素材命名空间闸(M3 复审 E1:转码源必须限定在工况 A 布局内,
+/// 且实际只允许「2. 原始素材」与「3. 特别素材」两个素材夹)。
+pub fn resolve_asset_a_in_project(
+    project_root: &Path,
+    meta: &project::ProjectMeta,
+    rel: &str,
+) -> std::result::Result<PathBuf, String> {
+    if meta.scenario != Scenario::A {
+        return Err("仅工况 A 项目支持转码素材路径".into());
+    }
+    let first = rel.split('/').next().unwrap_or("");
+    let allowed = [project::SCENARIO_A_DIRS[1], project::SCENARIO_A_DIRS[2]];
+    if !allowed.contains(&first) {
+        return Err(format!(
+            "路径不在工况 A 素材命名空间内(须位于 {} / {}): {rel}",
+            allowed[0], allowed[1]
+        ));
+    }
+    resolve_in_project(project_root, rel)
+}
+
 /// 「文件滞留回收站」的稳定标记:核心层报文与命令层升级判定共用,
 /// 避免文案改动让 error 升级静默失效(复验 P2)。
 pub const STRANDED_MARKER: &str = "滞留在回收站目录";

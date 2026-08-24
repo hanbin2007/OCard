@@ -638,6 +638,8 @@ pub fn start_copy_task<R: tauri::Runtime>(
         );
     }
     m.source_uid = source_uid;
+    // 拷完自动转代理意图持久化(M3 T1.5:intent = manifest id,at-least-once 补投递)
+    m.auto_proxy = input.auto_proxy && stats.meta.scenario == project::Scenario::A;
 
     // target_rel 带上素材根父级(评审 P1-13)
     let raw_dir_name = match stats.meta.scenario {
