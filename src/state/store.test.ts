@@ -304,12 +304,22 @@ describe("reducer", () => {
     expect(started.orphanProgress["t-1"]).toBeUndefined();
   });
 
-  it("监听建立失败会落到 progressError", () => {
+  it("监听建立失败经通知中心呈现（不再是一次性横幅）", () => {
     const next = reducer(initialState, {
-      type: "progressListenFailed",
-      error: "进度监听未能建立：boom",
+      type: "noticeReceived",
+      notice: {
+        level: "error",
+        code: "progress-listen-failed",
+        message: "进度监听未能建立：boom",
+        occurredAt: "2026-08-24T10:00:00+08:00",
+      },
     });
-    expect(next.progressError).toContain("boom");
+    expect(next.notices).toHaveLength(1);
+    expect(next.notices[0].level).toBe("error");
+    expect(next.notices[0].code).toBe("progress-listen-failed");
+    expect(next.notices[0].message).toContain("boom");
+    expect(next.notices[0].live).toBe(true);
+    expect(next.notices[0].read).toBe(false);
   });
 
   it("设置对话框开合，保存后写回工作站并自动关闭", () => {

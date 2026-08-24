@@ -42,9 +42,12 @@ describe("进度监听（常驻单一 listener）", () => {
 
     render(<App preloaded={{ route: "projects", workstation: mockWorkstation }} />);
 
+    // 现在经通知中心呈现：error 走 role="alert" 且不会自动消失
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("进度监听未能建立");
     expect(alert.textContent).toContain("event channel closed");
+    expect(alert.getAttribute("data-code")).toBe("progress-listen-failed");
+    expect(screen.getByTestId("notice-unread").textContent).toBe("1");
     spy.mockRestore();
   });
 

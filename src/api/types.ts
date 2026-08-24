@@ -281,3 +281,23 @@ export interface WorkstationInfo {
   /** 本机配置的 NAS 根路径 */
   nasRoot: string;
 }
+
+/* ------------------------------------------------------------------ *
+ * 通知（tauri 事件 `app://notice`）
+ * ------------------------------------------------------------------ */
+
+export type NoticeLevel = "warning" | "error";
+
+/**
+ * 后端推送的降级/失败通知。
+ *
+ * 硬性原则：任何 fail-open（降级、跳过、兜底）都必须让用户看见，
+ * 不允许静默。`code` 是稳定机器码，用于去重、分组与前端的差异化呈现；
+ * 前端对**未知 code 必须能通用呈现**，后端随时会加新的。
+ */
+export interface NoticeDto {
+  level: NoticeLevel;
+  code: string;
+  message: string;
+  occurredAt: string;
+}

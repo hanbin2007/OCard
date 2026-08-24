@@ -2,6 +2,7 @@
 
 import type { ReactNode } from "react";
 import { IconSettings } from "./Icon";
+import { NoticeBell } from "./NotificationCenter";
 import { useStore } from "../state/store";
 
 export function TopBar({
@@ -26,6 +27,8 @@ export function TopBar({
       ) : null}
       <div className="topbar__actions">
         {actions}
+        {/* 通知铃铛常驻所有屏幕：降级/失败必须随时看得见 */}
+        <NoticeBell />
         {/* 设置入口常驻：首跑没配 NAS 时也要够得着 */}
         <button
           type="button"

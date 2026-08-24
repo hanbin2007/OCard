@@ -1,0 +1,214 @@
+/**
+ * 通知中心。
+ *
+ * 硬性原则：任何 fail-open（降级、跳过、兜底）都必须让用户看见。
+ * - error：立刻以非侵入横幅呈现，**不自动消失**，必须手动确认；role="alert"
+ * - warning：同样即时可见，数秒后自动收进铃铛；aria-live="polite"
+ * - 同 code 连续重复折叠成一条并计数（×N），不刷屏
+ * - 对**未知 code 通用呈现**：后端随时会加新 code，前端不做白名单
+ */
+
+import { useEffect, useRef } from "react";
+import { IconBell, IconClose } from "./Icon";
+import { formatTimestamp } from "../lib/format";
+import { useStore, type NoticeEntry } from "../state/store";
+
+/** warning 在即时呈现区停留多久后自动收进铃铛 */
+const WARNING_AUTO_HIDE_MS = 6000;
+
+/** 已知 code 的中文抬头；未知 code 一律回落到通用抬头 */
+const NOTICE_TITLES: Record<string, string> = {
+  "audit-outbox": "审计日志暂存本机",
+  "audit-lost": "审计链存在缺口",
+  "registry-journal-degraded": "登记表日志有损坏行被跳过",
+  "project-meta-corrupt": "项目元数据损坏被跳过",
+  "rebuild-scan-failed": "启动重建扫描降级",
+  "rebuild-manifest-unreadable": "部分任务清单不可读",
+  "progress-listen-failed": "进度监听未能建立",
+  "notice-listen-failed": "通知通道未能建立",
+};
+
+/** 未知 code 也要有体面的抬头，不能露出空白 */
+function noticeTitle(entry: NoticeEntry): string {
+  return NOTICE_TITLES[entry.code] ?? (entry.level === "error" ? "发生错误" : "降级提示");
+}
+
+/* ------------------------------------------------------------------ *
+ * 即时呈现区（Shell 级，一份）
+ * ------------------------------------------------------------------ */
+
+function NoticeBanner({ entry }: { entry: NoticeEntry }) {
+  const { dispatch } = useStore();
+  const isError = entry.level === "error";
+
+  useEffect(() => {
+    // error 不自动消失：必须由用户确认，避免降级被一晃而过地忽略
+    if (isError) return;
+    const timer = setTimeout(
+      () => dispatch({ type: "noticeToastDismissed", id: entry.id }),
+      WARNING_AUTO_HIDE_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [isError, entry.id, entry.count, dispatch]);
+
+  return (
+    <div
+      className={`toast toast--${entry.level}`}
+      data-testid={`notice-toast-${entry.level}`}
+      data-code={entry.code}
+      {...(isError
+        ? { role: "alert" as const }
+        : { role: "status" as const, "aria-live": "polite" as const })}
+    >
+      <span className={`dot toast__dot toast__dot--${entry.level}`} />
+      <div className="toast__body">
+        <div className="toast__head">
+          <strong className="toast__title">{noticeTitle(entry)}</strong>
+          <code className="toast__code">{entry.code}</code>
+          {entry.count > 1 ? (
+            <span className="toast__count">×{entry.count}</span>
+          ) : null}
+        </div>
+        <p className="toast__message">{entry.message}</p>
+      </div>
+      <button
+        type="button"
+        className="btn btn--ghost btn--icon btn--sm"
+        data-testid="notice-toast-ack"
+        aria-label={isError ? "我知道了" : "收起提示"}
+        onClick={() => dispatch({ type: "noticeToastDismissed", id: entry.id })}
+      >
+        <IconClose />
+      </button>
+    </div>
+  );
+}
+
+/** 即时呈现层：只显示还 live 的通知，最多 3 条，其余进铃铛 */
+export function NoticeToasts() {
+  const { state } = useStore();
+  const live = state.notices.filter((n) => n.live).slice(0, 3);
+  if (live.length === 0) return null;
+  return (
+    <div className="toasts" data-testid="notice-toasts">
+      {live.map((entry) => (
+        <NoticeBanner key={entry.id} entry={entry} />
+      ))}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * 铃铛 + 面板（TopBar 内，常驻所有屏幕）
+ * ------------------------------------------------------------------ */
+
+export function NoticeBell() {
+  const { state, dispatch } = useStore();
+  const { notices, noticesOpen } = state;
+  const unread = notices.filter((n) => !n.read).length;
+  const hasError = notices.some((n) => n.level === "error");
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  // 点外部/Esc 关闭
+  useEffect(() => {
+    if (!noticesOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (!wrapRef.current?.contains(e.target as Node)) {
+        dispatch({ type: "noticesPanelClosed" });
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") dispatch({ type: "noticesPanelClosed" });
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [noticesOpen, dispatch]);
+
+  return (
+    <div className="notice-bell" ref={wrapRef}>
+      <button
+        type="button"
+        data-testid="notice-bell"
+        className="btn btn--ghost btn--icon"
+        aria-label={unread > 0 ? `通知，${unread} 条未读` : "通知"}
+        aria-expanded={noticesOpen}
+        title="通知"
+        onClick={() => dispatch({ type: "noticesPanelToggled" })}
+      >
+        <IconBell />
+        {unread > 0 ? (
+          <span
+            className={`notice-bell__badge${hasError ? " notice-bell__badge--error" : ""}`}
+            data-testid="notice-unread"
+          >
+            {unread > 9 ? "9+" : unread}
+          </span>
+        ) : null}
+      </button>
+
+      {noticesOpen ? (
+        <div className="notice-panel" data-testid="notice-panel">
+          <div className="notice-panel__head">
+            <span className="card__title">通知</span>
+            {notices.length > 0 ? (
+              <button
+                type="button"
+                className="btn btn--ghost btn--sm push-right"
+                data-testid="notice-clear-all"
+                onClick={() => dispatch({ type: "noticesCleared" })}
+              >
+                全部清除
+              </button>
+            ) : null}
+          </div>
+
+          <div className="notice-panel__list">
+            {notices.length === 0 ? (
+              <p className="list__empty">暂无通知。</p>
+            ) : (
+              notices.map((entry) => (
+                <div
+                  className="notice-item"
+                  key={entry.id}
+                  data-testid="notice-item"
+                  data-code={entry.code}
+                  data-level={entry.level}
+                >
+                  <span className={`dot notice-item__dot notice-item__dot--${entry.level}`} />
+                  <div className="notice-item__body">
+                    <div className="notice-item__head">
+                      <strong className="notice-item__title">{noticeTitle(entry)}</strong>
+                      {entry.count > 1 ? (
+                        <span className="notice-item__count" data-testid="notice-count">
+                          ×{entry.count}
+                        </span>
+                      ) : null}
+                      <span className="notice-item__time">
+                        {formatTimestamp(entry.lastAt)}
+                      </span>
+                    </div>
+                    <p className="notice-item__message">{entry.message}</p>
+                    <code className="notice-item__code">{entry.code}</code>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn--ghost btn--icon btn--sm"
+                    data-testid="notice-dismiss"
+                    aria-label={`清除通知 ${entry.code}`}
+                    onClick={() => dispatch({ type: "noticeDismissed", id: entry.id })}
+                  >
+                    <IconClose />
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}

@@ -30,6 +30,7 @@ import type {
   CopyTask,
   CopyTaskPreview,
   FolderNode,
+  NoticeDto,
   NewCameraInput,
   NewProjectInput,
   NewStorageCardInput,
@@ -415,4 +416,39 @@ export function subscribeCopyProgress(
     disposed = true;
     clearInterval(timer);
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * 通知
+ * ------------------------------------------------------------------ */
+
+/**
+ * 订阅后端通知（降级/失败必须可见，不允许静默 fail-open）。
+ * 与进度订阅一样：常驻单一监听，包成可同步调用的 disposer，
+ * 并把 listen 自身的失败上报——连通知通道都建不起来时更不能装作没事。
+ */
+export function subscribeNotices(
+  onNotice: (notice: NoticeDto) => void,
+  onError?: (error: unknown) => void,
+): () => void {
+  if (IS_TAURI) {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    listen<NoticeDto>("app://notice", (e) => {
+      if (!disposed) onNotice(e.payload);
+    })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => {
+        if (!disposed) onError?.(err);
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }
+  // 浏览器/测试环境没有后端推送；测试通过 spy 注入通知
+  return () => {};
 }

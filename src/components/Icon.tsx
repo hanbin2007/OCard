@@ -120,6 +120,23 @@ export function IconRetry(props: IconProps) {
   );
 }
 
+export function IconBell(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M12.2 11.2V7.2a4.2 4.2 0 1 0-8.4 0v4l-1.1 1.6h10.6z" />
+      <path d="M6.6 13.8a1.5 1.5 0 0 0 2.8 0" />
+    </Svg>
+  );
+}
+
+export function IconClose(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M4 4l8 8M12 4l-8 8" />
+    </Svg>
+  );
+}
+
 export function IconSettings(props: IconProps) {
   return (
     <Svg {...props}>

@@ -22,6 +22,8 @@ import type {
   CopyFileItem,
   CopyProgressEvent,
   CopyTask,
+  NoticeDto,
+  NoticeLevel,
   Project,
   StorageCard,
   Volume,
@@ -29,6 +31,22 @@ import type {
 } from "../api/types";
 
 export type RouteName = "projects" | "new-project" | "devices" | "copy";
+
+/**
+ * 通知中心条目：同 code 连续重复会折叠成一条并计数，避免刷屏。
+ * `live` 表示还在即时呈现区（error 需手动确认，warning 数秒后自动收进铃铛）。
+ */
+export interface NoticeEntry {
+  id: string;
+  level: NoticeLevel;
+  code: string;
+  message: string;
+  firstAt: string;
+  lastAt: string;
+  count: number;
+  read: boolean;
+  live: boolean;
+}
 
 export interface AppState {
   route: RouteName;
@@ -50,8 +68,11 @@ export interface AppState {
    * 或快照还没拉回来）。先按 taskId 缓存最新一条，拉到快照后补上。
    */
   orphanProgress: Record<string, CopyProgressEvent>;
-  /** 进度监听建立失败：界面要说出来，不能假装一切正常 */
-  progressError: string | null;
+  /** 通知中心：一切降级/失败都在这里可见，不允许静默 fail-open */
+  notices: NoticeEntry[];
+  noticesOpen: boolean;
+  /** 生成稳定 id 用，保持 reducer 纯函数 */
+  noticeSeq: number;
 }
 
 type BootstrapPayload = Pick<
@@ -77,7 +98,12 @@ export type AppAction =
   | { type: "settingsClosed" }
   | { type: "workstationUpdated"; workstation: WorkstationInfo }
   | { type: "taskSnapshot"; task: CopyTask }
-  | { type: "progressListenFailed"; error: string };
+  | { type: "noticeReceived"; notice: NoticeDto }
+  | { type: "noticeToastDismissed"; id: string }
+  | { type: "noticeDismissed"; id: string }
+  | { type: "noticesCleared" }
+  | { type: "noticesPanelToggled" }
+  | { type: "noticesPanelClosed" };
 
 /** 孤儿对账的退避档位：失败一次等 2s，再失败 5s，之后稳定在 10s */
 const ORPHAN_BACKOFF_MS = [2000, 5000, 10000];
@@ -96,7 +122,9 @@ export const initialState: AppState = {
   selectedTaskId: null,
   settingsOpen: false,
   orphanProgress: {},
-  progressError: null,
+  notices: [],
+  noticesOpen: false,
+  noticeSeq: 0,
 };
 
 /** 把增量事件合并进文件列表；未在事件里出现的文件保持原样 */
@@ -271,8 +299,67 @@ export function reducer(state: AppState, action: AppAction): AppState {
       };
     }
 
-    case "progressListenFailed":
-      return { ...state, progressError: action.error };
+    case "noticeReceived": {
+      const notice = action.notice;
+      const head = state.notices[0];
+      // 同 code 连续重复折叠为一条并计数，不刷屏
+      if (head && head.code === notice.code && head.level === notice.level) {
+        const merged: NoticeEntry = {
+          ...head,
+          count: head.count + 1,
+          lastAt: notice.occurredAt,
+          message: notice.message,
+          read: false,
+          live: true,
+        };
+        return { ...state, notices: [merged, ...state.notices.slice(1)] };
+      }
+      const entry: NoticeEntry = {
+        id: `notice-${state.noticeSeq + 1}`,
+        level: notice.level,
+        code: notice.code,
+        message: notice.message,
+        firstAt: notice.occurredAt,
+        lastAt: notice.occurredAt,
+        count: 1,
+        read: false,
+        live: true,
+      };
+      return {
+        ...state,
+        notices: [entry, ...state.notices],
+        noticeSeq: state.noticeSeq + 1,
+      };
+    }
+
+    case "noticeToastDismissed":
+      return {
+        ...state,
+        notices: state.notices.map((n) =>
+          n.id === action.id ? { ...n, live: false } : n,
+        ),
+      };
+
+    case "noticeDismissed":
+      return { ...state, notices: state.notices.filter((n) => n.id !== action.id) };
+
+    case "noticesCleared":
+      return { ...state, notices: [] };
+
+    case "noticesPanelToggled": {
+      const open = !state.noticesOpen;
+      return {
+        ...state,
+        noticesOpen: open,
+        // 打开即视为已读，并把即时呈现区收起来
+        notices: open
+          ? state.notices.map((n) => ({ ...n, read: true, live: false }))
+          : state.notices,
+      };
+    }
+
+    case "noticesPanelClosed":
+      return { ...state, noticesOpen: false };
 
     case "settingsOpened":
       return { ...state, settingsOpen: true };
@@ -362,11 +449,39 @@ export function StoreProvider({
       (event) => dispatch({ type: "taskProgress", event }),
       (err) =>
         dispatch({
-          type: "progressListenFailed",
-          error:
-            err instanceof Error
-              ? `进度监听未能建立：${err.message}`
-              : "进度监听未能建立，界面可能不会自动刷新",
+          type: "noticeReceived",
+          notice: {
+            level: "error",
+            code: "progress-listen-failed",
+            message:
+              err instanceof Error
+                ? `进度监听未能建立：${err.message}。拷卡进度不会自动刷新，请重启应用；已在进行的拷贝不受影响。`
+                : "进度监听未能建立，拷卡进度不会自动刷新，请重启应用；已在进行的拷贝不受影响。",
+            occurredAt: new Date().toISOString(),
+          },
+        }),
+    );
+  }, []);
+
+  /**
+   * 后端通知（降级/失败）常驻订阅。
+   * 连通知通道本身建不起来也要说出来——否则后续所有降级都会静默。
+   */
+  useEffect(() => {
+    return api.subscribeNotices(
+      (notice) => dispatch({ type: "noticeReceived", notice }),
+      (err) =>
+        dispatch({
+          type: "noticeReceived",
+          notice: {
+            level: "error",
+            code: "notice-listen-failed",
+            message:
+              err instanceof Error
+                ? `通知通道未能建立：${err.message}。后端的降级提示可能无法送达，请重启应用。`
+                : "通知通道未能建立，后端的降级提示可能无法送达，请重启应用。",
+            occurredAt: new Date().toISOString(),
+          },
         }),
     );
   }, []);
