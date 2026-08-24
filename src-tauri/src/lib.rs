@@ -20,7 +20,7 @@ pub fn run() {
                 machine_id,
                 tasks: Default::default(),
                 notices: Default::default(),
-                delivering: Default::default(),
+                ops: Default::default(),
             });
             // 崩溃/重启后从未完成的 manifest 重建可续传任务
             commands::rebuild_tasks(app.handle(), &app.state::<AppState>());

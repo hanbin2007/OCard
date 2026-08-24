@@ -67,6 +67,10 @@ fn is_hidden(name: &str) -> bool {
     name.starts_with('.')
 }
 
+fn out_push_entry_err(warnings: &mut Vec<String>, dir: &Path, err: std::io::Error) {
+    warnings.push(format!("目录 {} 中有条目读取失败: {err}", dir.display()));
+}
+
 /// 收集一个目录下的全部文件(递归,忽略隐藏);不可读目录计入警告,不静默。
 /// **不跟随符号链接**(复验轮二 P0:链接目录会把收集范围递归到项目外),
 /// 链接条目跳过并警告。
@@ -83,7 +87,15 @@ fn collect(dir: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf> {
                 continue;
             }
         };
-        for e in entries.flatten() {
+        for e in entries {
+            let e = match e {
+                Ok(e) => e,
+                Err(err) => {
+                    // 逐项枚举错误不许静默丢:漏文件要可见(终审零静默)
+                    out_push_entry_err(warnings, &d, err);
+                    continue;
+                }
+            };
             if is_hidden(&e.file_name().to_string_lossy()) {
                 continue;
             }
@@ -208,6 +220,15 @@ pub fn build_delivery(project_root: &Path, meta: &project::ProjectMeta) -> Resul
     let mut out = DeliveryOutcome::default();
 
     for (category, dir) in &sources {
+        // 分类夹本身被换成链接:整夹拒绝交付(终审 P0:扫描根不跟随链接)
+        if super::paths::is_symlink(dir) {
+            out.failures.push((
+                category.clone(),
+                "error",
+                "分类夹是符号链接,拒绝交付该夹".to_string(),
+            ));
+            continue;
+        }
         for file in collect(dir, &mut out.warnings) {
             let rel = file
                 .strip_prefix(project_root)
@@ -217,7 +238,8 @@ pub fn build_delivery(project_root: &Path, meta: &project::ProjectMeta) -> Resul
             // 与交付清单保留名撞名的源文件必须显式拒绝:静默交付会被清单
             // 生成器漏计/覆盖(codex 复验 P0)
             if let Some(name) = file.file_name().and_then(|n| n.to_str()) {
-                if name == MANIFEST_NAME || name == SUMMARY_NAME {
+                let lower = name.to_lowercase();
+                if lower == MANIFEST_NAME || lower == SUMMARY_NAME {
                     out.failures.push((
                         rel,
                         "error",
@@ -269,13 +291,24 @@ pub fn build_delivery(project_root: &Path, meta: &project::ProjectMeta) -> Resul
     }
     out.packages.sort();
 
-    write_manifests(&delivery_root, &mut out);
+    write_manifests(project_root, &delivery_root, &mut out);
     Ok(out)
 }
 
 /// 清单一律从目标包目录**实况**生成(重跑/多轮后口径始终正确);
 /// 写失败降级为 `manifest-error` 失败项,不中断、不丢结果(评审 H1)。
-fn write_manifests(delivery_root: &Path, out: &mut DeliveryOutcome) {
+fn write_manifests(project_root: &Path, delivery_root: &Path, out: &mut DeliveryOutcome) {
+    // 交付根过落地闸:被换成链接时清单绝不写到项目外(终审 P0)
+    if delivery_root.exists() {
+        if let Err(e) = super::paths::ensure_dir_within(project_root, delivery_root) {
+            out.failures.push((
+                DELIVERY_DIR.to_string(),
+                "manifest-error",
+                format!("交付目录校验失败,清单未写入: {e}"),
+            ));
+            return;
+        }
+    }
     let mut pkg_dirs: Vec<String> = match fs::read_dir(delivery_root) {
         Ok(entries) => entries
             .flatten()
@@ -357,6 +390,10 @@ fn write_manifests(delivery_root: &Path, out: &mut DeliveryOutcome) {
 
 /// 派生文件(清单)的原子写:唯一临时文件 + rename 替换(清单允许重生成覆盖)。
 fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    if super::paths::is_symlink(path) {
+        // 清单位置被链接占据:拒绝(rename 替换会写穿链接目标)
+        return Err(std::io::Error::other("清单位置是符号链接,拒绝写入"));
+    }
     let dir = path.parent().unwrap_or(Path::new("."));
     let tmp = dir.join(format!(".{}.manifestpart", uuid::Uuid::new_v4()));
     fs::write(&tmp, content.as_bytes())?;

@@ -88,23 +88,22 @@ pub fn resolve_in_project(project_root: &Path, rel: &str) -> std::result::Result
     Ok(normalized)
 }
 
-/// 目标目录落地闸(复验轮二 P0):写入前把**目录实体**canonicalize 后断言
-/// 仍在项目内——挡住「精选/待修」「.ocard/trash」等固定目录被整体替换成
-/// 指向项目外的符号链接。canonicalize→写入之间的极窄窗口是无锁共享盘的
-/// 固有边界,已声明。目录不存在时先创建。
+/// 目标目录落地闸(复验轮二 P0 + 终审修复):委托 [`paths::ensure_dir_within`],
+/// 闸在副作用之前(链接祖先下的缺失子目录不会先在项目外被创建)。
 fn ensure_dir_in_project(project_root: &Path, dir: &Path) -> std::result::Result<(), String> {
-    fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {e}"))?;
-    let canon_root = fs::canonicalize(project_root).map_err(|e| format!("项目根解析失败: {e}"))?;
-    let canon = fs::canonicalize(dir).map_err(|e| format!("目录解析失败: {e}"))?;
-    let root_key = paths::comparison_key(&canon_root);
-    let key = paths::comparison_key(&canon);
-    if !key.starts_with(&root_key) {
-        return Err(format!(
-            "目录实际位置在项目外(疑似被符号链接替换),拒绝写入: {}",
-            dir.display()
-        ));
+    paths::ensure_dir_within(project_root, dir)
+}
+
+/// 回收站路径闸(终审 P0:回收站**源端**同样要设防)——
+/// `.ocard/trash` 目录过落地闸,`index.jsonl` 拒符号链接。
+/// list/trash/restore/empty 的一切回收站访问都从这里拿路径。
+fn checked_trash_dir(project_root: &Path) -> std::result::Result<PathBuf, String> {
+    let dir = trash_dir(project_root);
+    ensure_dir_in_project(project_root, &dir)?;
+    if paths::is_symlink(&dir.join(TRASH_INDEX)) {
+        return Err("回收站索引是符号链接,拒绝操作".into());
     }
-    Ok(())
+    Ok(dir)
 }
 
 /// 素材命名空间闸:asset id 的首段必须是工况 B 布局中的可见文件夹。
@@ -355,18 +354,15 @@ pub fn trash_dir(project_root: &Path) -> PathBuf {
     project_root.join(STATE_DIR).join(TRASH_DIR)
 }
 
-fn trash_index_path(project_root: &Path) -> PathBuf {
-    trash_dir(project_root).join(TRASH_INDEX)
-}
-
 fn append_index_line(project_root: &Path, line: String) -> std::result::Result<(), String> {
+    let dir = checked_trash_dir(project_root)?;
     let mut line = line;
     line.push('\n');
     use std::io::Write;
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(trash_index_path(project_root))
+        .open(dir.join(TRASH_INDEX))
         .map_err(|e| e.to_string())?;
     f.write_all(line.as_bytes()).map_err(|e| e.to_string())
 }
@@ -407,8 +403,8 @@ pub struct TrashList {
 /// 索引是纯追加文件:记录行 + 墓碑行(见 [`TrashTombstone`]);同 id 后行覆盖前行,
 /// 墓碑终结记录。stored_as 含分隔符/越界成分的行按坏行处理(共享可写文件,不可信)。
 pub fn list_trash(project_root: &Path) -> Result<TrashList> {
-    let path = trash_index_path(project_root);
-    let dir = trash_dir(project_root);
+    let dir = checked_trash_dir(project_root).map_err(CoreError::Invalid)?;
+    let path = dir.join(TRASH_INDEX);
     let mut out = TrashList::default();
     // 折叠:id → 最后一条记录;墓碑集合另记
     let mut by_id: std::collections::HashMap<String, TrashRecord> = Default::default();
@@ -472,14 +468,13 @@ pub fn trash_assets(
     asset_ids: &[String],
     operator: &str,
 ) -> Vec<ItemOutcome> {
-    let dir = trash_dir(project_root);
     asset_ids
         .iter()
         .map(|id| {
             let result = (|| -> std::result::Result<(), String> {
                 let src = resolve_asset_in_project(project_root, meta, id)?;
                 let meta = fs::metadata(&src).map_err(|_| "源文件不存在或不可读".to_string())?;
-                ensure_dir_in_project(project_root, &dir)?;
+                let dir = checked_trash_dir(project_root)?;
                 let rec_id = uuid::Uuid::new_v4().to_string();
                 let stored_as = format!("{rec_id}_{}", file_name_of(id));
                 let dst = dir.join(&stored_as);
@@ -528,7 +523,7 @@ pub fn restore_from_trash(
     entry_ids: &[String],
 ) -> Result<RestoreOutcome> {
     let list = list_trash(project_root)?;
-    let dir = trash_dir(project_root);
+    let dir = checked_trash_dir(project_root).map_err(CoreError::Invalid)?;
     let mut out = RestoreOutcome::default();
     for eid in entry_ids {
         let result = match list.records.iter().find(|r| &r.id == eid) {
@@ -565,7 +560,7 @@ pub struct EmptyTrashOutcome {
 /// 索引因此单调增长,属可接受成本(内部工具、行级体量);压缩归 M3。
 pub fn empty_trash(project_root: &Path) -> Result<EmptyTrashOutcome> {
     let list = list_trash(project_root)?;
-    let dir = trash_dir(project_root);
+    let dir = checked_trash_dir(project_root).map_err(CoreError::Invalid)?;
     let mut out = EmptyTrashOutcome::default();
     let mut tombstone_errors = 0usize;
     for rec in &list.records {
@@ -1034,7 +1029,7 @@ mod tests {
         fs::remove_dir_all(&curated_todo).ok();
         std::os::unix::fs::symlink(&outside, &curated_todo).unwrap();
         let out = curate_assets(&root, &meta, &[asset("a.jpg")]);
-        assert!(out[0].result.as_ref().unwrap_err().contains("项目外"));
+        assert!(out[0].result.as_ref().unwrap_err().contains("符号链接"));
         assert!(
             fs::read_dir(&outside).unwrap().next().is_none(),
             "不许写进外部"
@@ -1046,7 +1041,16 @@ mod tests {
         fs::remove_dir_all(&tdir).ok();
         std::os::unix::fs::symlink(&outside, &tdir).unwrap();
         let out = trash_assets(&root, &meta, &[asset("a.jpg")], "ZS");
-        assert!(out[0].result.as_ref().unwrap_err().contains("项目外"));
+        assert!(out[0].result.as_ref().unwrap_err().contains("符号链接"));
+        // 终审 P0:回收站源端(list/empty)对被换链接的 trash 也 fail-closed
+        assert!(
+            list_trash(&root).is_err(),
+            "list_trash 对链接 trash 必须拒绝"
+        );
+        assert!(
+            empty_trash(&root).is_err(),
+            "empty_trash 对链接 trash 必须拒绝"
+        );
         assert!(root.join(asset("a.jpg")).is_file(), "源文件原地未动");
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
     }

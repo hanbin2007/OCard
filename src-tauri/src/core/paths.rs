@@ -186,3 +186,72 @@ mod windows_tests {
         .is_err());
     }
 }
+
+/// 目录落地闸(终审修复):把目录实体 canonicalize 后断言仍在 root 之内。
+/// 次序是关键——**闸在副作用之前**:先对「最深已存在祖先」断言,
+/// 通过后才创建缺失段(缺失段由本进程刚创建,不可能是链接),
+/// 最后整体复核一次(防创建期间被替换)。canonicalize→写入之间的
+/// 极窄窗口是无锁共享盘的固有边界,已在评审收敛文档声明。
+pub(crate) fn ensure_dir_within(root: &Path, dir: &Path) -> Result<(), String> {
+    let canon_root = std::fs::canonicalize(root).map_err(|e| format!("根目录解析失败: {e}"))?;
+    let root_key = comparison_key(&canon_root);
+    let mut probe = dir.to_path_buf();
+    while !probe.exists() {
+        match probe.parent() {
+            Some(p) => probe = p.to_path_buf(),
+            None => return Err(format!("目录不在任何已存在路径下: {}", dir.display())),
+        }
+    }
+    let canon_probe = std::fs::canonicalize(&probe).map_err(|e| format!("目录解析失败: {e}"))?;
+    if !comparison_key(&canon_probe).starts_with(&root_key) {
+        return Err(format!(
+            "目录实际位置在根之外(疑似被符号链接替换),拒绝写入: {}",
+            dir.display()
+        ));
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    let canon = std::fs::canonicalize(dir).map_err(|e| format!("目录解析失败: {e}"))?;
+    if !comparison_key(&canon).starts_with(&root_key) {
+        return Err(format!(
+            "目录实际位置在根之外(疑似被符号链接替换),拒绝写入: {}",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// 判定路径自身是否为符号链接(不存在视为否)。
+pub(crate) fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod dir_gate_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn gate_refuses_before_side_effects() {
+        // 终审 P0:链接祖先下的缺失子目录不许先在根外被创建
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let target = root.join("link/新子夹/更深");
+        let err = ensure_dir_within(&root, &target).unwrap_err();
+        assert!(err.contains("根之外"), "{err}");
+        assert!(
+            !outside.join("新子夹").exists(),
+            "闸必须先于副作用:根外不许出现任何新目录"
+        );
+        // 正常目录通过并创建
+        ensure_dir_within(&root, &root.join("a/b")).unwrap();
+        assert!(root.join("a/b").is_dir());
+    }
+}

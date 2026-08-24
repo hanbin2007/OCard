@@ -107,6 +107,8 @@ pub fn spawn_worker(app: AppHandle, handle: Arc<TaskHandle>) {
     }
     std::thread::spawn(move || {
         let outcome = run_worker(&app, &handle);
+        // 拷贝路径也消费 fsx 回退标记(终审:告警不能只挂在分类命令上)
+        super::sorting_cmds::notify_if_unsafe_fallback(&app);
         if let Err(e) = &outcome {
             let mut snap = handle.snapshot.lock().unwrap();
             // IO 类错误(NAS 抖动/断连)是可恢复的暂停,不是死路(评审 H4)

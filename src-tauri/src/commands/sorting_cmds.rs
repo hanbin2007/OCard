@@ -23,18 +23,68 @@ fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-/// 交付互斥闸:打包进行中拒绝同项目的分类/回收站变更(不只靠前端禁用,
-/// 复验轮二 P1:直连 IPC 也要挡)。
-fn reject_if_delivering(state: &State<AppState>, project_id: &str) -> CmdResult<()> {
-    let guard = state.delivering.lock().unwrap();
-    if guard.as_deref() == Some(project_id) {
-        return Err("交付打包进行中,分类与回收站操作已暂停,请等打包完成".into());
+/// 本机「交付 ↔ 分类/回收站」互斥(终审修复:原子、可单测、panic 安全)。
+/// - 分类/回收站变更命令持 [`SortingGuard`] 直到操作结束;
+/// - 交付打包持 [`DeliveryGuard`];两边在获取时互相检查,检查与占位在同一锁内,
+///   不存在「检查通过后对方才置位」的重叠窗口;
+/// - Guard 走 Drop 释放:任何 panic/早退都不会把闸永久卡死。
+///
+/// 跨机互斥是 M3 前置(无锁 NAS,已声明边界)。
+#[derive(Default)]
+pub struct OpsMutex(Mutex<OpsState>);
+
+#[derive(Default)]
+struct OpsState {
+    delivering: Option<String>,
+    sorting_ops: usize,
+}
+
+pub struct SortingGuard<'a>(&'a OpsMutex);
+pub struct DeliveryGuard<'a>(&'a OpsMutex);
+
+impl OpsMutex {
+    fn lock(&self) -> std::sync::MutexGuard<'_, OpsState> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
-    Ok(())
+    pub fn begin_sorting(&self, project_id: &str) -> std::result::Result<SortingGuard<'_>, String> {
+        let mut st = self.lock();
+        if st.delivering.as_deref() == Some(project_id) {
+            return Err("交付打包进行中,分类与回收站操作已暂停,请等打包完成".into());
+        }
+        st.sorting_ops += 1;
+        Ok(SortingGuard(self))
+    }
+    pub fn begin_delivery(
+        &self,
+        project_id: &str,
+    ) -> std::result::Result<DeliveryGuard<'_>, String> {
+        let mut st = self.lock();
+        if st.delivering.is_some() {
+            return Err("已有交付打包在进行中,请等它完成".into());
+        }
+        if st.sorting_ops > 0 {
+            return Err("有分类/回收站操作正在进行,请稍候片刻再开始打包".into());
+        }
+        st.delivering = Some(project_id.to_string());
+        Ok(DeliveryGuard(self))
+    }
+}
+
+impl Drop for SortingGuard<'_> {
+    fn drop(&mut self) {
+        let mut st = self.0.lock();
+        st.sorting_ops = st.sorting_ops.saturating_sub(1);
+    }
+}
+
+impl Drop for DeliveryGuard<'_> {
+    fn drop(&mut self) {
+        self.0.lock().delivering = None;
+    }
 }
 
 /// fsx 最后回退(检查+改名)被使用过:发一次性告警(零静默,复验轮二 P1)。
-fn notify_if_unsafe_fallback(app: &AppHandle) {
+pub(crate) fn notify_if_unsafe_fallback(app: &AppHandle) {
     if crate::core::fsx::take_unsafe_fallback_flag() {
         notify::warn(
             app,
@@ -274,6 +324,7 @@ fn ensure_indexing(app: &AppHandle, project_id: &str, project_root: &Path, files
         let snapshot = st.clone();
         drop(map);
         emit_index_progress(&app, &project_id, &snapshot);
+        notify_if_unsafe_fallback(&app);
         if loop_result.is_err() {
             notify::error(
                 &app,
@@ -466,7 +517,7 @@ pub fn move_assets(
     asset_ids: Vec<String>,
     category_id: String,
 ) -> CmdResult<BulkResultDto> {
-    reject_if_delivering(&state, &project_id)?;
+    let _ops = state.ops.begin_sorting(&project_id)?;
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
     // 分类夹白名单:必须是该项目已知分类;精选是复制语义,走 curate_assets,
@@ -506,7 +557,7 @@ pub fn curate_assets(
 ) -> CmdResult<BulkResultDto> {
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
-    reject_if_delivering(&state, &project_id)?;
+    let _ops = state.ops.begin_sorting(&project_id)?;
     let res = bulk(sorting::curate_assets(&stats.root, &stats.meta, &asset_ids));
     notify_if_unsafe_fallback(&app);
     audit_bulk(
@@ -527,6 +578,7 @@ pub fn trash_assets(
     project_id: String,
     asset_ids: Vec<String>,
 ) -> CmdResult<BulkResultDto> {
+    let _ops = state.ops.begin_sorting(&project_id)?;
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
     let op = operator(&app, &state);
@@ -536,6 +588,7 @@ pub fn trash_assets(
         &asset_ids,
         &op,
     ));
+    notify_if_unsafe_fallback(&app);
     // 「文件滞留回收站」是数据位置异常(既不在原位也不在索引),升级为 error 通知
     let stranded = res
         .failed
@@ -615,7 +668,7 @@ pub fn restore_from_trash(
 ) -> CmdResult<BulkResultDto> {
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
-    reject_if_delivering(&state, &project_id)?;
+    let _ops = state.ops.begin_sorting(&project_id)?;
     let restored =
         sorting::restore_from_trash(&stats.root, &stats.meta, &entry_ids).map_err(err)?;
     if restored.tombstone_errors > 0 {
@@ -654,10 +707,11 @@ pub fn empty_trash(
     state: State<AppState>,
     project_id: String,
 ) -> CmdResult<EmptyTrashResultDto> {
-    reject_if_delivering(&state, &project_id)?;
+    let _ops = state.ops.begin_sorting(&project_id)?;
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
     let out = sorting::empty_trash(&stats.root).map_err(err)?;
+    notify_if_unsafe_fallback(&app);
     let op = operator(&app, &state);
     super::tasks::append_audit(
         &app,
@@ -744,16 +798,8 @@ pub fn build_delivery(
 ) -> CmdResult<DeliverySummaryDto> {
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
-    {
-        let mut guard = state.delivering.lock().unwrap();
-        if guard.is_some() {
-            return Err("已有交付打包在进行中,请等它完成".into());
-        }
-        *guard = Some(project_id.clone());
-    }
-    let out = crate::core::packaging::build_delivery(&stats.root, &stats.meta);
-    *state.delivering.lock().unwrap() = None; // 无论成败都解除互斥
-    let out = out.map_err(err)?;
+    let _ops = state.ops.begin_delivery(&project_id)?;
+    let out = crate::core::packaging::build_delivery(&stats.root, &stats.meta).map_err(err)?;
     notify_if_unsafe_fallback(&app);
 
     // 包表用目标目录实况总量(重跑时不显示 0,codex 复验 P1)
@@ -909,4 +955,50 @@ pub fn list_remote_activity(
     let mut out: Vec<RemoteActivityDto> = open.into_values().collect();
     out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
     Ok(out)
+}
+
+#[cfg(test)]
+mod ops_mutex_tests {
+    use super::OpsMutex;
+
+    #[test]
+    fn delivery_blocks_sorting_and_vice_versa() {
+        let m = OpsMutex::default();
+        let d = m.begin_delivery("p1").unwrap();
+        // 交付中:同项目分类拒绝;其他项目不受影响
+        assert!(m.begin_sorting("p1").is_err());
+        assert!(m.begin_sorting("p2").is_ok());
+        drop(d);
+        // 释放后恢复
+        let s = m.begin_sorting("p1").unwrap();
+        // 分类进行中:交付拒绝(检查与占位同锁,无重叠窗口)
+        assert!(m.begin_delivery("p1").is_err());
+        drop(s);
+        assert!(m.begin_delivery("p1").is_ok());
+    }
+
+    #[test]
+    fn double_delivery_rejected_and_guard_drop_is_panic_safe() {
+        let m = OpsMutex::default();
+        let _d = m.begin_delivery("p1").unwrap();
+        assert!(m.begin_delivery("p2").is_err());
+        // panic 路径:guard 随栈展开释放,闸不会永久卡死
+        let m2 = OpsMutex::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = m2.begin_delivery("p1").unwrap();
+            panic!("boom");
+        }));
+        assert!(m2.begin_delivery("p1").is_ok(), "panic 后闸必须已释放");
+    }
+
+    #[test]
+    fn concurrent_sorting_ops_counted() {
+        let m = OpsMutex::default();
+        let a = m.begin_sorting("p1").unwrap();
+        let b = m.begin_sorting("p1").unwrap();
+        drop(a);
+        assert!(m.begin_delivery("p1").is_err(), "还有一个分类操作在途");
+        drop(b);
+        assert!(m.begin_delivery("p1").is_ok());
+    }
 }

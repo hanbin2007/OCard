@@ -68,10 +68,34 @@
   包表改实况总量 package_totals。
 - E2E 增补:精选复制、重跑 verified-skip 磁盘断言。
 
-已声明边界(不再视为缺陷,写入模块文档):fsx 在异构文件系统的最后回退存在微秒级
-复查窗口;EXIF 夏令时空档退化按 UTC 解释;缩略图缓存键 path+size(同名同大小同 mtime
-替换的缓存陈旧属理论场景);打包对分类夹内子目录扁平化落包(同名跨子目录报
-name-collision,人工裁决)。
+已声明边界(不再视为缺陷,写入模块文档):fsx 在异构文件系统的最后回退存在
+检查-改名窗口(本地盘微秒级,NAS 可达网络往返;触发时经 UNSAFE_FALLBACK 标记
+发一次性用户告警,零静默);EXIF 夏令时空档退化按 UTC 解释;缩略图缓存键
+path+size+mtime(修复波四起,与索引指纹同源);打包对分类夹内子目录扁平化落包
+(同名跨子目录报 name-collision,人工裁决);canonicalize→写入之间的极窄 TOCTOU
+窗口(无锁共享盘固有);跨机互斥归 M3 前置。
+
+## 终审轮(2026-08-24,gpt-5.6-sol max + fable-5 双票)与终审修复波
+
+双票均判不可收口。fable 抓住:delivering 互斥闸漏接 trash_assets(后端)且该闸
+零测试;codex 抓住:ensure_dir_in_project 闸前副作用(create_dir_all 先于
+canonicalize)、回收站源端(list/restore/empty/index 追加)未设闸、write_manifests
+无闸、互斥检查非原子、fsx 告警消费点不全、collect 逐项枚举错误静默丢弃。
+
+终审修复波(全部落地):
+- `paths::ensure_dir_within`:探针先行(最深已存在祖先先断言,再创建,再复核),
+  副作用永远在闸后;unix 测试断言「根外不许出现任何新目录」。
+- 回收站源端统一走 `checked_trash_dir`(目录过闸 + index.jsonl 拒链接):
+  list/trash/restore/empty/append 全覆盖;测试补 list/empty 对链接 trash 拒绝。
+- packaging:deliver_one 闸提到一切判定之前 + dst 自身拒链接;分类夹为链接整夹
+  拒绝交付;write_manifests 过交付根闸;write_atomic 拒链接目标;保留名判定
+  大小写不敏感;collect 逐项错误计警告。
+- 互斥闸重做为 `OpsMutex` RAII(检查与占位同锁原子、Guard Drop panic 安全、
+  纯结构可单测):五个变更命令 + build_delivery 全接线,三组单测
+  (交付↔分类互拒、双交付拒、panic 释放、并发计数)。
+- fsx 回退告警消费点补全:trash/empty/拷贝 worker/索引收尾。
+- Rust 96→100 测试。前端(波六):确认删除链路按打包态禁用、导航保护、
+  折叠计数与次级刷新收尾。
 
 ## 计划修订(记入 M2 语义宣称,架构项排 M3 前置批)
 
