@@ -1,5 +1,5 @@
 //! 分类工作台命令层(M2):契约见 src/api/types.ts。
-//! - 分页列素材(缩略图 base64 内联,未索引到为 None → UI 占位);
+//! - 分页列素材(缩略图经 thumb:// 协议按需读取,未索引到为 None → UI 占位);
 //! - 后台索引线程:首次列出即启动,进度经 `index://progress` 推送,失败计数可见;
 //! - 批量操作返回 BulkResult(部分失败逐条给原因);
 //! - 连拍分组(groupId)v1 不实现,归 M3 AI 选片聚类——如实声明,不糊弄。
@@ -7,7 +7,6 @@
 use super::notify;
 use super::{find_project, nas_root, operator, AppState};
 use crate::core::{copy, media, project, sorting};
-use base64::Engine;
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -107,6 +106,8 @@ pub struct SortingAssetDto {
     pub shot_at_fallback: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<String>,
+    /// 缩略图缓存已就绪(索引完成刷新判据——thumbnail 为 URL 后不能再用其存在性判断)。
+    pub thumb_ready: bool,
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_id: Option<String>,
@@ -384,7 +385,13 @@ fn inbox_rel_files(project_root: &Path) -> CmdResult<Vec<InboxFile>> {
     Ok(files)
 }
 
-fn asset_dto(project_root: &Path, rel: &str, size: u64, mtime: u128) -> SortingAssetDto {
+fn asset_dto(
+    project_root: &Path,
+    project_id: &str,
+    rel: &str,
+    size: u64,
+    mtime: u128,
+) -> SortingAssetDto {
     let abs = project_root.join(rel.split('/').collect::<PathBuf>());
     let kind = media::classify(rel);
     let exif_time = media::exif_shot_at(&abs);
@@ -396,16 +403,15 @@ fn asset_dto(project_root: &Path, rel: &str, size: u64, mtime: u128) -> SortingA
             .map(chrono::DateTime::<Utc>::from)
     });
     let thumb_path = media::cached_thumb_path(project_root, rel, size, mtime);
-    // 命中也要验完整性:半截缓存宁可占位也不端破图给界面(复验 P2)
-    let thumb = (thumb_path.is_file() && media::looks_like_valid_jpeg(&thumb_path))
-        .then(|| std::fs::read(&thumb_path).ok())
-        .flatten()
-        .map(|bytes| {
-            format!(
-                "data:image/jpeg;base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(bytes)
-            )
-        });
+    // 命中也要验完整性:半截缓存宁可占位也不端破图给界面(复验 P2)。
+    // W4:不再内联 base64,就绪时给 thumb:// URL(协议层再过一次闸)
+    let thumb_ready = thumb_path.is_file() && media::looks_like_valid_jpeg(&thumb_path);
+    let thumb = thumb_ready.then(|| {
+        super::thumb_proto::thumb_url(
+            project_id,
+            &thumb_path.file_name().unwrap_or_default().to_string_lossy(),
+        )
+    });
     SortingAssetDto {
         id: rel.to_string(),
         file_name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
@@ -413,6 +419,7 @@ fn asset_dto(project_root: &Path, rel: &str, size: u64, mtime: u128) -> SortingA
         shot_at: shot_at.map(|t| t.to_rfc3339()),
         shot_at_fallback: shot_at.is_some().then_some(fallback).filter(|f| *f),
         thumbnail: thumb,
+        thumb_ready,
         kind: match kind {
             media::AssetKind::Photo => "photo",
             media::AssetKind::Raw => "raw",
@@ -439,8 +446,8 @@ pub fn list_pending_assets<R: tauri::Runtime>(
     let items = files
         .iter()
         .skip(offset)
-        .take(limit.min(200)) // 上限与前端页大小一致,守住缩略图 base64 的 IPC 体积
-        .map(|(rel, size, mtime)| asset_dto(&stats.root, rel, *size, *mtime))
+        .take(limit.min(200)) // 上限与前端页大小一致
+        .map(|(rel, size, mtime)| asset_dto(&stats.root, &project_id, rel, *size, *mtime))
         .collect();
     Ok(AssetPageDto { items, total })
 }

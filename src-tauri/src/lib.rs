@@ -81,6 +81,53 @@ pub fn run() {
             });
             Ok(())
         })
+        .register_asynchronous_uri_scheme_protocol("thumb", |ctx, request, responder| {
+            // 缩略图按需读取(M3 W4):闸在 thumb_proto::resolve_thumb_request,
+            // 这里只做 IO;异步线程防主线程卡死;失败聚合告警(零静默)
+            let app = ctx.app_handle().clone();
+            let path = request.uri().path().to_string();
+            std::thread::spawn(move || {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static CONSECUTIVE_FAILS: AtomicU32 = AtomicU32::new(0);
+                let bytes = (|| -> Result<Vec<u8>, String> {
+                    let state = app.state::<commands::AppState>();
+                    let (cfg, _) = core::config::load_checked(&state.config_dir);
+                    let nas = cfg.nas_root.ok_or("未配置 NAS 根路径")?;
+                    let p = commands::thumb_proto::resolve_thumb_request(&nas, &path)?;
+                    std::fs::read(&p).map_err(|e| e.to_string())
+                })();
+                match bytes {
+                    Ok(body) => {
+                        CONSECUTIVE_FAILS.store(0, Ordering::Relaxed);
+                        responder.respond(
+                            tauri::http::Response::builder()
+                                .status(200)
+                                .header("Content-Type", "image/jpeg")
+                                .body(body)
+                                .unwrap_or_default(),
+                        );
+                    }
+                    Err(e) => {
+                        // 单张失败=占位(既有语义);连续大量失败=协议/NAS 级异常,必须可见
+                        let n = CONSECUTIVE_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == 20 {
+                            commands::notify::warn(
+                                &app,
+                                "thumb-protocol-degraded",
+                                format!("缩略图服务连续 {n} 次读取失败(最近一次: {e}),网格可能大面积显示占位图;请检查 NAS 连接"),
+                            );
+                            CONSECUTIVE_FAILS.store(0, Ordering::Relaxed);
+                        }
+                        responder.respond(
+                            tauri::http::Response::builder()
+                                .status(404)
+                                .body(Vec::new())
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+            });
+        })
         .invoke_handler(crate::ocard_invoke_handler!())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
