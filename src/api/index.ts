@@ -40,6 +40,17 @@ import type {
   WorkstationInfo,
 } from "./types";
 
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+/** 运行在 Tauri 里时走真实 IPC;浏览器/vitest 环境回退 mock */
+const IS_TAURI =
+  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+function ipc<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  return invoke<T>(cmd, args);
+}
+
 /** 模拟一次 IPC 往返的延迟，让加载态在开发期真实可见 */
 const IPC_DELAY_MS = 120;
 
@@ -57,7 +68,7 @@ function nextId(prefix: string): string {
 
 /** 当前工作站身份与 NAS 根路径（PRD §6.3） */
 export function getWorkstationInfo(): Promise<WorkstationInfo> {
-  // TODO: tauri invoke("get_workstation_info")
+  if (IS_TAURI) return ipc("get_workstation_info");
   return reply(mockWorkstation);
 }
 
@@ -67,13 +78,13 @@ export function getWorkstationInfo(): Promise<WorkstationInfo> {
 
 /** 列出 NAS 根下的全部项目（合并各机 journal 后的重放结果） */
 export function listProjects(): Promise<Project[]> {
-  // TODO: tauri invoke("list_projects")
+  if (IS_TAURI) return ipc("list_projects");
   return reply(mockProjects);
 }
 
 /** 取单个项目详情 */
 export function getProject(projectId: string): Promise<Project | null> {
-  // TODO: tauri invoke("get_project", { projectId })
+  if (IS_TAURI) return ipc("get_project", { projectId });
   return reply(mockProjects.find((p) => p.id === projectId) ?? null);
 }
 
@@ -82,7 +93,7 @@ export function getProject(projectId: string): Promise<Project | null> {
  * Rust 侧须复用与 `buildFolderTree` 等价的模板规则。
  */
 export function createProject(input: NewProjectInput): Promise<Project> {
-  // TODO: tauri invoke("create_project", { input })
+  if (IS_TAURI) return ipc("create_project", { input });
   const folderName = buildProjectFolderName(input.date, input.name);
   const project: Project = {
     id: nextId("p"),
@@ -109,7 +120,7 @@ export function previewFolderTree(
   scenario: Scenario,
   categories: string[],
 ): Promise<FolderNode[]> {
-  // TODO: tauri invoke("preview_folder_tree", { scenario, categories })
+  if (IS_TAURI) return ipc("preview_folder_tree", { scenario, categories });
   return reply(buildFolderTree(scenario, categories));
 }
 
@@ -118,12 +129,12 @@ export function previewFolderTree(
  * ------------------------------------------------------------------ */
 
 export function listCameras(): Promise<CameraReg[]> {
-  // TODO: tauri invoke("list_cameras")
+  if (IS_TAURI) return ipc("list_cameras");
   return reply(mockCameras);
 }
 
 export function createCamera(input: NewCameraInput): Promise<CameraReg> {
-  // TODO: tauri invoke("create_camera", { input })
+  if (IS_TAURI) return ipc("create_camera", { input });
   const camera: CameraReg = {
     id: nextId("cam"),
     model: input.model.trim(),
@@ -137,20 +148,20 @@ export function createCamera(input: NewCameraInput): Promise<CameraReg> {
 }
 
 export function deleteCamera(cameraId: string): Promise<void> {
-  // TODO: tauri invoke("delete_camera", { cameraId })
+  if (IS_TAURI) return ipc("delete_camera", { cameraId });
   void cameraId;
   return reply(undefined);
 }
 
 export function listStorageCards(): Promise<StorageCard[]> {
-  // TODO: tauri invoke("list_storage_cards")
+  if (IS_TAURI) return ipc("list_storage_cards");
   return reply(mockStorageCards);
 }
 
 export function createStorageCard(
   input: NewStorageCardInput,
 ): Promise<StorageCard> {
-  // TODO: tauri invoke("create_storage_card", { input })
+  if (IS_TAURI) return ipc("create_storage_card", { input });
   const card: StorageCard = {
     id: nextId("card"),
     label: input.label.trim(),
@@ -163,7 +174,7 @@ export function createStorageCard(
 }
 
 export function deleteStorageCard(cardId: string): Promise<void> {
-  // TODO: tauri invoke("delete_storage_card", { cardId })
+  if (IS_TAURI) return ipc("delete_storage_card", { cardId });
   void cardId;
   return reply(undefined);
 }
@@ -174,12 +185,12 @@ export function deleteStorageCard(cardId: string): Promise<void> {
 
 /** 当前插入的可移动卷（PRD §6.5，Rust 侧同时以事件推送插拔） */
 export function listVolumes(): Promise<Volume[]> {
-  // TODO: tauri invoke("list_volumes")
+  if (IS_TAURI) return ipc("list_volumes");
   return reply(mockVolumes);
 }
 
 export function listCopyTasks(projectId?: string): Promise<CopyTask[]> {
-  // TODO: tauri invoke("list_copy_tasks", { projectId })
+  if (IS_TAURI) return ipc("list_copy_tasks", { projectId });
   const tasks = projectId
     ? mockCopyTasks.filter((t) => t.projectId === projectId)
     : mockCopyTasks;
@@ -187,13 +198,13 @@ export function listCopyTasks(projectId?: string): Promise<CopyTask[]> {
 }
 
 export function getCopyTask(taskId: string): Promise<CopyTask | null> {
-  // TODO: tauri invoke("get_copy_task", { taskId })
+  if (IS_TAURI) return ipc("get_copy_task", { taskId });
   return reply(mockCopyTasks.find((t) => t.id === taskId) ?? null);
 }
 
 /** 双确认通过后发起拷卡；返回创建出的任务 */
 export function startCopyTask(input: StartCopyInput): Promise<CopyTask> {
-  // TODO: tauri invoke("start_copy_task", { input })
+  if (IS_TAURI) return ipc("start_copy_task", { input });
   const template = mockCopyTasks[0];
   const volume = mockVolumes.find((v) => v.id === input.volumeId);
   const camera = mockCameras.find((c) => c.id === input.cameraId);
@@ -228,20 +239,20 @@ export function startCopyTask(input: StartCopyInput): Promise<CopyTask> {
 
 /** 挂起任务（NAS 断连或人工暂停），按 manifest 可续传 */
 export function pauseCopyTask(taskId: string): Promise<void> {
-  // TODO: tauri invoke("pause_copy_task", { taskId })
+  if (IS_TAURI) return ipc("pause_copy_task", { taskId });
   void taskId;
   return reply(undefined);
 }
 
 export function resumeCopyTask(taskId: string): Promise<void> {
-  // TODO: tauri invoke("resume_copy_task", { taskId })
+  if (IS_TAURI) return ipc("resume_copy_task", { taskId });
   void taskId;
   return reply(undefined);
 }
 
 /** 单文件重试（失败文件不作废整个任务，PRD §6.4） */
 export function retryCopyFile(taskId: string, fileId: string): Promise<void> {
-  // TODO: tauri invoke("retry_copy_file", { taskId, fileId })
+  if (IS_TAURI) return ipc("retry_copy_file", { taskId, fileId });
   void taskId;
   void fileId;
   return reply(undefined);
@@ -253,14 +264,14 @@ export function listCopyFiles(
   offset = 0,
   limit = 200,
 ): Promise<{ items: CopyFileItem[]; total: number }> {
-  // TODO: tauri invoke("list_copy_files", { taskId, offset, limit })
+  if (IS_TAURI) return ipc("list_copy_files", { taskId, offset, limit });
   const files = mockCopyTasks.find((t) => t.id === taskId)?.files ?? [];
   return reply({ items: files.slice(offset, offset + limit), total: files.length });
 }
 
 /** 探查源卷：素材时间范围 + 建议时段前缀（PRD §5.3「从素材时间戳自动推断，可改」） */
 export function inspectVolume(volumeId: string): Promise<VolumeInspection> {
-  // TODO: tauri invoke("inspect_volume", { volumeId })
+  if (IS_TAURI) return ipc("inspect_volume", { volumeId });
   const volume = mockVolumes.find((v) => v.id === volumeId);
   return reply({
     volumeId,
@@ -284,7 +295,21 @@ export function subscribeCopyProgress(
   taskIds: string[],
   onEvent: (event: CopyProgressEvent) => void,
 ): () => void {
-  // TODO: tauri invoke -> @tauri-apps/api/event listen("copy://progress")
+  if (IS_TAURI) {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void listen<CopyProgressEvent>("copy://progress", (e) => {
+      if (!disposed && taskIds.includes(e.payload.taskId)) onEvent(e.payload);
+    }).then((fn) => {
+      // 组件可能在 listen 完成前就卸载:此时立刻退订,不留悬空监听
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }
   const tracked = mockCopyTasks.filter(
     (t) => taskIds.includes(t.id) && t.state === "running",
   );
