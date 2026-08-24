@@ -8,6 +8,7 @@ pub mod notify;
 pub mod sorting_cmds;
 pub mod tasks;
 pub mod thumb_proto;
+pub mod transcode_cmds;
 pub mod updater;
 
 use crate::core::{catalog, config, copy, journal, manifest, project, registry, volumes};

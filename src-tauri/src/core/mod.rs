@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod config;
 pub mod copy;
 pub mod error;
+pub mod ffmpeg;
 pub mod fsx;
 pub mod hash;
 pub mod jobs;

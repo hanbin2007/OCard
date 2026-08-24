@@ -49,6 +49,9 @@ macro_rules! ocard_invoke_handler {
             $crate::commands::sorting_cmds::list_jobs,
             $crate::commands::sorting_cmds::get_job,
             $crate::commands::sorting_cmds::cancel_job,
+            $crate::commands::transcode_cmds::ffmpeg_status,
+            $crate::commands::transcode_cmds::transcode_capabilities,
+            $crate::commands::transcode_cmds::transcode_diagnostics,
             $crate::commands::sorting_cmds::list_remote_activity,
         ]
     };
@@ -72,6 +75,8 @@ pub fn run() {
                 notices: Default::default(),
                 ops: Default::default(),
             });
+            // sidecar 缺失立即可见(零静默 ffmpeg-missing)
+            commands::transcode_cmds::notify_ffmpeg_missing_on_startup(app.handle());
             // 崩溃/重启后从未完成的 manifest 重建可续传任务
             commands::rebuild_tasks(app.handle(), &app.state::<AppState>());
             // 静默 OTA:后台周期检查、签名校验、静默安装,重启生效

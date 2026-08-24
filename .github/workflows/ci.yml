@@ -100,6 +100,10 @@ jobs:
 
       # CI 只验证打包链路;updater 工件需签名私钥,仅在 Release 工作流生成,
       # 私钥不进普通 CI(暴露面最小化)
+      - name: Fetch ffmpeg sidecar (SHA-256 校验)
+        shell: bash
+        run: bash scripts/fetch-ffmpeg.sh
+
       - name: Build Tauri bundles
         # 用文件而非内联 JSON:Windows pwsh 会吞内联引号
         run: pnpm tauri build --config src-tauri/ci-no-updater.conf.json
@@ -154,6 +158,9 @@ jobs:
         run: cargo install tauri-driver --locked
 
       - run: pnpm install --frozen-lockfile
+
+      - name: Fetch ffmpeg sidecar (SHA-256 校验)
+        run: bash scripts/fetch-ffmpeg.sh
 
       - name: Build app (debug, no bundle)
         run: pnpm tauri build --debug --no-bundle
