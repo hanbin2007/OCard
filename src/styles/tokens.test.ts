@@ -6,6 +6,7 @@
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import process from "node:process";
 import { describe, expect, it } from "vitest";
 
 // jsdom 环境下 import.meta.url 不是 file: URL，按项目根解析
