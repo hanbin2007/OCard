@@ -40,8 +40,8 @@ pub struct PackagedFile {
 pub struct DeliveryOutcome {
     pub packages: Vec<String>,
     pub files: Vec<PackagedFile>,
-    /// 逐文件失败(路径, 原因)——零静默。
-    pub failures: Vec<(String, String)>,
+    /// 逐文件失败(路径, 机器码, 原因)——零静默。机器码: "already-exists" | "error"。
+    pub failures: Vec<(String, &'static str, String)>,
     pub total_bytes: u64,
 }
 
@@ -109,7 +109,7 @@ pub fn build_delivery(project_root: &Path, meta: &project::ProjectMeta) -> Resul
             let meta_fs = match fs::metadata(&file) {
                 Ok(m) => m,
                 Err(e) => {
-                    out.failures.push((rel, format!("读取失败: {e}")));
+                    out.failures.push((rel, "error", format!("读取失败: {e}")));
                     continue;
                 }
             };
@@ -120,12 +120,17 @@ pub fn build_delivery(project_root: &Path, meta: &project::ProjectMeta) -> Resul
             let dst_dir = delivery_root.join(&package).join(category);
             let dst = dst_dir.join(file.file_name().unwrap_or_default());
 
-            let result = (|| -> std::result::Result<(), String> {
+            let result = (|| -> std::result::Result<(), (&'static str, String)> {
                 if dst.exists() {
-                    return Err("包内已存在同名文件,拒绝覆盖".into());
+                    return Err((
+                        "already-exists",
+                        "包内已存在同名文件,拒绝覆盖(重跑安全)".to_string(),
+                    ));
                 }
-                fs::create_dir_all(&dst_dir).map_err(|e| e.to_string())?;
-                fs::copy(&file, &dst).map(|_| ()).map_err(|e| e.to_string())
+                fs::create_dir_all(&dst_dir).map_err(|e| ("error", e.to_string()))?;
+                fs::copy(&file, &dst)
+                    .map(|_| ())
+                    .map_err(|e| ("error", e.to_string()))
             })();
 
             match result {
@@ -141,7 +146,7 @@ pub fn build_delivery(project_root: &Path, meta: &project::ProjectMeta) -> Resul
                         size_bytes: meta_fs.len(),
                     });
                 }
-                Err(e) => out.failures.push((rel, e)),
+                Err((kind, e)) => out.failures.push((rel, kind, e)),
             }
         }
     }
@@ -177,8 +182,8 @@ pub fn build_delivery(project_root: &Path, meta: &project::ProjectMeta) -> Resul
         let n = out.files.iter().filter(|f| &f.package == pkg).count();
         summary.push_str(&format!("{pkg}\t{n} 个文件\n"));
     }
-    for (rel, e) in &out.failures {
-        summary.push_str(&format!("[失败] {rel}: {e}\n"));
+    for (rel, kind, e) in &out.failures {
+        summary.push_str(&format!("[{kind}] {rel}: {e}\n"));
     }
     fs::create_dir_all(&delivery_root)?;
     fs::write(delivery_root.join("交付总清单.txt"), summary)?;
@@ -256,6 +261,7 @@ mod tests {
         let again = build_delivery(&root, &meta).unwrap();
         assert_eq!(again.files.len(), 0);
         assert_eq!(again.failures.len(), 3);
-        assert!(again.failures[0].1.contains("拒绝覆盖"));
+        assert_eq!(again.failures[0].1, "already-exists");
+        assert!(again.failures[0].2.contains("拒绝覆盖"));
     }
 }

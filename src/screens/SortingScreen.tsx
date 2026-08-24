@@ -5,6 +5,7 @@ import * as api from "../api";
 import type { BulkResult, SortingAsset, SortingCategory } from "../api/types";
 import { AssetLightbox } from "../components/AssetLightbox";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
+import { DeliveryButton } from "../components/DeliveryPanel";
 import { TopBar } from "../components/TopBar";
 import { Badge, EmptyState, Kbd, ProgressBar } from "../components/ui";
 import { VirtualGrid } from "../components/VirtualGrid";
@@ -370,6 +371,7 @@ export function SortingScreen() {
             <span className="text-xs dim" data-testid="sorting-remaining">
               待分类 {total}
             </span>
+            <DeliveryButton projectId={project.id} />
             <button
               type="button"
               className="btn btn--sm"

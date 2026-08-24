@@ -404,3 +404,37 @@ export interface IndexingStatus {
 export interface IndexProgressEvent extends IndexingStatus {
   occurredAt: string;
 }
+
+/* ------------------------------------------------------------------ *
+ * 交付打包（PRD §5.7，工况 B）
+ * ------------------------------------------------------------------ */
+
+/** 一个交付包 = 一个半天时段的文件夹（不压缩） */
+export interface DeliveryPackage {
+  /** 包文件夹名，如 `0824上午` */
+  name: string;
+  fileCount: number;
+  bytes: number;
+}
+
+/**
+ * 打包失败项。
+ *
+ * `kind` 用来把「重跑时目标已存在」与真正的错误分开——前者是零覆盖策略的
+ * 正常结果，不是事故。后端暂未提供该字段时，前端按 message 兜底判定；
+ * 建议后端补一个稳定机器码，别让界面靠字符串匹配猜语义。
+ */
+export interface DeliveryFailure {
+  assetId: string;
+  message: string;
+  kind?: "already-exists" | "error";
+}
+
+export interface DeliverySummary {
+  packages: DeliveryPackage[];
+  totalFiles: number;
+  totalBytes: number;
+  failures: DeliveryFailure[];
+  /** 交付根目录（含清单），绝对路径 */
+  deliveryPath: string;
+}

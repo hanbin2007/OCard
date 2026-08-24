@@ -10,6 +10,7 @@ import {
   mockCameras,
   mockCopyTasks,
   mockCategories,
+  mockDelivery,
   mockIndexing,
   mockInspection,
   mockPendingAssets,
@@ -35,6 +36,7 @@ import type {
   AssetPage,
   BulkResult,
   CopyTaskPreview,
+  DeliverySummary,
   FolderNode,
   IndexingStatus,
   IndexProgressEvent,
@@ -57,6 +59,7 @@ import type {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 
 /** 运行在 Tauri 里时走真实 IPC;浏览器/vitest 环境回退 mock */
 const IS_TAURI =
@@ -633,4 +636,26 @@ export function subscribeIndexProgress(
     };
   }
   return { dispose: () => {}, ready: Promise.resolve() };
+}
+
+/* ------------------------------------------------------------------ *
+ * 交付打包（PRD §5.7）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 按拍摄时间半天分包，**复制**出交付包并生成清单。
+ * 零覆盖：重跑时已打包过的文件会出现在 failures 里，这是安全策略不是事故。
+ * 上传网盘与发链接由人工完成，OCard 只负责打包与留痕。
+ */
+export function buildDelivery(projectId: string): Promise<DeliverySummary> {
+  if (IS_TAURI) return ipc("build_delivery", { projectId });
+  return reply(mockDelivery);
+}
+
+/** 在 Finder / 资源管理器里定位到该路径 */
+export function revealPath(path: string): Promise<void> {
+  if (IS_TAURI) return revealItemInDir(path);
+  // 浏览器/测试环境没有文件管理器可调
+  void path;
+  return Promise.resolve();
 }

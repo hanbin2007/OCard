@@ -73,6 +73,9 @@ pub struct BulkResultDto {
 pub struct BulkFailure {
     pub asset_id: String,
     pub message: String,
+    /// 稳定机器码(交付打包用): "already-exists" | "error";批量分类操作暂缺省。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -311,6 +314,7 @@ fn bulk(outcomes: Vec<sorting::ItemOutcome>) -> BulkResultDto {
             Err(message) => res.failed.push(BulkFailure {
                 asset_id: o.asset_id,
                 message,
+                kind: None,
             }),
         }
     }
@@ -557,9 +561,10 @@ pub fn build_delivery(
     let failures: Vec<BulkFailure> = out
         .failures
         .iter()
-        .map(|(path, message)| BulkFailure {
+        .map(|(path, kind, message)| BulkFailure {
             asset_id: path.clone(),
             message: message.clone(),
+            kind: Some(kind),
         })
         .collect();
 

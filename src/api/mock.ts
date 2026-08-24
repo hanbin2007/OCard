@@ -5,6 +5,7 @@
 
 import type {
   CameraReg,
+  DeliverySummary,
   IndexingStatus,
   SortingAsset,
   SortingCategory,
@@ -447,4 +448,22 @@ export const mockIndexing: IndexingStatus = {
   total: SORTING_TOTAL,
   running: true,
   failed: 3,
+};
+
+/** 交付打包 mock：两个半天包 + 一条「重跑已存在」的失败 */
+export const mockDelivery: DeliverySummary = {
+  packages: [
+    { name: "0824上午", fileCount: 412, bytes: 38 * 1024 ** 3 },
+    { name: "0824下午", fileCount: 357, bytes: 31 * 1024 ** 3 },
+  ],
+  totalFiles: 769,
+  totalBytes: 69 * 1024 ** 3,
+  failures: [
+    {
+      assetId: "6. 精选/已修/DSC_00931.JPG",
+      message: "目标已存在，已跳过（零覆盖）",
+      kind: "already-exists",
+    },
+  ],
+  deliveryPath: "/Volumes/DIT-NAS/Projects/20260824_校运会/交付/20260824",
 };
