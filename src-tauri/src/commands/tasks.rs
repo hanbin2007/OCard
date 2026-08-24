@@ -88,6 +88,16 @@ pub fn spawn_worker(app: AppHandle, handle: Arc<TaskHandle>) {
                 snap.state = "failed";
                 snap.finished_at = Some(Utc::now().to_rfc3339());
             }
+            // 目的地状态与任务终态保持一致(终验缺陷 #3)
+            let dest_state = if snap.state == "paused" {
+                "idle"
+            } else {
+                "error"
+            };
+            for d in snap.destinations.iter_mut() {
+                d.state = dest_state;
+            }
+            snap.speed_bytes_per_sec = 0;
             drop(snap);
             eprintln!("拷卡任务中断: {e}");
         }

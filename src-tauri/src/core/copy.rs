@@ -283,7 +283,13 @@ fn copy_one(
             }
         }
         if pre_existing.len() == finals.len() {
-            // 所有目的地都已有同内容文件:无需写入
+            // 所有目的地都已有同内容文件:无需写入;顺带清理本任务可能的残留 part(终验 #4)
+            for f in &finals {
+                let _ = fs::remove_file(f.with_file_name(format!(
+                    "{}.{task_tag}{PART_SUFFIX}",
+                    f.file_name().unwrap().to_string_lossy()
+                )));
+            }
             on_chunk(fs::metadata(&src_path)?.len());
             return Ok(src_hash);
         }

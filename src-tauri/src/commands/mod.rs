@@ -382,7 +382,14 @@ pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
         match c {
             Component::CurDir => {}
             Component::ParentDir => {
-                if !out.pop() {
+                // POSIX 语义:根之上仍是根,`/..` ≡ `/`(终验缺陷 #1:根后奇数个 `..`)
+                let ends_at_root = matches!(
+                    out.components().next_back(),
+                    Some(Component::RootDir) | Some(Component::Prefix(_))
+                );
+                if ends_at_root {
+                    // 丢弃
+                } else if !out.pop() {
                     out.push(Component::ParentDir);
                 }
             }
@@ -757,7 +764,8 @@ pub fn rebuild_tasks(state: &AppState) {
                         error: None,
                     })
                     .collect(),
-                total_bytes: m.entries.iter().map(|e| e.size).sum(),
+                // 以重建出的完整清单为准(终验缺陷 #2:entries 之和会让早停任务进度虚高)
+                total_bytes: files.iter().map(|f| f.size_bytes).sum(),
                 copied_bytes: copied,
                 speed_bytes_per_sec: 0,
                 state: "paused",
@@ -812,5 +820,20 @@ mod tests {
             PathBuf::from("/a/c")
         );
         assert_eq!(normalize_lexical(Path::new("/a/b/")), PathBuf::from("/a/b"));
+    }
+
+    #[test]
+    fn normalize_clamps_parent_dir_at_root() {
+        // 终验缺陷 #1:根后奇数个 `..` 必须钳制在根(POSIX /.. ≡ /)
+        assert_eq!(
+            normalize_lexical(Path::new("/../Volumes/CARD")),
+            PathBuf::from("/Volumes/CARD")
+        );
+        assert_eq!(
+            normalize_lexical(Path::new("/../../x")),
+            PathBuf::from("/x")
+        );
+        // 相对路径的越根 `..` 保留(不属于绝对路径校验路径)
+        assert_eq!(normalize_lexical(Path::new("../a")), PathBuf::from("../a"));
     }
 }
