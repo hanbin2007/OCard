@@ -104,12 +104,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       # 路径/rename/卷检测行为平台相关,Rust 测试三平台全跑(评审建议)
-      - name: cargo test
-        run: cargo test
-        working-directory: src-tauri
-
-      # CI 只验证打包链路;updater 工件需签名私钥,仅在 Release 工作流生成,
-      # 私钥不进普通 CI(暴露面最小化)
       - name: Cache ffmpeg sidecar
         uses: actions/cache@v4
         with:
@@ -120,6 +114,12 @@ jobs:
         shell: bash
         run: bash scripts/fetch-ffmpeg.sh
 
+      - name: cargo test
+        run: cargo test
+        working-directory: src-tauri
+
+      # CI 只验证打包链路;updater 工件需签名私钥,仅在 Release 工作流生成,
+      # 私钥不进普通 CI(暴露面最小化)
       - name: Build Tauri bundles
         # 用文件而非内联 JSON:Windows pwsh 会吞内联引号
         run: pnpm tauri build --config src-tauri/ci-no-updater.conf.json
