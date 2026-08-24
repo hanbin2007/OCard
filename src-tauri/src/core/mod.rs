@@ -7,6 +7,7 @@ pub mod journal;
 pub mod machine;
 pub mod manifest;
 pub mod naming;
+pub mod paths;
 pub mod project;
 pub mod registry;
 pub mod volumes;

@@ -373,61 +373,9 @@ pub fn list_copy_files(
     })
 }
 
-/// 词法归一:消解 `.` 与 `..` 组件(复核 P0:`/Volumes/../Volumes/CARD`
-/// 这类别名能绕过 starts_with 嵌套检查写回源卡)。不触碰文件系统、不解析符号链接。
-pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                // POSIX 语义:根之上仍是根,`/..` ≡ `/`(终验缺陷 #1:根后奇数个 `..`)
-                let ends_at_root = matches!(
-                    out.components().next_back(),
-                    Some(Component::RootDir) | Some(Component::Prefix(_))
-                );
-                if ends_at_root {
-                    // 丢弃
-                } else if !out.pop() {
-                    out.push(Component::ParentDir);
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
+use crate::core::paths::{normalize_lexical, validate_dest_layout};
 
-/// 源与目的地布局校验(纯函数,可测):绝对路径、拒绝源目标嵌套、拒绝重复目的地。
-/// 一切比较基于词法归一后的路径。开拷与**每次续传/重绑**都必须过这道闸
-/// (codex 终验 P0:重绑后的新源挂载点可能是某目的地的祖先,不复核会写回源卡)。
-fn validate_dest_layout(source_root: &Path, dest_targets: &[PathBuf]) -> CmdResult<()> {
-    let source_root = normalize_lexical(source_root);
-    let normalized: Vec<PathBuf> = dest_targets.iter().map(|t| normalize_lexical(t)).collect();
-    for t in &normalized {
-        if !t.is_absolute() {
-            return Err(format!("目的地必须是绝对路径: {}", t.display()));
-        }
-        if t.starts_with(&source_root) || source_root.starts_with(t) {
-            return Err(format!(
-                "目的地与源卷互相嵌套,拒绝执行(会写回源卡): {}",
-                t.display()
-            ));
-        }
-    }
-    // 两个目的地指向同一实际位置也拒绝
-    for (i, a) in normalized.iter().enumerate() {
-        for b in normalized.iter().skip(i + 1) {
-            if a == b {
-                return Err(format!("两个目的地指向同一位置: {}", a.display()));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 校验源卷与目的地(评审 H5/P1-5):卷白名单 + 布局校验。
+/// 校验源卷与目的地(评审 H5/P1-5):卷白名单 + 布局校验(core::paths)。
 fn validate_copy_paths(source_root: &Path, dest_targets: &[PathBuf]) -> CmdResult<()> {
     let source_root_n = normalize_lexical(source_root);
     let known = volumes::list_volumes();
@@ -621,11 +569,10 @@ pub fn resume_copy_task(app: AppHandle, state: State<AppState>, task_id: String)
             .map(|v| (v.mount_point, v.name))
             .collect();
         let recorded = handle.source_root.lock().unwrap().clone();
-        let resolved = tasks::resolve_resume_source(&recorded, &m.source_label, &vols)?;
-        // 重绑后的源挂载点必须与固定目的地重新做布局校验(codex 终验 P0:
-        // 重插的卡可能挂到某目的地的祖先路径,不复核会把素材写回源卡)。
-        // 同时覆盖旧 manifest 携带的病态目的地字符串(`..` 等)。
-        validate_dest_layout(&resolved, &handle.dest_targets)?;
+        // 重解析 + 布局复核一体(codex 终验 P0:重插的卡可能挂到某目的地的
+        // 祖先路径,不复核会把素材写回源卡);同时覆盖旧 manifest 的病态目的地。
+        let resolved =
+            tasks::prepare_resume(&recorded, &m.source_label, &vols, &handle.dest_targets)?;
         {
             let mut src = handle.source_root.lock().unwrap();
             *src = resolved.clone();
@@ -818,70 +765,4 @@ pub fn retry_copy_file(
     _file_id: String,
 ) -> CmdResult<()> {
     resume_copy_task(app, state, task_id)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::normalize_lexical;
-    use std::path::{Path, PathBuf};
-
-    #[test]
-    fn normalize_resolves_dot_and_dotdot_aliases() {
-        // 复核 P0:`..` 别名绕过嵌套检查写回源卡
-        assert_eq!(
-            normalize_lexical(Path::new("/Volumes/../Volumes/CARD")),
-            PathBuf::from("/Volumes/CARD")
-        );
-        assert_eq!(
-            normalize_lexical(Path::new("/a/./b/../c")),
-            PathBuf::from("/a/c")
-        );
-        assert_eq!(normalize_lexical(Path::new("/a/b/")), PathBuf::from("/a/b"));
-    }
-
-    #[test]
-    fn dest_layout_rejects_rebound_source_ancestor() {
-        // codex 终验 P0 场景:重绑后的源挂载点是备份目的地的祖先(盘符漂移)
-        let src = PathBuf::from("/mnt/f");
-        let dests = vec![PathBuf::from("/mnt/f/Backup/target")];
-        assert!(super::validate_dest_layout(&src, &dests)
-            .unwrap_err()
-            .contains("嵌套"));
-        // 反向嵌套同样拒绝
-        let src2 = PathBuf::from("/mnt/f/card");
-        let dests2 = vec![PathBuf::from("/mnt/f")];
-        assert!(super::validate_dest_layout(&src2, &dests2).is_err());
-        // `..` 别名伪装的同位置也拦得住
-        let dests3 = vec![PathBuf::from("/mnt/../mnt/f/x")];
-        assert!(super::validate_dest_layout(&PathBuf::from("/mnt/f"), &dests3).is_err());
-        // 相对路径拒绝
-        assert!(super::validate_dest_layout(&src, &[PathBuf::from("relative/x")]).is_err());
-        // 重复目的地拒绝
-        assert!(super::validate_dest_layout(
-            &PathBuf::from("/mnt/card"),
-            &[PathBuf::from("/nas/t"), PathBuf::from("/nas/../nas/t")]
-        )
-        .is_err());
-        // 正常不相交布局通过
-        assert!(super::validate_dest_layout(
-            &PathBuf::from("/mnt/card"),
-            &[PathBuf::from("/nas/t"), PathBuf::from("/backup/t")]
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn normalize_clamps_parent_dir_at_root() {
-        // 终验缺陷 #1:根后奇数个 `..` 必须钳制在根(POSIX /.. ≡ /)
-        assert_eq!(
-            normalize_lexical(Path::new("/../Volumes/CARD")),
-            PathBuf::from("/Volumes/CARD")
-        );
-        assert_eq!(
-            normalize_lexical(Path::new("/../../x")),
-            PathBuf::from("/x")
-        );
-        // 相对路径的越根 `..` 保留(不属于绝对路径校验路径)
-        assert_eq!(normalize_lexical(Path::new("../a")), PathBuf::from("../a"));
-    }
 }

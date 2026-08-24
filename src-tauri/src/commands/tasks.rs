@@ -136,6 +136,19 @@ pub fn resolve_resume_source(
     }
 }
 
+/// 续传准备(纯函数,可测):按卷名重解析源挂载点后,**必须**与固定目的地
+/// 重新做布局校验(codex 终验 P0:重插的卡可能挂到目的地祖先,写回源卡)。
+pub fn prepare_resume(
+    recorded_mount: &std::path::Path,
+    expected_label: &str,
+    volumes: &[(PathBuf, String)],
+    dest_targets: &[PathBuf],
+) -> std::result::Result<PathBuf, String> {
+    let resolved = resolve_resume_source(recorded_mount, expected_label, volumes)?;
+    crate::core::paths::validate_dest_layout(&resolved, dest_targets)?;
+    Ok(resolved)
+}
+
 /// journal 追加带重试;彻底失败时写本机 outbox 兜底,绝不静默丢审计(评审 P1-7)。
 pub fn append_audit(
     project_root: &std::path::Path,
@@ -466,5 +479,31 @@ mod tests {
         let v = vols(&[("/Volumes/ELSE", "ELSE")]);
         let err = resolve_resume_source(&PathBuf::from("/Volumes/CARD"), "CARD", &v).unwrap_err();
         assert!(err.contains("源卷未挂载"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod prepare_resume_tests {
+    use super::prepare_resume;
+    use crate::core::paths::tests::abs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn rebind_landing_on_dest_ancestor_is_rejected() {
+        // codex 微验 #17:resume 接线级覆盖——重插的卡挂到了备份目的地的祖先盘符
+        let vols: Vec<(PathBuf, String)> = vec![(abs("/mnt/f"), "CARD".to_string())];
+        let dests = vec![abs("/mnt/f/Backup/target")];
+        let err = prepare_resume(&abs("/mnt/e"), "CARD", &vols, &dests).unwrap_err();
+        assert!(err.contains("嵌套"), "{err}");
+    }
+
+    #[test]
+    fn rebind_with_disjoint_layout_succeeds() {
+        let vols: Vec<(PathBuf, String)> = vec![(abs("/mnt/g"), "CARD".to_string())];
+        let dests = vec![abs("/nas/target"), abs("/backup/target")];
+        assert_eq!(
+            prepare_resume(&abs("/mnt/e"), "CARD", &vols, &dests).unwrap(),
+            abs("/mnt/g")
+        );
     }
 }
