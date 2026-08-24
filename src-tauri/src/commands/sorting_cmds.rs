@@ -508,3 +508,97 @@ pub fn indexing_status(app: AppHandle, project_id: String) -> IndexingStatusDto 
         failed: st.failed,
     }
 }
+
+// ---------- 交付打包 ----------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryPackageDto {
+    pub name: String,
+    pub file_count: usize,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliverySummaryDto {
+    pub packages: Vec<DeliveryPackageDto>,
+    pub total_files: usize,
+    pub total_bytes: u64,
+    pub failures: Vec<BulkFailure>,
+    /// 交付根目录绝对路径(人工上传百度网盘的入口)。
+    pub delivery_path: String,
+}
+
+/// 执行交付打包(PRD §5.7):半天分包、复制不动原件、清单落盘;
+/// 上传与发链接人工完成(既定边界)。重跑安全(零覆盖,已打包项报失败)。
+#[tauri::command]
+pub fn build_delivery(
+    app: AppHandle,
+    state: State<AppState>,
+    project_id: String,
+) -> CmdResult<DeliverySummaryDto> {
+    let nas = nas_root(&app, &state)?;
+    let stats = find_project(&nas, &project_id)?;
+    let out = crate::core::packaging::build_delivery(&stats.root, &stats.meta).map_err(err)?;
+
+    let packages: Vec<DeliveryPackageDto> = out
+        .packages
+        .iter()
+        .map(|p| {
+            let files: Vec<_> = out.files.iter().filter(|f| &f.package == p).collect();
+            DeliveryPackageDto {
+                name: p.clone(),
+                file_count: files.len(),
+                bytes: files.iter().map(|f| f.size_bytes).sum(),
+            }
+        })
+        .collect();
+    let failures: Vec<BulkFailure> = out
+        .failures
+        .iter()
+        .map(|(path, message)| BulkFailure {
+            asset_id: path.clone(),
+            message: message.clone(),
+        })
+        .collect();
+
+    let op = operator(&app, &state);
+    super::tasks::append_audit(
+        &app,
+        &stats.root,
+        &state.config_dir,
+        &sorting::audit_event(
+            &state.machine_id,
+            &op,
+            "delivery_built",
+            serde_json::json!({
+                "packages": out.packages,
+                "files": out.files.len(),
+                "bytes": out.total_bytes,
+                "failures": failures.len(),
+            }),
+        ),
+    );
+    if !failures.is_empty() {
+        notify::warn(
+            &app,
+            "delivery-partial",
+            format!(
+                "交付打包完成,但 {} 个文件失败(多为重跑时已存在,详见交付总清单)",
+                failures.len()
+            ),
+        );
+    }
+    Ok(DeliverySummaryDto {
+        packages,
+        total_files: out.files.len(),
+        total_bytes: out.total_bytes,
+        failures,
+        delivery_path: stats
+            .root
+            .join(crate::core::packaging::DELIVERY_DIR)
+            .display()
+            .to_string(),
+    })
+}
