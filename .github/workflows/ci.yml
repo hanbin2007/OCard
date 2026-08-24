@@ -42,6 +42,16 @@ jobs:
       - run: pnpm build
       - run: pnpm test
 
+      - name: Cache ffmpeg sidecar
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/binaries
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('src-tauri/binaries/SHA256SUMS.txt') }}
+
+      - name: Fetch ffmpeg sidecar (SHA-256 校验)
+        shell: bash
+        run: bash scripts/fetch-ffmpeg.sh
+
       - name: cargo fmt
         run: cargo fmt --check
         working-directory: src-tauri
@@ -100,6 +110,12 @@ jobs:
 
       # CI 只验证打包链路;updater 工件需签名私钥,仅在 Release 工作流生成,
       # 私钥不进普通 CI(暴露面最小化)
+      - name: Cache ffmpeg sidecar
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/binaries
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('src-tauri/binaries/SHA256SUMS.txt') }}
+
       - name: Fetch ffmpeg sidecar (SHA-256 校验)
         shell: bash
         run: bash scripts/fetch-ffmpeg.sh
@@ -159,7 +175,14 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      - name: Cache ffmpeg sidecar
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/binaries
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('src-tauri/binaries/SHA256SUMS.txt') }}
+
       - name: Fetch ffmpeg sidecar (SHA-256 校验)
+        shell: bash
         run: bash scripts/fetch-ffmpeg.sh
 
       - name: Build app (debug, no bundle)
