@@ -111,30 +111,39 @@ pub async fn check_for_update(app: AppHandle) -> Result<String, String> {
     Ok(check_and_download(&app, true).await)
 }
 
-/// 用户主动安装已下载的更新。有运行中拷卡任务时拒绝(安装会退出进程)。
+/// 用户主动安装已下载的更新。有运行中拷卡任务时拒绝(安装会退出进程);
+/// 与检查/下载共用同一串行闸(codex 五轮:安装可与下载并发)。
 #[tauri::command]
 pub fn install_update(app: AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+    if IN_PROGRESS.swap(true, Ordering::SeqCst) {
+        return Err("后台正在检查或下载更新,请稍候再试".into());
+    }
+    let result = do_install(&app, &state);
+    IN_PROGRESS.store(false, Ordering::SeqCst);
+    result
+}
+
+fn do_install(app: &AppHandle, state: &tauri::State<AppState>) -> Result<(), String> {
     if state.tasks.any_running() {
         return Err("有拷卡任务正在进行,安装更新会中断它们;请等任务完成或暂停后再更新".into());
     }
-    let pending = app
-        .try_state::<PendingUpdate>()
-        .ok_or("更新状态不可用")?
-        .0
-        .lock()
-        .unwrap()
-        .take();
-    let Some((update, bytes)) = pending else {
-        return Err("没有已下载的更新;请先检查更新".into());
-    };
-    // install 在 Windows 上启动安装器并退出进程;macOS/Linux 替换后重启由用户完成
-    update.install(bytes).map_err(|e| {
-        notify::error(&app, "update-install-failed", format!("更新安装失败: {e}"));
-        format!("更新安装失败: {e}")
-    })?;
+    let pending_state = app.try_state::<PendingUpdate>().ok_or("更新状态不可用")?;
+    // 不预先 take:安装失败时保留已下载的包,无需重新下载(codex 五轮回归项)
+    {
+        let guard = pending_state.0.lock().unwrap();
+        let Some((update, bytes)) = guard.as_ref() else {
+            return Err("没有已下载的更新;请先检查更新".into());
+        };
+        // install 在 Windows 上启动安装器并退出进程;macOS/Linux 替换后重启由用户完成
+        update.install(bytes).map_err(|e| {
+            notify::error(app, "update-install-failed", format!("更新安装失败: {e}"));
+            format!("更新安装失败: {e}")
+        })?;
+    }
+    *pending_state.0.lock().unwrap() = None;
     // 到达此处的平台(mac/linux):提示重启
     notify::info(
-        &app,
+        app,
         "update-installed",
         "更新已安装,重启应用后生效".to_string(),
     );

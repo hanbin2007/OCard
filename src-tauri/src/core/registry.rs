@@ -83,16 +83,27 @@ pub fn delete_camera(
     operator: &str,
     camera_id: &str,
 ) -> Result<()> {
-    // 级联:该相机名下的卡一并写删除事件,避免折叠后出现孤儿卡(评审 P1-12)
+    // 级联:该相机名下的卡一并写删除事件,避免折叠后出现孤儿卡(评审 P1-12)。
+    // 中途失败时给出**准确**的进度语义,不许谎报「未改动」(codex 五轮)。
     let reg = load(nas_root)?.registry;
-    for card in reg.cards.iter().filter(|c| c.camera_id == camera_id) {
+    let cards: Vec<_> = reg
+        .cards
+        .iter()
+        .filter(|c| c.camera_id == camera_id)
+        .collect();
+    let total = cards.len();
+    for (done, card) in cards.iter().enumerate() {
         let ev = Event::new(
             machine,
             operator,
             kind::CARD_DELETED,
             serde_json::json!({ "id": card.id }),
         );
-        journal::append_in(&registry_dir(nas_root), &ev)?;
+        journal::append_in(&registry_dir(nas_root), &ev).map_err(|e| {
+            CoreError::Invalid(format!(
+                "级联删除中断:{done}/{total} 张关联卡的删除已写入,相机本身未删除。存储恢复后重试即可(重试安全): {e}"
+            ))
+        })?;
     }
     let ev = Event::new(
         machine,
@@ -100,7 +111,11 @@ pub fn delete_camera(
         kind::CAMERA_DELETED,
         serde_json::json!({ "id": camera_id }),
     );
-    journal::append_in(&registry_dir(nas_root), &ev)
+    journal::append_in(&registry_dir(nas_root), &ev).map_err(|e| {
+        CoreError::Invalid(format!(
+            "关联卡({total} 张)已删除,但相机删除写入失败。存储恢复后重试即可(重试安全): {e}"
+        ))
+    })
 }
 
 pub fn register_card(

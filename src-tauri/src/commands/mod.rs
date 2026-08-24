@@ -29,14 +29,23 @@ fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-fn nas_root(state: &AppState) -> CmdResult<PathBuf> {
-    config::load(&state.config_dir)
+/// 读配置并上报问题(零静默:业务路径的配置损坏/权限错误也必须可见,codex 五轮)。
+fn load_config(app: &AppHandle, state: &AppState) -> config::WorkstationConfig {
+    let (cfg, problem) = config::load_checked(&state.config_dir);
+    if let Some(msg) = problem {
+        notify::warn(app, "workstation-config-degraded", msg);
+    }
+    cfg
+}
+
+fn nas_root(app: &AppHandle, state: &AppState) -> CmdResult<PathBuf> {
+    load_config(app, state)
         .nas_root
         .ok_or_else(|| "尚未配置 NAS 根路径,请先在设置中配置".to_string())
 }
 
-fn operator(state: &AppState) -> String {
-    let op = config::load(&state.config_dir).operator;
+fn operator(app: &AppHandle, state: &AppState) -> String {
+    let op = load_config(app, state).operator;
     if op.is_empty() {
         "未登记DIT".to_string()
     } else {
@@ -146,7 +155,7 @@ fn notice_catalog_warnings(app: &AppHandle, warnings: &[String]) {
 
 #[tauri::command]
 pub fn list_projects(app: AppHandle, state: State<AppState>) -> CmdResult<Vec<ProjectDto>> {
-    let nas = nas_root(&state)?;
+    let nas = nas_root(&app, &state)?;
     let running: Vec<String> = state
         .tasks
         .snapshots(None)
@@ -180,7 +189,7 @@ pub fn create_project(
     state: State<AppState>,
     input: NewProjectInput,
 ) -> CmdResult<ProjectDto> {
-    let nas = nas_root(&state)?;
+    let nas = nas_root(&app, &state)?;
     let date = parse_compact_date(&input.date)?;
     let root = project::create_project(&nas, date, &input.name, input.scenario, &input.categories)
         .map_err(err)?;
@@ -190,7 +199,7 @@ pub fn create_project(
         &state.config_dir,
         &journal::Event::new(
             state.machine_id.clone(),
-            operator(&state),
+            operator(&app, &state),
             journal::kind::PROJECT_CREATED,
             serde_json::json!({"name": input.name, "scenario": input.scenario}),
         ),
@@ -239,20 +248,21 @@ pub fn preview_folder_tree(
 
 #[tauri::command]
 pub fn list_cameras(app: AppHandle, state: State<AppState>) -> CmdResult<Vec<registry::CameraReg>> {
-    let load = registry::load(&nas_root(&state)?).map_err(err)?;
+    let load = registry::load(&nas_root(&app, &state)?).map_err(err)?;
     notice_registry_health(&app, &load);
     Ok(load.registry.cameras)
 }
 
 #[tauri::command]
 pub fn create_camera(
+    app: AppHandle,
     state: State<AppState>,
     input: NewCameraInput,
 ) -> CmdResult<registry::CameraReg> {
     registry::register_camera(
-        &nas_root(&state)?,
+        &nas_root(&app, &state)?,
         &state.machine_id,
-        &operator(&state),
+        &operator(&app, &state),
         &input.model,
         &input.position,
         &input.operator_alias,
@@ -262,11 +272,11 @@ pub fn create_camera(
 }
 
 #[tauri::command]
-pub fn delete_camera(state: State<AppState>, camera_id: String) -> CmdResult<()> {
+pub fn delete_camera(app: AppHandle, state: State<AppState>, camera_id: String) -> CmdResult<()> {
     registry::delete_camera(
-        &nas_root(&state)?,
+        &nas_root(&app, &state)?,
         &state.machine_id,
-        &operator(&state),
+        &operator(&app, &state),
         &camera_id,
     )
     .map_err(err)
@@ -277,20 +287,21 @@ pub fn list_storage_cards(
     app: AppHandle,
     state: State<AppState>,
 ) -> CmdResult<Vec<registry::StorageCard>> {
-    let load = registry::load(&nas_root(&state)?).map_err(err)?;
+    let load = registry::load(&nas_root(&app, &state)?).map_err(err)?;
     notice_registry_health(&app, &load);
     Ok(load.registry.cards)
 }
 
 #[tauri::command]
 pub fn create_storage_card(
+    app: AppHandle,
     state: State<AppState>,
     input: NewStorageCardInput,
 ) -> CmdResult<registry::StorageCard> {
     registry::register_card(
-        &nas_root(&state)?,
+        &nas_root(&app, &state)?,
         &state.machine_id,
-        &operator(&state),
+        &operator(&app, &state),
         &input.label,
         &input.camera_id,
         input.capacity_bytes,
@@ -300,11 +311,15 @@ pub fn create_storage_card(
 }
 
 #[tauri::command]
-pub fn delete_storage_card(state: State<AppState>, card_id: String) -> CmdResult<()> {
+pub fn delete_storage_card(
+    app: AppHandle,
+    state: State<AppState>,
+    card_id: String,
+) -> CmdResult<()> {
     registry::delete_card(
-        &nas_root(&state)?,
+        &nas_root(&app, &state)?,
         &state.machine_id,
-        &operator(&state),
+        &operator(&app, &state),
         &card_id,
     )
     .map_err(err)
@@ -315,7 +330,7 @@ pub fn delete_storage_card(state: State<AppState>, card_id: String) -> CmdResult
 #[tauri::command]
 pub fn list_volumes(app: AppHandle, state: State<AppState>) -> Vec<VolumeDto> {
     // 卡匹配是增强信息:登记表读不到时降级为「不匹配」,但必须告知(零静默)
-    let cards = match nas_root(&state) {
+    let cards = match nas_root(&app, &state) {
         Err(_) => Vec::new(), // NAS 未配置:首跑正常态,引导页已在处理,不算降级
         Ok(nas) => match registry::load(&nas) {
             Ok(load) => {
@@ -477,7 +492,7 @@ pub fn preview_copy_task(
     state: State<AppState>,
     input: StartCopyInput,
 ) -> CmdResult<serde_json::Value> {
-    let nas = nas_root(&state)?;
+    let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &input.project_id)?;
     let load = registry::load(&nas).map_err(err)?;
     notice_registry_health(&app, &load);
@@ -487,7 +502,7 @@ pub fn preview_copy_task(
         .iter()
         .find(|c| c.id == input.camera_id)
         .ok_or_else(|| format!("相机未登记: {}", input.camera_id))?;
-    let op = operator(&state);
+    let op = operator(&app, &state);
     let (dto, _) = tasks::build_task(
         &input,
         &stats.root,
@@ -514,7 +529,7 @@ pub fn start_copy_task(
     if input.destinations.is_empty() {
         return Err("至少需要一个目的地".into());
     }
-    let nas = nas_root(&state)?;
+    let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &input.project_id)?;
     let load = registry::load(&nas).map_err(err)?;
     notice_registry_health(&app, &load);
@@ -536,7 +551,7 @@ pub fn start_copy_task(
         .map(|v| v.name)
         .unwrap_or_else(|| input.volume_id.clone());
 
-    let op = operator(&state);
+    let op = operator(&app, &state);
     let mut m = manifest::CopyManifest::new("", &volume_name, &camera.code, &op, &input.note);
     let (dto, dest_targets) = tasks::build_task(
         &input,
