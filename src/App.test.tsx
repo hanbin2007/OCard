@@ -5,9 +5,8 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import * as api from "./api";
-import { mockCopyTasks } from "./api/mock";
+import { mockCopyTasks, mockProjects, mockWorkstation } from "./api/mock";
 import type { CopyProgressEvent, CopyTask } from "./api/types";
-import { mockProjects, mockWorkstation } from "./api/mock";
 
 afterEach(cleanup);
 
@@ -88,6 +87,65 @@ describe("进度监听（常驻单一 listener）", () => {
     getSpy.mockRestore();
     subSpy.mockRestore();
   });
+
+  it("终态孤儿：唯一一条事件 + 首次拉取失败，退避后自动重试入列（不投第二条事件）", async () => {
+    let emit: ((event: CopyProgressEvent) => void) | null = null;
+    const subSpy = vi
+      .spyOn(api, "subscribeCopyProgress")
+      .mockImplementation((onEvent) => {
+        emit = onEvent;
+        return () => {};
+      });
+
+    const terminal: CopyTask = {
+      ...mockCopyTasks[0],
+      id: "t-terminal",
+      projectId: mockProjects[0].id,
+      volumeName: "ORPHAN_CARD",
+      state: "done",
+    };
+    const getSpy = vi
+      .spyOn(api, "getCopyTask")
+      .mockRejectedValueOnce(new Error("NAS 抖动"))
+      .mockResolvedValue(terminal);
+
+    render(
+      <App
+        preloaded={{
+          route: "copy",
+          workstation: mockWorkstation,
+          projects: mockProjects,
+          selectedProjectId: mockProjects[0].id,
+          tasks: [],
+        }}
+      />,
+    );
+
+    // 只投一条终态事件：之后不会再有任何事件来驱动重试
+    act(() =>
+      emit?.({
+        taskId: "t-terminal",
+        revision: 1,
+        occurredAt: new Date().toISOString(),
+        copiedBytes: 100,
+        speedBytesPerSec: 0,
+        state: "done",
+        changedFiles: [],
+        changedDestinations: [],
+      }),
+    );
+
+    await waitFor(() => expect(getSpy).toHaveBeenCalledTimes(1));
+
+    // 退避定时器（2s）自行重试，任务最终进入列表
+    await waitFor(() => expect(screen.getByText("ORPHAN_CARD")).toBeDefined(), {
+      timeout: 6000,
+    });
+    expect(getSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+
+    getSpy.mockRestore();
+    subSpy.mockRestore();
+  }, 10000);
 
   it("卸载时退订，不留悬空监听", () => {
     const dispose = vi.fn();

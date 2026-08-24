@@ -10,6 +10,7 @@ import {
   useEffect,
   useMemo,
   useReducer,
+  useRef,
   useState,
   type Dispatch,
   type ReactNode,
@@ -385,6 +386,32 @@ export function StoreProvider({
     .sort()
     .join(",");
 
+  /**
+   * 拉取失败后的退避重试。
+   *
+   * 只靠「下一条新事件」重试是不够的：终态任务（done/failed/paused）不会再有
+   * 下一条事件，如果它唯一那条事件的拉取失败了，这个任务就永远进不了列表。
+   * 所以这里按 2s → 5s → 10s 退避（之后稳定在 10s）持续对账，直到孤儿清空。
+   */
+  const [retryTick, setRetryTick] = useState(0);
+  const retryAttemptRef = useRef(0);
+
+  // 孤儿集合变化说明有新进展，重新从最短退避开始
+  useEffect(() => {
+    retryAttemptRef.current = 0;
+  }, [orphanKey]);
+
+  useEffect(() => {
+    if (!orphanKey) return;
+    const delays = [2000, 5000, 10000];
+    const delay = delays[Math.min(retryAttemptRef.current, delays.length - 1)];
+    const timer = setTimeout(() => {
+      retryAttemptRef.current += 1;
+      setRetryTick((n) => n + 1);
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [orphanKey, retryTick]);
+
   useEffect(() => {
     if (!orphanKey) return;
     let cancelled = false;
@@ -395,14 +422,14 @@ export function StoreProvider({
           const task = await api.getCopyTask(id);
           if (!cancelled && task) dispatch({ type: "taskSnapshot", task });
         } catch {
-          // 拉不到就留在缓存里，该任务的下一条事件会再触发一次拉取
+          // 留在缓存里：上面的退避定时器会再来一次，不依赖新事件
         }
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [orphanKey]);
+  }, [orphanKey, retryTick]);
 
   const value = useMemo(
     () => ({ state, dispatch, reload, refreshTask }),
