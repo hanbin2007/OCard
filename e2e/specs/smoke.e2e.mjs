@@ -7,8 +7,9 @@ import path from "node:path";
 const nasRoot = process.env.OCARD_E2E_NAS_ROOT;
 
 describe("OCard M1 冒烟", () => {
-  it("应用启动并渲染导航", async () => {
+  it("应用启动并渲染导航,预置配置已生效(无首跑引导)", async () => {
     await $('[data-testid="nav-projects"]').waitForExist({ timeout: 30000 });
+    expect(await $('[data-testid="first-run-guide"]').isExisting()).toBe(false);
   });
 
   it("新建工况A项目,NAS 上按规范建夹", async () => {
