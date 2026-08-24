@@ -1,7 +1,10 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+pub mod core;
+
+// 命令层将在核心模块齐备后接入(见 docs/superpowers/plans/2026-08-24-m1-plan.md 任务4);
+// 暂保留脚手架 greet 供前端 mock 期调用。
 #[tauri::command]
 fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
+    format!("Hello, {name}! You've been greeted from Rust!")
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

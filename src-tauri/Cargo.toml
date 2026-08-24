@@ -1,8 +1,8 @@
 [package]
 name = "ocard"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "内部 DIT 素材备份管理工具"
+authors = ["Hanbin Zhang"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -22,4 +22,11 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
 
