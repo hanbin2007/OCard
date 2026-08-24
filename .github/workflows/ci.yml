@@ -98,8 +98,10 @@ jobs:
         run: cargo test
         working-directory: src-tauri
 
+      # CI 只验证打包链路;updater 工件需签名私钥,仅在 Release 工作流生成,
+      # 私钥不进普通 CI(暴露面最小化)
       - name: Build Tauri bundles
-        run: pnpm tauri build
+        run: pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Upload bundles
         uses: actions/upload-artifact@v7
