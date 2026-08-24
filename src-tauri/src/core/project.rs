@@ -88,6 +88,17 @@ pub fn create_project(
                 )));
             }
         }
+        // Windows 保留设备名(NAS 共享给 Windows 工作站时会建不出/打不开)
+        let stem = c.split('.').next().unwrap_or(c).to_ascii_uppercase();
+        let is_dev = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+                && stem.len() == 4
+                && stem.as_bytes()[3].is_ascii_digit());
+        if is_dev {
+            return Err(CoreError::Invalid(format!(
+                "分类名「{c}」是 Windows 保留设备名,跨平台会不可用"
+            )));
+        }
     }
 
     match scenario {

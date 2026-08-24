@@ -54,6 +54,9 @@ pub struct DeliveryOutcome {
     pub warnings: Vec<String>,
     /// 本轮新复制的字节数。
     pub total_bytes: u64,
+    /// 各包**实况**总量(名称, 文件数, 字节)——从目标目录实扫,
+    /// 重跑时也是真实累计口径(codex 复验:包计数不能只数本轮新复制)。
+    pub package_totals: Vec<(String, usize, u64)>,
 }
 
 fn is_hidden(name: &str) -> bool {
@@ -185,6 +188,18 @@ pub fn build_delivery(project_root: &Path, meta: &project::ProjectMeta) -> Resul
                 .unwrap_or(&file)
                 .to_string_lossy()
                 .replace('\\', "/");
+            // 与交付清单保留名撞名的源文件必须显式拒绝:静默交付会被清单
+            // 生成器漏计/覆盖(codex 复验 P0)
+            if let Some(name) = file.file_name().and_then(|n| n.to_str()) {
+                if name == MANIFEST_NAME || name == SUMMARY_NAME {
+                    out.failures.push((
+                        rel,
+                        "error",
+                        format!("文件名与交付清单保留名「{name}」冲突,请改名后重新打包"),
+                    ));
+                    continue;
+                }
+            }
             let meta_fs = match fs::metadata(&file) {
                 Ok(m) => m,
                 Err(e) => {
@@ -311,6 +326,7 @@ fn write_manifests(delivery_root: &Path, out: &mut DeliveryOutcome) {
             format!("总清单写入失败(文件交付结果不受影响,可重跑补齐): {e}"),
         ));
     }
+    out.package_totals = summary_rows;
 }
 
 /// 派生文件(清单)的原子写:唯一临时文件 + rename 替换(清单允许重生成覆盖)。

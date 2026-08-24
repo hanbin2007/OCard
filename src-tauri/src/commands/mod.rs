@@ -223,26 +223,30 @@ pub fn preview_folder_tree(
                 children: None,
             })
             .collect(),
-        project::Scenario::B => project::scenario_b_dirs(&categories)
-            .into_iter()
-            .map(|d| {
-                let children = if d.ends_with(project::CURATED_DIR_NAME) {
-                    Some(vec![
-                        FolderNode {
-                            name: project::CURATED_TODO.into(),
-                            children: None,
-                        },
-                        FolderNode {
-                            name: project::CURATED_DONE.into(),
-                            children: None,
-                        },
-                    ])
-                } else {
-                    None
-                };
-                FolderNode { name: d, children }
-            })
-            .collect(),
+        project::Scenario::B => {
+            let dirs = project::scenario_b_dirs(&categories);
+            let curated_idx = dirs.len() - 2; // 角色按布局下标,不猜名字(复验 10)
+            dirs.into_iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    let children = if i == curated_idx {
+                        Some(vec![
+                            FolderNode {
+                                name: project::CURATED_TODO.into(),
+                                children: None,
+                            },
+                            FolderNode {
+                                name: project::CURATED_DONE.into(),
+                                children: None,
+                            },
+                        ])
+                    } else {
+                        None
+                    };
+                    FolderNode { name: d, children }
+                })
+                .collect()
+        }
     }
 }
 
@@ -379,7 +383,7 @@ pub fn inspect_volume(volume_id: String) -> CmdResult<VolumeInspectionDto> {
     // 大卡按步长采样(≤300 个样本)控制 EXIF 解析耗时
     let mut earliest: Option<chrono::DateTime<Utc>> = None;
     let mut latest: Option<chrono::DateTime<Utc>> = None;
-    let step = (files.len() / 300).max(1);
+    let step = files.len().div_ceil(300).max(1); // 向上取整:301-599 个也只采 ≤300 样本
     for (i, (rel, _)) in files.iter().enumerate() {
         if i % step != 0 {
             continue;
@@ -684,7 +688,9 @@ pub fn resume_copy_task(app: AppHandle, state: State<AppState>, task_id: String)
         // 续传身份核对(评审 M10/P0-1)+ 按卷名重解析挂载点(复核必修 A:
         // 卡后插/换挂载口场景,插回原卡即可续传,无需重启应用)
         let m = manifest::load(&handle.project_root, &handle.manifest_id).map_err(err)?;
-        let vols: Vec<(PathBuf, String)> = volumes::list_volumes()
+        // 只看可移动卷:系统盘永远在场,混进来会让「没有检测到可移动卷」
+        // 分支永不可达,报文失真(复验 18)
+        let vols: Vec<(PathBuf, String)> = volumes::removable_volumes()
             .into_iter()
             .map(|v| (v.mount_point, v.name))
             .collect();

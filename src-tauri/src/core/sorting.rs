@@ -1,12 +1,14 @@
 //! 分类工作台核心(M2 任务2):分类移动、精选复制、回收站三件套。
 //! 不变量:
 //! - **路径闸**:一切外部传入的项目内相对路径(asset_ids、回收站索引里的
-//!   original_path/stored_as)都是不可信输入,必须过 [`resolve_in_project`],
-//!   拒绝任何越界(`..`、绝对路径、盘符、反斜杠);
+//!   original_path/stored_as)都是不可信输入,必须过 [`resolve_asset_in_project`]:
+//!   词法拒越界(`..`、绝对路径、盘符、反斜杠)+ 拒符号链接成分 +
+//!   素材命名空间白名单(挡 `.ocard`/「交付」等内部目录);
 //! - **零覆盖**:任何移动/复制/恢复走 `fsx::rename_no_replace`/独占创建,
-//!   目标已存在即失败该项,绝不替换;
-//! - **两段式删除**:trash 只移入 `.ocard/trash`,`empty_trash` 是全应用唯一物理删除,
-//!   且只重写索引中本轮删除的行——并发机器新写的行原样保留;
+//!   目标已存在即失败该项,绝不替换(fsx 在极少数异构文件系统上的最后回退
+//!   存在微秒级复查窗口,见 fsx 模块文档,属已声明边界);
+//! - **两段式删除**:trash 只移入 `.ocard/trash`,`empty_trash` 是全应用唯一物理删除;
+//!   索引为**纯追加**(记录行+墓碑行),永不重写——并发机器任何时刻 append 都不丢;
 //! - 批量操作逐项返回结果(部分失败必须可表达,前端恢复失败项选中态)。
 
 use super::journal::{self, Event};
@@ -58,15 +60,56 @@ pub fn resolve_in_project(project_root: &Path, rel: &str) -> std::result::Result
             _ => return Err(format!("路径包含非法成分: {rel}")),
         }
     }
+    let norm_root = paths::normalize_lexical(project_root);
     let joined = project_root.join(rel.split('/').collect::<PathBuf>());
     let normalized = paths::normalize_lexical(&joined);
-    let root_key = paths::comparison_key(&paths::normalize_lexical(project_root));
+    let root_key = paths::comparison_key(&norm_root);
     let key = paths::comparison_key(&normalized);
     if key == root_key || !key.starts_with(&root_key) {
         return Err(format!("路径越界(不在项目内): {rel}"));
     }
+    // 词法闸之外还要挡符号链接(复验 P0):项目目录树在共享 NAS 上同样不可信,
+    // 项目内一个指向外部的链接会让 rename/copy/delete 实际作用在项目外。
+    // 逐段检查已存在的成分;不存在的尾段(目标落位名)无链接可言。
+    let mut cur = norm_root.clone();
+    if let Ok(below) = normalized.strip_prefix(&norm_root) {
+        for comp in below.components() {
+            cur.push(comp);
+            match fs::symlink_metadata(&cur) {
+                Ok(md) if md.file_type().is_symlink() => {
+                    return Err(format!("路径包含符号链接,拒绝操作: {rel}"));
+                }
+                _ => {}
+            }
+        }
+    }
     Ok(normalized)
 }
+
+/// 素材命名空间闸:asset id 的首段必须是工况 B 布局中的可见文件夹。
+/// [`resolve_in_project`] 只保证「在项目内」,但项目内还有 `.ocard`(清单/日志/
+/// 回收站)与「交付」等内部命名空间——分类/回收站操作绝不允许触碰(复验 P0)。
+pub fn resolve_asset_in_project(
+    project_root: &Path,
+    meta: &project::ProjectMeta,
+    rel: &str,
+) -> std::result::Result<PathBuf, String> {
+    if meta.scenario != Scenario::B {
+        return Err("仅工况 B 项目支持分类/回收站操作".into());
+    }
+    let first = rel.split('/').next().unwrap_or("");
+    let dirs = project::scenario_b_dirs(&meta.categories);
+    if !dirs.iter().any(|d| d == first) {
+        return Err(format!(
+            "路径不在素材命名空间内(首段须是分类布局文件夹): {rel}"
+        ));
+    }
+    resolve_in_project(project_root, rel)
+}
+
+/// 「文件滞留回收站」的稳定标记:核心层报文与命令层升级判定共用,
+/// 避免文案改动让 error 升级静默失效(复验 P2)。
+pub const STRANDED_MARKER: &str = "滞留在回收站目录";
 
 /// 校验单个文件名成分(回收站 stored_as 等,不允许任何分隔符)。
 fn valid_single_segment(name: &str) -> bool {
@@ -197,18 +240,26 @@ fn move_no_replace(src: &Path, dst: &Path) -> std::result::Result<(), String> {
 }
 
 /// 批量移动素材到分类夹(扁平落位,保留文件名)。
-/// asset_ids 与 category_folder 都过路径闸;调用方还需按分类白名单校验 category。
+/// asset_ids 过素材命名空间闸,category_folder 过布局白名单+路径闸;
+/// 调用方还需按分类角色白名单校验 category(拒 inbox/curated)。
 pub fn move_assets(
     project_root: &Path,
+    meta: &project::ProjectMeta,
     asset_ids: &[String],
     category_folder: &str,
 ) -> Vec<ItemOutcome> {
-    let cat_dir = resolve_in_project(project_root, category_folder);
+    let cat_dir = (|| {
+        let dirs = project::scenario_b_dirs(&meta.categories);
+        if !dirs.iter().any(|d| d == category_folder) {
+            return Err(format!("目标不是分类布局文件夹: {category_folder}"));
+        }
+        resolve_in_project(project_root, category_folder)
+    })();
     asset_ids
         .iter()
         .map(|id| {
             let result = (|| -> std::result::Result<(), String> {
-                let src = resolve_in_project(project_root, id)?;
+                let src = resolve_asset_in_project(project_root, meta, id)?;
                 let dir = cat_dir.clone()?;
                 move_no_replace(&src, &dir.join(file_name_of(id)))
             })();
@@ -232,7 +283,7 @@ pub fn curate_assets(
         .iter()
         .map(|id| {
             let result = (|| -> std::result::Result<(), String> {
-                let src = resolve_in_project(project_root, id)?;
+                let src = resolve_asset_in_project(project_root, meta, id)?;
                 let dir = curated_todo
                     .clone()
                     .ok_or_else(|| "找不到「精选/待修」文件夹".to_string())?;
@@ -287,8 +338,8 @@ fn trash_index_path(project_root: &Path) -> PathBuf {
     trash_dir(project_root).join(TRASH_INDEX)
 }
 
-fn append_trash_record(project_root: &Path, rec: &TrashRecord) -> std::result::Result<(), String> {
-    let mut line = serde_json::to_string(rec).map_err(|e| e.to_string())?;
+fn append_index_line(project_root: &Path, line: String) -> std::result::Result<(), String> {
+    let mut line = line;
     line.push('\n');
     use std::io::Write;
     let mut f = fs::OpenOptions::new()
@@ -297,6 +348,30 @@ fn append_trash_record(project_root: &Path, rec: &TrashRecord) -> std::result::R
         .open(trash_index_path(project_root))
         .map_err(|e| e.to_string())?;
     f.write_all(line.as_bytes()).map_err(|e| e.to_string())
+}
+
+fn append_trash_record(project_root: &Path, rec: &TrashRecord) -> std::result::Result<(), String> {
+    append_index_line(
+        project_root,
+        serde_json::to_string(rec).map_err(|e| e.to_string())?,
+    )
+}
+
+/// 墓碑行:标记某条记录已终结(物理删除/已恢复)。索引因此是**纯追加**文件,
+/// 彻底消灭「读取→重写」的并发蒸发窗口(codex 复验 P0/H3 根治)。
+#[derive(Debug, Serialize, Deserialize)]
+struct TrashTombstone {
+    deleted: String,
+}
+
+fn append_tombstone(project_root: &Path, id: &str) -> std::result::Result<(), String> {
+    append_index_line(
+        project_root,
+        serde_json::to_string(&TrashTombstone {
+            deleted: id.to_string(),
+        })
+        .map_err(|e| e.to_string())?,
+    )
 }
 
 /// 回收站读取结果:实存记录 + 坏行数 + 孤儿文件(有实体无索引,不可恢复但必须可见)。
@@ -308,29 +383,49 @@ pub struct TrashList {
 }
 
 /// 读取回收站(以磁盘实存为准;索引坏行与孤儿文件都计数上报,零静默)。
-/// stored_as 含分隔符/越界成分的行按坏行处理(索引是共享可写文件,不可信)。
+/// 索引是纯追加文件:记录行 + 墓碑行(见 [`TrashTombstone`]);同 id 后行覆盖前行,
+/// 墓碑终结记录。stored_as 含分隔符/越界成分的行按坏行处理(共享可写文件,不可信)。
 pub fn list_trash(project_root: &Path) -> Result<TrashList> {
     let path = trash_index_path(project_root);
     let dir = trash_dir(project_root);
     let mut out = TrashList::default();
-    let mut referenced: std::collections::HashSet<String> = Default::default();
+    // 折叠:id → 最后一条记录;墓碑集合另记
+    let mut by_id: std::collections::HashMap<String, TrashRecord> = Default::default();
+    let mut tombstoned: std::collections::HashSet<String> = Default::default();
     if path.exists() {
         let bytes = fs::read(&path)?;
         let text = String::from_utf8_lossy(&bytes);
         for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
             match serde_json::from_str::<TrashRecord>(line) {
                 Ok(rec) if valid_single_segment(&rec.stored_as) => {
-                    referenced.insert(rec.stored_as.clone());
-                    // 只报告仍实存的(恢复/清空后旧行残留属正常)
-                    if dir.join(&rec.stored_as).is_file() {
-                        out.records.retain(|r: &TrashRecord| r.id != rec.id);
-                        out.records.push(rec);
-                    }
+                    by_id.insert(rec.id.clone(), rec);
                 }
-                _ => out.skipped += 1,
+                Ok(_) => out.skipped += 1,
+                Err(_) => match serde_json::from_str::<TrashTombstone>(line) {
+                    Ok(t) => {
+                        tombstoned.insert(t.deleted);
+                    }
+                    Err(_) => out.skipped += 1,
+                },
             }
         }
     }
+    // 存活引用 = 未被墓碑终结的折叠记录;被覆盖/被终结的 stored_as 不占引用,
+    // 其残留实体会以孤儿现身(复验:重复 id 篡改不再让实体凭空隐身)
+    let mut referenced: std::collections::HashSet<String> = Default::default();
+    for (id, rec) in &by_id {
+        if !tombstoned.contains(id) {
+            referenced.insert(rec.stored_as.clone());
+            // 只报告仍实存的(索引写失败回滚/外部干预后旧行残留属正常)
+            if dir.join(&rec.stored_as).is_file() {
+                out.records.push(rec.clone());
+            }
+        }
+    }
+    out.records.sort_by_key(|r| std::cmp::Reverse(r.trashed_at));
     // 孤儿扫描:索引写失败且回滚失败的文件不能凭空消失(评审 H2)
     if let Ok(entries) = fs::read_dir(&dir) {
         for e in entries.flatten() {
@@ -350,13 +445,18 @@ pub fn list_trash(project_root: &Path) -> Result<TrashList> {
 /// 批量移入回收站(两段式删除的第二段;第一段是前端确认)。
 /// 索引写失败时尝试回滚移动;回滚也失败时**如实报告文件滞留回收站**,
 /// 该文件会以孤儿身份出现在 list_trash(评审 H2:不再假装已还原)。
-pub fn trash_assets(project_root: &Path, asset_ids: &[String], operator: &str) -> Vec<ItemOutcome> {
+pub fn trash_assets(
+    project_root: &Path,
+    meta: &project::ProjectMeta,
+    asset_ids: &[String],
+    operator: &str,
+) -> Vec<ItemOutcome> {
     let dir = trash_dir(project_root);
     asset_ids
         .iter()
         .map(|id| {
             let result = (|| -> std::result::Result<(), String> {
-                let src = resolve_in_project(project_root, id)?;
+                let src = resolve_asset_in_project(project_root, meta, id)?;
                 let meta = fs::metadata(&src).map_err(|_| "源文件不存在或不可读".to_string())?;
                 fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
                 let rec_id = uuid::Uuid::new_v4().to_string();
@@ -392,8 +492,13 @@ pub fn trash_assets(project_root: &Path, asset_ids: &[String], operator: &str) -
 }
 
 /// 恢复:按 originalPath 放回,零覆盖。
-/// originalPath 来自共享索引文件,按不可信输入过路径闸(评审 F1)。
-pub fn restore_from_trash(project_root: &Path, entry_ids: &[String]) -> Result<Vec<ItemOutcome>> {
+/// originalPath 来自共享索引文件,按不可信输入过素材命名空间闸(评审 F1 + 复验 P0)。
+/// 恢复成功追加墓碑终结该行(失败可忽略:实体已回原位,陈旧行由实存过滤兜住)。
+pub fn restore_from_trash(
+    project_root: &Path,
+    meta: &project::ProjectMeta,
+    entry_ids: &[String],
+) -> Result<Vec<ItemOutcome>> {
     let list = list_trash(project_root)?;
     let dir = trash_dir(project_root);
     Ok(entry_ids
@@ -401,9 +506,12 @@ pub fn restore_from_trash(project_root: &Path, entry_ids: &[String]) -> Result<V
         .map(|eid| {
             let result = match list.records.iter().find(|r| &r.id == eid) {
                 None => Err("回收站中找不到该条目".to_string()),
-                Some(rec) => resolve_in_project(project_root, &rec.original_path)
+                Some(rec) => resolve_asset_in_project(project_root, meta, &rec.original_path)
                     .map_err(|e| format!("恢复目标路径非法(索引可能被篡改): {e}"))
-                    .and_then(|dst| move_no_replace(&dir.join(&rec.stored_as), &dst)),
+                    .and_then(|dst| move_no_replace(&dir.join(&rec.stored_as), &dst))
+                    .inspect(|_| {
+                        let _ = append_tombstone(project_root, eid);
+                    }),
             };
             ItemOutcome {
                 asset_id: eid.clone(),
@@ -418,76 +526,38 @@ pub fn restore_from_trash(project_root: &Path, entry_ids: &[String]) -> Result<V
 pub struct EmptyTrashOutcome {
     pub deleted: usize,
     pub failed: usize,
-    /// 索引重写失败(文件删除结果不受影响;陈旧行会在下次列出/清空时自愈)。
+    /// 墓碑追加失败(文件删除结果不受影响;无墓碑的陈旧行由实存过滤兜住)。
     pub index_rewrite_error: Option<String>,
 }
 
 /// 清空回收站:**全应用唯一物理删除入口**。
-/// 索引处理(评审 H3):只把**本轮成功删除**的行过滤掉,原子重写;
-/// 并发机器在读取之后新追加的行,以及删除失败的行,原样保留。
-/// 读取→重写之间仍有极小的并发追加窗口(无锁 NAS 的固有边界),
-/// 窗口内丢的只是索引行,文件实体还在,会以孤儿形式可见,不会静默丢失。
+/// 索引处理(评审 H3 根治):删除成功即追加墓碑行——索引纯追加,永不重写,
+/// 并发机器随时 append 都不会被蒸发;删除失败的行原样保留可重试。
+/// 索引因此单调增长,属可接受成本(内部工具、行级体量);压缩归 M3。
 pub fn empty_trash(project_root: &Path) -> Result<EmptyTrashOutcome> {
     let list = list_trash(project_root)?;
     let dir = trash_dir(project_root);
     let mut out = EmptyTrashOutcome::default();
-    let mut deleted_ids: std::collections::HashSet<String> = Default::default();
+    let mut tombstone_errors = 0usize;
     for rec in &list.records {
         match fs::remove_file(dir.join(&rec.stored_as)) {
             Ok(()) => {
                 out.deleted += 1;
-                deleted_ids.insert(rec.id.clone());
+                if let Err(e) = append_tombstone(project_root, &rec.id) {
+                    tombstone_errors += 1;
+                    out.index_rewrite_error = Some(e);
+                }
             }
             Err(_) => out.failed += 1,
         }
     }
-    // 重写失败不吞掉删除结果:降级上报,陈旧行由「文件已不存在」过滤自愈
-    if let Err(e) = rewrite_index_excluding(project_root, &deleted_ids) {
-        out.index_rewrite_error = Some(e.to_string());
+    if tombstone_errors > 0 {
+        out.index_rewrite_error = Some(format!(
+            "{tombstone_errors} 条删除标记写入失败: {}",
+            out.index_rewrite_error.take().unwrap_or_default()
+        ));
     }
     Ok(out)
-}
-
-/// 重写回收站索引,滤掉指定 id 的行;其余行(包括解析不了的坏行,
-/// 以及实体仍存在的并发新行)逐字节保留。写入经唯一临时文件原子替换。
-fn rewrite_index_excluding(
-    project_root: &Path,
-    exclude_ids: &std::collections::HashSet<String>,
-) -> Result<()> {
-    let path = trash_index_path(project_root);
-    if !path.exists() {
-        return Ok(());
-    }
-    let bytes = fs::read(&path)?;
-    let text = String::from_utf8_lossy(&bytes);
-    let mut kept = String::new();
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let drop_line = serde_json::from_str::<TrashRecord>(line)
-            .map(|rec| {
-                // 已删除的行滤掉;此外顺带压缩掉「文件已不存在」的陈旧行
-                exclude_ids.contains(&rec.id)
-                    || (valid_single_segment(&rec.stored_as)
-                        && !trash_dir(project_root).join(&rec.stored_as).is_file())
-            })
-            .unwrap_or(false); // 坏行保留:不销毁读不懂的数据
-        if !drop_line {
-            kept.push_str(line);
-            kept.push('\n');
-        }
-    }
-    if kept.is_empty() {
-        fs::remove_file(&path)?;
-        return Ok(());
-    }
-    let tmp = path.with_file_name(format!(".{}.indexpart", uuid::Uuid::new_v4()));
-    fs::write(&tmp, kept.as_bytes())?;
-    fs::rename(&tmp, &path).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })?;
-    Ok(())
 }
 
 /// 写分类环节审计事件(经调用方的 append_audit 兜底通道)。
@@ -526,7 +596,7 @@ mod tests {
         format!("1. 待分类/0824上午_A7M4_A_ZS/{rel}")
     }
 
-    // ---------- 路径闸(评审 F1 要求的逃逸用例) ----------
+    // ---------- 路径闸(评审 F1 + 复验 P0 的逃逸用例) ----------
 
     #[test]
     fn resolve_rejects_parent_dir_escape() {
@@ -560,32 +630,93 @@ mod tests {
     }
 
     #[test]
-    fn escape_attempts_fail_across_operations() {
-        let (_t, root, _m) = setup_project();
-        // 越界 id 在 move/trash/curate 里都必须逐项失败,不碰文件系统
-        let meta = project::load_meta(&root).unwrap();
-        let evil = vec!["../../受害者.jpg".to_string()];
-        assert!(move_assets(&root, &evil, "2. 开幕式")[0].result.is_err());
-        assert!(trash_assets(&root, &evil, "ZS")[0].result.is_err());
+    fn namespace_gate_blocks_internal_dirs() {
+        // 复验 P0:.ocard(清单/日志/回收站)与「交付」不许被分类/回收站操作触碰
+        let (_t, root, meta) = setup_project();
+        fs::create_dir_all(root.join("交付")).unwrap();
+        fs::write(root.join("交付/清单.txt"), b"x").unwrap();
+        let manifest_like = root.join(".ocard/manifests/m.json");
+        fs::write(&manifest_like, b"{}").unwrap();
+
+        for evil in [".ocard/manifests/m.json", "交付/清单.txt"] {
+            let evil = vec![evil.to_string()];
+            assert!(
+                trash_assets(&root, &meta, &evil, "ZS")[0].result.is_err(),
+                "{evil:?} 不许进回收站"
+            );
+            assert!(move_assets(&root, &meta, &evil, "2. 开幕式")[0]
+                .result
+                .is_err());
+            assert!(curate_assets(&root, &meta, &evil)[0].result.is_err());
+        }
+        assert!(manifest_like.is_file(), "内部文件必须原地未动");
+        assert!(root.join("交付/清单.txt").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_inside_project_cannot_reach_outside() {
+        // 复验 P0:项目内符号链接不许把操作带出项目
+        let (tmp, root, meta) = setup_project();
+        let outside = tmp.path().join("外部仓库");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("victim.jpg"), b"precious").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("1. 待分类/link")).unwrap();
+
+        let via_link = vec!["1. 待分类/link/victim.jpg".to_string()];
+        assert!(trash_assets(&root, &meta, &via_link, "ZS")[0]
+            .result
+            .is_err());
+        assert!(move_assets(&root, &meta, &via_link, "2. 开幕式")[0]
+            .result
+            .is_err());
+        assert!(curate_assets(&root, &meta, &via_link)[0].result.is_err());
+        assert!(
+            outside.join("victim.jpg").is_file(),
+            "项目外文件必须安然无恙"
+        );
+        assert!(
+            !root.join("4. 精选/待修/victim.jpg").exists(),
+            "不许经链接复制进项目"
+        );
+    }
+
+    #[test]
+    fn escape_attempts_fail_and_victim_survives() {
+        // 复验 P2:受害者真实存在,砍掉任何一道闸测试都必须红
+        let (tmp, root, meta) = setup_project();
+        fs::write(tmp.path().join("受害者.jpg"), b"outside").unwrap();
+        let evil = vec!["../受害者.jpg".to_string()];
+        assert!(move_assets(&root, &meta, &evil, "2. 开幕式")[0]
+            .result
+            .is_err());
+        assert!(trash_assets(&root, &meta, &evil, "ZS")[0].result.is_err());
         assert!(curate_assets(&root, &meta, &evil)[0].result.is_err());
-        // 分类夹本身越界也不行
-        let out = move_assets(&root, &[asset("a.jpg")], "../别的项目");
+        assert_eq!(
+            fs::read(tmp.path().join("受害者.jpg")).unwrap(),
+            b"outside",
+            "项目外文件不许被动"
+        );
+        assert!(!root.join("2. 开幕式/受害者.jpg").exists());
+        assert!(!root.join("4. 精选/待修/受害者.jpg").exists());
+        // 分类夹参数越界也不行
+        let out = move_assets(&root, &meta, &[asset("a.jpg")], "../别的项目");
         assert!(out[0].result.is_err());
         assert!(root.join(asset("a.jpg")).is_file(), "源文件不许被动过");
     }
 
     #[test]
     fn restore_rejects_tampered_original_path() {
-        let (_t, root, _m) = setup_project();
-        trash_assets(&root, &[asset("a.jpg")], "ZS");
+        let (_t, root, meta) = setup_project();
+        trash_assets(&root, &meta, &[asset("a.jpg")], "ZS");
         // 篡改索引:original_path 指向项目外
-        let idx = trash_index_path(&root);
+        let idx = trash_dir(&root).join(TRASH_INDEX);
         let text = fs::read_to_string(&idx).unwrap();
         let tampered = text.replace("1. 待分类", "../越狱");
         fs::write(&idx, tampered).unwrap();
         let list = list_trash(&root).unwrap();
         assert_eq!(list.records.len(), 1);
-        let restored = restore_from_trash(&root, &[list.records[0].id.clone()]).unwrap();
+        let restored = restore_from_trash(&root, &meta, &[list.records[0].id.clone()]).unwrap();
         let err = restored[0].result.as_ref().unwrap_err();
         assert!(err.contains("非法"), "错误要点名路径非法: {err}");
         // 文件仍安全地留在回收站
@@ -654,7 +785,16 @@ mod tests {
     fn reserved_category_names_rejected_at_creation() {
         let tmp = tempdir().unwrap();
         let date = NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
-        for bad in ["精选", "运动会精选", "其他", "待分类", "a/b", ""] {
+        for bad in [
+            "精选",
+            "运动会精选",
+            "其他",
+            "待分类",
+            "a/b",
+            "",
+            "CON",
+            "nul.txt",
+        ] {
             let r = project::create_project(
                 tmp.path(),
                 date,
@@ -677,15 +817,15 @@ mod tests {
 
     #[test]
     fn move_flattens_and_refuses_overwrite() {
-        let (_t, root, _m) = setup_project();
-        let out = move_assets(&root, &[asset("a.jpg")], "2. 开幕式");
+        let (_t, root, meta) = setup_project();
+        let out = move_assets(&root, &meta, &[asset("a.jpg")], "2. 开幕式");
         assert!(out[0].result.is_ok());
         assert!(root.join("2. 开幕式/a.jpg").is_file());
         assert!(!root.join(asset("a.jpg")).exists());
 
         // 再放一个同名的进待分类,移动必须拒绝覆盖
         fs::write(root.join(asset("a.jpg")), vec![9u8; 50]).unwrap();
-        let out2 = move_assets(&root, &[asset("a.jpg")], "2. 开幕式");
+        let out2 = move_assets(&root, &meta, &[asset("a.jpg")], "2. 开幕式");
         assert!(out2[0].result.as_ref().unwrap_err().contains("拒绝覆盖"));
         assert_eq!(
             fs::read(root.join("2. 开幕式/a.jpg")).unwrap(),
@@ -712,12 +852,12 @@ mod tests {
         assert!(out2[0].result.as_ref().unwrap_err().contains("拒绝覆盖"));
     }
 
-    // ---------- 回收站 ----------
+    // ---------- 回收站(纯追加索引 + 墓碑) ----------
 
     #[test]
     fn trash_restore_roundtrip_and_empty_is_only_physical_delete() {
-        let (_t, root, _m) = setup_project();
-        let out = trash_assets(&root, &[asset("c.jpg")], "赵晋宇");
+        let (_t, root, meta) = setup_project();
+        let out = trash_assets(&root, &meta, &[asset("c.jpg")], "赵晋宇");
         assert!(out[0].result.is_ok());
         assert!(!root.join(asset("c.jpg")).exists());
 
@@ -728,84 +868,95 @@ mod tests {
         assert_eq!(list.records[0].original_path, asset("c.jpg"));
         assert_eq!(list.records[0].operator, "赵晋宇");
 
-        // 恢复
-        let restored = restore_from_trash(&root, &[list.records[0].id.clone()]).unwrap();
+        // 恢复:文件回原位,墓碑终结索引行
+        let restored = restore_from_trash(&root, &meta, &[list.records[0].id.clone()]).unwrap();
         assert!(restored[0].result.is_ok());
         assert!(root.join(asset("c.jpg")).is_file());
         assert!(list_trash(&root).unwrap().records.is_empty());
+        let text = fs::read_to_string(trash_dir(&root).join(TRASH_INDEX)).unwrap();
+        assert!(text.contains("deleted"), "恢复成功要落墓碑");
 
-        // 再删一次并清空:物理删除
-        trash_assets(&root, &[asset("c.jpg")], "赵晋宇");
+        // 再删一次并清空:物理删除 + 墓碑,索引永不重写
+        trash_assets(&root, &meta, &[asset("c.jpg")], "赵晋宇");
         let out = empty_trash(&root).unwrap();
         assert_eq!((out.deleted, out.failed), (1, 0));
+        assert!(out.index_rewrite_error.is_none());
         assert!(list_trash(&root).unwrap().records.is_empty());
     }
 
     #[test]
     fn restore_refuses_overwrite() {
-        let (_t, root, _m) = setup_project();
-        trash_assets(&root, &[asset("a.jpg")], "ZS");
+        let (_t, root, meta) = setup_project();
+        trash_assets(&root, &meta, &[asset("a.jpg")], "ZS");
         // 原位置被新文件占据
         fs::write(root.join(asset("a.jpg")), b"new").unwrap();
         let list = list_trash(&root).unwrap();
-        let restored = restore_from_trash(&root, &[list.records[0].id.clone()]).unwrap();
+        let restored = restore_from_trash(&root, &meta, &[list.records[0].id.clone()]).unwrap();
         assert!(restored[0]
             .result
             .as_ref()
             .unwrap_err()
             .contains("拒绝覆盖"));
-        // 回收站里的文件安然无恙
+        // 回收站里的文件安然无恙,且失败不落墓碑
         assert_eq!(list_trash(&root).unwrap().records.len(), 1);
     }
 
     #[test]
-    fn empty_trash_preserves_concurrent_rows_from_other_machines() {
-        // 评审 H3 的跨机用例:重写只滤掉本轮删除的行,别机新行原样保留
-        let (_t, root, _m) = setup_project();
-        trash_assets(&root, &[asset("a.jpg")], "A机");
-        trash_assets(&root, &[asset("b.jpg")], "B机");
-        let list = list_trash(&root).unwrap();
-        let a_id = list
-            .records
-            .iter()
-            .find(|r| r.operator == "A机")
-            .unwrap()
-            .id
-            .clone();
-        // 模拟:只删 A 的行(相当于 A 机读到快照后,B 机的行是并发新增)
-        let mut only_a: std::collections::HashSet<String> = Default::default();
-        only_a.insert(a_id);
-        rewrite_index_excluding(&root, &only_a).unwrap();
-        let after = list_trash(&root).unwrap();
-        assert_eq!(after.records.len(), 1, "B 机的行必须幸存");
-        assert_eq!(after.records[0].operator, "B机");
+    fn empty_trash_never_rewrites_concurrent_appends_survive() {
+        // H3 根治断言:清空前后,索引里既有行只增不减(纯追加)
+        let (_t, root, meta) = setup_project();
+        trash_assets(&root, &meta, &[asset("a.jpg")], "A机");
+        let idx = trash_dir(&root).join(TRASH_INDEX);
+        let before = fs::read_to_string(&idx).unwrap();
+
+        // 模拟并发:另一台机器在清空进行前追加了一条记录+实体
+        fs::write(trash_dir(&root).join("bb_b.jpg"), b"bb").unwrap();
+        let concurrent = TrashRecord {
+            id: "bb".into(),
+            file_name: "b.jpg".into(),
+            size_bytes: 2,
+            original_path: asset("b.jpg"),
+            trashed_at: Utc::now(),
+            operator: "B机".into(),
+            stored_as: "bb_b.jpg".into(),
+        };
+        append_trash_record(&root, &concurrent).unwrap();
+
+        let out = empty_trash(&root).unwrap();
+        assert_eq!(out.deleted, 2, "两条实存记录都被清空");
+        let after = fs::read_to_string(&idx).unwrap();
+        assert!(
+            after.starts_with(&before),
+            "索引必须纯追加:旧内容原样保留为前缀"
+        );
+        assert!(after.contains("bb"), "并发行原样保留");
+        assert!(list_trash(&root).unwrap().records.is_empty());
     }
 
     #[test]
     fn empty_trash_keeps_corrupt_lines() {
-        let (_t, root, _m) = setup_project();
-        trash_assets(&root, &[asset("a.jpg")], "ZS");
-        // 追加一行坏数据:清空重写后必须原样保留(不销毁读不懂的数据)
-        let idx = trash_index_path(&root);
+        let (_t, root, meta) = setup_project();
+        trash_assets(&root, &meta, &[asset("a.jpg")], "ZS");
+        let idx = trash_dir(&root).join(TRASH_INDEX);
         let mut text = fs::read_to_string(&idx).unwrap();
         text.push_str("{corrupt-not-json\n");
         fs::write(&idx, &text).unwrap();
 
         let out = empty_trash(&root).unwrap();
         assert_eq!((out.deleted, out.failed), (1, 0));
-        assert!(out.index_rewrite_error.is_none());
         let text_after = fs::read_to_string(&idx).unwrap();
         assert!(text_after.contains("{corrupt-not-json"), "坏行不销毁");
-        assert!(!text_after.contains("a.jpg"), "已删除的行要滤掉");
+        assert_eq!(list_trash(&root).unwrap().skipped, 1);
+        assert!(list_trash(&root).unwrap().records.is_empty());
     }
 
     #[cfg(unix)]
     #[test]
     fn empty_trash_failed_delete_keeps_row_and_degrades() {
         use std::os::unix::fs::PermissionsExt;
-        let (_t, root, _m) = setup_project();
-        trash_assets(&root, &[asset("a.jpg")], "ZS");
-        // 回收站目录只读:删除与索引重写都会失败,但必须降级不炸、行保留可重试
+        let (_t, root, meta) = setup_project();
+        trash_assets(&root, &meta, &[asset("a.jpg")], "ZS");
+        // 回收站目录只读:删除失败必须降级不炸、行保留可重试
         let dir = trash_dir(&root);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
         let out = empty_trash(&root).unwrap();
@@ -814,6 +965,29 @@ mod tests {
         assert_eq!((out.deleted, out.failed), (0, 1), "删不掉要如实计失败");
         let after = list_trash(&root).unwrap();
         assert_eq!(after.records.len(), 1, "删除失败的行必须保留可重试");
+    }
+
+    #[test]
+    fn duplicate_id_tampering_leaves_entity_visible_as_orphan() {
+        // 复验:同 id 两条不同 stored_as 的篡改行,被覆盖的实体必须以孤儿现身
+        let (_t, root, meta) = setup_project();
+        trash_assets(&root, &meta, &[asset("a.jpg")], "ZS");
+        let list = list_trash(&root).unwrap();
+        let rec = &list.records[0];
+        // 追加一条同 id 但 stored_as 指向别处的行(后行覆盖前行)
+        let mut shadow = rec.clone();
+        shadow.stored_as = "影子_x.jpg".into();
+        fs::write(trash_dir(&root).join("影子_x.jpg"), b"shadow").unwrap();
+        append_trash_record(&root, &shadow).unwrap();
+
+        let after = list_trash(&root).unwrap();
+        assert_eq!(after.records.len(), 1);
+        assert_eq!(after.records[0].stored_as, "影子_x.jpg");
+        assert_eq!(
+            after.orphans,
+            vec![rec.stored_as.clone()],
+            "被覆盖的原实体不许凭空隐身"
+        );
     }
 
     #[test]
@@ -827,9 +1001,10 @@ mod tests {
 
     #[test]
     fn bulk_partial_failure_is_expressed() {
-        let (_t, root, _m) = setup_project();
+        let (_t, root, meta) = setup_project();
         let out = move_assets(
             &root,
+            &meta,
             &[asset("a.jpg"), "1. 待分类/不存在.jpg".to_string()],
             "3. 比赛",
         );

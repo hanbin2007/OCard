@@ -124,12 +124,23 @@ pub struct IndexState {
     pub fingerprint: u64,
 }
 
-fn inbox_fingerprint(files: &[(String, u64)]) -> u64 {
+/// 待分类清单指纹:路径+大小+mtime。带 mtime 才能捕捉「同名同大小替换」
+/// (codex 复验 15);逐文件 stat 的成本在分页命令的量级内可接受。
+fn inbox_fingerprint(project_root: &Path, files: &[(String, u64)]) -> u64 {
     let mut key = String::new();
     for (rel, size) in files {
         key.push_str(rel);
         key.push('\u{0}');
         key.push_str(&size.to_string());
+        key.push('\u{0}');
+        let abs = project_root.join(rel.split('/').collect::<PathBuf>());
+        let mtime = std::fs::metadata(&abs)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        key.push_str(&mtime.to_string());
         key.push('\n');
     }
     xxhash_rust::xxh3::xxh3_64(key.as_bytes())
@@ -162,7 +173,11 @@ fn ensure_indexing(
     project_root: &Path,
     files: &[(String, u64)],
 ) {
-    let fingerprint = inbox_fingerprint(files);
+    // 空清单不 spawn 线程:没活可干还发 0/0 事件纯属浪费(复验 P2)
+    if files.is_empty() {
+        return;
+    }
+    let fingerprint = inbox_fingerprint(project_root, files);
     let mgr = app.state::<IndexManager>();
     {
         let mut map = mgr.0.lock().unwrap();
@@ -209,12 +224,15 @@ fn ensure_indexing(
                     {
                         st.indexed += 1;
                     }
-                    // 文件在索引期间被分类走/删除:不是损坏,单独计数(评审 M3)
+                    // 文件在索引期间被分类走/删除:不是损坏,单独计数(评审 M3)。
+                    // 除 metadata 阶段的 NotFound 外,解码阶段发现文件已消失
+                    // 也算 missing(codex 复验 12)
                     Ok(Err(crate::core::CoreError::Io(e)))
                         if e.kind() == std::io::ErrorKind::NotFound =>
                     {
                         st.missing += 1;
                     }
+                    Ok(_) if !abs.exists() => st.missing += 1,
                     _ => st.failed += 1,
                 }
                 let snapshot = st.clone();
@@ -226,7 +244,12 @@ fn ensure_indexing(
             }
         }));
         let mgr = app.state::<IndexManager>();
-        let mut map = mgr.0.lock().unwrap();
+        // 收尾必须成功:即使锁被循环里的 panic 毒化也要把 running 拉回 false,
+        // 否则界面永远显示「索引中」(复验 P2)
+        let mut map = match mgr.0.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let st = map.entry(project_id.clone()).or_default();
         st.running = false;
         let snapshot = st.clone();
@@ -290,8 +313,8 @@ fn asset_dto(project_root: &Path, rel: &str, size: u64) -> SortingAssetDto {
             .map(chrono::DateTime::<Utc>::from)
     });
     let thumb_path = media::cached_thumb_path(project_root, rel, size);
-    let thumb = thumb_path
-        .is_file()
+    // 命中也要验完整性:半截缓存宁可占位也不端破图给界面(复验 P2)
+    let thumb = (thumb_path.is_file() && media::looks_like_valid_jpeg(&thumb_path))
         .then(|| std::fs::read(&thumb_path).ok())
         .flatten()
         .map(|bytes| {
@@ -333,7 +356,7 @@ pub fn list_pending_assets(
     let items = files
         .iter()
         .skip(offset)
-        .take(limit.min(500))
+        .take(limit.min(200)) // 上限与前端页大小一致,守住缩略图 base64 的 IPC 体积
         .map(|(rel, size)| asset_dto(&stats.root, rel, *size))
         .collect();
     Ok(AssetPageDto { items, total })
@@ -427,7 +450,12 @@ pub fn move_assets(
         }
         _ => return Err(format!("未知分类: {category_id}")),
     }
-    let res = bulk(sorting::move_assets(&stats.root, &asset_ids, &category_id));
+    let res = bulk(sorting::move_assets(
+        &stats.root,
+        &stats.meta,
+        &asset_ids,
+        &category_id,
+    ));
     audit_bulk(
         &app,
         &state,
@@ -470,12 +498,17 @@ pub fn trash_assets(
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
     let op = operator(&app, &state);
-    let res = bulk(sorting::trash_assets(&stats.root, &asset_ids, &op));
+    let res = bulk(sorting::trash_assets(
+        &stats.root,
+        &stats.meta,
+        &asset_ids,
+        &op,
+    ));
     // 「文件滞留回收站」是数据位置异常(既不在原位也不在索引),升级为 error 通知
     let stranded = res
         .failed
         .iter()
-        .filter(|f| f.message.contains("滞留"))
+        .filter(|f| f.message.contains(sorting::STRANDED_MARKER))
         .count();
     if stranded > 0 {
         notify::error(
@@ -550,7 +583,7 @@ pub fn restore_from_trash(
 ) -> CmdResult<BulkResultDto> {
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
-    let res = bulk(sorting::restore_from_trash(&stats.root, &entry_ids).map_err(err)?);
+    let res = bulk(sorting::restore_from_trash(&stats.root, &stats.meta, &entry_ids).map_err(err)?);
     audit_bulk(
         &app,
         &state,
@@ -665,16 +698,14 @@ pub fn build_delivery(
     let stats = find_project(&nas, &project_id)?;
     let out = crate::core::packaging::build_delivery(&stats.root, &stats.meta).map_err(err)?;
 
+    // 包表用目标目录实况总量(重跑时不显示 0,codex 复验 P1)
     let packages: Vec<DeliveryPackageDto> = out
-        .packages
+        .package_totals
         .iter()
-        .map(|p| {
-            let files: Vec<_> = out.files.iter().filter(|f| &f.package == p).collect();
-            DeliveryPackageDto {
-                name: p.clone(),
-                file_count: files.len(),
-                bytes: files.iter().map(|f| f.size_bytes).sum(),
-            }
+        .map(|(name, file_count, bytes)| DeliveryPackageDto {
+            name: name.clone(),
+            file_count: *file_count,
+            bytes: *bytes,
         })
         .collect();
     let failures: Vec<BulkFailure> = out

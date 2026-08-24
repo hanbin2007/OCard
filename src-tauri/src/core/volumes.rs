@@ -78,12 +78,30 @@ pub fn ensure_volume_uid(mount: &std::path::Path) -> Option<String> {
         return Some(uid);
     }
     let uid = uuid::Uuid::new_v4().to_string();
-    match std::fs::File::create_new(mount.join(VOLUME_UID_FILE)) {
+    let path = mount.join(VOLUME_UID_FILE);
+    match std::fs::File::create_new(&path) {
         Ok(mut f) => {
             use std::io::Write;
-            f.write_all(uid.as_bytes()).ok().map(|_| uid)
+            match f.write_all(uid.as_bytes()) {
+                Ok(()) => Some(uid),
+                Err(_) => {
+                    // 写不进内容就别留 0 字节壳:否则这张卡永远拿不到指纹
+                    drop(f);
+                    let _ = std::fs::remove_file(&path);
+                    None
+                }
+            }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_volume_uid(mount),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // 竞选落败:胜者可能刚建好还没写完内容,短暂重试再放弃
+            for _ in 0..5 {
+                if let Some(uid) = read_volume_uid(mount) {
+                    return Some(uid);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            read_volume_uid(mount)
+        }
         Err(_) => None,
     }
 }

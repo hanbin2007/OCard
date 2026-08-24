@@ -180,7 +180,7 @@ fn make_raw_thumb(abs: &Path, dir: &Path, cache: &Path) -> Option<PathBuf> {
 
 /// 轻量 JPEG 完整性检查:SOI(FFD8)开头 + EOI(FFD9)结尾。
 /// 挡得住半截文件与非 JPEG 垃圾;不做全解码(索引热路径,开销要小)。
-fn looks_like_valid_jpeg(path: &Path) -> bool {
+pub(crate) fn looks_like_valid_jpeg(path: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = fs::File::open(path) else {
         return false;
@@ -215,10 +215,11 @@ fn write_jpeg(img: &image::DynamicImage, dir: &Path, cache: &Path) -> Option<Pat
     }
     match super::fsx::rename_no_replace(&tmp, cache) {
         Ok(()) => Some(cache.to_path_buf()),
-        // 别机先写完:它的成品就是我们要的,弃自己的临时文件
+        // 别机先写完:验一下成品再采信——若既有文件是坏的(复验 11:
+        // 删除失败的坏缓存会走到这里),不能原样端给界面
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let _ = fs::remove_file(&tmp);
-            Some(cache.to_path_buf())
+            looks_like_valid_jpeg(cache).then(|| cache.to_path_buf())
         }
         Err(_) => {
             let _ = fs::remove_file(&tmp);

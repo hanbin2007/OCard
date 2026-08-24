@@ -1,7 +1,13 @@
 // M2 冒烟:工况B建项目 → 注入素材 → 分类移动 → 回收站两段删除 → 交付打包,
 // 全程对 NAS 目录做磁盘断言(真实 Tauri→IPC→磁盘链路,评审收口要求)。
 import { $, $$, browser, expect } from "@wdio/globals";
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 
 const nasRoot = process.env.OCARD_E2E_NAS_ROOT;
@@ -51,6 +57,7 @@ describe("OCard M2 分类工作台冒烟", () => {
     mkdirSync(inbox, { recursive: true });
     writeFileSync(path.join(inbox, "e2e_a.jpg"), TINY_JPEG);
     writeFileSync(path.join(inbox, "e2e_b.jpg"), TINY_JPEG);
+    writeFileSync(path.join(inbox, "e2e_c.jpg"), TINY_JPEG);
   });
 
   it("分类移动:点分类条,文件真实落到分类夹", async () => {
@@ -69,6 +76,21 @@ describe("OCard M2 分类工作台冒烟", () => {
     expect(
       existsSync(path.join(root, "1. 待分类/0824上午_A7M4_A_ZS/e2e_a.jpg")),
     ).toBe(false);
+  });
+
+  it("精选是复制:原件留在待分类,副本进精选/待修", async () => {
+    await $('[data-asset$="e2e_c.jpg"]').waitForExist({ timeout: 15000 });
+    await $('[data-asset$="e2e_c.jpg"]').click();
+    await $('[data-testid="sorting-category"][data-category="5. 精选"]').click();
+
+    const root = projectRoot();
+    await browser.waitUntil(
+      () => existsSync(path.join(root, "5. 精选/待修/e2e_c.jpg")),
+      { timeout: 15000, timeoutMsg: "精选复制未落盘" },
+    );
+    expect(
+      existsSync(path.join(root, "1. 待分类/0824上午_A7M4_A_ZS/e2e_c.jpg")),
+    ).toBe(true);
   });
 
   it("两段式删除:标记→确认→文件进回收站,清空后物理删除", async () => {
@@ -121,5 +143,33 @@ describe("OCard M2 分类工作台冒烟", () => {
     expect(existsSync(path.join(pkg, "2. 领导", "e2e_a.jpg"))).toBe(true);
     // 原件不动
     expect(existsSync(path.join(root, "2. 领导", "e2e_a.jpg"))).toBe(true);
+    // 待修副本不交付
+    expect(existsSync(path.join(pkg, "5. 精选/待修/e2e_c.jpg"))).toBe(false);
+  });
+
+  it("重跑交付:hash 校验跳过,不产生重复或残留", async () => {
+    await $('[data-testid="delivery-close"]').click();
+    await $('[data-testid="delivery-open"]').waitForClickable({ timeout: 15000 });
+    await $('[data-testid="delivery-open"]').click();
+    await confirmDangerDialog();
+    await $('[data-testid="delivery-result"]').waitForExist({ timeout: 30000 });
+
+    const root = projectRoot();
+    const delivery = path.join(root, "交付");
+    const packages = readdirSync(delivery).filter(
+      (d) => !d.startsWith(".") && !d.endsWith(".txt"),
+    );
+    const leaderDir = path.join(delivery, packages[0], "2. 领导");
+    const files = readdirSync(leaderDir).filter((f) => !f.startsWith("."));
+    expect(files).toEqual(["e2e_a.jpg"]);
+    // 不残留 staging 文件,清单仍列出已交付文件
+    expect(
+      readdirSync(leaderDir).some((f) => f.includes("deliverypart")),
+    ).toBe(false);
+    const manifest = readFileSync(
+      path.join(delivery, packages[0], "清单.txt"),
+      "utf8",
+    );
+    expect(manifest.includes("e2e_a.jpg")).toBe(true);
   });
 });
