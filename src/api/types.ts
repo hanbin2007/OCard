@@ -438,3 +438,23 @@ export interface DeliverySummary {
   /** 交付根目录（含清单），绝对路径 */
   deliveryPath: string;
 }
+
+/* ------------------------------------------------------------------ *
+ * 跨机协同（规范 §6.3 / PRD §6.3）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 其他工作站在本项目上进行中的拷卡（24h 内未完成的）。
+ * 用途只有一个：让两名 DIT 看见对方正在拷哪张卡，避免重复拷同一张。
+ * 它是**提示**而非锁——不阻断任何操作。
+ */
+export interface RemoteActivity {
+  machine: string;
+  operator: string;
+  /** 源卷名 */
+  volume: string;
+  /** 相机编码 */
+  camera: string;
+  targetFolder: string;
+  startedAt: string;
+}

@@ -10,6 +10,7 @@ import type {
 } from "../api/types";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { IconPlus, IconRetry, IconTrash } from "../components/Icon";
+import { RemoteActivityBanner } from "../components/RemoteActivityBanner";
 import { TopBar } from "../components/TopBar";
 import { Badge, EmptyState, Field, ProgressBar } from "../components/ui";
 import {
@@ -29,6 +30,10 @@ import {
 } from "../lib/labels";
 import { buildCopyTargetPath, copyTargetParent } from "../lib/naming";
 import { validateStartCopy } from "../lib/validation";
+import {
+  remoteActivityForVolume,
+  useRemoteActivity,
+} from "../hooks/useRemoteActivity";
 import { useStore } from "../state/store";
 
 interface DestDraft {
@@ -86,6 +91,9 @@ export function CopyTaskScreen() {
   const [files, setFiles] = useState<CopyFileItem[]>([]);
   const [fileTotal, setFileTotal] = useState(0);
   const [filesLoading, setFilesLoading] = useState(false);
+
+  const { activities: remoteActivities, unavailable: remoteUnavailable } =
+    useRemoteActivity(project?.id ?? null);
 
   const camera = cameras.find((c) => c.id === cameraId) ?? null;
   const validation = useMemo(
@@ -278,6 +286,8 @@ export function CopyTaskScreen() {
   const fullyLoaded = totalFiles > 0 && files.length >= totalFiles;
 
   const volume = volumes.find((v) => v.id === volumeId) ?? null;
+  // 同名卷提示：只警告不阻断——这是协作提示，不是锁
+  const remoteSameVolume = remoteActivityForVolume(remoteActivities, volume?.name);
 
   return (
     <>
@@ -292,6 +302,11 @@ export function CopyTaskScreen() {
 
       <div className="content">
         <div className="content__inner">
+          <RemoteActivityBanner
+            activities={remoteActivities}
+            unavailable={remoteUnavailable}
+          />
+
           <div className="copy">
             <div className="copy__form">
               <div className="card">
@@ -376,6 +391,21 @@ export function CopyTaskScreen() {
                         <span className="field__error" role="alert">
                           {startError}
                         </span>
+                      ) : null}
+
+                      {remoteSameVolume ? (
+                        <div
+                          className="notice notice--warn"
+                          role="alert"
+                          data-testid="copy-same-volume-warning"
+                        >
+                          <strong>该卡可能正被他机拷贝</strong>
+                          <span>
+                            {remoteSameVolume.machine}（操作人 {remoteSameVolume.operator}）
+                            正在拷同名卷「{remoteSameVolume.volume}」。
+                            请与对方确认后再继续，避免重复拷同一张卡。
+                          </span>
+                        </div>
                       ) : null}
 
                       <div className="row-inline">

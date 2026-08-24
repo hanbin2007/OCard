@@ -37,6 +37,7 @@ import type {
   BulkResult,
   CopyTaskPreview,
   DeliverySummary,
+  RemoteActivity,
   FolderNode,
   IndexingStatus,
   IndexProgressEvent,
@@ -658,4 +659,18 @@ export function revealPath(path: string): Promise<void> {
   // 浏览器/测试环境没有文件管理器可调
   void path;
   return Promise.resolve();
+}
+
+/* ------------------------------------------------------------------ *
+ * 跨机协同
+ * ------------------------------------------------------------------ */
+
+/**
+ * 其他工作站在本项目上进行中的拷卡。
+ * 数据来自各机 journal 的合并重放，SMB 上没有可靠变更通知，所以由前端轮询。
+ */
+export function listRemoteActivity(projectId: string): Promise<RemoteActivity[]> {
+  if (IS_TAURI) return ipc("list_remote_activity", { projectId });
+  void projectId;
+  return reply([]);
 }
