@@ -3,7 +3,14 @@
  * 仅用于非 Tauri 环境（浏览器预览 / 测试），真实实现全在 Rust 侧。
  */
 
-import type { DeliveryJob, JobSnapshot, ProxyResult, TranscodeJob } from "./types";
+import type {
+  AnalysisResult,
+  AnalyzeJob,
+  DeliveryJob,
+  JobSnapshot,
+  ProxyResult,
+  TranscodeJob,
+} from "./types";
 import { mockDelivery } from "./mock";
 
 const TICK_MS = 120;
@@ -187,6 +194,69 @@ export function mockStartProxyTranscode(projectId: string): TranscodeJob {
         message: `C${String(done).padStart(4, "0")}.MP4`,
       }),
     );
+  }, TICK_MS);
+  timers.set(id, timer);
+
+  return job;
+}
+
+/* ------------------------------------------------------------------ *
+ * 分析作业时间线
+ * ------------------------------------------------------------------ */
+
+const ANALYZE_TOTAL = 1240;
+
+export const mockAnalysisResult: AnalysisResult = {
+  analyzed: 1180,
+  cached: 57,
+  missing: 2,
+  failed: [
+    { rel: "1. 待分类/0824上午_NikonZ9_E_CQ/DSC_00099.NEF", message: "RAW 解码失败" },
+  ],
+  cacheSkippedLines: 3,
+};
+
+export function mockStartAnalysis(projectId: string): AnalyzeJob {
+  seq += 1;
+  const id = `job-${seq}`;
+  const job: AnalyzeJob = {
+    id,
+    kind: "analyze",
+    projectId,
+    state: "queued",
+    done: 0,
+    total: ANALYZE_TOTAL,
+    bytesDone: 0,
+    revision: 1,
+    startedAt: new Date().toISOString(),
+  };
+  jobs.set(id, job);
+
+  let step = 0;
+  const timer = setInterval(() => {
+    const current = jobs.get(id);
+    if (!current || current.kind !== "analyze" || current.state === "cancelled") {
+      clearInterval(timer);
+      timers.delete(id);
+      return;
+    }
+    step += 1;
+    if (step >= STEPS) {
+      clearInterval(timer);
+      timers.delete(id);
+      emit(
+        bump(current, {
+          state: "done",
+          done: ANALYZE_TOTAL,
+          message: undefined,
+          finishedAt: new Date().toISOString(),
+          result: mockAnalysisResult,
+        }),
+      );
+      return;
+    }
+    const done = Math.floor((ANALYZE_TOTAL * step) / STEPS);
+    emit(bump(current, { state: "running", done, message: `分析中 ${done}` }));
   }, TICK_MS);
   timers.set(id, timer);
 

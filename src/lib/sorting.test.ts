@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { SortingCategory } from "../api/types";
 import {
   actionTargets,
+  buildGridEntries,
+  filterBySuggestion,
+  resolveEntryIds,
   clickSelection,
   emptySelection,
   groupBurst,
@@ -317,5 +320,69 @@ describe("连拍分组", () => {
   it("无 groupId 的各自独立，不会被并到一起", () => {
     const groups = groupBurst([{ id: "1" }, { id: "2" }]);
     expect(groups).toHaveLength(2);
+  });
+});
+
+describe("连拍折叠（网格条目）", () => {
+  const assets = [
+    { id: "a" },
+    { id: "b", groupId: "g1" },
+    { id: "c", groupId: "g1" },
+    { id: "d", groupId: "g1" },
+    { id: "e" },
+    { id: "f", groupId: "g2" },
+  ];
+
+  it("≥2 件的同组折成恰好一格", () => {
+    const entries = buildGridEntries(assets);
+    // a / [b,c,d] / e / f → 4 格
+    expect(entries).toHaveLength(4);
+    expect(entries[1].kind).toBe("group");
+    expect(entries[1].id).toBe("group:g1");
+  });
+
+  it("单件组不折叠，仍是普通格", () => {
+    const entries = buildGridEntries(assets);
+    const last = entries[3];
+    expect(last.kind).toBe("asset");
+    expect(last.id).toBe("f");
+  });
+
+  it("组 id 展开成全部成员 assetId", () => {
+    const entries = buildGridEntries(assets);
+    expect(resolveEntryIds(entries, ["group:g1"])).toEqual(["b", "c", "d"]);
+  });
+
+  it("普通条目原样返回，未知 id 被忽略", () => {
+    const entries = buildGridEntries(assets);
+    expect(resolveEntryIds(entries, ["a", "e", "zz"])).toEqual(["a", "e"]);
+  });
+
+  it("选区模型完全不用改：组 id 就是普通字符串 id", () => {
+    const entries = buildGridEntries(assets);
+    const ids = entries.map((e) => e.id);
+    const sel = moveCursor(ids, emptySelection, "ArrowRight", 4);
+    expect(sel.cursor).toBe("a");
+    const next = moveCursor(ids, sel, "ArrowRight", 4);
+    expect(next.cursor).toBe("group:g1");
+    // 对组条目的操作会展开成 3 个真实素材
+    expect(resolveEntryIds(entries, actionTargets(next))).toEqual(["b", "c", "d"]);
+  });
+});
+
+describe("filterBySuggestion", () => {
+  const list = [
+    { id: "1", judgement: { suggestedKeep: true } },
+    { id: "2", judgement: { suggestedKeep: false } },
+    { id: "3" },
+  ];
+
+  it("关闭时原样返回", () => {
+    expect(filterBySuggestion(list, false)).toHaveLength(3);
+  });
+
+  it("开启时保留「建议保留」与尚无判定的", () => {
+    const out = filterBySuggestion(list, true);
+    expect(out.map((a) => a.id)).toEqual(["1", "3"]);
   });
 });

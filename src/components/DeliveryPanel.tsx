@@ -12,6 +12,7 @@ import { formatBytes } from "../lib/format";
 import { classifyFailures, deliveryHeadline } from "../lib/delivery";
 import { selectLatestDeliveryJob, useStore } from "../state/store";
 import { ConfirmDialog, type ConfirmRequest } from "./ConfirmDialog";
+import { DeliveryStatusToggle } from "./FinalCutPanel";
 import { Badge, ProgressBar } from "./ui";
 
 export function DeliveryButton({
@@ -415,6 +416,7 @@ function DeliveryResult({
               </button>
               <Badge tone="warn">上传网盘与发送链接需人工完成</Badge>
             </div>
+            {job ? <DeliveryStatusToggle projectId={job.projectId} /> : null}
             {revealError ? (
               <span className="field__error" role="alert" data-testid="delivery-reveal-error">
                 无法打开文件管理器：{revealError}

@@ -8,6 +8,7 @@
 
 import {
   mockCancelJob,
+  mockStartAnalysis,
   mockStartProxyTranscode,
   mockGetJob,
   mockListJobs,
@@ -19,6 +20,9 @@ import {
   mockCopyTasks,
   mockCapabilities,
   mockCategories,
+  mockDeliveryStatus,
+  mockFinalCuts,
+  mockFlowHints,
   mockDiagnostics,
   mockFfmpegStatus,
   mockIndexing,
@@ -46,7 +50,11 @@ import type {
   AssetPage,
   BulkResult,
   CopyTaskPreview,
+  AnalyzeJob,
+  CuratedFlowHint,
+  DeliveryStatus,
   FfmpegStatus,
+  FinalCutReport,
   JobSnapshot,
   RemoteActivity,
   StartProxyInput,
@@ -776,4 +784,57 @@ export function transcodeDiagnostics(): Promise<Record<string, unknown>> {
 export function startProxyTranscode(input: StartProxyInput): Promise<TranscodeJob> {
   if (IS_TAURI) return ipc("start_proxy_transcode", { input });
   return reply(mockStartProxyTranscode(input.projectId));
+}
+
+/* ------------------------------------------------------------------ *
+ * 本地 AI 分析（M3 W7a）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 发起本地分析作业（kind = "analyze"）。
+ * AI 只产出标注，**绝不移动或删除任何文件**——采纳与否由 DIT 决定（PRD §5.5）。
+ */
+export function startAnalysis(projectId: string): Promise<AnalyzeJob> {
+  if (IS_TAURI) return ipc("start_analysis", { projectId });
+  return reply(mockStartAnalysis(projectId));
+}
+
+/* ------------------------------------------------------------------ *
+ * 成片校验与交付状态（M3 W8）
+ * ------------------------------------------------------------------ */
+
+/** 成片命名校验（工况 A，PRD §5.8） */
+export function checkFinalCuts(projectId: string): Promise<FinalCutReport> {
+  if (IS_TAURI) return ipc("check_final_cuts", { projectId });
+  void projectId;
+  return reply(mockFinalCuts);
+}
+
+/** 「待修 → 已修」流转提示（工况 B，PRD §5.4） */
+export function curatedFlowHints(projectId: string): Promise<CuratedFlowHint[]> {
+  if (IS_TAURI) return ipc("curated_flow_hints", { projectId });
+  void projectId;
+  return reply(mockFlowHints);
+}
+
+export function getDeliveryStatus(projectId: string): Promise<DeliveryStatus> {
+  if (IS_TAURI) return ipc("get_delivery_status", { projectId });
+  void projectId;
+  // 返回副本：真实 IPC 每次都是新对象，mock 若返回同一引用会让调用方
+  // 「不回读也能看到更新」，测试因此丧失分辨力
+  return reply({ ...mockDeliveryStatus });
+}
+
+/** 人工勾选「已上传网盘」——OCard 不代传，只记录状态（PRD §5.7） */
+export function setDeliveryStatus(
+  projectId: string,
+  uploaded: boolean,
+): Promise<DeliveryStatus> {
+  if (IS_TAURI) return ipc("set_delivery_status", { projectId, uploaded });
+  Object.assign(mockDeliveryStatus, {
+    uploaded,
+    updatedBy: mockWorkstation.operator,
+    updatedAt: new Date().toISOString(),
+  });
+  return reply({ ...mockDeliveryStatus });
 }

@@ -336,3 +336,76 @@ export function groupBurst<T extends { id: string; groupId?: string }>(
   }
   return out;
 }
+
+/* ------------------------------------------------------------------ *
+ * 连拍折叠（M3 W7a）
+ * ------------------------------------------------------------------ */
+
+export const GROUP_ID_PREFIX = "group:";
+
+export interface AssetEntry<T> {
+  kind: "asset";
+  id: string;
+  asset: T;
+}
+
+export interface GroupEntry<T> {
+  kind: "group";
+  id: string;
+  groupId: string;
+  items: T[];
+}
+
+export type GridEntry<T> = AssetEntry<T> | GroupEntry<T>;
+
+/**
+ * 把素材列表折成网格条目：相邻同 groupId 且 ≥2 件的折成**一格**。
+ *
+ * 折叠后选区仍然只认「条目 id」——组条目用 `group:<groupId>` 这个合成 id，
+ * 因此 VirtualGrid 的等高行不被破坏，选择模型也完全不用改。
+ * 真正下发操作前用 `resolveEntryIds` 把组 id 展开成成员 assetId。
+ */
+export function buildGridEntries<T extends { id: string; groupId?: string }>(
+  assets: T[],
+): Array<GridEntry<T>> {
+  const out: Array<GridEntry<T>> = [];
+  for (const group of groupBurst(assets)) {
+    if (group.groupId !== null && group.items.length > 1) {
+      out.push({
+        kind: "group",
+        id: `${GROUP_ID_PREFIX}${group.groupId}`,
+        groupId: group.groupId,
+        items: group.items,
+      });
+    } else {
+      for (const asset of group.items) {
+        out.push({ kind: "asset", id: asset.id, asset });
+      }
+    }
+  }
+  return out;
+}
+
+/** 把条目 id（可能含组 id）展开成真实的 assetId 列表 */
+export function resolveEntryIds<T extends { id: string }>(
+  entries: Array<GridEntry<T>>,
+  entryIds: string[],
+): string[] {
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  const out: string[] = [];
+  for (const id of entryIds) {
+    const entry = byId.get(id);
+    if (!entry) continue;
+    if (entry.kind === "group") out.push(...entry.items.map((item) => item.id));
+    else out.push(entry.asset.id);
+  }
+  return out;
+}
+
+/** 「按建议筛选」：只保留 AI 建议保留的、以及没有判定结果的 */
+export function filterBySuggestion<
+  T extends { judgement?: { suggestedKeep: boolean } },
+>(assets: T[], enabled: boolean): T[] {
+  if (!enabled) return assets;
+  return assets.filter((a) => !a.judgement || a.judgement.suggestedKeep);
+}

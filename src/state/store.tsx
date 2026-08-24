@@ -21,6 +21,7 @@ import type {
   CopyDestination,
   CopyFileItem,
   CopyProgressEvent,
+  AnalyzeJob,
   CopyTask,
   DeliveryJob,
   JobSnapshot,
@@ -899,6 +900,21 @@ export function selectLatestTranscodeJob(
 ): TranscodeJob | null {
   const candidates = state.jobs.filter(
     (job): job is TranscodeJob => isTranscodeJob(job) && job.projectId === projectId,
+  );
+  if (candidates.length === 0) return null;
+  return candidates.reduce((latest, job) =>
+    job.startedAt >= latest.startedAt ? job : latest,
+  );
+}
+
+/** 该项目最近一个分析作业 */
+export function selectLatestAnalyzeJob(
+  state: AppState,
+  projectId: string,
+): AnalyzeJob | null {
+  const candidates = state.jobs.filter(
+    (job): job is AnalyzeJob =>
+      job.kind === "analyze" && job.projectId === projectId,
   );
   if (candidates.length === 0) return null;
   return candidates.reduce((latest, job) =>

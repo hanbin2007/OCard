@@ -1,6 +1,10 @@
 /** 屏 1：项目列表（列表 + 详情，↑/↓ 键盘导航）。 */
 
 import { useEffect } from "react";
+import {
+  DeliveryStatusToggle,
+  FinalCutPanel,
+} from "../components/FinalCutPanel";
 import { FolderTreeView } from "../components/FolderTreeView";
 import { TopBar } from "../components/TopBar";
 import { Badge, EmptyState, Kbd, ProgressBar } from "../components/ui";
@@ -226,6 +230,21 @@ export function ProjectsScreen() {
                       />
                     </div>
                   </div>
+
+                  {/* 交付状态：人工勾选，OCard 不代传 */}
+                  <div className="card">
+                    <div className="card__head">
+                      <span className="card__title">交付状态</span>
+                    </div>
+                    <div className="card__body">
+                      <DeliveryStatusToggle projectId={selected.id} />
+                    </div>
+                  </div>
+
+                  {/* 成片校验只对工况 A 有意义 */}
+                  {selected.scenario === "A" ? (
+                    <FinalCutPanel projectId={selected.id} />
+                  ) : null}
 
                   <button
                     type="button"

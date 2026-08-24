@@ -2,7 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import * as api from "../api";
-import type { BulkResult, SortingAsset, SortingCategory } from "../api/types";
+import type {
+  BulkResult,
+  CuratedFlowHint,
+  SortingAsset,
+  SortingCategory,
+} from "../api/types";
 import { AssetLightbox } from "../components/AssetLightbox";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { DeliveryButton } from "../components/DeliveryPanel";
@@ -12,7 +17,10 @@ import { VirtualGrid } from "../components/VirtualGrid";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import {
   actionTargets,
+  buildGridEntries,
   clickSelection,
+  filterBySuggestion,
+  resolveEntryIds,
   emptySelection,
   initialPendingDelete,
   moveCursor,
@@ -23,7 +31,11 @@ import {
   toggleSelection,
   type Selection,
 } from "../lib/sorting";
-import { selectDeliveryWorking, useStore } from "../state/store";
+import {
+  selectDeliveryWorking,
+  selectLatestAnalyzeJob,
+  useStore,
+} from "../state/store";
 
 const PAGE_SIZE = 200;
 /** 索引事件驱动的重拉节流：索引中事件很密，不能每条都打一次 IPC */
@@ -47,6 +59,10 @@ export function SortingScreen() {
   const project = state.projects.find((p) => p.id === state.selectedProjectId) ?? null;
   /** 交付作业进行中（由 job 状态派生）：分类、删除链路、导航都要据此禁用 */
   const deliveryWorking = selectDeliveryWorking(state);
+  const analyzeJob = project ? selectLatestAnalyzeJob(state, project.id) : null;
+  const analyzing =
+    analyzeJob !== null &&
+    (analyzeJob.state === "queued" || analyzeJob.state === "running");
 
   const [assets, setAssets] = useState<SortingAsset[]>([]);
   const [total, setTotal] = useState(0);
@@ -58,6 +74,11 @@ export function SortingScreen() {
   const [pageError, setPageError] = useState<string | null>(null);
   /** 连续加载失败的缩略图数：任一成功即归零 */
   const [thumbFailStreak, setThumbFailStreak] = useState(0);
+  const [suggestionOnly, setSuggestionOnly] = useState(false);
+  const [openGroup, setOpenGroup] = useState<string | null>(null);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [flowHints, setFlowHints] = useState<CuratedFlowHint[]>([]);
+  const [flowHintsOpen, setFlowHintsOpen] = useState(false);
   const [categories, setCategories] = useState<SortingCategory[]>([]);
   const [indexing, setIndexing] = useState<{
     indexed: number;
@@ -103,7 +124,13 @@ export function SortingScreen() {
   const onThumbError = useCallback(() => setThumbFailStreak((n) => n + 1), []);
   const onThumbLoad = useCallback(() => setThumbFailStreak(0), []);
 
-  const assetIds = useMemo(() => assets.map((a) => a.id), [assets]);
+  const visibleAssets = useMemo(
+    () => filterBySuggestion(assets, suggestionOnly),
+    [assets, suggestionOnly],
+  );
+  const entries = useMemo(() => buildGridEntries(visibleAssets), [visibleAssets]);
+  /** 选区认的是「条目 id」——组条目用合成 id，等高行与选择模型都不受影响 */
+  const assetIds = useMemo(() => entries.map((e) => e.id), [entries]);
   const markedSet = useMemo(() => new Set(pendingDelete.marked), [pendingDelete.marked]);
   const selectedSet = useMemo(() => new Set(selection.selected), [selection.selected]);
   const cursorIndex = selection.cursor ? assetIds.indexOf(selection.cursor) : -1;
@@ -179,6 +206,30 @@ export function SortingScreen() {
         }。当前显示的可能不是最新状态，可稍后重试或重新进入本屏。`,
       );
     }
+  }, [projectId]);
+
+  // 分析作业转 done 后重拉当前页，让 judgement 角标出来
+  const analyzeDoneRev = analyzeJob?.state === "done" ? analyzeJob.revision : 0;
+  useEffect(() => {
+    if (!analyzeDoneRev) return;
+    void refreshLoadedAssets();
+  }, [analyzeDoneRev, refreshLoadedAssets]);
+
+  // 「待修 → 已修」流转提示（PRD §5.4）：只提示，删除仍走既有回收站流程
+  useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const hints = await api.curatedFlowHints(projectId);
+        if (!cancelled) setFlowHints(hints);
+      } catch {
+        // 提示类信息拿不到不阻断分类；下次进屏会再试
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [projectId]);
 
   const loadMore = useCallback(async () => {
@@ -391,7 +442,7 @@ export function SortingScreen() {
 
   const runAssign = useCallback(
     async (categoryId: string) => {
-      const targets = actionTargets(selection);
+      const targets = resolveEntryIds(entries, actionTargets(selection));
       if (!projectId || targets.length === 0 || busy || deliveryWorking) return;
       // 精选永远是复制语义，move 到 curated 会让素材卡在没有流程的位置
       if (categories.find((c) => c.id === categoryId)?.kind === "curated") {
@@ -418,6 +469,7 @@ export function SortingScreen() {
       selection,
       busy,
       deliveryWorking,
+      entries,
       categories,
       applyBulk,
       refreshCategories,
@@ -426,7 +478,7 @@ export function SortingScreen() {
   );
 
   const runCurate = useCallback(async () => {
-    const targets = actionTargets(selection);
+    const targets = resolveEntryIds(entries, actionTargets(selection));
     if (!projectId || targets.length === 0 || busy || deliveryWorking) return;
     setBusy(true);
     try {
@@ -449,7 +501,7 @@ export function SortingScreen() {
     } finally {
       setBusy(false);
     }
-  }, [projectId, selection, busy, deliveryWorking, refreshCategories, notify]);
+  }, [projectId, selection, busy, deliveryWorking, entries, refreshCategories, notify]);
 
   runCurateRef.current = runCurate;
 
@@ -481,6 +533,19 @@ export function SortingScreen() {
       );
     }
   }, [projectId, pendingDelete.marked, applyBulk, notify]);
+
+  async function startAnalysis() {
+    if (!projectId || analyzing) return;
+    setAnalysisError(null);
+    try {
+      const job = await api.startAnalysis(projectId);
+      dispatch({ type: "jobProgress", job });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setAnalysisError(message);
+      notify("error", "analysis-start-failed", `分析作业未能启动：${message}`);
+    }
+  }
 
   function requestDeleteConfirm() {
     if (pendingDelete.marked.length === 0 || deliveryWorking) return;
@@ -558,10 +623,16 @@ export function SortingScreen() {
         case "markDelete":
           // 打包期间不许新增待删标记：后端 OpsMutex 也会拒，但 UI 要先行拦下并说明
           if (deliveryWorking) return;
-          dispatchDelete({ type: "mark", assetIds: actionTargets(selection) });
+          dispatchDelete({
+            type: "mark",
+            assetIds: resolveEntryIds(entries, actionTargets(selection)),
+          });
           return;
         case "unmarkDelete":
-          dispatchDelete({ type: "unmark", assetIds: actionTargets(selection) });
+          dispatchDelete({
+            type: "unmark",
+            assetIds: resolveEntryIds(entries, actionTargets(selection)),
+          });
           return;
       }
     },
@@ -574,6 +645,7 @@ export function SortingScreen() {
       columns,
       cursorIndex,
       deliveryWorking,
+      entries,
       runAssign,
       runCurate,
     ],
@@ -611,6 +683,17 @@ export function SortingScreen() {
             <span className="text-xs dim" data-testid="sorting-remaining">
               待分类 {total}
             </span>
+            <button
+              type="button"
+              className="btn btn--sm"
+              data-testid="sorting-analyze"
+              disabled={analyzing}
+              onClick={() => void startAnalysis()}
+            >
+              {analyzing
+                ? `分析中 ${analyzeJob?.done ?? 0}/${analyzeJob?.total ?? 0}`
+                : "分析"}
+            </button>
             <DeliveryButton projectId={project.id} />
             <button
               type="button"
@@ -658,7 +741,63 @@ export function SortingScreen() {
                 <span className="chip__count">{category.count}</span>
               </button>
             ))}
+
+            <label className="row-inline text-xs push-right">
+              <input
+                type="checkbox"
+                data-testid="sorting-suggestion-filter"
+                checked={suggestionOnly}
+                onChange={(e) => setSuggestionOnly(e.currentTarget.checked)}
+              />
+              只看建议保留
+            </label>
           </div>
+
+          {analysisError ? (
+            <div className="sorting__indexing">
+              <span className="field__error" role="alert" data-testid="sorting-analysis-error">
+                分析未能启动：{analysisError}
+              </span>
+            </div>
+          ) : null}
+
+          {flowHints.length > 0 ? (
+            <div className="sorting__indexing" data-testid="sorting-flow-hints">
+              <div className="row-inline">
+                <span className="text-xs">
+                  {flowHints.length} 个待修原稿已有成品，建议清理
+                </span>
+                <button
+                  type="button"
+                  className="btn btn--ghost btn--sm push-right"
+                  data-testid="sorting-flow-hints-toggle"
+                  aria-expanded={flowHintsOpen}
+                  onClick={() => setFlowHintsOpen((v) => !v)}
+                >
+                  {flowHintsOpen ? "收起" : "查看"}
+                </button>
+              </div>
+              {flowHintsOpen ? (
+                <div className="stack stack--sm">
+                  {flowHints.map((hint) => (
+                    <div
+                      className="delivery__failure"
+                      key={hint.todoAssetId}
+                      data-testid="flow-hint-item"
+                    >
+                      <span className="mono text-2xs truncate" title={hint.todoAssetId}>
+                        {hint.todoAssetId}
+                      </span>
+                      <span className="text-2xs dim">已修：{hint.doneFileName}</span>
+                    </div>
+                  ))}
+                  <span className="text-2xs dim">
+                    删除仍走「标记 → 确认 → 回收站」流程，OCard 不会替你删任何文件。
+                  </span>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
 
           {thumbFailStreak >= THUMB_FAIL_BANNER_AT ? (
             <div
@@ -735,7 +874,7 @@ export function SortingScreen() {
               <EmptyState>待分类里没有素材了。</EmptyState>
             ) : (
               <VirtualGrid
-                items={assets}
+                items={entries}
                 minCellWidth={CELL_MIN_WIDTH}
                 rowHeight={ROW_HEIGHT}
                 gap={GRID_GAP}
@@ -743,25 +882,45 @@ export function SortingScreen() {
                 ariaLabel="待分类素材网格"
                 scrollToIndex={cursorIndex}
                 onColumnsChange={setColumns}
-                keyOf={(asset) => asset.id}
-                renderItem={(asset, index) => (
-                  <AssetCell
-                    key={asset.id}
-                    asset={asset}
-                    index={index}
-                    selected={selectedSet.has(asset.id)}
-                    focused={selection.cursor === asset.id}
-                    marked={markedSet.has(asset.id)}
-                    onSelect={(modifiers) =>
-                      setSelection((prev) =>
-                        clickSelection(assetIds, prev, asset.id, modifiers),
-                      )
-                    }
-                    onOpen={() => setPreviewIndex(index)}
-                    onThumbError={onThumbError}
-                    onThumbLoad={onThumbLoad}
-                  />
-                )}
+                keyOf={(entry) => entry.id}
+                renderItem={(entry, index) =>
+                  entry.kind === "group" ? (
+                    <GroupCell
+                      key={entry.id}
+                      entry={entry}
+                      selected={selectedSet.has(entry.id)}
+                      focused={selection.cursor === entry.id}
+                      markedCount={
+                        entry.items.filter((i) => markedSet.has(i.id)).length
+                      }
+                      onSelect={(modifiers) =>
+                        setSelection((prev) =>
+                          clickSelection(assetIds, prev, entry.id, modifiers),
+                        )
+                      }
+                      onExpand={() => setOpenGroup(entry.groupId)}
+                      onThumbError={onThumbError}
+                      onThumbLoad={onThumbLoad}
+                    />
+                  ) : (
+                    <AssetCell
+                      key={entry.id}
+                      asset={entry.asset}
+                      index={index}
+                      selected={selectedSet.has(entry.id)}
+                      focused={selection.cursor === entry.id}
+                      marked={markedSet.has(entry.id)}
+                      onSelect={(modifiers) =>
+                        setSelection((prev) =>
+                          clickSelection(assetIds, prev, entry.id, modifiers),
+                        )
+                      }
+                      onOpen={() => setPreviewIndex(index)}
+                      onThumbError={onThumbError}
+                      onThumbLoad={onThumbLoad}
+                    />
+                  )
+                }
               />
             )}
           </div>
@@ -844,6 +1003,25 @@ export function SortingScreen() {
           ) : null}
         </div>
       </div>
+
+      {openGroup ? (
+        <GroupOverlay
+          items={
+            entries.find((e) => e.kind === "group" && e.groupId === openGroup)
+              ?.kind === "group"
+              ? (entries.find(
+                  (e) => e.kind === "group" && e.groupId === openGroup,
+                ) as { items: SortingAsset[] }).items
+              : []
+          }
+          selectedSet={selectedSet}
+          markedSet={markedSet}
+          onSelect={(id, modifiers) =>
+            setSelection((prev) => clickSelection(assetIds, prev, id, modifiers))
+          }
+          onClose={() => setOpenGroup(null)}
+        />
+      ) : null}
 
       {previewIndex !== null && assets[previewIndex] ? (
         <AssetLightbox
@@ -944,6 +1122,8 @@ function AssetCell({
         </span>
       </div>
 
+      <JudgementBadges judgement={asset.judgement} />
+
       {marked ? (
         <span className="asset__flag asset__flag--delete" title="已标记待删除">
           D
@@ -957,6 +1137,171 @@ function AssetCell({
             }`
           : ""}
       </span>
+    </div>
+  );
+}
+
+
+/** 判定角标：AI 只标注，不触发任何文件操作 */
+function JudgementBadges({ judgement }: { judgement?: SortingAsset["judgement"] }) {
+  if (!judgement) return null;
+  return (
+    <span className="asset__judge" data-testid="asset-judgement">
+      {judgement.suggestedKeep ? (
+        <Badge tone="ok">建议保留</Badge>
+      ) : null}
+      {judgement.blurry ? <Badge tone="warn">糊</Badge> : null}
+      {judgement.overExposed ? <Badge tone="warn">过曝</Badge> : null}
+      {judgement.underExposed ? <Badge tone="warn">欠曝</Badge> : null}
+      {/* 分数只用区间表达，不显示数值 */}
+      {judgement.score < 0.4 ? <span className="dot judge-dot--low" title="低分" /> : null}
+    </span>
+  );
+}
+
+/** 连拍组：恰占一格，角标 ×N；展开走 overlay */
+function GroupCell({
+  entry,
+  selected,
+  focused,
+  markedCount,
+  onSelect,
+  onExpand,
+  onThumbError,
+  onThumbLoad,
+}: {
+  entry: { id: string; groupId: string; items: SortingAsset[] };
+  selected: boolean;
+  focused: boolean;
+  markedCount: number;
+  onSelect: (modifiers: { shift?: boolean; meta?: boolean }) => void;
+  onExpand: () => void;
+  onThumbError: () => void;
+  onThumbLoad: () => void;
+}) {
+  // 封面优先用组内「建议保留」的那张
+  const cover =
+    entry.items.find((i) => i.judgement?.suggestedKeep) ?? entry.items[0];
+  const [failed, setFailed] = useState(false);
+
+  return (
+    <div
+      role="gridcell"
+      aria-selected={selected}
+      data-testid="asset-group"
+      data-group={entry.groupId}
+      className={`asset asset--group${selected ? " asset--selected" : ""}${
+        focused ? " asset--focused" : ""
+      }`}
+      onClick={(e) => onSelect({ shift: e.shiftKey, meta: e.metaKey || e.ctrlKey })}
+      onDoubleClick={onExpand}
+    >
+      {cover.thumbReady && cover.thumbnail && !failed ? (
+        <img
+          className="asset__thumb"
+          src={cover.thumbnail}
+          alt=""
+          loading="lazy"
+          onError={() => {
+            setFailed(true);
+            onThumbError();
+          }}
+          onLoad={onThumbLoad}
+        />
+      ) : (
+        <div className="asset__thumb asset__thumb--empty">
+          <span className="text-2xs dim">索引中</span>
+        </div>
+      )}
+
+      <div className="asset__meta">
+        <span className="asset__name truncate">连拍组</span>
+        <span className="asset__sub">
+          <Badge tone="neutral">×{entry.items.length}</Badge>
+          {markedCount > 0 ? <Badge tone="danger">待删 {markedCount}</Badge> : null}
+        </span>
+      </div>
+
+      <JudgementBadges judgement={cover.judgement} />
+
+      <button
+        type="button"
+        className="asset__expand"
+        data-testid="group-expand"
+        aria-label={`展开连拍组 ${entry.groupId}`}
+        onClick={(e) => {
+          e.stopPropagation();
+          onExpand();
+        }}
+      >
+        展开
+      </button>
+    </div>
+  );
+}
+
+/** 组内网格：选中语义与主网格一致（写的是同一个选区） */
+function GroupOverlay({
+  items,
+  selectedSet,
+  markedSet,
+  onSelect,
+  onClose,
+}: {
+  items: SortingAsset[];
+  selectedSet: Set<string>;
+  markedSet: Set<string>;
+  onSelect: (id: string, modifiers: { shift?: boolean; meta?: boolean }) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div
+        className="dialog dialog--wide"
+        role="dialog"
+        aria-modal="true"
+        aria-label="连拍组"
+        data-testid="group-overlay"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="dialog__title">连拍组（{items.length} 张）</h2>
+        <p className="dialog__message">
+          组内可以单独选中并执行分类/精选/标删；AI 只给建议，不会替你动文件。
+        </p>
+        <div className="group-overlay__grid dialog__form">
+          {items.map((asset) => (
+            <div
+              key={asset.id}
+              role="gridcell"
+              aria-selected={selectedSet.has(asset.id)}
+              data-testid="group-item"
+              data-asset={asset.id}
+              className={`asset${selectedSet.has(asset.id) ? " asset--selected" : ""}${
+                markedSet.has(asset.id) ? " asset--marked" : ""
+              }`}
+              onClick={(e) =>
+                onSelect(asset.id, {
+                  shift: e.shiftKey,
+                  meta: e.metaKey || e.ctrlKey,
+                })
+              }
+            >
+              {asset.thumbReady && asset.thumbnail ? (
+                <img className="asset__thumb" src={asset.thumbnail} alt="" />
+              ) : (
+                <div className="asset__thumb asset__thumb--empty" />
+              )}
+              <span className="asset__name truncate">{asset.fileName}</span>
+              <JudgementBadges judgement={asset.judgement} />
+            </div>
+          ))}
+        </div>
+        <div className="dialog__actions">
+          <button type="button" className="btn" data-testid="group-close" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

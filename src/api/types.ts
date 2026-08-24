@@ -356,8 +356,13 @@ export interface SortingAsset {
    */
   thumbReady: boolean;
   kind: SortingAssetKind;
-  /** 连拍组 id；同组的会折叠显示（PRD §5.4） */
+  /** 连拍组 id；同组的会折叠显示（PRD §5.4）。分析跑过后才有真值。 */
   groupId?: string;
+  /**
+   * 本地 AI 的客观判定（PRD §5.5）。
+   * **只做标注**：AI 绝不自动移动或删除任何文件，采纳与否由 DIT 决定。
+   */
+  judgement?: AssetJudgement;
 }
 
 export interface AssetPage {
@@ -532,8 +537,7 @@ export interface TranscodeJob extends JobBase {
 
 export interface AnalyzeJob extends JobBase {
   kind: "analyze";
-  /** M3 后续波次落地；先留空，别退化成 unknown 的裸用 */
-  result?: never;
+  result?: AnalysisResult;
 }
 
 export type JobSnapshot = DeliveryJob | TranscodeJob | AnalyzeJob;
@@ -604,4 +608,67 @@ export interface StartProxyInput {
   projectId: string;
   cameraFolders?: string[];
   forceAll?: boolean;
+}
+
+/* ------------------------------------------------------------------ *
+ * 本地 AI 分析（M3 W7a，PRD §5.5）
+ * ------------------------------------------------------------------ */
+
+export interface AssetJudgement {
+  groupId?: string;
+  /** 综合质量分（0–1）；界面只用区间，不显示数值 */
+  score: number;
+  blurry: boolean;
+  overExposed: boolean;
+  underExposed: boolean;
+  /** 组内建议保留项。**只是建议**，不触发任何文件操作 */
+  suggestedKeep: boolean;
+}
+
+export interface AnalysisFailure {
+  rel: string;
+  message: string;
+}
+
+export interface AnalysisResult {
+  analyzed: number;
+  cached: number;
+  missing: number;
+  failed: AnalysisFailure[];
+  /** 分析缓存里被跳过的损坏行数（降级但不阻断） */
+  cacheSkippedLines: number;
+}
+
+/* ------------------------------------------------------------------ *
+ * 成片命名校验与交付状态（M3 W8）
+ * ------------------------------------------------------------------ */
+
+export interface FinalCutItem {
+  fileName: string;
+  valid: boolean;
+  issues: string[];
+  /** 识别出的用途/版本分类，如 "预览版" / "成品" */
+  class?: string;
+  parsed?: Record<string, string>;
+  /** 分辨率与命名声明不符（如名字写 4K 实际 720p） */
+  resolutionMismatch?: boolean;
+  /** 无法校验（探测失败等），附原因 */
+  uncheckable?: string;
+}
+
+export interface FinalCutReport {
+  items: FinalCutItem[];
+  warnings: string[];
+}
+
+/** 「待修 → 已修」流转提示：待修里的原稿已经有成品了 */
+export interface CuratedFlowHint {
+  todoAssetId: string;
+  doneFileName: string;
+}
+
+export interface DeliveryStatus {
+  uploaded: boolean;
+  updatedBy?: string;
+  updatedAt?: string;
 }

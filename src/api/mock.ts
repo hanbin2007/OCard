@@ -6,7 +6,10 @@
 import type {
   CameraReg,
   CapabilityReport,
+  CuratedFlowHint,
+  DeliveryStatus,
   FfmpegStatus,
+  FinalCutReport,
   TranscodeCapabilities,
   DeliverySummary,
   IndexingStatus,
@@ -406,8 +409,28 @@ export const mockPendingAssets: SortingAsset[] = Array.from(
       thumbnail: index % 13 === 0 ? undefined : mockThumb((i * 37) % 360),
       thumbReady: index % 13 !== 0,
       kind: isVideo ? "video" : isRaw ? "raw" : "photo",
-      // groupId 现阶段后端恒为空，连拍分组归 M3；groupBurst 已兼容缺省值
-      groupId: undefined,
+      // 连拍组：放在列表靠后位置（40–44），避免打乱前若干格的单件语义
+      groupId: i >= 40 && i <= 44 ? "burst-1" : undefined,
+      // 分析跑过后才有 judgement；这里给几件带上，用于角标与「建议保留」
+      judgement:
+        i >= 40 && i <= 44
+          ? {
+              groupId: "burst-1",
+              score: i === 42 ? 0.86 : 0.31,
+              blurry: i === 41,
+              overExposed: i === 43,
+              underExposed: false,
+              suggestedKeep: i === 42,
+            }
+          : i === 5
+            ? {
+                score: 0.22,
+                blurry: true,
+                overExposed: false,
+                underExposed: true,
+                suggestedKeep: false,
+              }
+            : undefined,
     } satisfies SortingAsset;
   },
 );
@@ -530,4 +553,55 @@ export const mockDiagnostics: Record<string, unknown> = {
   winners: readyReport.winners,
   probes: readyReport.probes,
   probedAt: readyReport.probedAt,
+};
+
+/* ------------------------------------------------------------------ *
+ * W8 mock
+ * ------------------------------------------------------------------ */
+
+export const mockFinalCuts: FinalCutReport = {
+  items: [
+    {
+      fileName: "20260822_年中发布会_4K_官网_v3.mp4",
+      valid: true,
+      issues: [],
+      class: "成品",
+      parsed: { date: "20260822", title: "年中发布会", resolution: "4K" },
+    },
+    {
+      fileName: "发布会终版.mp4",
+      valid: false,
+      issues: ["缺少日期前缀", "缺少分辨率与用途", "缺少版本号"],
+    },
+    {
+      fileName: "20260822_年中发布会_4K_官网_v2.mp4",
+      valid: true,
+      issues: [],
+      class: "成品",
+      resolutionMismatch: true,
+    },
+    {
+      fileName: "20260822_年中发布会_720p_预览_v1.mov",
+      valid: true,
+      issues: [],
+      class: "预览版",
+      uncheckable: "ffprobe 无法读取该容器，未校验分辨率",
+    },
+  ],
+  warnings: ["「6. 成片」下有 2 个非视频文件已跳过"],
+};
+
+export const mockFlowHints: CuratedFlowHint[] = [
+  {
+    todoAssetId: "6. 精选/待修/DSC_00311.NEF",
+    doneFileName: "DSC_00311.jpg",
+  },
+  {
+    todoAssetId: "6. 精选/待修/DSC_00476.NEF",
+    doneFileName: "DSC_00476.jpg",
+  },
+];
+
+export const mockDeliveryStatus: DeliveryStatus = {
+  uploaded: false,
 };

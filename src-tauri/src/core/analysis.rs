@@ -489,3 +489,43 @@ mod tests {
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
     }
 }
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// 工程预验(非 SLA 证据;SLA 须用户提供真实素材,计划 W7):
+    /// 合成 24MP JPEG 单张全流水线耗时 → 外推千张多核吞吐。
+    /// 运行:`cargo test --release bench_single_24mp -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_single_24mp_pipeline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bench.jpg");
+        // 带高频纹理的 6000×4000(避免纯色被编码器秒杀)
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(6000, 4000, |x, y| {
+            image::Rgb([
+                ((x * 7 + y * 3) % 256) as u8,
+                ((x * 3) % 256) as u8,
+                ((y * 5) % 256) as u8,
+            ])
+        }));
+        img.save(&path).unwrap();
+        let n = 8;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            let decoded = image::open(&path).unwrap();
+            let _ = extract_features(&decoded);
+        }
+        let per = t0.elapsed().as_secs_f64() / n as f64;
+        let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(4);
+        let est_1000 = per * 1000.0 / (cores.saturating_sub(1).max(1)) as f64;
+        eprintln!(
+            "单张 24MP 全流水线 {per:.3}s;{cores} 核外推千张 ≈ {est_1000:.0}s(预算 300s)"
+        );
+        assert!(
+            est_1000 < 300.0,
+            "工程预验超预算:外推千张 {est_1000:.0}s ≥ 300s"
+        );
+    }
+}

@@ -124,6 +124,22 @@ jobs:
         # 用文件而非内联 JSON:Windows pwsh 会吞内联引号
         run: pnpm tauri build --config src-tauri/ci-no-updater.conf.json
 
+      - name: Verify sidecars in build output (W9 installer 校验)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # tauri 会把 externalBin 以平台命名落到构建产物旁/包内;缺失=打包链路断
+          case "${{ runner.os }}" in
+            macOS)
+              APP=$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name "*.app" | head -1)
+              test -x "$APP/Contents/MacOS/ffmpeg" && test -x "$APP/Contents/MacOS/ffprobe" ;;
+            Linux)
+              test -x src-tauri/target/release/ffmpeg && test -x src-tauri/target/release/ffprobe ;;
+            Windows)
+              test -f src-tauri/target/release/ffmpeg.exe && test -f src-tauri/target/release/ffprobe.exe ;;
+          esac
+          echo "sidecars verified"
+
       - name: Upload bundles
         uses: actions/upload-artifact@v7
         with:

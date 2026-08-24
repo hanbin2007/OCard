@@ -63,6 +63,8 @@ describe("E2E 锚点", () => {
       "sorting-remaining",
       "sorting-open-trash",
       "delivery-open",
+      "sorting-analyze",
+      "sorting-suggestion-filter",
       "virtual-grid",
       "asset-cell",
     ]);
