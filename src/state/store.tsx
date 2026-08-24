@@ -44,6 +44,13 @@ export interface AppState {
   selectedTaskId: string | null;
   /** 工作站设置对话框是否打开 */
   settingsOpen: boolean;
+  /**
+   * 收到了事件、但本地还没有这个任务（别的窗口/重启后重建的任务，
+   * 或快照还没拉回来）。先按 taskId 缓存最新一条，拉到快照后补上。
+   */
+  orphanProgress: Record<string, CopyProgressEvent>;
+  /** 进度监听建立失败：界面要说出来，不能假装一切正常 */
+  progressError: string | null;
 }
 
 type BootstrapPayload = Pick<
@@ -67,7 +74,9 @@ export type AppAction =
   | { type: "taskProgress"; event: CopyProgressEvent }
   | { type: "settingsOpened" }
   | { type: "settingsClosed" }
-  | { type: "workstationUpdated"; workstation: WorkstationInfo };
+  | { type: "workstationUpdated"; workstation: WorkstationInfo }
+  | { type: "taskSnapshot"; task: CopyTask }
+  | { type: "progressListenFailed"; error: string };
 
 export const initialState: AppState = {
   route: "projects",
@@ -82,6 +91,8 @@ export const initialState: AppState = {
   selectedProjectId: null,
   selectedTaskId: null,
   settingsOpen: false,
+  orphanProgress: {},
+  progressError: null,
 };
 
 /** 把增量事件合并进文件列表；未在事件里出现的文件保持原样 */
@@ -107,6 +118,22 @@ function mergeDestinations(
     const next = patch.get(dest.id);
     return next ? { ...dest, ...next } : dest;
   });
+}
+
+/** 把一条进度事件合并进任务；乱序/过期事件原样返回 */
+function applyProgress(task: CopyTask, event: CopyProgressEvent): CopyTask {
+  if (task.progressRevision !== undefined && event.revision <= task.progressRevision) {
+    return task;
+  }
+  return {
+    ...task,
+    progressRevision: event.revision,
+    copiedBytes: event.copiedBytes,
+    speedBytesPerSec: event.speedBytesPerSec,
+    state: event.state,
+    files: mergeFiles(task.files, event.changedFiles),
+    destinations: mergeDestinations(task.destinations, event.changedDestinations),
+  };
 }
 
 export function reducer(state: AppState, action: AppAction): AppState {
@@ -175,26 +202,42 @@ export function reducer(state: AppState, action: AppAction): AppState {
 
     case "taskProgress": {
       const { event } = action;
+      const known = state.tasks.some((t) => t.id === event.taskId);
+      if (!known) {
+        // 不认识的 taskId：缓存最新一条，等快照拉回来再补
+        const buffered = state.orphanProgress[event.taskId];
+        if (buffered && buffered.revision >= event.revision) return state;
+        return {
+          ...state,
+          orphanProgress: { ...state.orphanProgress, [event.taskId]: event },
+        };
+      }
       return {
         ...state,
-        tasks: state.tasks.map((task) => {
-          if (task.id !== event.taskId) return task;
-          // 丢弃乱序/过期事件
-          if (task.progressRevision !== undefined && event.revision <= task.progressRevision) {
-            return task;
-          }
-          return {
-            ...task,
-            progressRevision: event.revision,
-            copiedBytes: event.copiedBytes,
-            speedBytesPerSec: event.speedBytesPerSec,
-            state: event.state,
-            files: mergeFiles(task.files, event.changedFiles),
-            destinations: mergeDestinations(task.destinations, event.changedDestinations),
-          };
-        }),
+        tasks: state.tasks.map((task) =>
+          task.id === event.taskId ? applyProgress(task, event) : task,
+        ),
       };
     }
+
+    case "taskSnapshot": {
+      // 快照对账：以后端为准，再把期间缓存的事件补上
+      const buffered = state.orphanProgress[action.task.id];
+      const merged = buffered ? applyProgress(action.task, buffered) : action.task;
+      const exists = state.tasks.some((t) => t.id === merged.id);
+      const rest = { ...state.orphanProgress };
+      delete rest[merged.id];
+      return {
+        ...state,
+        tasks: exists
+          ? state.tasks.map((t) => (t.id === merged.id ? merged : t))
+          : [merged, ...state.tasks],
+        orphanProgress: rest,
+      };
+    }
+
+    case "progressListenFailed":
+      return { ...state, progressError: action.error };
 
     case "settingsOpened":
       return { ...state, settingsOpen: true };
@@ -215,6 +258,8 @@ interface StoreValue {
   dispatch: Dispatch<AppAction>;
   /** bootstrap 失败后重试 */
   reload: () => void;
+  /** 与后端对账某个任务的最新快照 */
+  refreshTask: (taskId: string) => Promise<void>;
 }
 
 const StoreContext = createContext<StoreValue | null>(null);
@@ -272,21 +317,55 @@ export function StoreProvider({
     };
   }, [skipBootstrap, reloadToken]);
 
-  // 进度订阅集中在这里，只按「进行中任务的 id 集合」重建，
-  // 不随每次进度事件重订阅（否则永远从头开始，进度卡住）。
-  const runningTaskKey = state.tasks
-    .filter((t) => t.state === "running" || t.state === "verifying")
-    .map((t) => t.id)
-    .join(",");
-
+  /**
+   * 常驻单一监听：应用启动即建立，整个生命周期只此一个，绝不按任务状态拆建。
+   * 之前按「进行中任务 id」重建订阅会造成订阅断裂——任务转 paused 后监听被拆掉，
+   * 点「继续」后端在发事件却没人听；小任务也可能在监听建立前就跑完丢掉终态。
+   */
   useEffect(() => {
-    if (!runningTaskKey) return;
-    return api.subscribeCopyProgress(runningTaskKey.split(","), (event) => {
-      dispatch({ type: "taskProgress", event });
-    });
-  }, [runningTaskKey]);
+    return api.subscribeCopyProgress(
+      (event) => dispatch({ type: "taskProgress", event }),
+      (err) =>
+        dispatch({
+          type: "progressListenFailed",
+          error:
+            err instanceof Error
+              ? `进度监听未能建立：${err.message}`
+              : "进度监听未能建立，界面可能不会自动刷新",
+        }),
+    );
+  }, []);
 
-  const value = useMemo(() => ({ state, dispatch, reload }), [state, reload]);
+  /** 拉一次任务快照与后端对账（start/resume/retry 之后调用） */
+  const refreshTask = useCallback(async (taskId: string) => {
+    const task = await api.getCopyTask(taskId);
+    if (task) dispatch({ type: "taskSnapshot", task });
+  }, []);
+
+  // 收到了不认识的 taskId 的事件：把快照拉回来补上
+  const orphanIds = Object.keys(state.orphanProgress).join(",");
+  useEffect(() => {
+    if (!orphanIds) return;
+    let cancelled = false;
+    void (async () => {
+      for (const id of orphanIds.split(",")) {
+        try {
+          const task = await api.getCopyTask(id);
+          if (!cancelled && task) dispatch({ type: "taskSnapshot", task });
+        } catch {
+          // 拉不到就留在缓存里，下一条事件会再触发一次
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [orphanIds]);
+
+  const value = useMemo(
+    () => ({ state, dispatch, reload, refreshTask }),
+    [state, reload, refreshTask],
+  );
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;
 }
 

@@ -1,8 +1,14 @@
 /** 屏 4：拷卡任务面板（源卷双确认 + 多目的地 + 逐文件哈希状态）。 */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api";
-import type { DestinationKind } from "../api/types";
+import type {
+  CopyFileItem,
+  CopyTaskPreview,
+  DestinationKind,
+  StartCopyInput,
+} from "../api/types";
+import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { IconPlus, IconRetry, IconTrash } from "../components/Icon";
 import { TopBar } from "../components/TopBar";
 import { Badge, EmptyState, Field, ProgressBar } from "../components/ui";
@@ -38,7 +44,7 @@ function newDest(kind: DestinationKind, path = ""): DestDraft {
 }
 
 export function CopyTaskScreen() {
-  const { state, dispatch } = useStore();
+  const { state, dispatch, refreshTask } = useStore();
   const { volumes, cameras, tasks, projects, selectedProjectId, selectedTaskId } = state;
 
   // 不做 `?? projects[0]` 兜底：没选项目就不该猜一个往里拷
@@ -66,6 +72,17 @@ export function CopyTaskScreen() {
   const [submitted, setSubmitted] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
+
+  // 后端解析出的真实落盘位置（双确认屏只显示这个，不显示用户填的路径）
+  const [preview, setPreview] = useState<CopyTaskPreview | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+
+  // 文件明细分页拉取：list_copy_tasks 按契约不带 files
+  const [files, setFiles] = useState<CopyFileItem[]>([]);
+  const [fileTotal, setFileTotal] = useState(0);
+  const [filesLoading, setFilesLoading] = useState(false);
 
   const camera = cameras.find((c) => c.id === cameraId) ?? null;
   const validation = useMemo(
@@ -75,7 +92,7 @@ export function CopyTaskScreen() {
         cameraId,
         note,
         targetPrefix,
-        destinations: dests.map((d) => d.path),
+        destinations: dests.map(({ kind, path }) => ({ kind, path })),
       }),
     [volumeId, cameraId, note, targetPrefix, dests],
   );
@@ -103,11 +120,101 @@ export function CopyTaskScreen() {
     };
   }, [volumeId, project]);
 
+
+  const PAGE_SIZE = 200;
+
+  /** 拉一页文件明细并合并（offset=0 表示重新加载） */
+  const loadFiles = useCallback(
+    async (taskId: string, offset: number) => {
+      setFilesLoading(true);
+      try {
+        const page = await api.listCopyFiles(taskId, offset, PAGE_SIZE);
+        setFileTotal(page.total);
+        setFiles((prev) => (offset === 0 ? page.items : [...prev, ...page.items]));
+      } finally {
+        setFilesLoading(false);
+      }
+    },
+    [],
+  );
+
+  // 选中任务变化时重新拉第一页；任务进度推进时也刷新，保证状态列跟得上
+  const taskId = task?.id ?? null;
+  const taskRevision = task?.progressRevision ?? 0;
+  useEffect(() => {
+    if (!taskId) {
+      setFiles([]);
+      setFileTotal(0);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const page = await api.listCopyFiles(taskId, 0, PAGE_SIZE);
+      if (cancelled) return;
+      setFiles(page.items);
+      setFileTotal(page.total);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [taskId, taskRevision]);
+
+  /** 真正提交；confirmExisting 为 true 时表示用户已在对话框里同意继续 */
+  async function submitStart(confirmExisting: boolean) {
+    if (!project) return;
+    setBusy(true);
+    setStartError(null);
+    try {
+      const input: StartCopyInput = {
+        projectId: project.id,
+        volumeId,
+        cameraId,
+        note,
+        targetPrefix,
+        destinations: dests.map(({ kind, path }) => ({ kind, path })),
+        ...(confirmExisting ? { confirmExistingTarget: true } : {}),
+      };
+      const started = await api.startCopyTask(input);
+      dispatch({ type: "taskStarted", task: started });
+      // 与后端对账一次，别只信 start 的返回值
+      void refreshTask(started.id);
+      setNote("");
+      setSubmitted(false);
+      setConfirming(false);
+      setPreview(null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.startsWith("TARGET_EXISTS:")) {
+        // 目标夹已存在且非空：极可能是同名重复拷卡，必须让人明示
+        setConfirm({
+          title: "目标夹已存在",
+          message:
+            "目标夹已存在且非空，可能是同名重复拷卡。确认继续将只补缺失文件、绝不覆盖已有文件。",
+          confirmLabel: "继续拷卡",
+          onConfirm: () => void submitStart(true),
+        });
+      } else {
+        setStartError(message);
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function confirmAndStart() {
     if (!validation.valid || !project || busy) return;
-    setBusy(true);
+    await submitStart(false);
+  }
+
+  /** 进入第二步前，先问后端「实际会写到哪」，确认屏只展示真值 */
+  async function requestConfirm() {
+    setSubmitted(true);
+    if (!validation.valid || !project) return;
+    setConfirming(true);
+    setPreview(null);
+    setPreviewError(null);
     try {
-      const started = await api.startCopyTask({
+      const result = await api.previewCopyTask({
         projectId: project.id,
         volumeId,
         cameraId,
@@ -115,31 +222,19 @@ export function CopyTaskScreen() {
         targetPrefix,
         destinations: dests.map(({ kind, path }) => ({ kind, path })),
       });
-      dispatch({ type: "taskStarted", task: started });
-      setNote("");
-      setSubmitted(false);
-      setConfirming(false);
-    } finally {
-      setBusy(false);
+      setPreview(result);
+    } catch (err) {
+      setPreviewError(
+        err instanceof Error ? err.message : "无法解析目标路径，请检查配置",
+      );
     }
-  }
-
-  function requestConfirm() {
-    setSubmitted(true);
-    if (!validation.valid || !project) return;
-    setConfirming(true);
   }
 
   const fileSummary = useMemo(() => {
     const counts = { pending: 0, copied: 0, verified: 0, failed: 0 };
-    for (const f of task?.files ?? []) counts[f.status] += 1;
+    for (const f of files) counts[f.status] += 1;
     return counts;
-  }, [task]);
-
-  const allVerified =
-    task !== null &&
-    task.files.length > 0 &&
-    fileSummary.verified === task.files.length;
+  }, [files]);
 
   const volume = volumes.find((v) => v.id === volumeId) ?? null;
 
@@ -202,22 +297,32 @@ export function CopyTaskScreen() {
                           <span className="dl__val mono">{camera?.code}</span>
                         </div>
                         <div className="dl__row">
-                          <span className="dl__key">目标</span>
-                          <span className="dl__val mono">{targetPath}</span>
+                          <span className="dl__key">目标夹</span>
+                          <span className="dl__val mono" data-testid="confirm-target-folder">
+                            {preview ? preview.targetFolder : "解析中…"}
+                          </span>
                         </div>
                         <div className="dl__row">
                           <span className="dl__key">备注</span>
                           <span className="dl__val">{note}</span>
                         </div>
                         <div className="dl__row">
-                          <span className="dl__key">目的地</span>
-                          <span className="dl__val">
-                            {dests.map((d) => (
-                              <span key={d.id} className="dest-line__path truncate">
-                                {DESTINATION_KIND_LABEL[d.kind]} · {d.path}
-                                <br />
+                          <span className="dl__key">实际落盘</span>
+                          <span className="dl__val" data-testid="confirm-destinations">
+                            {previewError ? (
+                              <span className="field__error" role="alert">
+                                {previewError}
                               </span>
-                            ))}
+                            ) : preview ? (
+                              preview.destinations.map((d) => (
+                                <span key={d.id} className="dest-line__path">
+                                  {DESTINATION_KIND_LABEL[d.kind]} · {d.path}
+                                  <br />
+                                </span>
+                              ))
+                            ) : (
+                              <span className="dim">解析中…</span>
+                            )}
                           </span>
                         </div>
                       </div>
@@ -225,6 +330,12 @@ export function CopyTaskScreen() {
                       <p className="text-xs dim">
                         确认后开始读卡。校验全部通过前请勿拔卡，OCard 不会代为格式化。
                       </p>
+
+                      {startError ? (
+                        <span className="field__error" role="alert">
+                          {startError}
+                        </span>
+                      ) : null}
 
                       <div className="row-inline">
                         <button
@@ -236,9 +347,10 @@ export function CopyTaskScreen() {
                         </button>
                         <button
                           type="button"
+                          data-testid="copy-confirm-start"
                           className="btn btn--primary"
                           onClick={confirmAndStart}
-                          disabled={busy}
+                          disabled={busy || !preview}
                         >
                           {busy ? "正在建立任务…" : "确认开始"}
                         </button>
@@ -384,7 +496,8 @@ export function CopyTaskScreen() {
                         <span className="field__label">目的地</span>
                         <div className="stack stack--sm">
                           {dests.map((dest, index) => (
-                            <div className="dest-row" key={dest.id}>
+                            <div key={dest.id}>
+                            <div className="dest-row">
                               <select
                                 className="select"
                                 value={dest.kind}
@@ -408,11 +521,22 @@ export function CopyTaskScreen() {
                                 ))}
                               </select>
                               <input
-                                className="input input--mono"
+                                className={`input input--mono${
+                                  submitted && validation.errors.destinationAt?.[index]
+                                    ? " input--invalid"
+                                    : ""
+                                }`}
                                 type="text"
-                                value={dest.path}
+                                value={dest.kind === "nas" ? "" : dest.path}
                                 aria-label={`第 ${index + 1} 个目的地路径`}
-                                placeholder="选择或粘贴目标文件夹路径"
+                                /* NAS 目的地由项目结构推导，用户填了也会被后端忽略 */
+                                readOnly={dest.kind === "nas"}
+                                disabled={dest.kind === "nas"}
+                                placeholder={
+                                  dest.kind === "nas"
+                                    ? "由项目结构自动推导"
+                                    : "选择或粘贴目标文件夹路径"
+                                }
                                 onChange={(e) => {
                                   const path = e.currentTarget.value;
                                   setDests((prev) =>
@@ -432,6 +556,14 @@ export function CopyTaskScreen() {
                               >
                                 <IconTrash />
                               </button>
+                            </div>
+                            {submitted && validation.errors.destinationAt?.[index] ? (
+                              <div className="dest-row__error">
+                                <span className="field__error" role="alert">
+                                  {validation.errors.destinationAt[index]}
+                                </span>
+                              </div>
+                            ) : null}
                             </div>
                           ))}
                           <button
@@ -483,7 +615,7 @@ export function CopyTaskScreen() {
 
               {task ? (
                 <>
-                  {task.state === "done" && allVerified ? (
+                  {task.state === "done" ? (
                     <div className="notice notice--ok" role="status">
                       <strong>校验 100% 通过，本卡可格式化。</strong>
                       <span>
@@ -505,7 +637,11 @@ export function CopyTaskScreen() {
                           <button
                             type="button"
                             className="btn btn--sm"
-                            onClick={() => void api.pauseCopyTask(task.id)}
+                            onClick={() => {
+                              void api
+                                .pauseCopyTask(task.id)
+                                .then(() => refreshTask(task.id));
+                            }}
                           >
                             挂起
                           </button>
@@ -514,7 +650,11 @@ export function CopyTaskScreen() {
                           <button
                             type="button"
                             className="btn btn--sm"
-                            onClick={() => void api.resumeCopyTask(task.id)}
+                            onClick={() => {
+                              void api
+                                .resumeCopyTask(task.id)
+                                .then(() => refreshTask(task.id));
+                            }}
                           >
                             继续
                           </button>
@@ -560,8 +700,8 @@ export function CopyTaskScreen() {
                           </div>
                           <div>
                             <div className="stat__label">已校验</div>
-                            <div className="stat__value">
-                              {fileSummary.verified}/{task.files.length}
+                            <div className="stat__value" data-testid="copy-verified-stat">
+                              {fileSummary.verified}/{files.length}
                             </div>
                           </div>
                           <div>
@@ -626,7 +766,8 @@ export function CopyTaskScreen() {
                     <div className="section__head">
                       <h2 className="section__title">文件</h2>
                       <span className="card__hint">
-                        待拷 {fileSummary.pending} · 已拷 {fileSummary.copied} · 已校验{" "}
+                        共 {fileTotal} 个（已加载 {files.length}）· 待拷{" "}
+                        {fileSummary.pending} · 已拷 {fileSummary.copied} · 已校验{" "}
                         {fileSummary.verified} · 失败 {fileSummary.failed}
                       </span>
                     </div>
@@ -639,7 +780,7 @@ export function CopyTaskScreen() {
                           <span>状态</span>
                           <span />
                         </div>
-                        {task.files.map((f) => (
+                        {files.map((f) => (
                           <div className="list__row files__row" key={f.id}>
                             <span className="files__name truncate" title={f.path}>
                               {f.name}
@@ -660,7 +801,12 @@ export function CopyTaskScreen() {
                                   type="button"
                                   className="btn btn--ghost btn--icon btn--sm"
                                   aria-label={`重试 ${f.name}`}
-                                  onClick={() => void api.retryCopyFile(task.id, f.id)}
+                                  onClick={() => {
+                                    void api
+                                      .retryCopyFile(task.id, f.id)
+                                      .then(() => refreshTask(task.id))
+                                      .then(() => loadFiles(task.id, 0));
+                                  }}
                                 >
                                   <IconRetry />
                                 </button>
@@ -668,8 +814,27 @@ export function CopyTaskScreen() {
                             </span>
                           </div>
                         ))}
+                        {files.length === 0 && !filesLoading ? (
+                          <EmptyState>暂无文件明细。</EmptyState>
+                        ) : null}
                       </div>
                     </div>
+
+                    {files.length < fileTotal ? (
+                      <div className="hint-bar">
+                        <button
+                          type="button"
+                          className="btn btn--sm"
+                          data-testid="copy-load-more-files"
+                          disabled={filesLoading}
+                          onClick={() => void loadFiles(task.id, files.length)}
+                        >
+                          {filesLoading
+                            ? "加载中…"
+                            : `加载更多（还有 ${fileTotal - files.length} 个）`}
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
                 </>
               ) : (
@@ -683,6 +848,8 @@ export function CopyTaskScreen() {
           </div>
         </div>
       </div>
+
+      <ConfirmDialog request={confirm} onCancel={() => setConfirm(null)} />
     </>
   );
 }

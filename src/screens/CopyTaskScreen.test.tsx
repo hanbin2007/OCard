@@ -1,6 +1,7 @@
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as api from "../api";
 import App from "../App";
 import {
   mockCameras,
@@ -36,7 +37,7 @@ async function waitForInferredPrefix() {
 }
 
 async function fillDestinations(user: ReturnType<typeof userEvent.setup>) {
-  await user.type(screen.getByLabelText("第 1 个目的地路径"), "/nas/ocard");
+  // 第 1 行是 NAS,路径由项目结构自动推导,不可填
   await user.type(screen.getByLabelText("第 2 个目的地路径"), "/backup/ocard");
 }
 
@@ -45,10 +46,11 @@ function targetPreview() {
 }
 
 describe("拷卡任务面板", () => {
-  it("逐文件展示大小、哈希与四种状态", () => {
+  it("逐文件展示大小、哈希与四种状态", async () => {
     render(<App preloaded={preloaded} />);
 
-    expect(screen.getByText("C0001.MP4")).toBeDefined();
+    // 明细由 listCopyFiles 分页拉取,不再来自 task.files
+    expect(await screen.findByText("C0001.MP4")).toBeDefined();
     expect(screen.getByText("8f2a1c04b7d9e355")).toBeDefined();
     expect(screen.getAllByText("已校验").length).toBeGreaterThan(0);
     expect(screen.getAllByText("已拷").length).toBeGreaterThan(0);
@@ -56,9 +58,9 @@ describe("拷卡任务面板", () => {
     expect(screen.getAllByText("失败").length).toBeGreaterThan(0);
   });
 
-  it("失败文件带原因与重试按钮，其他文件没有", () => {
+  it("失败文件带原因与重试按钮，其他文件没有", async () => {
     render(<App preloaded={preloaded} />);
-    expect(screen.getByText(/回读校验不一致/)).toBeDefined();
+    expect(await screen.findByText(/回读校验不一致/)).toBeDefined();
     expect(screen.getByRole("button", { name: "重试 C0007.MP4" })).toBeDefined();
     expect(screen.queryByRole("button", { name: "重试 C0001.MP4" })).toBeNull();
   });
@@ -84,18 +86,31 @@ describe("拷卡任务面板", () => {
     expect(targetPreview()).toBe(`1. 待分类/${expectedSlot}_SonyA7M4_A_LM`);
   });
 
-  it("默认不预填任何平台特有路径，缺目的地时拦下", async () => {
+  it("NAS 行只读且不预填平台特有路径", () => {
+    render(<App preloaded={preloaded} />);
+
+    const nasRow = screen.getByLabelText("第 1 个目的地路径") as HTMLInputElement;
+    expect(nasRow.value).toBe("");
+    expect(nasRow.readOnly).toBe(true);
+    expect(nasRow.placeholder).toContain("自动推导");
+
+    const localRow = screen.getByLabelText("第 2 个目的地路径") as HTMLInputElement;
+    expect(localRow.value).toBe("");
+    expect(localRow.readOnly).toBe(false);
+  });
+
+  it("自填目的地行留空时逐行标红，不进确认步骤", async () => {
     const user = userEvent.setup();
     render(<App preloaded={preloaded} />);
 
-    expect((screen.getByLabelText("第 1 个目的地路径") as HTMLInputElement).value).toBe("");
-
     await user.click(screen.getByRole("radio", { name: "选择源卷 SONY_A7M4" }));
+    await waitForInferredPrefix();
     await user.type(screen.getByLabelText("内容备注"), "上午田赛");
+    // 第 2 行(移动盘)留空就提交
     await user.click(screen.getByRole("button", { name: "开始拷卡" }));
 
     const alerts = screen.getAllByRole("alert").map((el) => el.textContent);
-    expect(alerts).toContain("至少需要一个目的地");
+    expect(alerts.some((t) => t?.includes("请填写目的地路径"))).toBe(true);
     expect(screen.queryByText("确认拷卡信息")).toBeNull();
   });
 
@@ -147,7 +162,11 @@ describe("拷卡任务面板", () => {
     const group = screen.getByRole("group", { name: "任务切换" });
     expect(within(group).getAllByRole("button")).toHaveLength(mockCopyTasks.length);
 
-    await user.click(screen.getByRole("button", { name: "确认开始" }));
+    // 确认屏要等后端解析出真实落盘路径后才可开跑
+    await waitFor(() =>
+      expect(screen.getByTestId("confirm-target-folder").textContent).not.toBe("解析中…"),
+    );
+    await user.click(screen.getByTestId("copy-confirm-start"));
     await waitFor(() =>
       expect(within(group).getAllByRole("button")).toHaveLength(
         mockCopyTasks.length + 1,
@@ -155,5 +174,129 @@ describe("拷卡任务面板", () => {
     );
     // 新任务置顶且带出相机编码构成的目标夹
     expect(screen.getAllByText(/NikonZ9_E_CQ/).length).toBeGreaterThan(0);
+  });
+});
+
+describe("目标夹已存在（TARGET_EXISTS）", () => {
+  /** 走到确认屏并等后端解析完成 */
+  async function reachConfirm(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(screen.getByRole("radio", { name: "选择源卷 NIKON_Z9" }));
+    await waitForInferredPrefix();
+    await user.type(screen.getByLabelText("内容备注"), "下午径赛");
+    await fillDestinations(user);
+    await user.click(screen.getByRole("button", { name: "开始拷卡" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("confirm-target-folder").textContent).not.toBe("解析中…"),
+    );
+  }
+
+  it("后端报 TARGET_EXISTS 时弹确认框，说明只补缺失、绝不覆盖", async () => {
+    const user = userEvent.setup();
+    const spy = vi
+      .spyOn(api, "startCopyTask")
+      .mockRejectedValueOnce(new Error("TARGET_EXISTS: 0824下午_NikonZ9_E_CQ 已存在且非空"));
+
+    render(<App preloaded={preloaded} />);
+    await reachConfirm(user);
+    await user.click(screen.getByTestId("copy-confirm-start"));
+
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog.textContent).toContain("目标夹已存在");
+    expect(dialog.textContent).toContain("绝不覆盖");
+    expect(spy).toHaveBeenCalledTimes(1);
+    // 尚未确认，任务不应被创建
+    expect(spy.mock.calls[0][0].confirmExistingTarget).toBeUndefined();
+    spy.mockRestore();
+  });
+
+  it("用户确认后带 confirmExistingTarget 重发", async () => {
+    const user = userEvent.setup();
+    const spy = vi
+      .spyOn(api, "startCopyTask")
+      .mockRejectedValueOnce(new Error("TARGET_EXISTS: 已存在"));
+
+    render(<App preloaded={preloaded} />);
+    await reachConfirm(user);
+    await user.click(screen.getByTestId("copy-confirm-start"));
+    await screen.findByRole("alertdialog");
+
+    await user.click(screen.getByRole("button", { name: "继续拷卡" }));
+
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(2));
+    expect(spy.mock.calls[1][0].confirmExistingTarget).toBe(true);
+    spy.mockRestore();
+  });
+
+  it("取消则不重发，也不创建任务", async () => {
+    const user = userEvent.setup();
+    const spy = vi
+      .spyOn(api, "startCopyTask")
+      .mockRejectedValueOnce(new Error("TARGET_EXISTS: 已存在"));
+
+    render(<App preloaded={preloaded} />);
+    await reachConfirm(user);
+    await user.click(screen.getByTestId("copy-confirm-start"));
+    await screen.findByRole("alertdialog");
+
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    const group = screen.getByRole("group", { name: "任务切换" });
+    expect(within(group).getAllByRole("button")).toHaveLength(mockCopyTasks.length);
+    spy.mockRestore();
+  });
+
+  it("非 TARGET_EXISTS 的错误直接显示，不弹确认框", async () => {
+    const user = userEvent.setup();
+    const spy = vi
+      .spyOn(api, "startCopyTask")
+      .mockRejectedValueOnce(new Error("NAS 不可达"));
+
+    render(<App preloaded={preloaded} />);
+    await reachConfirm(user);
+    await user.click(screen.getByTestId("copy-confirm-start"));
+
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole("alert").some((el) => el.textContent?.includes("NAS 不可达")),
+      ).toBe(true),
+    );
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    spy.mockRestore();
+  });
+});
+
+describe("文件明细分页", () => {
+  it("明细来自 listCopyFiles 而不是 task.files", async () => {
+    const spy = vi.spyOn(api, "listCopyFiles");
+    render(<App preloaded={preloaded} />);
+
+    await screen.findByText("C0001.MP4");
+    expect(spy).toHaveBeenCalledWith(mockCopyTasks[0].id, 0, 200);
+    spy.mockRestore();
+  });
+
+  it("即便任务对象的 files 为空（契约如此），文件表照样有内容", async () => {
+    const stripped = mockCopyTasks.map((t) => ({ ...t, files: [] }));
+    render(<App preloaded={{ ...preloaded, tasks: stripped }} />);
+
+    expect(await screen.findByText("C0001.MP4")).toBeDefined();
+    expect(screen.getAllByText(/已校验/).length).toBeGreaterThan(0);
+  });
+
+  it("「可格式化」提示只认 task.state === done，不依赖前端 files 归约", async () => {
+    const doneTask = { ...mockCopyTasks[1], files: [] };
+    render(
+      <App
+        preloaded={{
+          ...preloaded,
+          tasks: [doneTask],
+          selectedTaskId: doneTask.id,
+        }}
+      />,
+    );
+
+    expect(await screen.findByText(/本卡可格式化/)).toBeDefined();
   });
 });

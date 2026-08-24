@@ -8,6 +8,18 @@ import { ProjectsScreen } from "./screens/ProjectsScreen";
 import { StoreProvider, useStore, type AppState } from "./state/store";
 import { ThemeProvider } from "./state/theme";
 
+/** 进度监听没建立起来时必须说出来：否则界面看起来只是「没动静」 */
+function ProgressListenBanner() {
+  const { state } = useStore();
+  if (!state.progressError) return null;
+  return (
+    <div className="notice notice--warn notice--banner" role="alert">
+      <strong>{state.progressError}</strong>
+      <span>拷卡任务的进度可能不会自动刷新，请重启应用；已在进行的拷贝不受影响。</span>
+    </div>
+  );
+}
+
 function Routes() {
   const { state, reload, dispatch } = useStore();
 
@@ -114,6 +126,7 @@ export function Shell() {
     <div className="shell">
       <Sidebar />
       <main className="main">
+        <ProgressListenBanner />
         <Routes />
       </main>
       <SettingsDialog />

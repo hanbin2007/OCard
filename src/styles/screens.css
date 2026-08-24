@@ -245,6 +245,10 @@
   color: var(--text-tertiary);
 }
 
+.dest-row__error {
+  padding: var(--space-1) 0 0 calc(96px + var(--space-2));
+}
+
 .dest-row {
   display: grid;
   grid-template-columns: 96px minmax(0, 1fr) 32px;

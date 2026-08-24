@@ -198,6 +198,73 @@ describe("reducer", () => {
     expect(next.tasks[0].destinations[0].state).toBe("done");
   });
 
+  it("不认识的 taskId：事件先缓存，不丢也不误伤现有任务", () => {
+    const seeded = { ...initialState, tasks: [runningTask] };
+    const next = reducer(seeded, {
+      type: "taskProgress",
+      event: progressEvent({ taskId: "t-unknown", revision: 4, copiedBytes: 42 }),
+    });
+    expect(next.tasks[0].copiedBytes).toBe(runningTask.copiedBytes);
+    expect(next.orphanProgress["t-unknown"].copiedBytes).toBe(42);
+  });
+
+  it("缓存只保留最新一条，过期事件不覆盖", () => {
+    const a = reducer(initialState, {
+      type: "taskProgress",
+      event: progressEvent({ taskId: "t-x", revision: 5, copiedBytes: 50 }),
+    });
+    const b = reducer(a, {
+      type: "taskProgress",
+      event: progressEvent({ taskId: "t-x", revision: 2, copiedBytes: 20 }),
+    });
+    expect(b.orphanProgress["t-x"].copiedBytes).toBe(50);
+  });
+
+  it("快照到达后补上缓存事件并清空缓存", () => {
+    const buffered = reducer(initialState, {
+      type: "taskProgress",
+      event: progressEvent({ taskId: "t-1", revision: 7, copiedBytes: 90, state: "done" }),
+    });
+    expect(buffered.tasks).toHaveLength(0);
+
+    const snapped = reducer(buffered, { type: "taskSnapshot", task: runningTask });
+    expect(snapped.tasks).toHaveLength(1);
+    // 快照里是 running/copied=10，缓存事件把它推进到 done/90
+    expect(snapped.tasks[0].copiedBytes).toBe(90);
+    expect(snapped.tasks[0].state).toBe("done");
+    expect(snapped.orphanProgress["t-1"]).toBeUndefined();
+  });
+
+  it("快照对已知任务是就地替换，不产生重复行", () => {
+    const seeded = { ...initialState, tasks: [runningTask] };
+    const next = reducer(seeded, {
+      type: "taskSnapshot",
+      task: { ...runningTask, state: "paused" as const, copiedBytes: 33 },
+    });
+    expect(next.tasks).toHaveLength(1);
+    expect(next.tasks[0].state).toBe("paused");
+    expect(next.tasks[0].copiedBytes).toBe(33);
+  });
+
+  it("paused / failed 态任务的事件照常归约（订阅不再按状态过滤）", () => {
+    const paused = { ...runningTask, state: "paused" as const };
+    const seeded = { ...initialState, tasks: [paused] };
+    const next = reducer(seeded, {
+      type: "taskProgress",
+      event: progressEvent({ revision: 9, copiedBytes: 70, state: "running" }),
+    });
+    expect(next.tasks[0].state).toBe("running");
+    expect(next.tasks[0].copiedBytes).toBe(70);
+  });
+
+  it("监听建立失败会落到 progressError", () => {
+    const next = reducer(initialState, {
+      type: "progressListenFailed",
+      error: "进度监听未能建立：boom",
+    });
+    expect(next.progressError).toContain("boom");
+  });
+
   it("设置对话框开合，保存后写回工作站并自动关闭", () => {
     const opened = reducer(initialState, { type: "settingsOpened" });
     expect(opened.settingsOpen).toBe(true);

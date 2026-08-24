@@ -223,6 +223,23 @@ export interface StartCopyInput {
   destinations: Array<{ kind: DestinationKind; path: string }>;
   /** 拷完自动转代理（工况 A，PRD §5.6） */
   autoProxy?: boolean;
+  /**
+   * 目标夹已存在且非空时，后端会以 `TARGET_EXISTS:` 开头的错误拒绝。
+   * 用户在确认对话框里明示「继续」后带上此标志重发：
+   * 后端只补缺失文件，绝不覆盖已有文件。
+   */
+  confirmExistingTarget?: boolean;
+}
+
+/**
+ * `preview_copy_task` 的返回：后端解析后的**真实**落盘位置。
+ *
+ * 必须显示这个而不是用户填的路径——kind = "nas" 的目的地后端会忽略用户输入，
+ * 固定落到项目素材目录下。确认屏显示假路径等于让人对着错信息做双确认。
+ */
+export interface CopyTaskPreview {
+  targetFolder: string;
+  destinations: CopyDestination[];
 }
 
 /** 源卷探查结果：用于推断工况 B 的时段并给出素材规模预估 */

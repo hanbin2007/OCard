@@ -2,7 +2,7 @@
  * 表单校验（新建项目向导、设备登记）。纯函数，返回逐字段错误，便于单测。
  */
 
-import type { NewCameraInput, NewProjectInput } from "../api/types";
+import type { DestinationKind, NewCameraInput, NewProjectInput } from "../api/types";
 import {
   hasIllegalChars,
   isReservedName,
@@ -198,6 +198,8 @@ export interface StartCopyErrors {
   note?: string;
   targetPrefix?: string;
   destinations?: string;
+  /** 逐行错误，key 为目的地下标（标红该行） */
+  destinationAt?: Record<number, string>;
 }
 
 export function validateStartCopy(input: {
@@ -205,7 +207,11 @@ export function validateStartCopy(input: {
   cameraId: string;
   note: string;
   targetPrefix: string;
-  destinations: string[];
+  /**
+   * kind 必须带上：kind = "nas" 的路径由项目结构自动推导、用户不填，
+   * 不能和「留空的本机/移动盘行」一样判错。
+   */
+  destinations: Array<{ kind: DestinationKind; path: string }>;
 }): ValidationResult<StartCopyErrors> {
   const errors: StartCopyErrors = {};
 
@@ -220,13 +226,32 @@ export function validateStartCopy(input: {
     errors.targetPrefix = "前缀含非法字符";
   }
 
-  const paths = input.destinations.map((p) => p.trim()).filter(Boolean);
+  const destinationAt: Record<number, string> = {};
+  input.destinations.forEach((dest, index) => {
+    // NAS 行由后端按项目结构推导，留空是正常的
+    if (dest.kind === "nas") return;
+    if (!dest.path.trim()) {
+      destinationAt[index] = "请填写目的地路径，或删除这一行";
+    }
+  });
+
+  // 只对用户自填的行查重（NAS 行路径由后端决定）
+  const paths = input.destinations
+    .filter((d) => d.kind !== "nas")
+    .map((d) => d.path.trim())
+    .filter(Boolean);
   const keys = paths.map(normalizePathKey);
-  if (paths.length === 0) {
+
+  if (input.destinations.length === 0) {
     errors.destinations = "至少需要一个目的地";
   } else if (new Set(keys).size !== keys.length) {
     // 大小写/结尾斜杠不同但指向同一个目录，等于只备份了一份
     errors.destinations = "目的地路径重复";
+  }
+
+  if (Object.keys(destinationAt).length > 0) {
+    errors.destinationAt = destinationAt;
+    if (!errors.destinations) errors.destinations = "目的地有误，请修正标红行";
   }
 
   return { valid: Object.keys(errors).length === 0, errors };

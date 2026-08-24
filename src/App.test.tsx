@@ -5,9 +5,62 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import * as api from "./api";
+import { mockCopyTasks } from "./api/mock";
 import { mockProjects, mockWorkstation } from "./api/mock";
 
 afterEach(cleanup);
+
+describe("进度监听（常驻单一 listener）", () => {
+  it("没有进行中任务时也建立监听——否则 resume/retry 后界面死寂", () => {
+    const spy = vi.spyOn(api, "subscribeCopyProgress");
+    const idle = mockCopyTasks.map((t) => ({ ...t, state: "paused" as const }));
+
+    render(<App preloaded={{ route: "copy", tasks: idle, workstation: mockWorkstation }} />);
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(typeof spy.mock.calls[0][0]).toBe("function");
+    spy.mockRestore();
+  });
+
+  it("任务全部处于终态时同样保持监听", () => {
+    const spy = vi.spyOn(api, "subscribeCopyProgress");
+    const done = mockCopyTasks.map((t) => ({ ...t, state: "done" as const }));
+
+    render(<App preloaded={{ route: "copy", tasks: done, workstation: mockWorkstation }} />);
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
+  });
+
+  it("监听建立失败时给出可见提示，而不是静静地不动", async () => {
+    const spy = vi
+      .spyOn(api, "subscribeCopyProgress")
+      .mockImplementation((_onEvent, onError) => {
+        onError?.(new Error("event channel closed"));
+        return () => {};
+      });
+
+    render(<App preloaded={{ route: "projects", workstation: mockWorkstation }} />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("进度监听未能建立");
+    expect(alert.textContent).toContain("event channel closed");
+    spy.mockRestore();
+  });
+
+  it("卸载时退订，不留悬空监听", () => {
+    const dispose = vi.fn();
+    const spy = vi.spyOn(api, "subscribeCopyProgress").mockReturnValue(dispose);
+
+    const view = render(
+      <App preloaded={{ route: "projects", workstation: mockWorkstation }} />,
+    );
+    view.unmount();
+
+    expect(dispose).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
+  });
+});
 
 describe("应用外壳", () => {
   it("有唯一的 main 地标与侧栏导航", () => {

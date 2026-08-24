@@ -20,6 +20,7 @@ import {
   buildCameraCode,
   buildCopyTargetFolder,
   buildProjectFolderName,
+  copyTargetParent,
   inferTimeSlot,
 } from "../lib/naming";
 import type {
@@ -27,6 +28,7 @@ import type {
   CopyFileItem,
   CopyProgressEvent,
   CopyTask,
+  CopyTaskPreview,
   FolderNode,
   NewCameraInput,
   NewProjectInput,
@@ -255,6 +257,37 @@ export function startCopyTask(input: StartCopyInput): Promise<CopyTask> {
   return reply(task);
 }
 
+/**
+ * 预览拷卡任务的真实落盘位置（不落任何数据）。
+ * 入参与 start_copy_task 完全一致，供双确认屏展示解析后的真值。
+ */
+export function previewCopyTask(input: StartCopyInput): Promise<CopyTaskPreview> {
+  if (IS_TAURI) return ipc("preview_copy_task", { input });
+
+  // mock 回退：按与 Rust 侧一致的规则本地拼一个合理值
+  const camera = mockCameras.find((c) => c.id === input.cameraId);
+  const project = mockProjects.find((p) => p.id === input.projectId);
+  const cameraCode = camera?.code ?? "";
+  const targetFolder = buildCopyTargetFolder(input.targetPrefix, cameraCode);
+  const parent = copyTargetParent(project?.scenario ?? "B");
+  const projectFolder = project?.folderName ?? "";
+
+  return reply({
+    targetFolder,
+    destinations: input.destinations.map((d, i) => ({
+      id: `preview-${i}`,
+      kind: d.kind,
+      // NAS 目的地由项目结构推导，用户填的路径会被后端忽略
+      path:
+        d.kind === "nas"
+          ? `${mockWorkstation.nasRoot}/${projectFolder}/${parent}/${targetFolder}`
+          : `${d.path.replace(/\/+$/, "")}/${projectFolder}/${parent}/${targetFolder}`,
+      state: "idle" as const,
+      writtenBytes: 0,
+    })),
+  });
+}
+
 /** 挂起任务（NAS 断连或人工暂停），按 manifest 可续传 */
 export function pauseCopyTask(taskId: string): Promise<void> {
   if (IS_TAURI) return ipc("pause_copy_task", { taskId });
@@ -303,34 +336,40 @@ export function inspectVolume(volumeId: string): Promise<VolumeInspection> {
 }
 
 /**
- * 订阅全部进行中任务的进度。
+ * 订阅拷卡进度事件。**常驻单一监听**：应用启动即建立，直到卸载。
  *
- * 真实实现是 `listen("copy://progress")`（返回 Promise<UnlistenFn>），
- * 这里把它包成可同步调用的 disposer，并处理「组件先卸载、unlisten 后返回」。
- * 终态（done/failed）后自行停止，不留悬空定时器。
+ * 不按 taskId 过滤——过滤会造成订阅断裂：任务转 paused 后监听被拆除，
+ * 点「继续」后端在发事件却没有监听者；小任务也可能在监听建立前就结束、
+ * 丢掉终态事件。归约交给 reducer 按 taskId 处理。
+ *
+ * `listen()` 返回 Promise<UnlistenFn>，这里包成可同步调用的 disposer，
+ * 并处理「组件先卸载、unlisten 后返回」以及 listen 本身失败的情况。
  */
 export function subscribeCopyProgress(
-  taskIds: string[],
   onEvent: (event: CopyProgressEvent) => void,
+  onError?: (error: unknown) => void,
 ): () => void {
   if (IS_TAURI) {
     let disposed = false;
     let unlisten: (() => void) | null = null;
-    void listen<CopyProgressEvent>("copy://progress", (e) => {
-      if (!disposed && taskIds.includes(e.payload.taskId)) onEvent(e.payload);
-    }).then((fn) => {
-      // 组件可能在 listen 完成前就卸载:此时立刻退订,不留悬空监听
-      if (disposed) fn();
-      else unlisten = fn;
-    });
+    listen<CopyProgressEvent>("copy://progress", (e) => {
+      if (!disposed) onEvent(e.payload);
+    })
+      .then((fn) => {
+        // 可能在 listen 完成前就卸载：此时立刻退订，不留悬空监听
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => {
+        // 监听建立失败必须让上层知道，否则界面会一直「静默不动」
+        if (!disposed) onError?.(err);
+      });
     return () => {
       disposed = true;
       unlisten?.();
     };
   }
-  const tracked = mockCopyTasks.filter(
-    (t) => taskIds.includes(t.id) && t.state === "running",
-  );
+  const tracked = mockCopyTasks.filter((t) => t.state === "running");
   if (tracked.length === 0) return () => {};
 
   const progress = new Map(tracked.map((t) => [t.id, t.copiedBytes]));

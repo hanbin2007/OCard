@@ -699,6 +699,21 @@
   color: var(--text-secondary);
 }
 
+.notice--warn {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.notice--warn strong {
+  color: var(--warn);
+}
+
+/* 全局横幅：贴在内容区顶部，不遮挡操作 */
+.notice--banner {
+  border-radius: 0;
+  border-width: 0 0 1px 0;
+}
+
 .notice--ok {
   border-color: var(--ok);
   background: var(--ok-soft);

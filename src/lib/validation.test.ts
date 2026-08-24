@@ -137,7 +137,10 @@ describe("validateStartCopy", () => {
     cameraId: "cam-1",
     note: "上午田赛",
     targetPrefix: "0824上午",
-    destinations: ["/Volumes/NAS", "/Volumes/T7"],
+    destinations: [
+      { kind: "local" as const, path: "/Volumes/NAS" },
+      { kind: "external" as const, path: "/Volumes/T7" },
+    ],
   };
 
   it("双确认信息齐全时通过", () => {
@@ -150,15 +153,52 @@ describe("validateStartCopy", () => {
     expect(result.errors.note).toContain("必填");
   });
 
-  it("没有目的地被拦下", () => {
-    const result = validateStartCopy({ ...base, destinations: ["", "  "] });
+  it("一个目的地都没有时被拦下", () => {
+    const result = validateStartCopy({ ...base, destinations: [] });
     expect(result.errors.destinations).toBe("至少需要一个目的地");
+  });
+
+  it("勾了行却没填路径的，逐行标错（不能原样发给后端）", () => {
+    const result = validateStartCopy({
+      ...base,
+      destinations: [
+        { kind: "local", path: "/Volumes/NAS" },
+        { kind: "external", path: "   " },
+      ],
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors.destinationAt?.[1]).toContain("请填写目的地路径");
+    expect(result.errors.destinationAt?.[0]).toBeUndefined();
+    expect(result.errors.destinations).toBeTruthy();
+  });
+
+  it("NAS 行留空是正常的：路径由项目结构自动推导", () => {
+    const result = validateStartCopy({
+      ...base,
+      destinations: [
+        { kind: "nas", path: "" },
+        { kind: "external", path: "/Volumes/T7" },
+      ],
+    });
+    expect(result.valid).toBe(true);
+    expect(result.errors.destinationAt).toBeUndefined();
+  });
+
+  it("只有一个留空的 NAS 行也算配齐（后端会推导出真实路径）", () => {
+    const result = validateStartCopy({
+      ...base,
+      destinations: [{ kind: "nas", path: "" }],
+    });
+    expect(result.valid).toBe(true);
   });
 
   it("目的地重复被拦下", () => {
     const result = validateStartCopy({
       ...base,
-      destinations: ["/Volumes/NAS", "/Volumes/NAS"],
+      destinations: [
+        { kind: "local", path: "/Volumes/NAS" },
+        { kind: "external", path: "/Volumes/NAS" },
+      ],
     });
     expect(result.errors.destinations).toBe("目的地路径重复");
   });
@@ -166,7 +206,10 @@ describe("validateStartCopy", () => {
   it("只有大小写/结尾斜杠差异的目的地也算重复（否则等于只备份了一份）", () => {
     const result = validateStartCopy({
       ...base,
-      destinations: ["/Volumes/NAS/", "/volumes/nas"],
+      destinations: [
+        { kind: "local", path: "/Volumes/NAS/" },
+        { kind: "external", path: "/volumes/nas" },
+      ],
     });
     expect(result.errors.destinations).toBe("目的地路径重复");
   });
