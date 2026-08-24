@@ -342,10 +342,19 @@ export interface SortingAsset {
   /** true 表示 shotAt 来自 mtime 而非 EXIF，界面要标注「时间为推断值」 */
   shotAtFallback?: boolean;
   /**
-   * v1 用 base64 data URL 直接内联。
-   * 为空 = 尚未索引到 / 无可用预览，UI 显示占位而不是空白。
+   * 缩略图 URL（`thumb://localhost/<projectId>/<cacheName>`；Windows 上是
+   * `http://thumb.localhost/...`，由后端按平台生成）。**仅缓存就绪时才有值。**
+   * 404 = 该图暂不可用（未索引 / 缓存被清），前端渲染占位。
    */
   thumbnail?: string;
+  /**
+   * 缩略图缓存是否就绪。
+   *
+   * 判断「这张图有没有出来」一律用它，**不要用 `thumbnail` 是否存在**——
+   * thumbnail 的语义已从「内联数据」变成「URL」，用存在性做判据会让
+   * 索引收尾对账（M2 #13）静默失效。
+   */
+  thumbReady: boolean;
   kind: SortingAssetKind;
   /** 连拍组 id；同组的会折叠显示（PRD §5.4） */
   groupId?: string;

@@ -399,7 +399,9 @@ export const mockPendingAssets: SortingAsset[] = Array.from(
       // 每 11 张有一张取不到 EXIF，走 mtime 回退
       shotAtFallback: index % 11 === 0,
       // 每 13 张有一张还没索引出缩略图，界面要显示占位
+      // 每 13 张有一张还没索引出缩略图：thumbnail 为空且 thumbReady=false
       thumbnail: index % 13 === 0 ? undefined : mockThumb((i * 37) % 360),
+      thumbReady: index % 13 !== 0,
       kind: isVideo ? "video" : isRaw ? "raw" : "photo",
       // groupId 现阶段后端恒为空，连拍分组归 M3；groupBurst 已兼容缺省值
       groupId: undefined,

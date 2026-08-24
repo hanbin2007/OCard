@@ -672,6 +672,7 @@ describe("分类工作台", () => {
     const allThumbs = mockPendingAssets.slice(0, 200).map((a) => ({
       ...a,
       thumbnail: a.thumbnail ?? "data:image/svg+xml;base64,AAAA",
+      thumbReady: true,
     }));
     const listSpy = vi
       .spyOn(api, "listPendingAssets")
@@ -724,6 +725,104 @@ describe("分类工作台", () => {
     statusSpy.mockRestore();
     subSpy.mockRestore();
   }, 15000);
+
+  it("#W4 thumbReady=false 的格子显示占位（thumbnail 是 URL，不看它是否存在）", async () => {
+    await renderSorting();
+    // mock 每 13 张一个未就绪
+    expect(screen.getAllByTestId("asset-no-thumb").length).toBeGreaterThan(0);
+    expect(screen.getAllByTestId("asset-thumb").length).toBeGreaterThan(0);
+  });
+
+  it("#W4 收尾对账判据用 thumbReady：URL 都在但缓存未就绪时仍要补刷", async () => {
+    // 关键场景：每个 asset 都有 thumbnail URL，但 thumbReady=false。
+    // 若判据错用 thumbnail 存在性，这里会认为「都出图了」而不补刷。
+    const notReady = mockPendingAssets.slice(0, 200).map((a) => ({
+      ...a,
+      thumbnail: "thumb://localhost/p/abcdef0123456789.jpg",
+      thumbReady: false,
+    }));
+    const listSpy = vi
+      .spyOn(api, "listPendingAssets")
+      .mockResolvedValue({ items: notReady, total: 1240 });
+
+    const statusSpy = vi.spyOn(api, "indexingStatus").mockResolvedValue({
+      projectId: project.id,
+      indexed: 1240,
+      total: 1240,
+      running: false,
+      failed: 0,
+      missing: 0,
+      round: 1,
+    });
+
+    render(<App preloaded={preloaded} />);
+    await screen.findAllByTestId("asset-cell");
+    const before = listSpy.mock.calls.length;
+
+    await waitFor(
+      () => expect(listSpy.mock.calls.length).toBeGreaterThan(before),
+      { timeout: 4000 },
+    );
+
+    listSpy.mockRestore();
+    statusSpy.mockRestore();
+  }, 15000);
+
+  it("#W4 有 URL 但 thumbReady=false 时不去取图，直接占位", async () => {
+    // 契约上 thumbnail 只在就绪时才有值；万一后端给了 URL 却未就绪，
+    // 前端也不能去发请求——渲染条件必须看 thumbReady
+    const notReady = mockPendingAssets.slice(0, 200).map((a) => ({
+      ...a,
+      thumbnail: "thumb://localhost/p/abcdef0123456789.jpg",
+      thumbReady: false,
+    }));
+    const listSpy = vi
+      .spyOn(api, "listPendingAssets")
+      .mockResolvedValue({ items: notReady, total: 1240 });
+
+    render(<App preloaded={preloaded} />);
+    await screen.findAllByTestId("asset-cell");
+
+    expect(screen.queryAllByTestId("asset-thumb")).toHaveLength(0);
+    expect(screen.getAllByTestId("asset-no-thumb").length).toBeGreaterThan(0);
+    listSpy.mockRestore();
+  });
+
+  it("#W4 取图 404 时该格转占位", async () => {
+    await renderSorting();
+    const img = screen.getAllByTestId("asset-thumb")[0];
+    const cell = img.closest("[data-testid='asset-cell']") as HTMLElement;
+
+    fireEvent.error(img);
+
+    await waitFor(() =>
+      expect(within(cell).getByTestId("asset-no-thumb").textContent).toContain(
+        "预览不可用",
+      ),
+    );
+  });
+
+  it("#W4 连续 20 张失败亮出屏内横幅，任一成功即归零", async () => {
+    await renderSorting();
+    expect(screen.queryByTestId("sorting-thumb-degraded")).toBeNull();
+
+    const imgs = screen.getAllByTestId("asset-thumb");
+    expect(imgs.length).toBeGreaterThanOrEqual(20);
+    for (let i = 0; i < 19; i += 1) fireEvent.error(imgs[i]);
+    // 19 次还不到阈值
+    expect(screen.queryByTestId("sorting-thumb-degraded")).toBeNull();
+
+    fireEvent.error(imgs[19]);
+    const banner = await screen.findByTestId("sorting-thumb-degraded");
+    expect(banner.textContent).toContain("缩略图服务异常，详见通知");
+
+    // 任一成功加载即归零
+    const survivor = screen.getAllByTestId("asset-thumb")[0];
+    fireEvent.load(survivor);
+    await waitFor(() =>
+      expect(screen.queryByTestId("sorting-thumb-degraded")).toBeNull(),
+    );
+  });
 
   it("#3 翻页失败给可见错误并保留已加载内容", async () => {
     const user = userEvent.setup();

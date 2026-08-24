@@ -1,6 +1,6 @@
 /** 全屏预览：左右切换、Esc 关闭（PRD §5.4 全屏对比）。 */
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type { SortingAsset } from "../api/types";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import { IconArrowLeft, IconChevronRight, IconClose } from "./Icon";
@@ -20,6 +20,12 @@ export function AssetLightbox({
   onPrev: () => void;
   onNext: () => void;
 }) {
+  // thumb:// 取图可能 404：转占位而不是留一个碎图
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    setFailed(false);
+  }, [asset.id]);
+
   // 预览态的键盘处理独立于网格：这里是模态，别让按键穿透回去
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -73,12 +79,23 @@ export function AssetLightbox({
           <IconArrowLeft />
         </button>
 
-        {asset.thumbnail ? (
-          // v1 用缩略图放大；像素级查看等 media_indexer 的全尺寸解码接上再换
-          <img className="lightbox__image" src={asset.thumbnail} alt={asset.fileName} />
+        {asset.thumbReady && asset.thumbnail && !failed ? (
+          // v1 放大缩略图；像素级查看等 media_indexer 的全尺寸解码接上再换
+          <img
+            className="lightbox__image"
+            src={asset.thumbnail}
+            alt={asset.fileName}
+            data-testid="lightbox-image"
+            onError={() => setFailed(true)}
+          />
         ) : (
-          <div className="lightbox__image lightbox__image--empty">
-            <span className="text-sm dim">该文件尚未生成预览</span>
+          <div
+            className="lightbox__image lightbox__image--empty"
+            data-testid="lightbox-no-image"
+          >
+            <span className="text-sm dim">
+              {failed ? "预览暂不可用（缩略图未就绪或已失效）" : "该文件尚未生成预览"}
+            </span>
           </div>
         )}
 

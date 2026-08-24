@@ -28,6 +28,8 @@ import { selectDeliveryWorking, useStore } from "../state/store";
 const PAGE_SIZE = 200;
 /** 索引事件驱动的重拉节流：索引中事件很密，不能每条都打一次 IPC */
 const INDEX_REFRESH_MIN_MS = 2000;
+/** 连续多少张缩略图加载失败就在屏内亮出横幅（后端另发 thumb-protocol-degraded 通知） */
+const THUMB_FAIL_BANNER_AT = 20;
 
 /** 非照片类型的中性徽章文案；other = 后端明确的「其他类型」，不再伪装成视频 */
 const KIND_LABEL: Record<SortingAsset["kind"], string> = {
@@ -54,6 +56,8 @@ export function SortingScreen() {
   const [reloadToken, setReloadToken] = useState(0);
   /** 翻页失败：保留已加载内容，单独显示错误 */
   const [pageError, setPageError] = useState<string | null>(null);
+  /** 连续加载失败的缩略图数：任一成功即归零 */
+  const [thumbFailStreak, setThumbFailStreak] = useState(0);
   const [categories, setCategories] = useState<SortingCategory[]>([]);
   const [indexing, setIndexing] = useState<{
     indexed: number;
@@ -95,6 +99,9 @@ export function SortingScreen() {
     loadedCountRef.current = assets.length;
     assetsRef.current = assets;
   }, [assets]);
+
+  const onThumbError = useCallback(() => setThumbFailStreak((n) => n + 1), []);
+  const onThumbLoad = useCallback(() => setThumbFailStreak(0), []);
 
   const assetIds = useMemo(() => assets.map((a) => a.id), [assets]);
   const markedSet = useMemo(() => new Set(pendingDelete.marked), [pendingDelete.marked]);
@@ -322,7 +329,8 @@ export function SortingScreen() {
     // total === 0 表示索引 map 里还没有这个项目的条目——索引根本没开始。
     // 此时若烧掉 reconciledRef，真正跑完那一轮就再也补不回来了。
     if (indexing.total <= 0) return;
-    if (!assetsRef.current.some((a) => !a.thumbnail)) return;
+    // 判据必须是 thumbReady：thumbnail 现在是 URL，用存在性判断会让本对账静默失效
+    if (!assetsRef.current.some((a) => !a.thumbReady)) return;
     reconciledRef.current = true;
     void refreshLoadedAssets();
   }, [projectId, loading, indexing, refreshLoadedAssets]);
@@ -652,6 +660,20 @@ export function SortingScreen() {
             ))}
           </div>
 
+          {thumbFailStreak >= THUMB_FAIL_BANNER_AT ? (
+            <div
+              className="notice notice--warn"
+              role="alert"
+              data-testid="sorting-thumb-degraded"
+            >
+              <strong>缩略图服务异常，详见通知</strong>
+              <span>
+                连续 {thumbFailStreak} 张缩略图加载失败，已改为显示占位。
+                分类操作不受影响，但看不到预览；可稍后重新进入本屏重试。
+              </span>
+            </div>
+          ) : null}
+
           {deliveryWorking ? (
             <div className="sorting__indexing" role="status" data-testid="sorting-delivery-lock">
               <span className="text-xs">
@@ -736,6 +758,8 @@ export function SortingScreen() {
                       )
                     }
                     onOpen={() => setPreviewIndex(index)}
+                    onThumbError={onThumbError}
+                    onThumbLoad={onThumbLoad}
                   />
                 )}
               />
@@ -857,6 +881,8 @@ function AssetCell({
   marked,
   onSelect,
   onOpen,
+  onThumbError,
+  onThumbLoad,
 }: {
   asset: SortingAsset;
   index: number;
@@ -865,7 +891,15 @@ function AssetCell({
   marked: boolean;
   onSelect: (modifiers: { shift?: boolean; meta?: boolean }) => void;
   onOpen: () => void;
+  onThumbError: () => void;
+  onThumbLoad: () => void;
 }) {
+  // thumb:// 取图可能 404（缓存被清/尚未索引）：该格转占位，并计入连续失败
+  const [thumbFailed, setThumbFailed] = useState(false);
+  useEffect(() => {
+    setThumbFailed(false);
+  }, [asset.thumbnail]);
+
   return (
     <div
       role="gridcell"
@@ -879,11 +913,22 @@ function AssetCell({
       onClick={(e) => onSelect({ shift: e.shiftKey, meta: e.metaKey || e.ctrlKey })}
       onDoubleClick={onOpen}
     >
-      {asset.thumbnail ? (
-        <img className="asset__thumb" src={asset.thumbnail} alt="" loading="lazy" />
+      {asset.thumbReady && asset.thumbnail && !thumbFailed ? (
+        <img
+          className="asset__thumb"
+          src={asset.thumbnail}
+          alt=""
+          loading="lazy"
+          data-testid="asset-thumb"
+          onError={() => {
+            setThumbFailed(true);
+            onThumbError();
+          }}
+          onLoad={onThumbLoad}
+        />
       ) : (
         <div className="asset__thumb asset__thumb--empty" data-testid="asset-no-thumb">
-          <span className="text-2xs dim">索引中</span>
+          <span className="text-2xs dim">{thumbFailed ? "预览不可用" : "索引中"}</span>
         </div>
       )}
 
