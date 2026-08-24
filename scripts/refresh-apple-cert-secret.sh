@@ -13,7 +13,9 @@ echo "==> 导出钥匙串身份(如弹窗请点「允许」)"
 security export -t identities -f pkcs12 -P "$P12PASS" -o "$TMP/all.p12"
 
 echo "==> 抽取 Developer ID 证书与私钥"
-openssl pkcs12 -in "$TMP/all.p12" -passin "pass:$P12PASS" -nodes -out "$TMP/dump.pem"
+# macOS security export 产出的 p12 用 RC2-40 老式加密,OpenSSL 3 需 -legacy;LibreSSL 无此参数,故先试后退。
+openssl pkcs12 -in "$TMP/all.p12" -passin "pass:$P12PASS" -nodes -out "$TMP/dump.pem" -legacy 2>/dev/null ||
+  openssl pkcs12 -in "$TMP/all.p12" -passin "pass:$P12PASS" -nodes -out "$TMP/dump.pem"
 
 python3 - "$TMP" "$IDENTITY" <<'PY'
 import re, sys
