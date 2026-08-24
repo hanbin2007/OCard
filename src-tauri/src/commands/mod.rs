@@ -44,8 +44,7 @@ fn parse_compact_date(s: &str) -> CmdResult<NaiveDate> {
     NaiveDate::parse_from_str(s, "%Y%m%d").map_err(|_| format!("日期格式应为 YYYYMMDD: {s}"))
 }
 
-fn project_dto(stats: &catalog::ProjectStats, cards_total: usize, running: bool) -> ProjectDto {
-    let manifests_dest_max = 1; // destination 细节在 manifest 里,汇总口径先取 1
+fn project_dto(stats: &catalog::ProjectStats, running: bool) -> ProjectDto {
     ProjectDto {
         id: stats.folder_name.clone(),
         name: stats.meta.name.clone(),
@@ -62,11 +61,12 @@ fn project_dto(stats: &catalog::ProjectStats, cards_total: usize, running: bool)
             "draft"
         },
         cards_copied: stats.cards_copied,
-        cards_total,
+        // 口径:本项目已发起拷卡的任务数(评审 M15/P2-16;项目级卡登记未建模,不冒充全局数)
+        cards_total: stats.manifest_count,
         bytes_copied: stats.bytes_copied,
         asset_count: stats.asset_count,
         sorted_count: 0,
-        destination_count: manifests_dest_max,
+        destination_count: stats.destination_max.max(1),
         updated_at: stats.updated_at.to_rfc3339(),
     }
 }
@@ -117,7 +117,6 @@ pub fn set_workstation_info(
 #[tauri::command]
 pub fn list_projects(state: State<AppState>) -> CmdResult<Vec<ProjectDto>> {
     let nas = nas_root(&state)?;
-    let cards_total = registry::load(&nas).map(|r| r.cards.len()).unwrap_or(0);
     let running: Vec<String> = state
         .tasks
         .snapshots(None)
@@ -128,7 +127,7 @@ pub fn list_projects(state: State<AppState>) -> CmdResult<Vec<ProjectDto>> {
     Ok(catalog::scan(&nas)
         .map_err(err)?
         .iter()
-        .map(|s| project_dto(s, cards_total, running.contains(&s.folder_name)))
+        .map(|s| project_dto(s, running.contains(&s.folder_name)))
         .collect())
 }
 
@@ -155,8 +154,7 @@ pub fn create_project(state: State<AppState>, input: NewProjectInput) -> CmdResu
         ),
     );
     let stats = find_project(&nas, &root.file_name().unwrap().to_string_lossy())?;
-    let cards_total = registry::load(&nas).map(|r| r.cards.len()).unwrap_or(0);
-    Ok(project_dto(&stats, cards_total, false))
+    Ok(project_dto(&stats, false))
 }
 
 #[tauri::command]
@@ -373,6 +371,88 @@ pub fn list_copy_files(
     })
 }
 
+/// 校验源卷与目的地(评审 H5/P1-5):卷白名单、绝对路径、拒绝源目标嵌套。
+fn validate_copy_paths(source_root: &Path, dest_targets: &[PathBuf]) -> CmdResult<()> {
+    let known = volumes::list_volumes();
+    if !known.iter().any(|v| v.mount_point == source_root) {
+        return Err(format!(
+            "源卷不在当前挂载卷列表中: {}",
+            source_root.display()
+        ));
+    }
+    for t in dest_targets {
+        if !t.is_absolute() {
+            return Err(format!("目的地必须是绝对路径: {}", t.display()));
+        }
+        if t.starts_with(source_root) || source_root.starts_with(t) {
+            return Err(format!(
+                "目的地与源卷互相嵌套,拒绝执行(会写回源卡): {}",
+                t.display()
+            ));
+        }
+    }
+    // 两个目的地指向同一实际位置也拒绝
+    for (i, a) in dest_targets.iter().enumerate() {
+        for b in dest_targets.iter().skip(i + 1) {
+            if a == b {
+                return Err(format!("两个目的地指向同一位置: {}", a.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 目标夹已存在且非空 → 需要人工确认(评审 F1 的第一道闸)。
+fn check_existing_target(dest_targets: &[PathBuf], confirmed: bool) -> CmdResult<()> {
+    if confirmed {
+        return Ok(());
+    }
+    for t in dest_targets {
+        let non_empty = std::fs::read_dir(t)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        if non_empty {
+            return Err(format!(
+                "TARGET_EXISTS: 目标夹已存在且非空: {}。可能是同名重复拷卡;确认继续将只补缺失文件、绝不覆盖已有文件",
+                t.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 解析一次拷卡任务的真实落盘目标(不落任何盘)。供前端双确认屏展示真值(评审 H6/P1-6)。
+#[tauri::command]
+pub fn preview_copy_task(
+    state: State<AppState>,
+    input: StartCopyInput,
+) -> CmdResult<serde_json::Value> {
+    let nas = nas_root(&state)?;
+    let stats = find_project(&nas, &input.project_id)?;
+    let reg = registry::load(&nas).map_err(err)?;
+    let camera = reg
+        .cameras
+        .iter()
+        .find(|c| c.id == input.camera_id)
+        .ok_or_else(|| format!("相机未登记: {}", input.camera_id))?;
+    let op = operator(&state);
+    let (dto, _) = tasks::build_task(
+        &input,
+        &stats.root,
+        stats.meta.scenario,
+        "",
+        &camera.code,
+        &op,
+        &[],
+        "preview",
+    )
+    .map_err(err)?;
+    Ok(serde_json::json!({
+        "targetFolder": dto.target_folder,
+        "destinations": dto.destinations,
+    }))
+}
+
 #[tauri::command]
 pub fn start_copy_task(
     app: AppHandle,
@@ -413,8 +493,18 @@ pub fn start_copy_task(
         &op,
         &files,
         &m.id,
-    );
-    m.target_rel = dto.target_folder.clone();
+    )
+    .map_err(err)?;
+
+    validate_copy_paths(&source_root, &dest_targets)?;
+    check_existing_target(&dest_targets, input.confirm_existing_target)?;
+
+    // target_rel 带上素材根父级(评审 P1-13)
+    let raw_dir_name = match stats.meta.scenario {
+        project::Scenario::A => project::SCENARIO_A_DIRS[1],
+        project::Scenario::B => project::PENDING_DIR_B,
+    };
+    m.target_rel = format!("{raw_dir_name}/{}", dto.target_folder);
     m.destinations = dest_targets
         .iter()
         .map(|p| p.display().to_string())
@@ -446,6 +536,7 @@ pub fn start_copy_task(
         source_root,
         dest_targets,
         machine_id: state.machine_id.clone(),
+        config_dir: state.config_dir.clone(),
     });
     state.tasks.insert(dto.id.clone(), handle.clone());
     tasks::spawn_worker(app, handle);
@@ -468,8 +559,158 @@ pub fn resume_copy_task(app: AppHandle, state: State<AppState>, task_id: String)
         .tasks
         .get(&task_id)
         .ok_or_else(|| format!("任务不存在: {task_id}"))?;
+
+    if !handle.running.load(Ordering::SeqCst) {
+        // 续传身份核对(评审 M10/P0-1):同一挂载点可能已换了另一张卡
+        let m = manifest::load(&handle.project_root, &handle.manifest_id).map_err(err)?;
+        let current_name = volumes::list_volumes()
+            .into_iter()
+            .find(|v| v.mount_point == handle.source_root)
+            .map(|v| v.name);
+        match current_name {
+            Some(name) if name == m.source_label => {}
+            Some(name) => {
+                return Err(format!(
+                    "源卷不匹配:任务记录的是「{}」,当前挂载的是「{name}」。请插回原卡再续传",
+                    m.source_label
+                ));
+            }
+            None => {
+                return Err(format!("源卷未挂载:请插回「{}」后再续传", m.source_label));
+            }
+        }
+        // 刷新清单:源卡内容可能在暂停期间变化,快照与引擎必须消费同一份新清单
+        let files = copy::scan_source(&handle.source_root).map_err(err)?;
+        let mut snap = handle.snapshot.lock().unwrap();
+        let old: std::collections::HashMap<String, &'static str> = snap
+            .files
+            .iter()
+            .map(|f| (f.id.clone(), f.status))
+            .collect();
+        snap.total_bytes = files.iter().map(|(_, s)| *s).sum();
+        snap.files = files
+            .iter()
+            .map(|(rel, size)| dto::CopyFileItemDto {
+                id: rel.clone(),
+                path: rel.clone(),
+                name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
+                size_bytes: *size,
+                status: old.get(rel).copied().unwrap_or("pending"),
+                hash: None,
+                error: None,
+                targets: None,
+            })
+            .collect();
+        snap.file_count = Some(files.len());
+    }
+
     tasks::spawn_worker(app, handle);
     Ok(())
+}
+
+/// 启动时从各项目未完成的 manifest 重建 paused 任务(评审 H3/P0-3):
+/// 崩溃/重启后任务不再消失,可从任务列表续传。
+pub fn rebuild_tasks(state: &AppState) {
+    let Some(nas) = config::load(&state.config_dir).nas_root else {
+        return;
+    };
+    let Ok(projects) = catalog::scan(&nas) else {
+        return;
+    };
+    let vols = volumes::list_volumes();
+    for p in projects {
+        let Ok(manifests) = manifest::list(&p.root) else {
+            continue;
+        };
+        for m in manifests.into_iter().filter(|m| !m.completed) {
+            let dest_targets: Vec<PathBuf> = m.destinations.iter().map(PathBuf::from).collect();
+            if dest_targets.is_empty() {
+                continue; // 旧格式 manifest,无法重建
+            }
+            // 源卷按卷名匹配当前挂载;找不到则置空,续传时会要求插回原卡
+            let source_root = vols
+                .iter()
+                .find(|v| v.name == m.source_label)
+                .map(|v| v.mount_point.clone())
+                .unwrap_or_default();
+            let files: Vec<CopyFileItemDto> = m
+                .entries
+                .iter()
+                .map(|e| CopyFileItemDto {
+                    id: e.rel_path.clone(),
+                    path: e.rel_path.clone(),
+                    name: e
+                        .rel_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&e.rel_path)
+                        .to_string(),
+                    size_bytes: e.size,
+                    status: if e.verified { "verified" } else { "pending" },
+                    hash: (!e.xxh3.is_empty()).then(|| e.xxh3.clone()),
+                    error: None,
+                    targets: None,
+                })
+                .collect();
+            let copied: u64 = m
+                .entries
+                .iter()
+                .filter(|e| e.verified)
+                .map(|e| e.size)
+                .sum();
+            let dto = CopyTaskDto {
+                id: m.id.clone(),
+                project_id: p.folder_name.clone(),
+                volume_id: source_root.display().to_string(),
+                volume_name: m.source_label.clone(),
+                camera_id: String::new(),
+                camera_code: m.camera_code.clone(),
+                note: m.note.clone(),
+                target_folder: m
+                    .target_rel
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&m.target_rel)
+                    .to_string(),
+                destinations: m
+                    .destinations
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| CopyDestinationDto {
+                        id: format!("dest-{i}"),
+                        kind: "local".into(),
+                        path: d.clone(),
+                        state: "idle",
+                        written_bytes: copied,
+                        verified_bytes: None,
+                        error: None,
+                    })
+                    .collect(),
+                total_bytes: m.entries.iter().map(|e| e.size).sum(),
+                copied_bytes: copied,
+                speed_bytes_per_sec: 0,
+                state: "paused",
+                progress_revision: Some(0),
+                operator: m.operator.clone(),
+                started_at: m.created_at.to_rfc3339(),
+                finished_at: None,
+                file_count: Some(files.len()),
+                files,
+            };
+            let handle = Arc::new(TaskHandle {
+                pause_requested: AtomicBool::new(false),
+                running: AtomicBool::new(false),
+                snapshot: std::sync::Mutex::new(dto),
+                project_root: p.root.clone(),
+                manifest_id: m.id.clone(),
+                source_root,
+                dest_targets,
+                machine_id: state.machine_id.clone(),
+                config_dir: state.config_dir.clone(),
+            });
+            state.tasks.insert(m.id.clone(), handle);
+        }
+    }
 }
 
 /// 单文件重试:失败文件在 manifest 中未验证,重跑任务即只补拷这些文件。

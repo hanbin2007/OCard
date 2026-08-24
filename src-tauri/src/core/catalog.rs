@@ -19,6 +19,10 @@ pub struct ProjectStats {
     pub has_incomplete_copy: bool,
     pub bytes_copied: u64,
     pub asset_count: usize,
+    /// 本项目已发起过的拷卡任务(manifest)总数。
+    pub manifest_count: usize,
+    /// 各次拷卡的最大目的地数(0 表示还没拷过)。
+    pub destination_max: usize,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -55,6 +59,12 @@ pub fn scan(nas_root: &Path) -> Result<Vec<ProjectStats>> {
             .map(|m| m.created_at)
             .max()
             .unwrap_or(meta.created_at);
+        let manifest_count = manifests.len();
+        let destination_max = manifests
+            .iter()
+            .map(|m| m.destinations.len())
+            .max()
+            .unwrap_or(0);
         out.push(ProjectStats {
             folder_name: path
                 .file_name()
@@ -66,6 +76,8 @@ pub fn scan(nas_root: &Path) -> Result<Vec<ProjectStats>> {
             has_incomplete_copy,
             bytes_copied,
             asset_count,
+            manifest_count,
+            destination_max,
             updated_at,
         });
     }

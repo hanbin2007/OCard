@@ -23,6 +23,8 @@ pub struct TaskHandle {
     pub source_root: PathBuf,
     pub dest_targets: Vec<PathBuf>,
     pub machine_id: String,
+    /// 应用配置目录(审计 outbox 兜底用)。
+    pub config_dir: PathBuf,
 }
 
 #[derive(Default)]
@@ -68,53 +70,93 @@ pub fn file_status_str(status: &copy::FileStatus) -> &'static str {
 
 /// 启动(或续跑)一个任务的后台工作线程。
 pub fn spawn_worker(app: AppHandle, handle: Arc<TaskHandle>) {
-    if handle.running.swap(true, Ordering::SeqCst) {
-        return; // 已有工作线程在跑
-    }
+    // 先清暂停标志再判 running:若旧 worker 还在跑且刚收到暂停请求,
+    // 用户此刻点「继续」应让旧 worker 撤销暂停继续跑(评审 L19/P1-9)。
     handle.pause_requested.store(false, Ordering::SeqCst);
+    if handle.running.swap(true, Ordering::SeqCst) {
+        return; // 已有工作线程在跑(暂停请求已被上面撤销)
+    }
     std::thread::spawn(move || {
         let outcome = run_worker(&app, &handle);
-        handle.running.store(false, Ordering::SeqCst);
         if let Err(e) = outcome {
             let mut snap = handle.snapshot.lock().unwrap();
-            snap.state = "failed";
-            snap.finished_at = Some(Utc::now().to_rfc3339());
+            // IO 类错误(NAS 抖动/断连)是可恢复的暂停,不是死路(评审 H4)
+            if matches!(e, crate::core::CoreError::Io(_)) {
+                snap.state = "paused";
+            } else {
+                snap.state = "failed";
+                snap.finished_at = Some(Utc::now().to_rfc3339());
+            }
             let ev = final_event(&mut snap, Vec::new());
             drop(snap);
             let _ = app.emit(PROGRESS_EVENT, &ev);
-            eprintln!("拷卡任务失败: {e}");
+            eprintln!("拷卡任务中断: {e}");
         }
+        handle.running.store(false, Ordering::SeqCst);
     });
+}
+
+/// journal 追加带重试;彻底失败时写本机 outbox 兜底,绝不静默丢审计(评审 P1-7)。
+fn append_audit(project_root: &std::path::Path, outbox_dir: &std::path::Path, ev: &journal::Event) {
+    for _ in 0..3 {
+        if journal::append(project_root, ev).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    let _ = std::fs::create_dir_all(outbox_dir);
+    if let Ok(mut line) = serde_json::to_string(ev) {
+        line.push('\n');
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(outbox_dir.join("journal-outbox.jsonl"))
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+    eprintln!("审计事件未能写入项目 journal,已落本机 outbox: {}", ev.kind);
 }
 
 fn run_worker(app: &AppHandle, handle: &TaskHandle) -> crate::core::Result<()> {
     let mut m = manifest::load(&handle.project_root, &handle.manifest_id)?;
 
-    // 从 manifest 恢复初始进度(续传场景)
+    let req = copy::CopyRequest {
+        source_root: handle.source_root.clone(),
+        destinations: handle.dest_targets.clone(),
+        task_tag: handle.manifest_id.chars().take(8).collect(),
+    };
+
+    // 单一清单:引擎、manifest、UI 快照消费同一份文件列表(评审 M11/P1-11)。
+    // 从 manifest+目标实存恢复初始进度(续传场景)。
+    let files: Vec<(String, u64)>;
     {
         let mut snap = handle.snapshot.lock().unwrap();
         snap.state = "running";
         snap.finished_at = None;
         let mut done_bytes = 0u64;
         for f in snap.files.iter_mut() {
-            if m.is_done(&f.id, f.size_bytes) {
+            if copy::file_done(&m, &f.id, f.size_bytes, &req.destinations) {
                 f.status = "verified";
                 done_bytes += f.size_bytes;
+            } else if f.status == "verified" {
+                f.status = "pending"; // manifest 说验证过但目标不在了 → 重拷
             }
         }
         snap.copied_bytes = done_bytes;
+        files = snap
+            .files
+            .iter()
+            .map(|f| (f.id.clone(), f.size_bytes))
+            .collect();
     }
-
-    let req = copy::CopyRequest {
-        source_root: handle.source_root.clone(),
-        destinations: handle.dest_targets.clone(),
-    };
 
     let mut last_emit = Instant::now();
     let mut window_bytes = 0u64;
     let mut window_start = Instant::now();
 
-    let outcome = copy::run_copy(&req, &mut m, &handle.project_root, |p| {
+    let outcome = copy::run_copy(&req, &files, &mut m, &handle.project_root, |p| {
         let mut changed: Vec<CopyFileItemDto> = Vec::new();
         let mut force_emit = false;
         {
@@ -191,8 +233,9 @@ fn run_worker(app: &AppHandle, handle: &TaskHandle) -> crate::core::Result<()> {
 
     for f in &outcome.files {
         if let copy::FileStatus::Failed(e) = &f.status {
-            let _ = journal::append(
+            append_audit(
                 &handle.project_root,
+                &handle.config_dir,
                 &journal::Event::new(
                     handle.machine_id.clone(),
                     operator.clone(),
@@ -203,8 +246,9 @@ fn run_worker(app: &AppHandle, handle: &TaskHandle) -> crate::core::Result<()> {
         }
     }
     if !outcome.paused {
-        let _ = journal::append(
+        append_audit(
             &handle.project_root,
+            &handle.config_dir,
             &journal::Event::new(
                 handle.machine_id.clone(),
                 operator,
@@ -243,6 +287,7 @@ fn final_event(snap: &mut CopyTaskDto, changed: Vec<CopyFileItemDto>) -> CopyPro
 }
 
 /// 由 StartCopyInput 组装任务快照与落盘目标。
+/// 目标夹命名走规范函数(评审 M14/P1-13):工况 A 强制 YYYYMMDD 前缀。
 #[allow(clippy::too_many_arguments)]
 pub fn build_task(
     input: &StartCopyInput,
@@ -253,9 +298,18 @@ pub fn build_task(
     operator: &str,
     files: &[(String, u64)],
     manifest_id: &str,
-) -> (CopyTaskDto, Vec<PathBuf>) {
-    let prefix = naming::sanitize_component(&input.target_prefix);
-    let target_folder = format!("{prefix}_{camera_code}");
+) -> crate::core::Result<(CopyTaskDto, Vec<PathBuf>)> {
+    let target_folder = match scenario {
+        project::Scenario::A => {
+            let date = chrono::NaiveDate::parse_from_str(
+                &naming::validate_date_prefix(&input.target_prefix)?,
+                "%Y%m%d",
+            )
+            .expect("validate_date_prefix 已校验");
+            naming::card_folder_name_a(date, camera_code)
+        }
+        project::Scenario::B => naming::card_folder_name_b(&input.target_prefix, camera_code)?,
+    };
     let raw_dir = project::raw_material_dir(project_root, scenario);
 
     let mut dest_dtos = Vec::new();
@@ -316,5 +370,5 @@ pub fn build_task(
         started_at: Utc::now().to_rfc3339(),
         finished_at: None,
     };
-    (dto, dest_targets)
+    Ok((dto, dest_targets))
 }

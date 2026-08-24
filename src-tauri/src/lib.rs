@@ -17,6 +17,8 @@ pub fn run() {
                 machine_id,
                 tasks: Default::default(),
             });
+            // 崩溃/重启后从未完成的 manifest 重建可续传任务
+            commands::rebuild_tasks(&app.state::<AppState>());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -37,6 +39,7 @@ pub fn run() {
             commands::list_copy_tasks,
             commands::get_copy_task,
             commands::list_copy_files,
+            commands::preview_copy_task,
             commands::start_copy_task,
             commands::pause_copy_task,
             commands::resume_copy_task,

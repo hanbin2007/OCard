@@ -28,8 +28,10 @@ pub fn sanitize_component(raw: &str) -> String {
 }
 
 /// 相机编码:`型号_机位_使用者`,如 `DJIRonin4D_B_ZS`。
-/// 型号与使用者内部的空白和下划线会被剔除,保证编码可按下划线切分。
+/// 清洗规则(与前端 src/lib/naming.ts 保持一致,以此处为权威):
+/// 型号与使用者剔除空白/下划线/连字符;使用者的 ASCII 字母统一大写。
 pub fn camera_code(model: &str, position: char, operator: &str) -> Result<String> {
+    let position = position.to_ascii_uppercase();
     if !position.is_ascii_uppercase() {
         return Err(CoreError::Invalid(format!(
             "机位必须是大写字母 A–Z,收到: {position:?}"
@@ -38,11 +40,11 @@ pub fn camera_code(model: &str, position: char, operator: &str) -> Result<String
     let strip = |s: &str| -> String {
         sanitize_component(s)
             .chars()
-            .filter(|c| !c.is_whitespace() && *c != '_')
+            .filter(|c| !c.is_whitespace() && *c != '_' && *c != '-')
             .collect()
     };
     let model = strip(model);
-    let operator = strip(operator);
+    let operator = strip(operator).to_uppercase();
     if model.is_empty() || model == "_" {
         return Err(CoreError::Invalid("相机型号不能为空".into()));
     }
@@ -67,13 +69,27 @@ pub fn card_folder_name_a(date: NaiveDate, camera_code: &str) -> String {
 }
 
 /// 工况 B 拷卡目标文件夹名:`时段_相机编码`(置于「1. 待分类」下),
-/// 时段如 `0101上午`。
+/// 时段如 `0101上午`。时段内部空白剔除(与前端预览一致)。
 pub fn card_folder_name_b(period: &str, camera_code: &str) -> Result<String> {
-    let period = sanitize_component(period);
-    if period == "_" {
+    let period: String = sanitize_component(period)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if period.is_empty() || period == "_" {
         return Err(CoreError::Invalid("时段不能为空".into()));
     }
     Ok(format!("{period}_{camera_code}"))
+}
+
+/// 校验并规整工况 A 的日期前缀(必须是合法 `YYYYMMDD`)。
+pub fn validate_date_prefix(prefix: &str) -> Result<String> {
+    let p = prefix.trim();
+    if NaiveDate::parse_from_str(p, "%Y%m%d").is_err() {
+        return Err(CoreError::Invalid(format!(
+            "工况 A 的目标夹前缀必须是 YYYYMMDD 日期,收到: {prefix:?}"
+        )));
+    }
+    Ok(p.to_string())
 }
 
 #[cfg(test)]
@@ -94,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn camera_code_matches_spec_example() {
+    fn camera_code_matches_spec_example_and_frontend_rules() {
         assert_eq!(
             camera_code("DJI Ronin 4D", 'B', "ZS").unwrap(),
             "DJIRonin4D_B_ZS"
@@ -103,13 +119,22 @@ mod tests {
             camera_code("A7M4", 'A', "李_启轩").unwrap(),
             "A7M4_A_李启轩"
         );
+        // 与前端清洗规则对齐:小写机位/代称统一大写、连字符剔除
+        assert_eq!(camera_code("A7-M4", 'a', "zs").unwrap(), "A7M4_A_ZS");
     }
 
     #[test]
     fn camera_code_rejects_bad_position() {
-        assert!(camera_code("A7M4", 'a', "ZS").is_err());
         assert!(camera_code("A7M4", '1', "ZS").is_err());
+        assert!(camera_code("A7M4", '中', "ZS").is_err());
         assert!(camera_code("", 'A', "ZS").is_err());
+    }
+
+    #[test]
+    fn date_prefix_validation() {
+        assert_eq!(validate_date_prefix("20260824").unwrap(), "20260824");
+        assert!(validate_date_prefix("0824上午").is_err());
+        assert!(validate_date_prefix("20261341").is_err());
     }
 
     #[test]

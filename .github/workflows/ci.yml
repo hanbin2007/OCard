@@ -93,6 +93,11 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # 路径/rename/卷检测行为平台相关,Rust 测试三平台全跑(评审建议)
+      - name: cargo test
+        run: cargo test
+        working-directory: src-tauri
+
       - name: Build Tauri bundles
         run: pnpm tauri build
 

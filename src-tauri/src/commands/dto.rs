@@ -171,6 +171,9 @@ pub struct StartCopyInput {
     pub destinations: Vec<StartCopyDestination>,
     #[serde(default)]
     pub auto_proxy: bool,
+    /// 目标夹已存在且非空时,须显式确认才继续(只补缺失文件,绝不覆盖)。
+    #[serde(default)]
+    pub confirm_existing_target: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

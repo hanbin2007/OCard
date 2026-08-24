@@ -63,27 +63,38 @@ pub fn append_in(dir: &Path, event: &Event) -> Result<()> {
     Ok(())
 }
 
-/// 合并读取目录下所有工作站的事件,按时间戳排序。
-/// 解析失败的行跳过(容忍半行写入/版本差异),不让单行坏数据毁掉整个状态。
+/// 合并读取目录下所有工作站的事件。
+/// 容错:非 UTF-8 字节 lossy 处理、解析失败的行跳过、单个文件读取失败跳过——
+/// 任何坏数据都不毁掉整个状态(SMB 断连可能撕开多字节字符)。
+/// 排序确定化:主键时间戳,并列时按 (机器文件名, 文件内行号) 裁决,
+/// 保证任意工作站折叠出同一结果。
 pub fn read_all_in(dir: &Path) -> Result<Vec<Event>> {
-    let mut events = Vec::new();
+    let mut keyed: Vec<(chrono::DateTime<Utc>, String, usize, Event)> = Vec::new();
     if !dir.exists() {
-        return Ok(events);
+        return Ok(Vec::new());
     }
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
         if !(name.starts_with("journal-") && name.ends_with(".jsonl")) {
             continue;
         }
-        for line in fs::read_to_string(&path)?.lines() {
+        let Ok(bytes) = fs::read(&path) else {
+            continue; // 单文件读取失败不中断整目录
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        for (idx, line) in text.lines().enumerate() {
             if let Ok(ev) = serde_json::from_str::<Event>(line) {
-                events.push(ev);
+                keyed.push((ev.ts, name.clone(), idx, ev));
             }
         }
     }
-    events.sort_by_key(|e| e.ts);
-    Ok(events)
+    keyed.sort_by(|a, b| (a.0, &a.1, a.2).cmp(&(b.0, &b.1, b.2)));
+    Ok(keyed.into_iter().map(|(_, _, _, e)| e).collect())
 }
 
 fn project_journal_dir(project_root: &Path) -> PathBuf {

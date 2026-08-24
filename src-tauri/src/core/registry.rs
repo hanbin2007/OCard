@@ -83,6 +83,17 @@ pub fn delete_camera(
     operator: &str,
     camera_id: &str,
 ) -> Result<()> {
+    // 级联:该相机名下的卡一并写删除事件,避免折叠后出现孤儿卡(评审 P1-12)
+    let reg = load(nas_root)?;
+    for card in reg.cards.iter().filter(|c| c.camera_id == camera_id) {
+        let ev = Event::new(
+            machine,
+            operator,
+            kind::CARD_DELETED,
+            serde_json::json!({ "id": card.id }),
+        );
+        journal::append_in(&registry_dir(nas_root), &ev)?;
+    }
     let ev = Event::new(
         machine,
         operator,
@@ -103,6 +114,10 @@ pub fn register_card(
 ) -> Result<StorageCard> {
     if label.trim().is_empty() {
         return Err(CoreError::Invalid("卡标签不能为空".into()));
+    }
+    // 引用校验:卡必须挂在已登记的相机上(评审 P1-12)
+    if !load(nas_root)?.cameras.iter().any(|c| c.id == camera_id) {
+        return Err(CoreError::Invalid(format!("相机未登记: {camera_id}")));
     }
     let card = StorageCard {
         id: uuid::Uuid::new_v4().to_string(),
