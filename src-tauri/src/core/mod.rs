@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod config;
 pub mod copy;
 pub mod error;
+pub mod fsx;
 pub mod hash;
 pub mod journal;
 pub mod machine;

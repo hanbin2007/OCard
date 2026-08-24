@@ -10,7 +10,15 @@ const BUF_SIZE: usize = 1024 * 1024;
 
 /// 计算文件的 xxHash3-64,返回 16 位十六进制小写字符串。
 pub fn xxh3_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path)?;
+    xxh3_reader(File::open(path)?)
+}
+
+/// 校验专用:尽量绕页缓存读取后计算哈希(M2 技术债:回读命中页缓存会弱化校验)。
+pub fn xxh3_file_uncached(path: &Path) -> Result<String> {
+    xxh3_reader(super::fsx::open_uncached(path)?)
+}
+
+fn xxh3_reader(mut file: File) -> Result<String> {
     let mut hasher = Xxh3::new();
     let mut buf = vec![0u8; BUF_SIZE];
     loop {

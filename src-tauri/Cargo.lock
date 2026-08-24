@@ -2529,6 +2529,7 @@ dependencies = [
  "chrono",
  "image",
  "kamadak-exif",
+ "libc",
  "serde",
  "serde_json",
  "sysinfo",

@@ -353,9 +353,9 @@ fn copy_one(
             }
         }
 
-        // 逐目的地回读校验
+        // 逐目的地回读校验(绕页缓存,尽量读介质而非内存,M2 技术债)
         for part in &parts {
-            let dest_hash = hash::xxh3_file(part)?;
+            let dest_hash = hash::xxh3_file_uncached(part)?;
             if dest_hash != src_hash {
                 return Err(super::CoreError::Invalid(format!(
                     "校验不一致: {} (源 {src_hash} / 目标 {dest_hash})",
@@ -383,25 +383,18 @@ fn copy_one(
 /// 文件系统不支持硬链接(部分 SMB/exFAT)时回退「存在性复查 + rename」,
 /// 该回退窗口为微秒级且长窗口已被入口 pre_existing 检查夹住。
 fn finalize_no_replace(part: &Path, fin: &Path) -> Result<()> {
-    match fs::hard_link(part, fin) {
-        Ok(()) => {
-            fs::remove_file(part)?;
-            Ok(())
+    // 平台原生 no-replace 原子改名(renamex_np/renameat2/MoveFileEx),
+    // 逐级回退见 fsx 模块(M2 技术债:替代此前的 hard_link 方案)
+    super::fsx::rename_no_replace(part, fin).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            super::CoreError::Invalid(format!(
+                "目标在拷贝期间被其他任务写入,拒绝覆盖: {}",
+                fin.display()
+            ))
+        } else {
+            super::CoreError::Io(e)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(super::CoreError::Invalid(
-            format!("目标在拷贝期间被其他任务写入,拒绝覆盖: {}", fin.display()),
-        )),
-        Err(_) => {
-            if fin.exists() {
-                return Err(super::CoreError::Invalid(format!(
-                    "目标在拷贝期间被其他任务写入,拒绝覆盖: {}",
-                    fin.display()
-                )));
-            }
-            fs::rename(part, fin)?;
-            Ok(())
-        }
-    }
+    })
 }
 
 /// 把 `/` 分隔的相对路径转为本平台路径。
