@@ -43,6 +43,9 @@ pub struct CopyManifest {
     /// 开拷时刻的完整源清单(不可变);续传/重建以它为准判断「计划内未完成」。
     #[serde(default)]
     pub planned: Vec<PlannedFile>,
+    /// 源卡身份指纹(卡根 .ocard-volume-id);写保护卡为 None,退化为卷名匹配。
+    #[serde(default)]
+    pub source_uid: Option<String>,
     pub created_at: DateTime<Utc>,
     pub completed: bool,
     pub entries: Vec<ManifestEntry>,
@@ -65,6 +68,7 @@ impl CopyManifest {
             note: note.into(),
             destinations: Vec::new(),
             planned: Vec::new(),
+            source_uid: None,
             created_at: Utc::now(),
             completed: false,
             entries: Vec::new(),

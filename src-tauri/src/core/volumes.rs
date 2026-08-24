@@ -57,3 +57,48 @@ mod tests {
         assert!(removable <= all);
     }
 }
+
+/// 卡片身份指纹文件:首次拷卡时写在卡根目录,身份随卡走(跨平台、免 OS API);
+/// 格式化后自然消失——格式化过的卡本就该视为新卡(M2 技术债:卷标弱身份根治)。
+pub const VOLUME_UID_FILE: &str = ".ocard-volume-id";
+
+/// 读取卡片指纹(不存在/不可读为 None)。
+pub fn read_volume_uid(mount: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(mount.join(VOLUME_UID_FILE)).ok()?;
+    let uid = raw.trim();
+    (!uid.is_empty() && uid.len() <= 64).then(|| uid.to_string())
+}
+
+/// 读取或写入卡片指纹。卡写保护/只读时返回 None(调用方须告知用户退化为卷名匹配)。
+pub fn ensure_volume_uid(mount: &std::path::Path) -> Option<String> {
+    if let Some(uid) = read_volume_uid(mount) {
+        return Some(uid);
+    }
+    let uid = uuid::Uuid::new_v4().to_string();
+    std::fs::write(mount.join(VOLUME_UID_FILE), &uid)
+        .ok()
+        .map(|_| uid)
+}
+
+#[cfg(test)]
+mod uid_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn ensure_creates_once_and_rereads() {
+        let tmp = tempdir().unwrap();
+        let a = ensure_volume_uid(tmp.path()).unwrap();
+        let b = ensure_volume_uid(tmp.path()).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(read_volume_uid(tmp.path()).unwrap(), a);
+    }
+
+    #[test]
+    fn missing_or_garbage_is_none() {
+        let tmp = tempdir().unwrap();
+        assert!(read_volume_uid(tmp.path()).is_none());
+        std::fs::write(tmp.path().join(VOLUME_UID_FILE), "  \n").unwrap();
+        assert!(read_volume_uid(tmp.path()).is_none());
+    }
+}

@@ -120,14 +120,27 @@ pub fn spawn_worker(app: AppHandle, handle: Arc<TaskHandle>) {
     });
 }
 
-/// 续传源卷解析(纯函数,可测):记录的挂载点上卷名相符则沿用;
-/// 否则按 manifest 卷名在当前挂载卷中重解析(卡后插/换挂载点,复核必修 A);
-/// 都找不到给出准确报错。
+/// 续传源卷解析(纯函数,可测)。
+/// **指纹优先**(M2 技术债:卷标弱身份根治):manifest 记录了卡指纹时,
+/// 只认指纹匹配的卷——同名不同卡直接拒绝;指纹缺失(写保护卡/旧任务)
+/// 退回卷名匹配:记录挂载点卷名相符沿用,否则按卷名全局重解析。
 pub fn resolve_resume_source(
     recorded_mount: &std::path::Path,
     expected_label: &str,
+    expected_uid: Option<&str>,
     volumes: &[(PathBuf, String)],
+    read_uid: &dyn Fn(&std::path::Path) -> Option<String>,
 ) -> std::result::Result<PathBuf, String> {
+    if let Some(uid) = expected_uid {
+        for (mp, _) in volumes {
+            if read_uid(mp).as_deref() == Some(uid) {
+                return Ok(mp.clone());
+            }
+        }
+        return Err(format!(
+            "源卡身份指纹不匹配:请插回原卡「{expected_label}」。若卡已被格式化,请重新发起拷卡(不会覆盖已拷素材)"
+        ));
+    }
     if let Some((mp, name)) = volumes.iter().find(|(mp, _)| mp == recorded_mount) {
         if name == expected_label {
             return Ok(mp.clone());
@@ -145,15 +158,23 @@ pub fn resolve_resume_source(
     }
 }
 
-/// 续传准备(纯函数,可测):按卷名重解析源挂载点后,**必须**与固定目的地
+/// 续传准备(纯函数,可测):重解析源挂载点后,**必须**与固定目的地
 /// 重新做布局校验(codex 终验 P0:重插的卡可能挂到目的地祖先,写回源卡)。
 pub fn prepare_resume(
     recorded_mount: &std::path::Path,
     expected_label: &str,
+    expected_uid: Option<&str>,
     volumes: &[(PathBuf, String)],
     dest_targets: &[PathBuf],
+    read_uid: &dyn Fn(&std::path::Path) -> Option<String>,
 ) -> std::result::Result<PathBuf, String> {
-    let resolved = resolve_resume_source(recorded_mount, expected_label, volumes)?;
+    let resolved = resolve_resume_source(
+        recorded_mount,
+        expected_label,
+        expected_uid,
+        volumes,
+        read_uid,
+    )?;
     crate::core::paths::validate_dest_layout(&resolved, dest_targets)?;
     Ok(resolved)
 }
@@ -475,7 +496,8 @@ mod tests {
     fn same_mount_same_label_is_reused() {
         let v = vols(&[("/Volumes/CARD", "CARD")]);
         assert_eq!(
-            resolve_resume_source(&PathBuf::from("/Volumes/CARD"), "CARD", &v).unwrap(),
+            resolve_resume_source(&PathBuf::from("/Volumes/CARD"), "CARD", None, &v, &|_| None)
+                .unwrap(),
             PathBuf::from("/Volumes/CARD")
         );
     }
@@ -485,7 +507,8 @@ mod tests {
         // 卡后插被挂到了新位置(复核必修 A 的核心场景)
         let v = vols(&[("/Volumes/CARD 1", "CARD")]);
         assert_eq!(
-            resolve_resume_source(&PathBuf::from("/Volumes/CARD"), "CARD", &v).unwrap(),
+            resolve_resume_source(&PathBuf::from("/Volumes/CARD"), "CARD", None, &v, &|_| None)
+                .unwrap(),
             PathBuf::from("/Volumes/CARD 1")
         );
     }
@@ -494,14 +517,18 @@ mod tests {
     fn different_card_at_recorded_mount_is_rejected() {
         // 同一挂载点换了另一张卡 → 拒绝(评审 M10)
         let v = vols(&[("/Volumes/CARD", "OTHER")]);
-        let err = resolve_resume_source(&PathBuf::from("/Volumes/CARD"), "CARD", &v).unwrap_err();
+        let err =
+            resolve_resume_source(&PathBuf::from("/Volumes/CARD"), "CARD", None, &v, &|_| None)
+                .unwrap_err();
         assert!(err.contains("源卷不匹配"), "{err}");
     }
 
     #[test]
     fn missing_card_reports_unmounted() {
         let v = vols(&[("/Volumes/ELSE", "ELSE")]);
-        let err = resolve_resume_source(&PathBuf::from("/Volumes/CARD"), "CARD", &v).unwrap_err();
+        let err =
+            resolve_resume_source(&PathBuf::from("/Volumes/CARD"), "CARD", None, &v, &|_| None)
+                .unwrap_err();
         assert!(err.contains("源卷未挂载"), "{err}");
     }
 }
@@ -517,7 +544,8 @@ mod prepare_resume_tests {
         // codex 微验 #17:resume 接线级覆盖——重插的卡挂到了备份目的地的祖先盘符
         let vols: Vec<(PathBuf, String)> = vec![(abs("/mnt/f"), "CARD".to_string())];
         let dests = vec![abs("/mnt/f/Backup/target")];
-        let err = prepare_resume(&abs("/mnt/e"), "CARD", &vols, &dests).unwrap_err();
+        let err =
+            prepare_resume(&abs("/mnt/e"), "CARD", None, &vols, &dests, &|_| None).unwrap_err();
         assert!(err.contains("嵌套"), "{err}");
     }
 
@@ -526,8 +554,57 @@ mod prepare_resume_tests {
         let vols: Vec<(PathBuf, String)> = vec![(abs("/mnt/g"), "CARD".to_string())];
         let dests = vec![abs("/nas/target"), abs("/backup/target")];
         assert_eq!(
-            prepare_resume(&abs("/mnt/e"), "CARD", &vols, &dests).unwrap(),
+            prepare_resume(&abs("/mnt/e"), "CARD", None, &vols, &dests, &|_| None).unwrap(),
             abs("/mnt/g")
         );
+    }
+}
+
+#[cfg(test)]
+mod uid_resolution_tests {
+    use super::resolve_resume_source;
+    use crate::core::paths::tests::abs;
+    use std::path::PathBuf;
+
+    fn vols(list: &[(&str, &str)]) -> Vec<(PathBuf, String)> {
+        list.iter()
+            .map(|(mp, n)| (abs(mp), n.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn uid_match_wins_over_label_and_mount() {
+        // 卡后插挂到新位置、卷名还被改了:指纹照样找到它
+        let v = vols(&[("/Volumes/RENAMED", "OTHER")]);
+        let hit = abs("/Volumes/RENAMED");
+        let resolved =
+            resolve_resume_source(&abs("/Volumes/OLD"), "CARD", Some("uid-123"), &v, &|p| {
+                (p == hit).then(|| "uid-123".to_string())
+            })
+            .unwrap();
+        assert_eq!(resolved, abs("/Volumes/RENAMED"));
+    }
+
+    #[test]
+    fn same_label_different_card_rejected_by_uid() {
+        // 同名不同卡(相机格式化后的典型):指纹不符必须拒绝——弱身份根治的核心断言
+        let v = vols(&[("/Volumes/CARD", "CARD")]);
+        let err = resolve_resume_source(
+            &abs("/Volumes/CARD"),
+            "CARD",
+            Some("uid-original"),
+            &v,
+            &|_| Some("uid-impostor".to_string()),
+        )
+        .unwrap_err();
+        assert!(err.contains("指纹不匹配"), "{err}");
+    }
+
+    #[test]
+    fn missing_uid_falls_back_to_label() {
+        let v = vols(&[("/Volumes/CARD", "CARD")]);
+        let resolved =
+            resolve_resume_source(&abs("/Volumes/CARD"), "CARD", None, &v, &|_| None).unwrap();
+        assert_eq!(resolved, abs("/Volumes/CARD"));
     }
 }

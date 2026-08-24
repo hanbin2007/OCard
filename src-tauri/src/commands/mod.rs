@@ -552,8 +552,20 @@ pub fn start_copy_task(
         .map(|v| v.name)
         .unwrap_or_else(|| input.volume_id.clone());
 
+    // 卡片指纹:身份随卡走;写保护卡拿不到指纹要告知(退化为卷名匹配,零静默)
+    let source_uid = volumes::ensure_volume_uid(&source_root);
+    if source_uid.is_none() {
+        notify::warn(
+            &app,
+            "volume-uid-unwritable",
+            format!(
+                "无法在卡「{volume_name}」上写入身份指纹(可能写保护):中断后续传将按卷名匹配,同名卡存在误认风险"
+            ),
+        );
+    }
     let op = operator(&app, &state);
     let mut m = manifest::CopyManifest::new("", &volume_name, &camera.code, &op, &input.note);
+    m.source_uid = source_uid;
     let (dto, dest_targets) = tasks::build_task(
         &input,
         &stats.root,
@@ -653,8 +665,14 @@ pub fn resume_copy_task(app: AppHandle, state: State<AppState>, task_id: String)
         let recorded = handle.source_root.lock().unwrap().clone();
         // 重解析 + 布局复核一体(codex 终验 P0:重插的卡可能挂到某目的地的
         // 祖先路径,不复核会把素材写回源卡);同时覆盖旧 manifest 的病态目的地。
-        let resolved =
-            tasks::prepare_resume(&recorded, &m.source_label, &vols, &handle.dest_targets)?;
+        let resolved = tasks::prepare_resume(
+            &recorded,
+            &m.source_label,
+            m.source_uid.as_deref(),
+            &vols,
+            &handle.dest_targets,
+            &|p| volumes::read_volume_uid(p),
+        )?;
         {
             let mut src = handle.source_root.lock().unwrap();
             *src = resolved.clone();
