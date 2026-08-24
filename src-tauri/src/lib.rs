@@ -66,6 +66,7 @@ pub fn run() {
             commands::sorting_cmds::empty_trash,
             commands::sorting_cmds::indexing_status,
             commands::sorting_cmds::build_delivery,
+            commands::sorting_cmds::list_remote_activity,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

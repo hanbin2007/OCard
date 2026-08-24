@@ -67,7 +67,8 @@ fn project_dto(stats: &catalog::ProjectStats, running: bool) -> ProjectDto {
         scenario: stats.meta.scenario,
         categories: stats.meta.categories.clone(),
         relative_path: stats.folder_name.clone(),
-        status: if running || stats.has_incomplete_copy {
+        // 有未完成 manifest 但无运行任务 = 暂停中(任务列表有续传入口),不再误标 copying(L21)
+        status: if running {
             "copying"
         } else if stats.cards_copied > 0 {
             "sorting"
@@ -374,16 +375,25 @@ pub fn inspect_volume(volume_id: String) -> CmdResult<VolumeInspectionDto> {
     let files = copy::scan_source(&root).map_err(err)?;
     let total_bytes = files.iter().map(|(_, s)| *s).sum();
 
+    // EXIF 拍摄时间优先(M2 技术债:mtime 会因拷贝/修复时间戳失真);
+    // 大卡按步长采样(≤300 个样本)控制 EXIF 解析耗时
     let mut earliest: Option<chrono::DateTime<Utc>> = None;
     let mut latest: Option<chrono::DateTime<Utc>> = None;
-    for (rel, _) in &files {
+    let step = (files.len() / 300).max(1);
+    for (i, (rel, _)) in files.iter().enumerate() {
+        if i % step != 0 {
+            continue;
+        }
         let p: PathBuf = rel.split('/').fold(root.clone(), |acc, c| acc.join(c));
-        if let Ok(meta) = std::fs::metadata(&p) {
-            if let Ok(modified) = meta.modified() {
-                let t: chrono::DateTime<Utc> = modified.into();
-                earliest = Some(earliest.map_or(t, |e| e.min(t)));
-                latest = Some(latest.map_or(t, |l| l.max(t)));
-            }
+        let t = crate::core::media::exif_shot_at(&p).or_else(|| {
+            std::fs::metadata(&p)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(chrono::DateTime::<Utc>::from)
+        });
+        if let Some(t) = t {
+            earliest = Some(earliest.map_or(t, |e| e.min(t)));
+            latest = Some(latest.map_or(t, |l| l.max(t)));
         }
     }
     let suggested_prefix = earliest

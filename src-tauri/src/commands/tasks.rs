@@ -39,7 +39,26 @@ impl TaskManager {
     }
 
     pub fn insert(&self, task_id: String, handle: Arc<TaskHandle>) {
-        self.inner.lock().unwrap().insert(task_id, handle);
+        let mut map = self.inner.lock().unwrap();
+        map.insert(task_id, handle);
+        // 句柄回收(L20):终态任务超过 40 个时按完成时间淘汰最旧,防止全天拷卡后
+        // 内存里堆满文件级快照
+        const KEEP: usize = 40;
+        if map.len() > KEEP {
+            let mut finished: Vec<(String, String)> = map
+                .iter()
+                .filter(|(_, h)| {
+                    let s = h.snapshot.lock().unwrap();
+                    matches!(s.state, "done" | "failed")
+                })
+                .map(|(k, h)| (k.clone(), h.snapshot.lock().unwrap().started_at.clone()))
+                .collect();
+            finished.sort_by(|a, b| a.1.cmp(&b.1));
+            let excess = map.len().saturating_sub(KEEP);
+            for (k, _) in finished.into_iter().take(excess) {
+                map.remove(&k);
+            }
+        }
     }
 
     /// 是否有任务的工作线程正在运行(安装更新前的安全闸)。

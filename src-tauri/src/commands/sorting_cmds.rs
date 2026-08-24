@@ -607,3 +607,80 @@ pub fn build_delivery(
             .to_string(),
     })
 }
+
+// ---------- 跨机活动可见(规范 §6.3,M2 技术债) ----------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteActivityDto {
+    pub machine: String,
+    pub operator: String,
+    pub volume: String,
+    pub camera: String,
+    pub target_folder: String,
+    pub started_at: String,
+}
+
+/// 其他工作站在本项目上进行中的拷卡(copy_started 无对应 copy_completed,24h 内)。
+/// 前端在拷卡屏轮询(约 10s),用于「避免重复拷同一张卡」。
+#[tauri::command]
+pub fn list_remote_activity(
+    app: AppHandle,
+    state: State<AppState>,
+    project_id: String,
+) -> CmdResult<Vec<RemoteActivityDto>> {
+    let nas = nas_root(&app, &state)?;
+    let stats = find_project(&nas, &project_id)?;
+    let read = crate::core::journal::read_all(&stats.root).map_err(err)?;
+    if read.skipped_lines > 0 || read.unreadable_files > 0 {
+        notify::warn(
+            &app,
+            "project-journal-degraded",
+            format!(
+                "项目日志有损坏数据(跳过 {} 行/{} 文件),跨机活动信息可能不完整",
+                read.skipped_lines, read.unreadable_files
+            ),
+        );
+    }
+    let mut open: std::collections::HashMap<String, RemoteActivityDto> = Default::default();
+    let cutoff = Utc::now() - chrono::Duration::hours(24);
+    for ev in read.events {
+        let task_id = ev
+            .data
+            .get("taskId")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        match ev.kind.as_str() {
+            k if k == crate::core::journal::kind::COPY_STARTED => {
+                if ev.machine != state.machine_id && ev.ts >= cutoff {
+                    let s = |key: &str| {
+                        ev.data
+                            .get(key)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    open.insert(
+                        task_id,
+                        RemoteActivityDto {
+                            machine: ev.machine.clone(),
+                            operator: ev.operator.clone(),
+                            volume: s("volume"),
+                            camera: s("camera"),
+                            target_folder: s("targetFolder"),
+                            started_at: ev.ts.to_rfc3339(),
+                        },
+                    );
+                }
+            }
+            k if k == crate::core::journal::kind::COPY_COMPLETED => {
+                open.remove(&task_id);
+            }
+            _ => {}
+        }
+    }
+    let mut out: Vec<RemoteActivityDto> = open.into_values().collect();
+    out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    Ok(out)
+}
