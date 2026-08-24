@@ -61,6 +61,8 @@ pub struct DeliveryOutcome {
     /// 各包**实况**总量(名称, 文件数, 字节)——从目标目录实扫,
     /// 重跑时也是真实累计口径(codex 复验:包计数不能只数本轮新复制)。
     pub package_totals: Vec<(String, usize, u64)>,
+    /// 本轮被用户取消(取消也按实况写清单,目录不留说谎态——计划 W2)。
+    pub cancelled: bool,
 }
 
 fn is_hidden(name: &str) -> bool {
@@ -191,6 +193,18 @@ fn deliver_one(
 /// 待分类与精选/待修不纳入(未完成分类/修图的不交付)。
 /// 夹角色按布局下标判定,不猜目录名(评审 M1)。
 pub fn build_delivery(project_root: &Path, meta: &project::ProjectMeta) -> Result<DeliveryOutcome> {
+    build_delivery_with(project_root, meta, &mut |_, _, _, _| {}, &|| false)
+}
+
+/// 带进度与取消的交付打包(M3 W2 作业化):
+/// `progress(done, total, bytes_done, current_rel)` 逐文件回调;
+/// `cancelled()` 为真时在**文件边界**停止复制——清单仍按实况生成。
+pub fn build_delivery_with(
+    project_root: &Path,
+    meta: &project::ProjectMeta,
+    progress: &mut dyn FnMut(usize, usize, u64, &str),
+    cancelled: &dyn Fn() -> bool,
+) -> Result<DeliveryOutcome> {
     if meta.scenario != Scenario::B {
         return Err(CoreError::Invalid("交付打包仅适用于工况 B".into()));
     }
@@ -215,6 +229,8 @@ pub fn build_delivery(project_root: &Path, meta: &project::ProjectMeta) -> Resul
     let delivery_root = project_root.join(DELIVERY_DIR);
     let mut out = DeliveryOutcome::default();
 
+    // 先收集全部待处理文件(总数给进度),再逐个落包
+    let mut work: Vec<(String, PathBuf)> = Vec::new();
     for (category, dir) in &sources {
         // 分类夹本身或其祖先被换成链接:整夹拒绝交付(终审复票:
         // 只查夹自身不够,「精选/已修」的父夹是链接同样会把扫描带出项目)
@@ -234,65 +250,83 @@ pub fn build_delivery(project_root: &Path, meta: &project::ProjectMeta) -> Resul
             continue;
         }
         for file in collect(dir, &mut out.warnings) {
-            let rel = file
-                .strip_prefix(project_root)
-                .unwrap_or(&file)
-                .to_string_lossy()
-                .replace('\\', "/");
-            // 与交付清单保留名撞名的源文件必须显式拒绝:静默交付会被清单
-            // 生成器漏计/覆盖(codex 复验 P0)
-            if let Some(name) = file.file_name().and_then(|n| n.to_str()) {
-                let lower = name.to_lowercase();
-                if lower == MANIFEST_NAME || lower == SUMMARY_NAME {
-                    out.failures.push((
-                        rel,
-                        "error",
-                        format!("文件名与交付清单保留名「{name}」冲突,请改名后重新打包"),
-                    ));
-                    continue;
-                }
-            }
-            let meta_fs = match fs::metadata(&file) {
-                Ok(m) => m,
-                Err(e) => {
-                    out.failures.push((rel, "error", format!("读取失败: {e}")));
-                    continue;
-                }
-            };
-            // 半天判定:EXIF 墙钟优先;无 EXIF 用 mtime 的本地墙钟;都没有用当前本地时间
-            let shot = media::exif_shot_naive(&file)
-                .or_else(|| {
-                    meta_fs
-                        .modified()
-                        .ok()
-                        .map(|m| DateTime::<Utc>::from(m).with_timezone(&Local).naive_local())
-                })
-                .unwrap_or_else(|| Local::now().naive_local());
-            let package = half_day_key(shot);
-            let dst_dir = delivery_root.join(&package).join(category);
-            let dst = dst_dir.join(file.file_name().unwrap_or_default());
-
-            match deliver_one(project_root, &file, &dst_dir, &dst) {
-                Ok(newly_copied) => {
-                    if !out.packages.contains(&package) {
-                        out.packages.push(package.clone());
-                    }
-                    if newly_copied {
-                        out.total_bytes += meta_fs.len();
-                        out.files.push(PackagedFile {
-                            source_rel: rel,
-                            category: category.clone(),
-                            package,
-                            size_bytes: meta_fs.len(),
-                        });
-                    } else {
-                        out.already_delivered += 1;
-                    }
-                }
-                Err((kind, e)) => out.failures.push((rel, kind, e)),
-            }
+            work.push((category.clone(), file));
         }
     }
+
+    let total = work.len();
+    let mut bytes_done: u64 = 0;
+    for (i, (category, file)) in work.iter().enumerate() {
+        if cancelled() {
+            out.cancelled = true;
+            break;
+        }
+        let rel = file
+            .strip_prefix(project_root)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        progress(i, total, bytes_done, &rel);
+        // 与交付清单保留名撞名的源文件必须显式拒绝:静默交付会被清单
+        // 生成器漏计/覆盖(codex 复验 P0;大小写不敏感)
+        if let Some(name) = file.file_name().and_then(|n| n.to_str()) {
+            let lower = name.to_lowercase();
+            if lower == MANIFEST_NAME || lower == SUMMARY_NAME {
+                out.failures.push((
+                    rel,
+                    "error",
+                    format!("文件名与交付清单保留名「{name}」冲突,请改名后重新打包"),
+                ));
+                continue;
+            }
+        }
+        let meta_fs = match fs::metadata(file) {
+            Ok(m) => m,
+            Err(e) => {
+                out.failures.push((rel, "error", format!("读取失败: {e}")));
+                continue;
+            }
+        };
+        // 半天判定:EXIF 墙钟优先;无 EXIF 用 mtime 的本地墙钟;都没有用当前本地时间
+        let shot = media::exif_shot_naive(file)
+            .or_else(|| {
+                meta_fs
+                    .modified()
+                    .ok()
+                    .map(|m| DateTime::<Utc>::from(m).with_timezone(&Local).naive_local())
+            })
+            .unwrap_or_else(|| Local::now().naive_local());
+        let package = half_day_key(shot);
+        let dst_dir = delivery_root.join(&package).join(category);
+        let dst = dst_dir.join(file.file_name().unwrap_or_default());
+
+        match deliver_one(project_root, file, &dst_dir, &dst) {
+            Ok(newly_copied) => {
+                if !out.packages.contains(&package) {
+                    out.packages.push(package.clone());
+                }
+                if newly_copied {
+                    out.total_bytes += meta_fs.len();
+                    bytes_done += meta_fs.len();
+                    out.files.push(PackagedFile {
+                        source_rel: rel,
+                        category: category.clone(),
+                        package,
+                        size_bytes: meta_fs.len(),
+                    });
+                } else {
+                    out.already_delivered += 1;
+                }
+            }
+            Err((kind, e)) => out.failures.push((rel, kind, e)),
+        }
+    }
+    progress(
+        total.min(out.files.len() + out.already_delivered + out.failures.len()),
+        total,
+        bytes_done,
+        "清单生成中",
+    );
     out.packages.sort();
 
     write_manifests(project_root, &delivery_root, &mut out);
@@ -646,6 +680,26 @@ mod tests {
             !all.iter().any(|r| r.contains("secret")),
             "链接内容不许进包"
         );
+    }
+
+    #[test]
+    fn cancel_stops_at_file_boundary_but_manifests_stay_honest() {
+        // W2:取消也按实况写清单,交付目录绝不处于无清单说谎态
+        let (_t, root, meta) = setup();
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        let out = build_delivery_with(&root, &meta, &mut |_, _, _, _| {}, &|| {
+            // 放过第一个文件,之后取消
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1
+        })
+        .unwrap();
+        assert!(out.cancelled, "取消要如实标记");
+        assert!(out.files.len() < 3, "不许把剩余文件继续拷完");
+        let delivery = root.join(DELIVERY_DIR);
+        if !out.files.is_empty() {
+            assert!(delivery.join("交付总清单.txt").is_file(), "取消后清单仍在");
+            let pkg = &out.packages[0];
+            assert!(delivery.join(pkg).join("清单.txt").is_file());
+        }
     }
 
     #[test]

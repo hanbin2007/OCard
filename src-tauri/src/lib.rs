@@ -45,7 +45,10 @@ macro_rules! ocard_invoke_handler {
             $crate::commands::sorting_cmds::restore_from_trash,
             $crate::commands::sorting_cmds::empty_trash,
             $crate::commands::sorting_cmds::indexing_status,
-            $crate::commands::sorting_cmds::build_delivery,
+            $crate::commands::sorting_cmds::start_delivery,
+            $crate::commands::sorting_cmds::list_jobs,
+            $crate::commands::sorting_cmds::get_job,
+            $crate::commands::sorting_cmds::cancel_job,
             $crate::commands::sorting_cmds::list_remote_activity,
         ]
     };
@@ -61,6 +64,7 @@ pub fn run() {
                 .map_err(|e| format!("初始化机器 ID 失败: {e}"))?;
             app.manage(commands::updater::PendingUpdate::default());
             app.manage(commands::sorting_cmds::IndexManager::default());
+            app.manage(std::sync::Arc::new(core::jobs::JobManager::default()));
             app.manage(AppState {
                 config_dir,
                 machine_id,

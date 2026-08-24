@@ -4,6 +4,7 @@ pub mod copy;
 pub mod error;
 pub mod fsx;
 pub mod hash;
+pub mod jobs;
 pub mod journal;
 pub mod machine;
 pub mod manifest;

@@ -130,6 +130,15 @@ fn do_install<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &tauri::State<AppState>,
 ) -> Result<(), String> {
+    let jobs_active = app
+        .try_state::<std::sync::Arc<crate::core::jobs::JobManager>>()
+        .map(|j| j.any_active())
+        .unwrap_or(false);
+    if jobs_active {
+        return Err(
+            "有后台作业(交付/转码/分析)进行中,安装更新会中断它们;请等作业完成或取消后再试".into(),
+        );
+    }
     if state.tasks.any_running() {
         return Err("有拷卡任务正在进行,安装更新会中断它们;请等任务完成或暂停后再更新".into());
     }

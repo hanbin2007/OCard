@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 pub const INDEX_EVENT: &str = "index://progress";
+pub const JOB_EVENT: &str = "job://progress";
 
 type CmdResult<T> = std::result::Result<T, String>;
 
@@ -30,8 +31,8 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 /// - Guard 走 Drop 释放:任何 panic/早退都不会把闸永久卡死。
 ///
 /// 跨机互斥是 M3 前置(无锁 NAS,已声明边界)。
-#[derive(Default)]
-pub struct OpsMutex(Mutex<OpsState>);
+#[derive(Default, Clone)]
+pub struct OpsMutex(std::sync::Arc<Mutex<OpsState>>);
 
 #[derive(Default)]
 struct OpsState {
@@ -39,25 +40,23 @@ struct OpsState {
     sorting_ops: usize,
 }
 
-pub struct SortingGuard<'a>(&'a OpsMutex);
-pub struct DeliveryGuard<'a>(&'a OpsMutex);
+/// owned guard(M3 W2:作业线程要把 guard 带走,生命周期不能借命令栈)。
+pub struct SortingGuard(std::sync::Arc<Mutex<OpsState>>);
+pub struct DeliveryGuard(std::sync::Arc<Mutex<OpsState>>);
 
 impl OpsMutex {
     fn lock(&self) -> std::sync::MutexGuard<'_, OpsState> {
         self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
-    pub fn begin_sorting(&self, project_id: &str) -> std::result::Result<SortingGuard<'_>, String> {
+    pub fn begin_sorting(&self, project_id: &str) -> std::result::Result<SortingGuard, String> {
         let mut st = self.lock();
         if st.delivering.as_deref() == Some(project_id) {
             return Err("交付打包进行中,分类与回收站操作已暂停,请等打包完成".into());
         }
         st.sorting_ops += 1;
-        Ok(SortingGuard(self))
+        Ok(SortingGuard(self.0.clone()))
     }
-    pub fn begin_delivery(
-        &self,
-        project_id: &str,
-    ) -> std::result::Result<DeliveryGuard<'_>, String> {
+    pub fn begin_delivery(&self, project_id: &str) -> std::result::Result<DeliveryGuard, String> {
         let mut st = self.lock();
         if st.delivering.is_some() {
             return Err("已有交付打包在进行中,请等它完成".into());
@@ -66,20 +65,20 @@ impl OpsMutex {
             return Err("有分类/回收站操作正在进行,请稍候片刻再开始打包".into());
         }
         st.delivering = Some(project_id.to_string());
-        Ok(DeliveryGuard(self))
+        Ok(DeliveryGuard(self.0.clone()))
     }
 }
 
-impl Drop for SortingGuard<'_> {
+impl Drop for SortingGuard {
     fn drop(&mut self) {
-        let mut st = self.0.lock();
+        let mut st = self.0.lock().unwrap_or_else(|p| p.into_inner());
         st.sorting_ops = st.sorting_ops.saturating_sub(1);
     }
 }
 
-impl Drop for DeliveryGuard<'_> {
+impl Drop for DeliveryGuard {
     fn drop(&mut self) {
-        self.0.lock().delivering = None;
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).delivering = None;
     }
 }
 
@@ -799,88 +798,182 @@ pub struct DeliverySummaryDto {
 /// 执行交付打包(PRD §5.7):半天分包、复制不动原件、清单落盘;
 /// 上传与发链接人工完成(既定边界)。重跑安全(零覆盖,已打包项报失败)。
 #[tauri::command]
-pub fn build_delivery<R: tauri::Runtime>(
+pub fn start_delivery<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
     project_id: String,
-) -> CmdResult<DeliverySummaryDto> {
+) -> CmdResult<crate::core::jobs::JobSnapshot> {
+    use crate::core::jobs::{JobKind, JobSnapshot};
+    let jobs = app
+        .state::<std::sync::Arc<crate::core::jobs::JobManager>>()
+        .inner()
+        .clone();
+    if jobs.has_active(JobKind::Delivery, &project_id) {
+        return Err("该项目已有交付打包作业在进行中".into());
+    }
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
-    let _ops = state.ops.begin_delivery(&project_id)?;
-    let out = crate::core::packaging::build_delivery(&stats.root, &stats.meta).map_err(err)?;
-    notify_if_unsafe_fallback(&app);
 
-    // 包表用目标目录实况总量(重跑时不显示 0,codex 复验 P1)
-    let packages: Vec<DeliveryPackageDto> = out
-        .package_totals
-        .iter()
-        .map(|(name, file_count, bytes)| DeliveryPackageDto {
-            name: name.clone(),
-            file_count: *file_count,
-            bytes: *bytes,
-        })
-        .collect();
-    let failures: Vec<BulkFailure> = out
-        .failures
-        .iter()
-        .map(|(path, kind, message)| BulkFailure {
-            asset_id: path.clone(),
-            message: message.clone(),
-            kind: Some(kind),
-        })
-        .collect();
-
-    for w in &out.warnings {
-        notify::warn(&app, "delivery-scan-degraded", w.clone());
-    }
+    let handle = jobs.create(JobKind::Delivery, &project_id);
+    let ops = state.ops.clone();
+    let pid = project_id.clone();
+    let machine_id = state.machine_id.clone();
+    let config_dir = state.config_dir.clone();
     let op = operator(&app, &state);
-    super::tasks::append_audit(
-        &app,
-        &stats.root,
-        &state.config_dir,
-        &sorting::audit_event(
-            &state.machine_id,
-            &op,
-            "delivery_built",
-            serde_json::json!({
-                "packages": out.packages,
-                "files": out.files.len(),
-                "bytes": out.total_bytes,
-                "alreadyDelivered": out.already_delivered,
-                "failures": failures.len(),
-            }),
-        ),
+    let root = stats.root.clone();
+    let meta = stats.meta.clone();
+    let body_app = app.clone();
+    let event_app = app.clone();
+    let body_handle = handle.clone();
+
+    jobs.run(
+        handle.clone(),
+        move || ops.begin_delivery(&pid),
+        move |h| {
+            let mut last_emit = std::time::Instant::now();
+            let out = crate::core::packaging::build_delivery_with(
+                &root,
+                &meta,
+                &mut |done, total, bytes, current| {
+                    h.progress(done, total, bytes, Some(current.to_string()));
+                    if last_emit.elapsed().as_millis() >= 500 {
+                        last_emit = std::time::Instant::now();
+                        let _ = body_app.emit(JOB_EVENT, &h.snapshot());
+                    }
+                },
+                &|| h.cancel_requested(),
+            )
+            .map_err(|e| e.to_string())?;
+            notify_if_unsafe_fallback(&body_app);
+            for w in &out.warnings {
+                notify::warn(&body_app, "delivery-scan-degraded", w.clone());
+            }
+
+            // 包表用目标目录实况总量(重跑时不显示 0,codex 复验 P1)
+            let packages: Vec<DeliveryPackageDto> = out
+                .package_totals
+                .iter()
+                .map(|(name, file_count, bytes)| DeliveryPackageDto {
+                    name: name.clone(),
+                    file_count: *file_count,
+                    bytes: *bytes,
+                })
+                .collect();
+            let failures: Vec<BulkFailure> = out
+                .failures
+                .iter()
+                .map(|(path, kind, message)| BulkFailure {
+                    asset_id: path.clone(),
+                    message: message.clone(),
+                    kind: Some(kind),
+                })
+                .collect();
+
+            // 审计:取消与完成分事件,取消也留痕(计划 W2)
+            let audit_kind = if out.cancelled {
+                "delivery_cancelled"
+            } else {
+                "delivery_built"
+            };
+            super::tasks::append_audit(
+                &body_app,
+                &root,
+                &config_dir,
+                &sorting::audit_event(
+                    &machine_id,
+                    &op,
+                    audit_kind,
+                    serde_json::json!({
+                        "packages": out.packages,
+                        "files": out.files.len(),
+                        "bytes": out.total_bytes,
+                        "alreadyDelivered": out.already_delivered,
+                        "failures": failures.len(),
+                        "cancelled": out.cancelled,
+                    }),
+                ),
+            );
+            if out.cancelled {
+                notify::warn(
+                    &body_app,
+                    "job-cancelled",
+                    format!(
+                        "交付打包已取消:本轮已复制 {} 个文件(清单按实况更新,重跑会从断点安全续打)",
+                        out.files.len()
+                    ),
+                );
+            }
+            if !failures.is_empty() {
+                let collisions = failures
+                    .iter()
+                    .filter(|f| f.kind == Some("name-collision"))
+                    .count();
+                let msg = if collisions > 0 {
+                    format!(
+                        "交付打包完成,但 {} 个文件未交付,其中 {collisions} 个是同名不同内容的冲突,需人工核对包内文件(详见交付总清单)",
+                        failures.len()
+                    )
+                } else {
+                    format!(
+                        "交付打包完成,但 {} 个文件失败(详见交付总清单)",
+                        failures.len()
+                    )
+                };
+                notify::warn(&body_app, "delivery-partial", msg);
+            }
+            let summary = DeliverySummaryDto {
+                packages,
+                total_files: out.files.len(),
+                total_bytes: out.total_bytes,
+                already_delivered: out.already_delivered,
+                failures,
+                delivery_path: root
+                    .join(crate::core::packaging::DELIVERY_DIR)
+                    .display()
+                    .to_string(),
+            };
+            serde_json::to_value(summary).map_err(|e| e.to_string())
+        },
+        move |s: JobSnapshot| {
+            let _ = event_app.emit(JOB_EVENT, &s);
+        },
     );
-    if !failures.is_empty() {
-        let collisions = failures
-            .iter()
-            .filter(|f| f.kind == Some("name-collision"))
-            .count();
-        let msg = if collisions > 0 {
-            format!(
-                "交付打包完成,但 {} 个文件未交付,其中 {collisions} 个是同名不同内容的冲突,需人工核对包内文件(详见交付总清单)",
-                failures.len()
-            )
-        } else {
-            format!(
-                "交付打包完成,但 {} 个文件失败(详见交付总清单)",
-                failures.len()
-            )
-        };
-        notify::warn(&app, "delivery-partial", msg);
+    Ok(body_handle.snapshot())
+}
+
+#[tauri::command]
+pub fn list_jobs<R: tauri::Runtime>(app: AppHandle<R>) -> Vec<crate::core::jobs::JobSnapshot> {
+    app.state::<std::sync::Arc<crate::core::jobs::JobManager>>()
+        .snapshots()
+}
+
+#[tauri::command]
+pub fn get_job<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    job_id: String,
+) -> Option<crate::core::jobs::JobSnapshot> {
+    app.state::<std::sync::Arc<crate::core::jobs::JobManager>>()
+        .get(&job_id)
+        .map(|h| h.snapshot())
+}
+
+#[tauri::command]
+pub fn cancel_job<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    job_id: String,
+) -> CmdResult<crate::core::jobs::JobSnapshot> {
+    let jobs = app.state::<std::sync::Arc<crate::core::jobs::JobManager>>();
+    // running 的作业由 worker 在安全点收尾;这里返回请求后的快照
+    match jobs.request_cancel(&job_id) {
+        Some(s) => {
+            let _ = app.emit(JOB_EVENT, &s);
+            Ok(s)
+        }
+        None => jobs
+            .get(&job_id)
+            .map(|h| h.snapshot())
+            .ok_or_else(|| format!("作业不存在: {job_id}")),
     }
-    Ok(DeliverySummaryDto {
-        packages,
-        total_files: out.files.len(),
-        total_bytes: out.total_bytes,
-        already_delivered: out.already_delivered,
-        failures,
-        delivery_path: stats
-            .root
-            .join(crate::core::packaging::DELIVERY_DIR)
-            .display()
-            .to_string(),
-    })
 }
 
 // ---------- 跨机活动可见(规范 §6.3,M2 技术债) ----------
