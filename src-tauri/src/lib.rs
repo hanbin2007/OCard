@@ -14,6 +14,7 @@ pub fn run() {
             let machine_id = core::machine::machine_id(&config_dir)
                 .map_err(|e| format!("初始化机器 ID 失败: {e}"))?;
             app.manage(commands::updater::PendingUpdate::default());
+            app.manage(commands::sorting_cmds::IndexManager::default());
             app.manage(AppState {
                 config_dir,
                 machine_id,
@@ -55,6 +56,15 @@ pub fn run() {
             commands::updater::check_for_update,
             commands::updater::install_update,
             commands::notify::list_notices,
+            commands::sorting_cmds::list_pending_assets,
+            commands::sorting_cmds::list_categories,
+            commands::sorting_cmds::move_assets,
+            commands::sorting_cmds::curate_assets,
+            commands::sorting_cmds::trash_assets,
+            commands::sorting_cmds::list_trash,
+            commands::sorting_cmds::restore_from_trash,
+            commands::sorting_cmds::empty_trash,
+            commands::sorting_cmds::indexing_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -3,6 +3,7 @@
 
 pub mod dto;
 pub mod notify;
+pub mod sorting_cmds;
 pub mod tasks;
 pub mod updater;
 

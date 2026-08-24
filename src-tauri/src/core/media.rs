@@ -169,6 +169,11 @@ fn write_jpeg(img: &image::DynamicImage, dir: &Path, cache: &Path) -> Option<Pat
     Some(cache.to_path_buf())
 }
 
+/// 素材对应的缩略图缓存路径(存在与否由调用方检查)。
+pub fn cached_thumb_path(project_root: &Path, rel_path: &str, size: u64) -> PathBuf {
+    thumbs_dir(project_root).join(thumb_cache_name(rel_path, size))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
