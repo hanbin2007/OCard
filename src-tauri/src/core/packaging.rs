@@ -176,7 +176,13 @@ fn deliver_one(
         }
     }
     match fsx::rename_no_replace(&tmp, dst) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            // 保留源时间戳(mtime/atime 三平台;创建时间 mac/win,Linux 声明边界)
+            if let Ok(m) = fs::metadata(src) {
+                fsx::preserve_times_counted(&m, dst);
+            }
+            Ok(true)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // 并发竞争:别机先落位。弃临时文件,按既有文件裁决
             let _ = fs::remove_file(&tmp);

@@ -416,7 +416,7 @@ export const mockPendingAssets: SortingAsset[] = Array.from(
         i >= 40 && i <= 44
           ? {
               groupId: "burst-1",
-              score: i === 42 ? 0.86 : 0.31,
+              score: i === 42 ? 86 : 31,
               blurry: i === 41,
               overExposed: i === 43,
               underExposed: false,
@@ -424,7 +424,7 @@ export const mockPendingAssets: SortingAsset[] = Array.from(
             }
           : i === 5
             ? {
-                score: 0.22,
+                score: 22,
                 blurry: true,
                 overExposed: false,
                 underExposed: true,

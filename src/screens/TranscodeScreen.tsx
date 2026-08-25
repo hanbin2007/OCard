@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import * as api from "../api";
 import type { FfmpegStatus, TranscodeJob } from "../api/types";
+import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { TopBar } from "../components/TopBar";
 import { Badge, EmptyState, ProgressBar } from "../components/ui";
 import { formatBytes, formatTimestamp } from "../lib/format";
@@ -19,6 +20,7 @@ export function TranscodeScreen() {
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
+  const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -48,7 +50,19 @@ export function TranscodeScreen() {
     [dispatch],
   );
 
-  async function start() {
+  function requestRetranscode() {
+    if (!project) return;
+    setConfirm({
+      title: "强制重转全部代理？",
+      message:
+        "这会先删除「4. 转码素材」下已有的代理文件，再重新转码——已删除的代理无法恢复。" +
+        "原始素材不受影响。只有在代理文件确认有问题时才需要这么做。",
+      confirmLabel: "删除并重转",
+      onConfirm: () => void start(true),
+    });
+  }
+
+  async function start(retranscode = false) {
     if (!project || starting) return;
     setStarting(true);
     setStartError(null);
@@ -56,6 +70,7 @@ export function TranscodeScreen() {
       const snapshot = await api.startProxyTranscode({
         projectId: project.id,
         forceAll,
+        ...(retranscode ? { retranscode: true } : {}),
       });
       dispatch({ type: "jobProgress", job: snapshot });
     } catch (err) {
@@ -154,16 +169,26 @@ export function TranscodeScreen() {
                       disabled={working || ffmpegMissing}
                       onChange={(e) => setForceAll(e.currentTarget.checked)}
                     />
-                    强制全转（忽略「已转码 / 无需转码」判定，重转所有素材）
+                    强制全转（忽略「高负载」判定，把所有素材纳入；
+                    <strong>不会</strong>重转已经有代理的素材）
                   </label>
 
                   <div className="row-inline">
                     <button
                       type="button"
+                      className="btn"
+                      data-testid="transcode-retranscode"
+                      disabled={working || starting || ffmpegMissing}
+                      onClick={requestRetranscode}
+                    >
+                      强制重转
+                    </button>
+                    <button
+                      type="button"
                       className="btn btn--primary"
                       data-testid="transcode-start"
                       disabled={working || starting || ffmpegMissing}
-                      onClick={start}
+                      onClick={() => void start(false)}
                     >
                       {working
                         ? "转码中…"
@@ -242,6 +267,8 @@ export function TranscodeScreen() {
           </div>
         </div>
       </div>
+
+      <ConfirmDialog request={confirm} onCancel={() => setConfirm(null)} />
     </>
   );
 }

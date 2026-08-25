@@ -3,7 +3,7 @@
 // 用的是**将被打包的那个 sidecar**(计划纪律:系统 ffmpeg 不算数)。
 import { $, browser, expect } from "@wdio/globals";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 
 const nasRoot = process.env.OCARD_E2E_NAS_ROOT;
@@ -59,7 +59,7 @@ describe("OCard M3 转码冒烟", () => {
     await $('[data-testid="transcode-result"]').waitForExist({ timeout: 120000 });
 
     const out = path.join(projectRoot(), "4. 转码素材", "0824_A7M4_A_ZS");
-    await browser.waitUntil(() => existsSync(path.join(out, "clip1_proxy.mp4")), {
+    await browser.waitUntil(() => existsSync(path.join(out, "clip1_MOV_proxy.mp4")), {
       timeout: 15000,
       timeoutMsg: "代理未落盘",
     });
@@ -67,17 +67,20 @@ describe("OCard M3 转码冒烟", () => {
     expect(
       readdirSync(out).some((f) => f.includes("transpart")),
     ).toBe(false);
-    // 幂等重跑:already-transcoded,不产生第二份
+    // 幂等重跑真断言(评审 P1-8:元素存在是空断言——按 mtime 不变 + 计数文本验证)
+    const proxyPath = path.join(out, "clip1_MOV_proxy.mp4");
+    const mtimeBefore = statSync(proxyPath).mtimeMs;
     await $('[data-testid="transcode-start"]').click();
     await confirmDangerDialogIfAny();
     await browser.waitUntil(
       async () => {
-        const t = await $('[data-testid="transcode-already"]').isExisting();
-        return t;
+        const t = await $('[data-testid="transcode-already"]').getText().catch(() => "");
+        return /^[1-9]\d*$/.test(t.trim());
       },
-      { timeout: 60000, timeoutMsg: "重跑未显示已转码跳过" },
+      { timeout: 60000, timeoutMsg: "重跑未报告非零的已转码跳过数" },
     );
+    expect(statSync(proxyPath).mtimeMs).toBe(mtimeBefore);
     const files = readdirSync(out).filter((f) => !f.startsWith("."));
-    expect(files).toEqual(["clip1_proxy.mp4"]);
+    expect(files).toEqual(["clip1_MOV_proxy.mp4"]);
   });
 });

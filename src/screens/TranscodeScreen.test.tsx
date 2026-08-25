@@ -181,6 +181,83 @@ describe("作业生命周期", () => {
     spy.mockRestore();
   });
 
+  it("#5 强制全转文案说真话：不承诺重转已有输出", async () => {
+    render(<App preloaded={preloaded(projectA.id)} />);
+    const label = (await screen.findByTestId("transcode-force-all")).closest(
+      "label",
+    ) as HTMLElement;
+    expect(label.textContent).toContain("忽略「高负载」判定");
+    expect(label.textContent).toContain("不会");
+    // 旧文案承诺「重转所有素材」，与后端行为不符
+    expect(label.textContent).not.toContain("重转所有素材");
+  });
+
+  it("#5 强制重转必须经二次确认，取消则不下发", async () => {
+    const user = userEvent.setup();
+    const spy = vi.spyOn(api, "startProxyTranscode");
+
+    render(<App preloaded={preloaded(projectA.id)} />);
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId("transcode-retranscode") as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    await user.click(screen.getByTestId("transcode-retranscode"));
+
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog.textContent).toContain("先删除");
+    expect(dialog.textContent).toContain("无法恢复");
+    expect(dialog.textContent).toContain("原始素材不受影响");
+    expect(spy).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("#5 确认后带 retranscode 参数下发", async () => {
+    const user = userEvent.setup();
+    const spy = vi
+      .spyOn(api, "startProxyTranscode")
+      .mockResolvedValue(transcodeJob({ state: "running", result: undefined }));
+
+    render(<App preloaded={preloaded(projectA.id)} />);
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId("transcode-retranscode") as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    await user.click(screen.getByTestId("transcode-retranscode"));
+    await user.click(screen.getByRole("button", { name: "删除并重转" }));
+
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    expect(spy.mock.calls[0][0].retranscode).toBe(true);
+    spy.mockRestore();
+  });
+
+  it("#P2 结果计数 testid 内含数值，E2E 可直接断言", async () => {
+    const user = userEvent.setup();
+    const spy = vi
+      .spyOn(api, "startProxyTranscode")
+      .mockResolvedValue(transcodeJob());
+    render(<App preloaded={preloaded(projectA.id)} />);
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId("transcode-start") as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    await user.click(screen.getByTestId("transcode-start"));
+
+    const result = await screen.findByTestId("transcode-result");
+    expect(within(result).getByTestId("transcode-converted").textContent).toMatch(
+      /^\d+$/,
+    );
+    expect(within(result).getByTestId("transcode-already").textContent).toMatch(
+      /^\d+$/,
+    );
+    spy.mockRestore();
+  });
+
   it("取消走既有 cancelJob，并显示已完成量与安全说明", async () => {
     const user = userEvent.setup();
     const startSpy = vi.spyOn(api, "startProxyTranscode").mockResolvedValue(

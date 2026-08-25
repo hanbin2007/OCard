@@ -184,3 +184,91 @@ mod tests {
         assert_eq!(read_file_uncached(&p).unwrap(), payload);
     }
 }
+
+/// 拷贝后时间戳保留失败计数(零静默:命令层取走后聚合告警)。
+static TIMES_PRESERVE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 取走时间戳保留失败数(swap 清零)。
+pub fn take_times_preserve_failures() -> u64 {
+    TIMES_PRESERVE_FAILURES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 把源文件的时间戳复制到目标(拷卡/交付/精选的复制路径都要调):
+/// - mtime/atime:三平台;
+/// - **创建时间**:macOS/Windows 可设,Linux 文件系统不支持设置 btime
+///   (声明边界:Linux 上创建时间为拷贝时刻,mtime 仍与源一致)。
+///
+/// 失败不阻塞复制(数据本体安全),计数由上层聚合为可见 warning。
+pub fn preserve_times(src_meta: &fs::Metadata, dst: &Path) -> io::Result<()> {
+    let mut times = fs::FileTimes::new();
+    if let Ok(m) = src_meta.modified() {
+        times = times.set_modified(m);
+    }
+    if let Ok(a) = src_meta.accessed() {
+        times = times.set_accessed(a);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::FileTimesExt;
+        if let Ok(c) = src_meta.created() {
+            times = times.set_created(c);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTimesExt;
+        if let Ok(c) = src_meta.created() {
+            times = times.set_created(c);
+        }
+    }
+    let f = fs::OpenOptions::new().write(true).open(dst)?;
+    f.set_times(times)
+}
+
+/// 带失败计数的便捷封装(复制落位后调用)。
+pub fn preserve_times_counted(src_meta: &fs::Metadata, dst: &Path) {
+    if preserve_times(src_meta, dst).is_err() {
+        TIMES_PRESERVE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod times_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn copied_file_keeps_source_mtime_and_creation_where_supported() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src.bin");
+        let dst = tmp.path().join("dst.bin");
+        fs::write(&src, b"data").unwrap();
+        // 让源的 mtime 明显早于现在
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 30);
+        let f = fs::OpenOptions::new().write(true).open(&src).unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(old)).unwrap();
+        drop(f);
+
+        fs::copy(&src, &dst).unwrap();
+        let src_meta = fs::metadata(&src).unwrap();
+        preserve_times(&src_meta, &dst).unwrap();
+
+        let dm = fs::metadata(&dst).unwrap().modified().unwrap();
+        let sm = src_meta.modified().unwrap();
+        let diff = dm
+            .duration_since(sm)
+            .unwrap_or_else(|e| e.duration())
+            .as_secs();
+        assert!(diff <= 2, "mtime 必须与源一致(差 {diff}s)");
+        #[cfg(target_os = "macos")]
+        {
+            let dc = fs::metadata(&dst).unwrap().created().unwrap();
+            let sc = src_meta.created().unwrap();
+            let cdiff = dc
+                .duration_since(sc)
+                .unwrap_or_else(|e| e.duration())
+                .as_secs();
+            assert!(cdiff <= 2, "macOS 上创建时间也要保留(差 {cdiff}s)");
+        }
+    }
+}

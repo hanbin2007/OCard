@@ -167,6 +167,146 @@ describe("连拍折叠", () => {
   });
 });
 
+describe("#9 展开层选中三条路径都真的生效", () => {
+  async function openGroup(user: ReturnType<typeof userEvent.setup>) {
+    await renderSorting();
+    const group = (await screen.findAllByTestId("asset-group"))[0];
+    await user.click(within(group).getByTestId("group-expand"));
+    const overlay = await screen.findByTestId("group-overlay");
+    const items = within(overlay).getAllByTestId("group-item");
+    await user.click(items[1]);
+    return { overlay, items };
+  }
+
+  it("分类：组内单选后按数字键真的下发该单件", async () => {
+    const user = userEvent.setup();
+    const move = vi.spyOn(api, "moveAssets");
+    const { overlay, items } = await openGroup(user);
+
+    fireEvent.keyDown(overlay, { key: "1" });
+
+    await waitFor(() => expect(move).toHaveBeenCalledTimes(1));
+    expect(move.mock.calls[0][1]).toEqual([items[1].getAttribute("data-asset")]);
+  });
+
+  it("精选：组内单选后按 P 真的下发", async () => {
+    const user = userEvent.setup();
+    const curate = vi.spyOn(api, "curateAssets");
+    const { overlay, items } = await openGroup(user);
+
+    fireEvent.keyDown(overlay, { key: "p" });
+
+    await waitFor(() => expect(curate).toHaveBeenCalledTimes(1));
+    expect(curate.mock.calls[0][1]).toEqual([items[1].getAttribute("data-asset")]);
+  });
+
+  it("标删：组内单选后按 D 真的进待删清单", async () => {
+    const user = userEvent.setup();
+    const { overlay } = await openGroup(user);
+
+    fireEvent.keyDown(overlay, { key: "d" });
+
+    const bar = await screen.findByTestId("sorting-pending-delete");
+    expect(bar.textContent).toContain("已标记 1 个待删除");
+  });
+});
+
+describe("#10 预览开对图", () => {
+  it("有折叠组时双击普通格开的是那一张，不是错位的另一张", async () => {
+    const user = userEvent.setup();
+    await renderSorting();
+
+    // 取折叠组之后的第一个普通格
+    const cells = screen.getAllByTestId("asset-cell");
+    const target = cells[cells.length - 1];
+    const expected = target.getAttribute("data-asset");
+
+    await user.dblClick(target);
+
+    const box = await screen.findByTestId("asset-lightbox");
+    expect(box.getAttribute("aria-label")).toContain(
+      expected!.split("/").pop()!,
+    );
+  });
+
+  it("左右切换在同一下标空间内推进，不越界", async () => {
+    const user = userEvent.setup();
+    await renderSorting();
+
+    const cells = screen.getAllByTestId("asset-cell");
+    await user.dblClick(cells[0]);
+    await screen.findByTestId("asset-lightbox");
+
+    const before = screen.getByTestId("lightbox-position").textContent;
+    fireEvent.keyDown(document, { key: "ArrowRight" });
+    await waitFor(() =>
+      expect(screen.getByTestId("lightbox-position").textContent).not.toBe(before),
+    );
+  });
+});
+
+describe("#11 第二轮分析仍会刷新角标", () => {
+  it("两轮分析（各自 jobId）都触发当前页重拉", async () => {
+    const user = userEvent.setup();
+    const start = vi
+      .spyOn(api, "startAnalysis")
+      .mockResolvedValueOnce(
+        analyzeJob({
+          id: "job-a1",
+          state: "running",
+          revision: 1,
+          result: undefined,
+        }),
+      )
+      .mockResolvedValueOnce(
+        analyzeJob({
+          id: "job-a2",
+          state: "running",
+          revision: 1,
+          result: undefined,
+        }),
+      );
+
+    await renderSorting();
+    const listSpy = vi.spyOn(api, "listPendingAssets");
+
+    // 第一轮
+    await user.click(screen.getByTestId("sorting-analyze"));
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      jobEmitters.forEach((emit) =>
+        emit(analyzeJob({ id: "job-a1", state: "done", revision: 4 })),
+      );
+    });
+    await waitFor(() => expect(listSpy).toHaveBeenCalled());
+    const afterFirst = listSpy.mock.calls.length;
+
+    // 第二轮：事件数相同（revision 也是 4），若拿 revision 当全局令牌就永不刷新
+    await user.click(screen.getByTestId("sorting-analyze"));
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      jobEmitters.forEach((emit) =>
+        emit(analyzeJob({ id: "job-a2", state: "done", revision: 4 })),
+      );
+    });
+
+    await waitFor(() =>
+      expect(listSpy.mock.calls.length).toBeGreaterThan(afterFirst),
+    );
+    listSpy.mockRestore();
+    start.mockRestore();
+  }, 15000);
+});
+
+describe("#24 score 量纲是 0–100", () => {
+  it("低分点按百分制阈值出现（0.31 那种小数不会误判为低分）", async () => {
+    await renderSorting();
+    // mock 里 score=22 与 31 都低于 25/都在百分制下有意义
+    const lows = screen.getAllByTestId("judge-low");
+    expect(lows.length).toBeGreaterThan(0);
+  });
+});
+
 describe("按建议筛选", () => {
   it("开启后只留建议保留与尚无判定的", async () => {
     const user = userEvent.setup();

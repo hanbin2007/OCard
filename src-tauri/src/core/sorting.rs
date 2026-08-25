@@ -341,6 +341,9 @@ pub fn curate_assets(
                 }
                 let tmp = dir.join(format!(".{}.curatepart", uuid::Uuid::new_v4()));
                 fs::copy(&src, &tmp).map_err(|e| format!("复制失败: {e}"))?;
+                if let Ok(m) = fs::metadata(&src) {
+                    fsx::preserve_times_counted(&m, &tmp);
+                }
                 fsx::rename_no_replace(&tmp, &dst).map_err(|e| {
                     let _ = fs::remove_file(&tmp);
                     if e.kind() == std::io::ErrorKind::AlreadyExists {

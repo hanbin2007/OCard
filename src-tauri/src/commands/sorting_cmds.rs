@@ -82,12 +82,21 @@ impl Drop for DeliveryGuard {
 }
 
 /// fsx 最后回退(检查+改名)被使用过:发一次性告警(零静默,复验轮二 P1)。
+/// 同点位顺带消费时间戳保留失败计数(拷贝路径共用的收尾钩子)。
 pub(crate) fn notify_if_unsafe_fallback<R: tauri::Runtime>(app: &AppHandle<R>) {
     if crate::core::fsx::take_unsafe_fallback_flag() {
         notify::warn(
             app,
             "fsx-fallback-window",
             "当前文件系统不支持原子防覆盖改名与硬链接,零覆盖保障退化为「复查后改名」,并发写入存在极小竞态窗口;建议确认 NAS 协议(SMB3/NFSv4)".into(),
+        );
+    }
+    let n = crate::core::fsx::take_times_preserve_failures();
+    if n > 0 {
+        notify::warn(
+            app,
+            "timestamps-not-preserved",
+            format!("{n} 个文件的源时间戳未能保留(目标文件系统限制或权限);文件内容不受影响"),
         );
     }
 }

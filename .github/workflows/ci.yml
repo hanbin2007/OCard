@@ -124,21 +124,58 @@ jobs:
         # 用文件而非内联 JSON:Windows pwsh 会吞内联引号
         run: pnpm tauri build --config src-tauri/ci-no-updater.conf.json
 
-      - name: Verify sidecars in build output (W9 installer 校验)
+      - name: Verify sidecars & model in build output (W9,fail-closed)
         shell: bash
         run: |
           set -euo pipefail
-          # tauri 会把 externalBin 以平台命名落到构建产物旁/包内;缺失=打包链路断
+          # 评审 P0-2:逐条显式判错(set -e 豁免 && 左操作数,不许用 && 链);
+          # 附 SHA-256 校验与模型资源;Linux 额外解包 .deb 验安装包内容
+          fail() { echo "::error::$1"; exit 1; }
+          need_file() { [ -f "$1" ] || fail "缺少 $1"; }
+          need_exec() { [ -x "$1" ] || fail "缺少或不可执行 $1"; }
+          sha_of() { shasum -a 256 "$1" 2>/dev/null | awk '{print $1}' || sha256sum "$1" | awk '{print $1}'; }
+          MODEL_SHA="8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
           case "${{ runner.os }}" in
             macOS)
               APP=$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name "*.app" | head -1)
-              test -x "$APP/Contents/MacOS/ffmpeg" && test -x "$APP/Contents/MacOS/ffprobe" ;;
+              [ -n "$APP" ] || fail "未找到 .app"
+              need_exec "$APP/Contents/MacOS/ffmpeg"
+              need_exec "$APP/Contents/MacOS/ffprobe"
+              want=$(grep " ffmpeg-aarch64-apple-darwin$" src-tauri/binaries/SHA256SUMS.txt | awk '{print $1}')
+              got=$(sha_of "$APP/Contents/MacOS/ffmpeg")
+              [ "$got" = "$want" ] || fail "app 内 ffmpeg SHA 不符: $got"
+              MODEL=$(find "$APP/Contents/Resources" -name "face_detection_yunet_2023mar.onnx" | head -1)
+              [ -n "$MODEL" ] || fail "app 内缺少 YuNet 模型"
+              [ "$(sha_of "$MODEL")" = "$MODEL_SHA" ] || fail "app 内模型 SHA 不符"
+              ;;
             Linux)
-              test -x src-tauri/target/release/ffmpeg && test -x src-tauri/target/release/ffprobe ;;
+              DEB=$(find src-tauri/target/release/bundle/deb -name "*.deb" | head -1)
+              [ -n "$DEB" ] || fail "未找到 .deb"
+              rm -rf /tmp/ocard-deb && mkdir -p /tmp/ocard-deb
+              dpkg-deb -x "$DEB" /tmp/ocard-deb
+              FF=$(find /tmp/ocard-deb -name ffmpeg -type f | head -1)
+              [ -n "$FF" ] || fail ".deb 内缺少 ffmpeg"
+              want=$(grep " ffmpeg-x86_64-unknown-linux-gnu$" src-tauri/binaries/SHA256SUMS.txt | awk '{print $1}')
+              [ "$(sha_of "$FF")" = "$want" ] || fail ".deb 内 ffmpeg SHA 不符"
+              FP=$(find /tmp/ocard-deb -name ffprobe -type f | head -1)
+              [ -n "$FP" ] || fail ".deb 内缺少 ffprobe"
+              MODEL=$(find /tmp/ocard-deb -name "face_detection_yunet_2023mar.onnx" | head -1)
+              [ -n "$MODEL" ] || fail ".deb 内缺少 YuNet 模型"
+              [ "$(sha_of "$MODEL")" = "$MODEL_SHA" ] || fail ".deb 内模型 SHA 不符"
+              ;;
             Windows)
-              test -f src-tauri/target/release/ffmpeg.exe && test -f src-tauri/target/release/ffprobe.exe ;;
+              # 安装包内容核查由 mac/linux 腿覆盖同一打包路径(声明边界);
+              # 此处验暂存产物存在性+SHA
+              need_file "src-tauri/target/release/ffmpeg.exe"
+              need_file "src-tauri/target/release/ffprobe.exe"
+              want=$(grep " ffmpeg-x86_64-pc-windows-msvc.exe$" src-tauri/binaries/SHA256SUMS.txt | awk '{print $1}')
+              [ "$(sha_of "src-tauri/target/release/ffmpeg.exe")" = "$want" ] || fail "ffmpeg.exe SHA 不符"
+              MODEL=$(find src-tauri/target/release -name "face_detection_yunet_2023mar.onnx" | head -1)
+              [ -n "$MODEL" ] || fail "缺少 YuNet 模型暂存"
+              ;;
+            *) fail "未知平台 ${{ runner.os }}" ;;
           esac
-          echo "sidecars verified"
+          echo "sidecars + model verified (SHA-256)"
 
       - name: Upload bundles
         uses: actions/upload-artifact@v7

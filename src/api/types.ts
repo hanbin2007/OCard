@@ -607,7 +607,10 @@ export interface ProxyResult {
 export interface StartProxyInput {
   projectId: string;
   cameraFolders?: string[];
+  /** 忽略「高负载」判定，把所有素材都纳入——**不会**重转已有输出 */
   forceAll?: boolean;
+  /** 强制重转：先删除已有代理再转。破坏性操作，必须经二次确认 */
+  retranscode?: boolean;
 }
 
 /* ------------------------------------------------------------------ *

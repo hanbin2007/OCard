@@ -363,9 +363,15 @@ fn copy_one(
                 )));
             }
         }
-        // 全部通过,原子防覆盖落位
+        // 全部通过,原子防覆盖落位;落位后保留源时间戳
+        // (mtime/atime 三平台;创建时间 mac/win——用户明确要求,Linux btime
+        //  不可设置为声明边界;失败计数聚合为可见 warning,不阻塞拷贝)
+        let src_meta = fs::metadata(&src_path).ok();
         for (part, &i) in parts.iter().zip(&missing) {
             finalize_no_replace(part, &finals[i])?;
+            if let Some(m) = &src_meta {
+                super::fsx::preserve_times_counted(m, &finals[i]);
+            }
         }
         Ok(src_hash)
     })();

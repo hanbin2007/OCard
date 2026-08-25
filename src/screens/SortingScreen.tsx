@@ -20,6 +20,7 @@ import {
   buildGridEntries,
   clickSelection,
   filterBySuggestion,
+  flattenEntries,
   resolveEntryIds,
   emptySelection,
   initialPendingDelete,
@@ -42,6 +43,8 @@ const PAGE_SIZE = 200;
 const INDEX_REFRESH_MIN_MS = 2000;
 /** 连续多少张缩略图加载失败就在屏内亮出横幅（后端另发 thumb-protocol-degraded 通知） */
 const THUMB_FAIL_BANNER_AT = 20;
+/** 后端 score 量纲是 0–100，低分阈值按百分制取 25 */
+export const LOW_SCORE_AT = 25;
 
 /** 非照片类型的中性徽章文案；other = 后端明确的「其他类型」，不再伪装成视频 */
 const KIND_LABEL: Record<SortingAsset["kind"], string> = {
@@ -94,7 +97,8 @@ export function SortingScreen() {
     pendingDeleteReducer,
     initialPendingDelete,
   );
-  const [previewIndex, setPreviewIndex] = useState<number | null>(null);
+  /** 预览锚在 assetId 上，避免折叠/筛选后下标错位 */
+  const [previewId, setPreviewId] = useState<string | null>(null);
   const [columns, setColumns] = useState(6);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [busy, setBusy] = useState(false);
@@ -128,7 +132,26 @@ export function SortingScreen() {
     () => filterBySuggestion(assets, suggestionOnly),
     [assets, suggestionOnly],
   );
-  const entries = useMemo(() => buildGridEntries(visibleAssets), [visibleAssets]);
+  const entries = useMemo(
+    () =>
+      buildGridEntries(visibleAssets, (reason) =>
+        notifyRef.current("warning", "sorting-grouping-degraded", reason),
+      ),
+    [visibleAssets],
+  );
+  /** 预览的唯一下标空间：网格显示顺序摊平后的素材列表 */
+  const previewAssets = useMemo(() => flattenEntries(entries), [entries]);
+  const openGroupItems = useMemo(() => {
+    if (!openGroup) return [] as SortingAsset[];
+    const entry = entries.find(
+      (e) => e.kind === "group" && e.groupId === openGroup,
+    );
+    return entry && entry.kind === "group" ? entry.items : [];
+  }, [entries, openGroup]);
+
+  const previewIndex = previewId
+    ? previewAssets.findIndex((a) => a.id === previewId)
+    : -1;
   /** 选区认的是「条目 id」——组条目用合成 id，等高行与选择模型都不受影响 */
   const assetIds = useMemo(() => entries.map((e) => e.id), [entries]);
   const markedSet = useMemo(() => new Set(pendingDelete.marked), [pendingDelete.marked]);
@@ -209,11 +232,16 @@ export function SortingScreen() {
   }, [projectId]);
 
   // 分析作业转 done 后重拉当前页，让 judgement 角标出来
-  const analyzeDoneRev = analyzeJob?.state === "done" ? analyzeJob.revision : 0;
+  // 按 jobId 判定「这一轮分析刚结束」——revision 是 per-job 的，
+  // 两轮事件数相同时用它当全局令牌会让第二轮永不刷新
+  const analyzeDoneId = analyzeJob?.state === "done" ? analyzeJob.id : null;
+  const refreshedAnalyzeIdRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!analyzeDoneRev) return;
+    if (!analyzeDoneId) return;
+    if (refreshedAnalyzeIdRef.current === analyzeDoneId) return;
+    refreshedAnalyzeIdRef.current = analyzeDoneId;
     void refreshLoadedAssets();
-  }, [analyzeDoneRev, refreshLoadedAssets]);
+  }, [analyzeDoneId, refreshLoadedAssets]);
 
   // 「待修 → 已修」流转提示（PRD §5.4）：只提示，删除仍走既有回收站流程
   useEffect(() => {
@@ -571,21 +599,20 @@ export function SortingScreen() {
           ctrlKey: event.ctrlKey,
         },
         categories,
-        { previewOpen: previewIndex !== null },
+        { previewOpen: previewId !== null },
       );
       if (!action) return;
       event.preventDefault();
 
       switch (action.type) {
         case "move": {
-          if (previewIndex !== null) {
+          if (previewIndex >= 0) {
             const delta = action.key === "ArrowRight" ? 1 : -1;
             const next = Math.min(
-              assets.length - 1,
+              previewAssets.length - 1,
               Math.max(0, previewIndex + delta),
             );
-            setPreviewIndex(next);
-            setSelection(clickSelection(assetIds, selection, assetIds[next]));
+            setPreviewId(previewAssets[next]?.id ?? null);
             return;
           }
           setSelection((prev) =>
@@ -603,11 +630,13 @@ export function SortingScreen() {
           setSelection((prev) => selectAll(assetIds, prev));
           return;
         case "preview": {
-          if (cursorIndex >= 0) setPreviewIndex(cursorIndex);
+          // 光标可能停在折叠组上：预览打开组内第一张
+          const targets = resolveEntryIds(entries, actionTargets(selection));
+          if (targets.length > 0) setPreviewId(targets[0]);
           return;
         }
         case "closePreview":
-          setPreviewIndex(null);
+          setPreviewId(null);
           return;
         case "assign":
           void runAssign(action.categoryId);
@@ -638,7 +667,9 @@ export function SortingScreen() {
     },
     [
       categories,
+      previewId,
       previewIndex,
+      previewAssets,
       assets.length,
       assetIds,
       selection,
@@ -915,7 +946,7 @@ export function SortingScreen() {
                           clickSelection(assetIds, prev, entry.id, modifiers),
                         )
                       }
-                      onOpen={() => setPreviewIndex(index)}
+                      onOpen={() => setPreviewId(entry.asset.id)}
                       onThumbError={onThumbError}
                       onThumbLoad={onThumbLoad}
                     />
@@ -945,7 +976,7 @@ export function SortingScreen() {
               </span>
               {selection.selected.length > 0 ? (
                 <span className="push-right" data-testid="sorting-selected-count">
-                  已选 {selection.selected.length}
+                  已选 {resolveEntryIds(entries, selection.selected).length}
                 </span>
               ) : null}
             </div>
@@ -1004,34 +1035,45 @@ export function SortingScreen() {
         </div>
       </div>
 
-      {openGroup ? (
+      {openGroupItems.length > 0 ? (
         <GroupOverlay
-          items={
-            entries.find((e) => e.kind === "group" && e.groupId === openGroup)
-              ?.kind === "group"
-              ? (entries.find(
-                  (e) => e.kind === "group" && e.groupId === openGroup,
-                ) as { items: SortingAsset[] }).items
-              : []
-          }
+          items={openGroupItems}
           selectedSet={selectedSet}
           markedSet={markedSet}
+          /* 关键：连选也在**组成员 id 空间**里做，
+             展开层选中的裸素材 id 由 resolveEntryIds 兜住，不再被静默丢弃 */
           onSelect={(id, modifiers) =>
-            setSelection((prev) => clickSelection(assetIds, prev, id, modifiers))
+            setSelection((prev) =>
+              clickSelection(
+                openGroupItems.map((i) => i.id),
+                prev,
+                id,
+                modifiers,
+              ),
+            )
           }
+          onKeyDown={handleKeyDown}
+          onThumbError={onThumbError}
+          onThumbLoad={onThumbLoad}
           onClose={() => setOpenGroup(null)}
         />
       ) : null}
 
-      {previewIndex !== null && assets[previewIndex] ? (
+      {previewIndex >= 0 && previewAssets[previewIndex] ? (
         <AssetLightbox
-          asset={assets[previewIndex]}
+          asset={previewAssets[previewIndex]}
           index={previewIndex}
-          total={assets.length}
-          onClose={() => setPreviewIndex(null)}
-          onPrev={() => setPreviewIndex(Math.max(0, previewIndex - 1))}
+          total={previewAssets.length}
+          onClose={() => setPreviewId(null)}
+          onPrev={() =>
+            setPreviewId(previewAssets[Math.max(0, previewIndex - 1)].id)
+          }
           onNext={() =>
-            setPreviewIndex(Math.min(assets.length - 1, previewIndex + 1))
+            setPreviewId(
+              previewAssets[
+                Math.min(previewAssets.length - 1, previewIndex + 1)
+              ].id,
+            )
           }
         />
       ) : null}
@@ -1154,7 +1196,9 @@ function JudgementBadges({ judgement }: { judgement?: SortingAsset["judgement"] 
       {judgement.overExposed ? <Badge tone="warn">过曝</Badge> : null}
       {judgement.underExposed ? <Badge tone="warn">欠曝</Badge> : null}
       {/* 分数只用区间表达，不显示数值 */}
-      {judgement.score < 0.4 ? <span className="dot judge-dot--low" title="低分" /> : null}
+      {judgement.score < LOW_SCORE_AT ? (
+        <span className="dot judge-dot--low" title="低分" data-testid="judge-low" />
+      ) : null}
     </span>
   );
 }
@@ -1246,14 +1290,26 @@ function GroupOverlay({
   selectedSet,
   markedSet,
   onSelect,
+  onKeyDown,
+  onThumbError,
+  onThumbLoad,
   onClose,
 }: {
   items: SortingAsset[];
   selectedSet: Set<string>;
   markedSet: Set<string>;
   onSelect: (id: string, modifiers: { shift?: boolean; meta?: boolean }) => void;
+  onKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => void;
+  onThumbError: () => void;
+  onThumbLoad: () => void;
   onClose: () => void;
 }) {
+  const boxRef = useRef<HTMLDivElement>(null);
+  // 展开层是 overlay，按键不会冒泡回网格——这里自己接，并把焦点拿过来
+  useEffect(() => {
+    boxRef.current?.focus();
+  }, []);
+
   return (
     <div className="overlay" onClick={onClose}>
       <div
@@ -1262,6 +1318,9 @@ function GroupOverlay({
         aria-modal="true"
         aria-label="连拍组"
         data-testid="group-overlay"
+        ref={boxRef}
+        tabIndex={0}
+        onKeyDown={onKeyDown}
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="dialog__title">连拍组（{items.length} 张）</h2>
@@ -1286,11 +1345,11 @@ function GroupOverlay({
                 })
               }
             >
-              {asset.thumbReady && asset.thumbnail ? (
-                <img className="asset__thumb" src={asset.thumbnail} alt="" />
-              ) : (
-                <div className="asset__thumb asset__thumb--empty" />
-              )}
+              <GroupThumb
+                asset={asset}
+                onThumbError={onThumbError}
+                onThumbLoad={onThumbLoad}
+              />
               <span className="asset__name truncate">{asset.fileName}</span>
               <JudgementBadges judgement={asset.judgement} />
             </div>
@@ -1302,6 +1361,42 @@ function GroupOverlay({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+
+/** 展开层缩略图：404 转占位，并计入连续失败统计（与主网格同一口径） */
+function GroupThumb({
+  asset,
+  onThumbError,
+  onThumbLoad,
+}: {
+  asset: SortingAsset;
+  onThumbError: () => void;
+  onThumbLoad: () => void;
+}) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [asset.thumbnail]);
+
+  if (asset.thumbReady && asset.thumbnail && !failed) {
+    return (
+      <img
+        className="asset__thumb"
+        src={asset.thumbnail}
+        alt=""
+        data-testid="group-item-thumb"
+        onError={() => {
+          setFailed(true);
+          onThumbError();
+        }}
+        onLoad={onThumbLoad}
+      />
+    );
+  }
+  return (
+    <div className="asset__thumb asset__thumb--empty" data-testid="group-item-no-thumb">
+      <span className="text-2xs dim">{failed ? "预览不可用" : "索引中"}</span>
     </div>
   );
 }
