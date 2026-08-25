@@ -538,7 +538,6 @@
   display: flex;
   flex-direction: column;
   background: var(--overlay);
-  backdrop-filter: blur(2px);
 }
 
 .lightbox__bar {

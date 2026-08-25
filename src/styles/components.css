@@ -11,7 +11,8 @@
   padding: 0 var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  background: var(--panel);
+  /* 次级按钮比所在面高一档，不靠阴影也能读作可点控件 */
+  background: var(--panel-raised);
   color: var(--text-primary);
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
@@ -167,12 +168,11 @@
   padding: 0 var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  background: var(--bg);
+  /* 输入面比所在面板沉一档，形成"凹"的层次 */
+  background: var(--field);
   color: var(--text-primary);
   font-size: var(--text-sm);
-  transition:
-    border-color var(--transition),
-    box-shadow var(--transition);
+  transition: border-color var(--transition);
 }
 
 .textarea {
@@ -194,11 +194,11 @@
   border-color: var(--border-strong);
 }
 
+/* 焦点不再用光晕阴影：边框变色 + 全局 :focus-visible 轮廓已经够清楚 */
 .input:focus,
 .select:focus,
 .textarea:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
   outline: none;
 }
 
@@ -638,6 +638,8 @@
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
   background: var(--panel);
+  /* 浮层是唯一允许阴影的层级 */
+  box-shadow: var(--shadow-overlay);
 }
 
 .dialog__title {
@@ -782,6 +784,7 @@
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
   background: var(--panel);
+  box-shadow: var(--shadow-overlay);
   overflow: hidden;
 }
 
