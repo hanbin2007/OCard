@@ -50,7 +50,7 @@ jobs:
       - run: pnpm test
 
       - name: Cache ffmpeg sidecar
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: src-tauri/binaries
           key: ffmpeg-${{ runner.os }}-${{ hashFiles('src-tauri/binaries/SHA256SUMS.txt') }}
@@ -123,7 +123,7 @@ jobs:
 
       # 路径/rename/卷检测行为平台相关,Rust 测试三平台全跑(评审建议)
       - name: Cache ffmpeg sidecar
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: src-tauri/binaries
           key: ffmpeg-${{ runner.os }}-${{ hashFiles('src-tauri/binaries/SHA256SUMS.txt') }}
@@ -199,7 +199,7 @@ jobs:
       # 否则改版本后仍会命中旧 cache、把漂移掩盖成"没变化"
       - name: Cache tauri-driver binary
         id: cache-tauri-driver
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/tauri-driver
           key: tauri-driver-${{ runner.os }}-${{ env.TAURI_DRIVER_VERSION }}
@@ -211,7 +211,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: Cache ffmpeg sidecar
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: src-tauri/binaries
           key: ffmpeg-${{ runner.os }}-${{ hashFiles('src-tauri/binaries/SHA256SUMS.txt') }}
