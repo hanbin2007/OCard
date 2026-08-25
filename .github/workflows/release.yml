@@ -47,7 +47,7 @@ jobs:
 
       # build.rs(tauri-build)会校验 externalBin 路径存在,cargo 侧检查也需要 sidecar
       - name: Cache ffmpeg sidecar
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: src-tauri/binaries
           key: ffmpeg-${{ runner.os }}-${{ hashFiles('src-tauri/binaries/SHA256SUMS.txt') }}
@@ -97,7 +97,7 @@ jobs:
       # 干净 runner 上这些文件不存在 → 不拉取则 tauri build 必失败。
       # 与 CI 保持同一套拉取+SHA-256 校验(fail-closed,scripts/fetch-ffmpeg.sh)。
       - name: Cache ffmpeg sidecar
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: src-tauri/binaries
           key: ffmpeg-${{ runner.os }}-${{ hashFiles('src-tauri/binaries/SHA256SUMS.txt') }}
@@ -144,7 +144,7 @@ jobs:
       # 同 release-linux:externalBin 前置,干净 runner 必须先拉 sidecar。
       # fetch 脚本是 bash,windows runner 默认 shell 为 pwsh → 显式 shell: bash(git-bash)
       - name: Cache ffmpeg sidecar
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: src-tauri/binaries
           key: ffmpeg-${{ runner.os }}-${{ hashFiles('src-tauri/binaries/SHA256SUMS.txt') }}
@@ -207,7 +207,7 @@ jobs:
 
       # 同 release-linux:externalBin 前置,干净 runner 必须先拉 sidecar
       - name: Cache ffmpeg sidecar
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: src-tauri/binaries
           key: ffmpeg-${{ runner.os }}-${{ hashFiles('src-tauri/binaries/SHA256SUMS.txt') }}
