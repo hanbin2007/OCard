@@ -505,7 +505,7 @@ pub fn list_copy_files(
     })
 }
 
-use crate::core::paths::{normalize_lexical, validate_dest_layout};
+use crate::core::paths::normalize_lexical;
 
 /// 校验源卷与目的地(评审 H5/P1-5):卷白名单 + 布局校验(core::paths)。
 fn validate_copy_paths(source_root: &Path, dest_targets: &[PathBuf]) -> CmdResult<()> {
@@ -520,7 +520,8 @@ fn validate_copy_paths(source_root: &Path, dest_targets: &[PathBuf]) -> CmdResul
             source_root_n.display()
         ));
     }
-    validate_dest_layout(source_root, dest_targets)
+    // R5 终审:canonical 投影复检(目的地根上级链接回源卡必须在此拦下)
+    crate::core::paths::validate_dest_layout_projected(source_root, dest_targets)
 }
 
 /// 目标夹已存在且非空 → 需要人工确认(评审 F1 的第一道闸)。

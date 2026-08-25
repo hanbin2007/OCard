@@ -259,30 +259,53 @@ fn src_provenance_fp(rel: &str, abs: &Path) -> Option<u64> {
     ))
 }
 
-fn write_provenance(final_out: &Path, rel: &str, abs: &Path) {
-    let Some(fp) = src_provenance_fp(rel, abs) else {
-        return; // 源元数据读不出:sidecar 缺席会让后续 skip 判失败,方向 fail-closed
-    };
-    let body = serde_json::json!({ "srcRel": rel, "srcFingerprint": fp.to_string() });
-    let tmp = provenance_path(final_out).with_extension("json.tmp");
-    if std::fs::write(&tmp, serde_json::to_vec(&body).unwrap_or_default()).is_ok() {
-        let _ = std::fs::rename(&tmp, provenance_path(final_out));
+/// R5 三票:写入必须**安全且 fail-closed**——不可预测独占临时名(可预测名
+/// 可被预置成指向项目外的链接,fs::write 会跟随并截断外部文件)、临时/终名
+/// 拒链接、任何失败向上返回(调用方不得计 converted)。sidecar 同时绑定
+/// **产物哈希**(只绑源指纹时,保留旧 sidecar 换掉视频仍可通过)。
+fn write_provenance(final_out: &Path, rel: &str, abs: &Path) -> std::result::Result<(), String> {
+    let fp = src_provenance_fp(rel, abs).ok_or("源文件元数据不可读")?;
+    let out_hash =
+        crate::core::hash::xxh3_file(final_out).map_err(|e| format!("产物哈希失败: {e}"))?;
+    let body = serde_json::json!({
+        "srcRel": rel,
+        "srcFingerprint": fp.to_string(),
+        "outXxh3": out_hash,
+    });
+    let sidecar = provenance_path(final_out);
+    if paths::is_symlink(&sidecar) {
+        return Err("来源指纹位置是符号链接,拒绝写入".into());
     }
+    let tmp = final_out.with_file_name(format!(".{}.srcjson.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, serde_json::to_vec(&body).unwrap_or_default())
+        .map_err(|e| format!("来源指纹写入失败: {e}"))?;
+    let _ = std::fs::remove_file(&sidecar); // 本作业刚落位产物,残留旧 sidecar 属陈旧态
+    crate::core::fsx::rename_no_replace(&tmp, &sidecar).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("来源指纹落位失败: {e}")
+    })
 }
 
-/// 校验既有产物的来源身份;Err 携带人话原因。
+/// 校验既有产物的来源身份 + 产物自身哈希;Err 携带人话原因。
 fn provenance_matches(final_out: &Path, rel: &str, abs: &Path) -> std::result::Result<(), String> {
     let p = provenance_path(final_out);
+    if paths::is_symlink(&p) {
+        return Err("来源指纹记录是符号链接,拒绝采信".into());
+    }
     let text = std::fs::read_to_string(&p)
         .map_err(|_| "缺少来源指纹记录(.src.json),无法确认产物属于当前源".to_string())?;
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|_| "来源指纹记录损坏".to_string())?;
     let want = src_provenance_fp(rel, abs).ok_or("源文件元数据不可读")?;
-    if v["srcFingerprint"].as_str() == Some(want.to_string().as_str()) {
-        Ok(())
-    } else {
-        Err("来源指纹不符:该产物属于另一版本/另一文件的源".into())
+    if v["srcFingerprint"].as_str() != Some(want.to_string().as_str()) {
+        return Err("来源指纹不符:该产物属于另一版本/另一文件的源".into());
     }
+    // R5 三票:sidecar 还要钉住产物本身——否则「留旧 sidecar、换新视频」可绕过
+    let cur = crate::core::hash::xxh3_file(final_out).map_err(|e| format!("产物哈希失败: {e}"))?;
+    if v["outXxh3"].as_str() != Some(cur.as_str()) {
+        return Err("产物哈希与指纹记录不符(产物被替换过)".into());
+    }
+    Ok(())
 }
 
 /// 转码作业出口保证(R4 终审 P1):body 从任何一条 `?` 提前失败退出时,
@@ -809,16 +832,23 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                                     .map_err(|e| format!("落位失败: {e}"))
                             });
                         match verdict {
-                            Ok(()) => {
-                                write_provenance(&final_out, rel, abs);
-                                result.converted += 1;
-                                // R2 P2:末文件覆写会把混合批报成单一编码器——如实标「混合」
-                                if result.converted == 1 {
-                                    result.used_encoder = used.clone();
-                                } else if result.used_encoder != used {
-                                    result.used_encoder = "混合".into(); // 一旦混编,保持「混合」
+                            Ok(()) => match write_provenance(&final_out, rel, abs) {
+                                Err(e) => result.failures.push(FailureDto {
+                                    rel: rel.clone(),
+                                    message: format!(
+                                        "产物已生成但来源指纹写入失败({e}):未计入完成,重跑会重新校验"
+                                    ),
+                                }),
+                                Ok(()) => {
+                                    result.converted += 1;
+                                    // R2 P2:末文件覆写会把混合批报成单一编码器——如实标「混合」
+                                    if result.converted == 1 {
+                                        result.used_encoder = used.clone();
+                                    } else if result.used_encoder != used {
+                                        result.used_encoder = "混合".into(); // 一旦混编,保持「混合」
+                                    }
                                 }
-                            }
+                            },
                             Err(e) => {
                                 let _ = std::fs::remove_file(&tmp);
                                 result.failures.push(FailureDto {
@@ -1447,15 +1477,22 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                                     .map_err(|e| format!("落位失败: {e}"))
                             });
                         match verdict {
-                            Ok(()) => {
-                                write_provenance(&final_out, rel, abs);
-                                result.converted += 1;
-                                if result.converted == 1 {
-                                    result.used_encoder = used.clone();
-                                } else if result.used_encoder != used {
-                                    result.used_encoder = "混合".into(); // 一旦混编,保持「混合」
+                            Ok(()) => match write_provenance(&final_out, rel, abs) {
+                                Err(e) => result.failures.push(FailureDto {
+                                    rel: rel.clone(),
+                                    message: format!(
+                                        "产物已生成但来源指纹写入失败({e}):未计入完成,重跑会重新校验"
+                                    ),
+                                }),
+                                Ok(()) => {
+                                    result.converted += 1;
+                                    if result.converted == 1 {
+                                        result.used_encoder = used.clone();
+                                    } else if result.used_encoder != used {
+                                        result.used_encoder = "混合".into(); // 一旦混编,保持「混合」
+                                    }
                                 }
-                            }
+                            },
                             Err(e) => {
                                 let _ = std::fs::remove_file(&tmp);
                                 result.failures.push(FailureDto {

@@ -235,12 +235,16 @@ pub fn run_copy(
             break;
         }
 
+        // R5 三票 P1:时间戳快照在 file_done 的源哈希**之前**采集——
+        // 修复目标场景里,验证读同样会刷新源 atime
+        let pre_meta = fs::metadata(req.source_root.join(rel_to_native(rel))).ok();
         let status = if file_done(m, &req.source_root, rel, *size, &req.destinations) {
             FileStatus::SkippedResume
         } else {
             match copy_one(
                 &req.source_root,
                 rel,
+                pre_meta,
                 &req.destinations,
                 &req.task_tag,
                 &mut |delta| {
@@ -321,6 +325,7 @@ pub fn run_copy(
 fn copy_one(
     source_root: &Path,
     rel: &str,
+    src_meta: Option<fs::Metadata>,
     destinations: &[PathBuf],
     task_tag: &str,
     on_chunk: &mut dyn FnMut(u64),
@@ -343,9 +348,8 @@ fn copy_one(
     // planned 项经 resume 并回后仍会读到卡外)——canonical 断言真实位置在源根内
     super::paths::assert_within(source_root, &src_path).map_err(super::CoreError::Invalid)?;
 
-    // 时间戳快照必须在**任何读取源之前**采集(R5:pre_existing 分支也会先
-    // 哈希源——读源刷新 atime;获取失败计入保留失败聚合告警)
-    let src_meta = fs::metadata(&src_path).ok();
+    // 时间戳快照由调用方在 file_done 源哈希之前采集传入(R5 三票 P1);
+    // 获取失败计入保留失败聚合告警
     if src_meta.is_none() {
         super::fsx::note_times_preserve_failures(destinations.len() as u64);
     }

@@ -868,7 +868,9 @@ fn proxy_transcode_end_to_end_with_real_ffmpeg() {
     std::fs::remove_file(&final_out).unwrap();
     let r4a = run_job();
     assert_eq!(r4a["result"]["converted"], 2, "两支源都应重转成功: {r4a}");
-    // 再用 C0001(1s 源)的有效代理顶换 C0002(3s 源)的产物——合法视频、错误来源
+    // R5 三票反例:**保留正确 sidecar、只替换视频文件**——用 C0001 的有效代理
+    // 顶换 C0002 的产物(C0002 的 sidecar 原样保留)。来源指纹匹配,但
+    // sidecar 里钉住的产物哈希必须把它拦下(时长校验是后面的第二道防线)
     let fake_done = final_out.with_file_name("C0002_MP4_proxy.mp4");
     std::fs::remove_file(&fake_done).unwrap();
     std::fs::copy(&final_out, &fake_done).unwrap();
@@ -880,9 +882,12 @@ fn proxy_transcode_end_to_end_with_real_ffmpeg() {
     assert!(
         fails.iter().any(|f| {
             f["rel"].as_str().unwrap_or_default().ends_with("C0002.MP4")
-                && f["message"].as_str().unwrap_or_default().contains("时长")
+                && f["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("产物哈希与指纹记录不符")
         }),
-        "合法但时长不符的冒充产物必须被完整校验拒绝: {r4}"
+        "保留 sidecar 只换视频必须被产物哈希绑定拒绝: {r4}"
     );
     assert_eq!(
         r4["result"]["alreadyTranscoded"], 1,

@@ -329,6 +329,21 @@ mod times_tests {
         let old_m = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 30);
         let old_a = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 20);
         let f = fs::OpenOptions::new().write(true).open(&src).unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            // R5 三票:created 也要预先拉开——否则「源/目标同刻创建」下
+            // 空实现也能靠 2 秒容差混过
+            use std::os::macos::fs::FileTimesExt;
+            let old_c = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 45);
+            f.set_times(
+                fs::FileTimes::new()
+                    .set_modified(old_m)
+                    .set_accessed(old_a)
+                    .set_created(old_c),
+            )
+            .unwrap();
+        }
+        #[cfg(not(target_os = "macos"))]
         f.set_times(fs::FileTimes::new().set_modified(old_m).set_accessed(old_a))
             .unwrap();
         drop(f);

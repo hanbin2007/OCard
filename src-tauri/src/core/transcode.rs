@@ -398,8 +398,21 @@ pub fn verify_output(
         ));
     }
     if let Some(h) = expect_height {
-        if out_info.height != h && src_info.height > h {
+        // R5 三票:代理滤镜是 scale=-2:1080——输出高度**恒等**目标(小源也会
+        // 放大),宽度按源宽高比精确推算(-2 取偶,容差 ±2)。
+        if out_info.height != h {
             return Err(format!("输出高度不符:期望 {h},实际 {}", out_info.height));
+        }
+        if src_info.width > 0 && src_info.height > 0 {
+            let expected_w =
+                ((src_info.width as f64) * (h as f64) / (src_info.height as f64)).round() as i64;
+            let dw = (out_info.width as i64 - expected_w).abs();
+            if dw > 2 || !out_info.width.is_multiple_of(2) {
+                return Err(format!(
+                    "输出宽度不符:按源宽高比期望约 {expected_w},实际 {}",
+                    out_info.width
+                ));
+            }
         }
     } else {
         // 归档语义:不缩放——输出几何必须与源完全一致(R5 终审:同时长
@@ -411,7 +424,9 @@ pub fn verify_output(
             ));
         }
     }
-    // 宽高比核对(两侧几何有效时;缩放路径宽度按 -2 取整,容差 2%)
+    // 宽高比核对(两侧几何有效时;缩放路径宽度按 -2 取整,容差 2%)。
+    // 声明边界:不解析 rotation/SAR——旋转元数据或非方形像素素材可能被
+    // 可见地误拒(fail-closed 方向,用户可用重转覆盖),不会静默放行。
     if src_info.width > 0 && src_info.height > 0 && out_info.width > 0 && out_info.height > 0 {
         let src_ar = src_info.width as f64 / src_info.height as f64;
         let out_ar = out_info.width as f64 / out_info.height as f64;

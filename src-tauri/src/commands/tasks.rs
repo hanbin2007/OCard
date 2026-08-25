@@ -231,7 +231,8 @@ pub fn prepare_resume(
         volumes,
         read_uid,
     )?;
-    crate::core::paths::validate_dest_layout(&resolved, dest_targets)?;
+    // R5 终审:续传同样走 canonical 投影复检(防目的地根上级链接回源卡)
+    crate::core::paths::validate_dest_layout_projected(&resolved, dest_targets)?;
     Ok(resolved)
 }
 

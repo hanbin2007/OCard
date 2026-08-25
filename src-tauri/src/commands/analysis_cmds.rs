@@ -611,10 +611,11 @@ mod video_thumb_tests {
         );
     }
 
-    /// 已有缓存必须验 JPEG 完整性:垃圾缓存不计成功,且重生成后的
-    /// AlreadyExists 分支也不许采信坏缓存(R4)。
+    /// R5 三票:坏缓存必须**删除并原子重建成功**——假 ffmpeg 产出真可解码
+    /// JPEG,证明重建路径闭环(而不是只证明拒绝);再用产出不可解码内容的
+    /// 假 ffmpeg 证明落位后验真会拒绝并清理。
     #[test]
-    fn video_thumb_rejects_corrupt_cached_jpeg() {
+    fn video_thumb_rebuilds_corrupt_cache_with_real_jpeg() {
         use std::io::Write;
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
@@ -624,20 +625,50 @@ mod video_thumb_tests {
         let cache = media::cached_thumb_path(&project, "1. 待分类/v.mp4", 1, 1);
         std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
         std::fs::write(&cache, b"garbage").unwrap();
-        // 假 ffmpeg 能产出合法 JPEG,但落位撞上既有坏缓存 → 不许采信坏缓存
-        let fake = tmp.path().join("ffmpeg");
+        // 真 JPEG 素材(用 image 生成,保证可解码),假 ffmpeg = cp
+        let real_jpg = tmp.path().join("real.jpg");
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            8,
+            8,
+            image::Rgb([128, 64, 32]),
+        ))
+        .save(&real_jpg)
+        .unwrap();
+        let fake_ok = tmp.path().join("ffmpeg");
         {
-            let mut f = std::fs::File::create(&fake).unwrap();
+            let mut f = std::fs::File::create(&fake_ok).unwrap();
+            f.write_all(
+                format!(
+                    "#!/bin/sh\nfor last; do :; done\ncp {} \"$last\"\n",
+                    real_jpg.display()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_ok, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            extract_video_thumb(&project, "1. 待分类/v.mp4", 1, 1, &src, Some(&fake_ok)),
+            "坏缓存必须被删除并用真产物原子重建成功"
+        );
+        assert!(image::open(&cache).is_ok(), "重建后的缓存必须真可解码");
+
+        // 场景二:产物不可解码 → 落位后验真必须拒绝并不留缓存
+        std::fs::write(&cache, b"garbage-again").unwrap();
+        let fake_bad = tmp.path().join("ffmpeg-bad");
+        {
+            let mut f = std::fs::File::create(&fake_bad).unwrap();
             f.write_all(
                 b"#!/bin/sh\nfor last; do :; done\nprintf '\\xff\\xd8x\\xff\\xd9' > \"$last\"\n",
             )
             .unwrap();
         }
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&fake_bad, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            !extract_video_thumb(&project, "1. 待分类/v.mp4", 1, 1, &src, Some(&fake)),
-            "坏缓存不得被计成功(入口验证 + AlreadyExists 分支验证)"
+            !extract_video_thumb(&project, "1. 待分类/v.mp4", 1, 1, &src, Some(&fake_bad)),
+            "不可解码产物不得计成功"
         );
+        assert!(!cache.exists(), "不可解码产物不得留在缓存位");
     }
 }

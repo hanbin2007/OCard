@@ -244,6 +244,24 @@ pub(crate) fn assert_within(root: &Path, target: &Path) -> Result<(), String> {
     }
 }
 
+/// 布局校验的 canonical 投影版(R5 终审三票 P0-1:目的地根的**上级**符号
+/// 链接可让纯词法检查放行「备份写回源卡」——`/tmp/link/backup` 且
+/// `link → /Volumes/CARD` 时词法互不嵌套,真实位置却在卡内)。
+/// 先词法快筛,再把源与每个目的地投影到真实位置复检双向嵌套/重复;
+/// 一切都在任何目录创建之前(闸先于副作用)。
+pub(crate) fn validate_dest_layout_projected(
+    source_root: &Path,
+    dest_targets: &[PathBuf],
+) -> Result<(), String> {
+    validate_dest_layout(source_root, dest_targets)?;
+    let src_p = canonical_projection(source_root)?;
+    let mut projected = Vec::with_capacity(dest_targets.len());
+    for t in dest_targets {
+        projected.push(canonical_projection(t)?);
+    }
+    validate_dest_layout(&src_p, &projected)
+}
+
 /// 词法目标的 canonical 投影(R4 终审 P0-5):把「最深已存在祖先」canonicalize
 /// 后拼回剩余段——目标尚未创建时也能得到真实落点,供**闸先于副作用**的检查用
 /// (`/tmp/link/sub` 在 `sub` 创建前就能判出 link 指向何处)。
@@ -293,6 +311,28 @@ pub(crate) fn is_symlink(path: &Path) -> bool {
 mod dir_gate_tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// R5 终审三票 P0-1:目的地根的上级是指向源卡的链接——词法检查放行,
+    /// 投影版必须拦下(否则「备份」写回源卡,格式化即双份全失)。
+    #[cfg(unix)]
+    #[test]
+    fn projected_layout_catches_dest_ancestor_link_to_source() {
+        let tmp = tempdir().unwrap();
+        let card = tmp.path().join("CARD");
+        std::fs::create_dir_all(&card).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&card, &link).unwrap();
+        let dest = link.join("backup");
+        // 词法互不嵌套 → 旧检查放行(这正是漏洞)
+        assert!(validate_dest_layout(&card, std::slice::from_ref(&dest)).is_ok());
+        // 投影后真实位置在卡内 → 必须拒绝
+        assert!(
+            validate_dest_layout_projected(&card, &[dest]).is_err(),
+            "目的地根上级链接回源卡必须被投影复检拦下"
+        );
+        // 正常目的地照常放行
+        assert!(validate_dest_layout_projected(&card, &[tmp.path().join("nas/backup")]).is_ok());
+    }
 
     #[test]
     fn safe_rel_accepts_normal_and_rejects_escapes() {
