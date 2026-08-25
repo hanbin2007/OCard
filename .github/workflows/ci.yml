@@ -194,6 +194,8 @@ jobs:
   e2e:
     name: E2E (linux, tauri-driver)
     needs: lint
+    permissions:
+      contents: write # 推送 e2e-shots 截图分支(仅此 job)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -252,3 +254,49 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
           path: e2e/screenshots/*.png
+
+      - name: Publish screenshots to e2e-shots branch + 内嵌进 Job Summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          shots=(e2e/screenshots/*.png)
+          if [ ${#shots[@]} -eq 0 ]; then
+            echo "无截图可发布"; exit 0
+          fi
+          # 孤儿分支只保留最新一次(单提交,主干历史零污染)
+          pub=$(mktemp -d)
+          i=0
+          : > "$pub/INDEX.md"
+          for f in "${shots[@]}"; do
+            i=$((i+1))
+            n=$(printf "%02d" "$i")
+            cp "$f" "$pub/$n.png"
+            echo "- $n.png ← $(basename "$f")" >> "$pub/INDEX.md"
+          done
+          cd "$pub"
+          git init -q -b e2e-shots
+          git -c user.name="ocard-ci" -c user.email="ci@ocard.local" add .
+          git -c user.name="ocard-ci" -c user.email="ci@ocard.local"             commit -q -m "E2E screenshots @ ${GITHUB_SHA::8}"
+          git push -qf             "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"             e2e-shots
+          NEW=$(git rev-parse HEAD)
+          {
+            echo "## E2E 界面截图(真实应用,${#shots[@]} 张)"
+            echo ""
+            echo "分支直览:[e2e-shots](https://github.com/${GITHUB_REPOSITORY}/tree/e2e-shots)"
+            echo ""
+            i=0
+            for f in "${shots[@]}"; do
+              i=$((i+1))
+              n=$(printf "%02d" "$i")
+              base=$(basename "$f" .png)
+              echo "<details open><summary>${base}</summary>"
+              echo ""
+              echo "<img width="640" alt="${base}" src="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${NEW}/${n}.png">"
+              echo ""
+              echo "</details>"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
