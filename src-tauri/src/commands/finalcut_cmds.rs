@@ -7,6 +7,7 @@
 //! - 交付「已上传」手动勾选:`.ocard/delivery-status.json`,原子替换,
 //!   last-write-wins(勾选状态,声明语义),跨机可见。
 
+use super::notify;
 use crate::core::{ffmpeg, naming, paths, project, transcode};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -53,6 +54,8 @@ pub fn check_final_cuts<R: tauri::Runtime>(
         return Err("成片命名校验仅适用于工况 A(视频)项目".into());
     }
     let dir = stats.root.join(project::SCENARIO_A_DIRS[5]); // 6. 成片
+                                                            // R2 P1:中间段可能被换成符号链接把读取导出项目外——canonical 只读闸
+    paths::assert_within(&stats.root, &dir)?;
     let mut report = FinalCutReportDto {
         items: Vec::new(),
         warnings: Vec::new(),
@@ -107,16 +110,13 @@ pub fn check_final_cuts<R: tauri::Runtime>(
             Ok(parsed) => {
                 let (mismatch, uncheckable) = match &ffprobe {
                     Ok(probe) => match transcode::probe_file(probe, &f) {
+                        Ok(info) if info.width == 0 || info.height == 0 => {
+                            (None, Some("实际分辨率未核对(探测返回零尺寸)".to_string()))
+                        }
                         Ok(info) => {
-                            // 竖幅按较小边比对
-                            let h = info.height.min(info.width.max(1));
-                            (
-                                naming::resolution_mismatch(
-                                    &parsed,
-                                    h.max(info.height.min(info.width)),
-                                ),
-                                None,
-                            )
+                            // 竖幅按较小边比对(横幅=height,竖幅=width)
+                            let effective = info.width.min(info.height);
+                            (naming::resolution_mismatch(&parsed, effective), None)
                         }
                         Err(e) => (None, Some(format!("实际分辨率未核对(探测失败: {e})"))),
                     },
@@ -165,21 +165,32 @@ pub fn curated_flow_hints<R: tauri::Runtime>(
     let curated = &dirs[dirs.len() - 2];
     let todo_dir = stats.root.join(curated).join(project::CURATED_TODO);
     let done_dir = stats.root.join(curated).join(project::CURATED_DONE);
+    // R2 P1:中间段符号链接闸(canonical 只读断言)
+    paths::assert_within(&stats.root, &todo_dir)?;
+    paths::assert_within(&stats.root, &done_dir)?;
     let stem = |n: &str| {
         n.rsplit_once('.')
             .map(|(s, _)| s.to_string())
             .unwrap_or_else(|| n.to_string())
     };
     let list = |d: &PathBuf| -> Vec<String> {
-        std::fs::read_dir(d)
-            .map(|es| {
-                es.flatten()
-                    .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .filter(|n| !n.starts_with('.'))
-                    .collect()
-            })
-            .unwrap_or_default()
+        match std::fs::read_dir(d) {
+            Ok(es) => es
+                .flatten()
+                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| !n.starts_with('.'))
+                .collect(),
+            Err(e) => {
+                // 读错不许静默当空(零静默):提示后按空处理
+                notify::warn(
+                    &app,
+                    "curated-hints-degraded",
+                    format!("读取 {} 失败({e}),流转提示可能不完整", d.display()),
+                );
+                Vec::new()
+            }
+        }
     };
     let done_stems: std::collections::HashMap<String, String> =
         list(&done_dir).into_iter().map(|n| (stem(&n), n)).collect();
@@ -221,6 +232,7 @@ pub fn get_delivery_status<R: tauri::Runtime>(
     let nas = super::nas_root(&app, &state)?;
     let stats = super::find_project(&nas, &project_id)?;
     let path = delivery_status_path(&stats.root);
+    paths::assert_within(&stats.root, &path)?;
     if !path.exists() {
         return Ok(DeliveryStatusDto::default());
     }

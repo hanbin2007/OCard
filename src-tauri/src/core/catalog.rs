@@ -36,10 +36,11 @@ pub struct CatalogScan {
 
 /// 短 TTL 扫描缓存(M3 W3):同一 NAS 根 2 秒内的重复扫描直接复用——
 /// 命令层每次调用都全 NAS 扫描的成本(M2 评审 M7)由此消化。
-/// 不做逐项目指纹:asset_count 等统计依赖文件树内容,任何指纹都盖不全,
-/// 「指纹相等即延长缓存」会造成无界陈旧;TTL 把一切陈旧(含**跨机写入**)
-/// 硬性封顶在 2 秒,SMB mtime 粒度也被兜住(计划 W3 的指纹条款按此收窄,
-/// 理由记录于此供复审裁决)。本机变更命令调 [`invalidate_cache`] 立即失效。
+/// 计划的逐项目指纹条款收窄为纯 TTL(评审复核后修正理由:统计确实全部来自
+/// manifests,指纹在技术上可行;真实取舍是**简单性**——TTL 把一切陈旧
+/// (含跨机写入)硬性封顶在 2 秒且无指纹失效的正确性风险;指纹留作后续
+/// 性能优化项)。本机变更命令调 [`invalidate_cache`] 立即失效。
+/// opus 复审已裁决接受该收窄。
 type ScanCacheMap = std::collections::HashMap<PathBuf, (std::time::Instant, CatalogScan)>;
 static SCAN_CACHE: std::sync::Mutex<Option<ScanCacheMap>> = std::sync::Mutex::new(None);
 const SCAN_TTL_MS: u128 = 2000;
@@ -254,5 +255,38 @@ mod cache_tests {
         // 换根不串缓存
         let tmp2 = tempdir().unwrap();
         assert_eq!(scan_cached(tmp2.path()).unwrap().projects.len(), 0);
+    }
+
+    #[test]
+    fn worker_and_config_switch_invalidation_paths() {
+        // W3 复审欠账:worker 失效钩子等价路径 + 配置切根路径都要有测试
+        let tmp = tempdir().unwrap();
+        let nas = tmp.path();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        project::create_project(nas, date, "甲", project::Scenario::B, &[]).unwrap();
+        invalidate_cache(nas);
+        assert_eq!(scan_cached(nas).unwrap().projects.len(), 1);
+
+        // 模拟拷卡 worker 收尾:project_root.parent() 失效(tasks.rs 同一调用形状)
+        let proot = nas.join(scan_cached(nas).unwrap().projects[0].folder_name.clone());
+        project::create_project(nas, date, "乙", project::Scenario::B, &[]).unwrap();
+        invalidate_cache(proot.parent().unwrap());
+        assert_eq!(
+            scan_cached(nas).unwrap().projects.len(),
+            2,
+            "worker 路径失效生效"
+        );
+
+        // 配置切根:两根缓存互不污染,来回切都各自正确
+        let tmp2 = tempdir().unwrap();
+        let nas2 = tmp2.path();
+        project::create_project(nas2, date, "丙", project::Scenario::B, &[]).unwrap();
+        invalidate_cache(nas2);
+        assert_eq!(scan_cached(nas2).unwrap().projects.len(), 1);
+        assert_eq!(
+            scan_cached(nas).unwrap().projects.len(),
+            2,
+            "切回原根仍正确"
+        );
     }
 }

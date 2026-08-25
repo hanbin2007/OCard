@@ -341,7 +341,12 @@ export function groupBurst<T extends { id: string; groupId?: string }>(
  * 连拍折叠（M3 W7a）
  * ------------------------------------------------------------------ */
 
-export const GROUP_ID_PREFIX = "group:";
+/**
+ * 组条目 id 前缀。用 NUL 开头：素材 id 是项目内相对路径，
+ * 路径里可以出现冒号（macOS 允许），但**不可能**出现 NUL，
+ * 所以这个前缀与真实素材 id 不会碰撞。
+ */
+export const GROUP_ID_PREFIX = "\u0000group:";
 
 export interface AssetEntry<T> {
   kind: "asset";
@@ -367,7 +372,24 @@ export type GridEntry<T> = AssetEntry<T> | GroupEntry<T>;
  */
 export function buildGridEntries<T extends { id: string; groupId?: string }>(
   assets: T[],
+  onDegrade?: (reason: string) => void,
 ): Array<GridEntry<T>> {
+  // 前缀碰撞防御：真实 id 若撞上前缀，宁可不折叠也不能张冠李戴
+  if (assets.some((a) => a.id.startsWith(GROUP_ID_PREFIX))) {
+    onDegrade?.("素材 id 与组前缀冲突，已停用连拍折叠");
+    return assets.map((asset) => ({ kind: "asset", id: asset.id, asset }));
+  }
+
+  // 重复 id 防御：Map 覆盖会让一格永远选不中，降级为不折叠并告警
+  const seen = new Set<string>();
+  for (const asset of assets) {
+    if (seen.has(asset.id)) {
+      onDegrade?.(`素材 id 重复（${asset.id}），已停用连拍折叠`);
+      return assets.map((a) => ({ kind: "asset", id: a.id, asset: a }));
+    }
+    seen.add(asset.id);
+  }
+
   const out: Array<GridEntry<T>> = [];
   for (const group of groupBurst(assets)) {
     if (group.groupId !== null && group.items.length > 1) {
@@ -386,18 +408,50 @@ export function buildGridEntries<T extends { id: string; groupId?: string }>(
   return out;
 }
 
-/** 把条目 id（可能含组 id）展开成真实的 assetId 列表 */
+/**
+ * 把条目 id 展开成真实的 assetId 列表。
+ *
+ * 同时接受**裸素材 id**——组展开层里选中的是组内单件，它没有自己的条目 id。
+ * 早先只认条目 id，导致展开层的选中被静默丢弃、分类/精选/标删拿到空集直接返回，
+ * 与展开层「组内可单独选中并执行」的文案自相矛盾。
+ */
 export function resolveEntryIds<T extends { id: string }>(
   entries: Array<GridEntry<T>>,
   entryIds: string[],
 ): string[] {
   const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  const memberIds = new Set<string>();
+  for (const entry of entries) {
+    if (entry.kind === "group") {
+      for (const item of entry.items) memberIds.add(item.id);
+    } else {
+      memberIds.add(entry.asset.id);
+    }
+  }
+
   const out: string[] = [];
   for (const id of entryIds) {
     const entry = byId.get(id);
-    if (!entry) continue;
-    if (entry.kind === "group") out.push(...entry.items.map((item) => item.id));
-    else out.push(entry.asset.id);
+    if (entry) {
+      if (entry.kind === "group") out.push(...entry.items.map((item) => item.id));
+      else out.push(entry.asset.id);
+      continue;
+    }
+    // 裸素材 id（组展开层的选中）
+    if (memberIds.has(id)) out.push(id);
+  }
+  // 组与成员同时被选中时去重
+  return [...new Set(out)];
+}
+
+/** 把网格条目摊平成显示顺序的素材列表——预览用的**唯一**下标空间 */
+export function flattenEntries<T extends { id: string }>(
+  entries: Array<GridEntry<T>>,
+): T[] {
+  const out: T[] = [];
+  for (const entry of entries) {
+    if (entry.kind === "group") out.push(...entry.items);
+    else out.push(entry.asset);
   }
   return out;
 }

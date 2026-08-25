@@ -7,8 +7,13 @@
 //! 竞输方放弃发布。
 //!
 //! 队列:同 kind 串行(排队的作业处于 queued,可被取消);异 kind 并行。
-//! 互斥 guard(OpsMutex 等)由**running worker** 在 `queued→running` 时获取、
-//! 终态发布前释放——绝不进入历史 Job 记录(计划 D2)。
+//! 互斥 guard(OpsMutex 等)由**running worker** 在 `queued→running` 时获取,
+//! 在终态快照生成后、事件发布回调前释放(先 transition 后 drop——语义上
+//! guard 覆盖全部实际工作;绝不进入历史 Job 记录,计划 D2)。
+//! 声明边界(R2):终态发布→guard 释放之间有微秒级窗口,期间新投递会通过
+//! `has_active` 检查、在获取 guard 时失败——表现为一条带明确原因的失败作业
+//! (「已有交付打包在进行中」),不产生数据风险;换序(先 drop 后 transition)
+//! 会让 guard 在作业名义上仍 running 时旁落,更糟。
 //!
 //! 作业不持久化:幂等由输出语义承担(转码 already-transcoded skip、
 //! 交付 verified-skip)。本模块 tauri 无关,事件发射由命令层包装。
@@ -114,6 +119,22 @@ impl JobHandle {
         s.revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
     }
 
+    /// 仅当当前状态为 `from` 时转移(request_cancel 用:queued 直接终态,
+    /// running 绝不代 worker 发终态——评审 P0-3)。
+    fn transition_from(&self, from: JobState, to: JobState) -> Option<JobSnapshot> {
+        let mut s = self.lock();
+        if s.state != from || !s.state.can_transition(to) {
+            return None;
+        }
+        s.state = to;
+        s.revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        if to.is_terminal() {
+            s.finished_at = Some(chrono::Utc::now().to_rfc3339());
+            s.message = None;
+        }
+        Some(s.clone())
+    }
+
     /// 状态转移(合法表 + 终态不可逆,锁内 CAS)。成功返回新快照。
     fn transition(&self, to: JobState) -> Option<JobSnapshot> {
         let mut s = self.lock();
@@ -208,14 +229,22 @@ impl JobManager {
             })
     }
 
-    /// 请求取消:queued 直接转 cancelled;running 置标志由 worker 在安全点收尾。
-    /// 返回取消请求是否被接受(终态返回 false)。
+    /// 请求取消:queued 直接转 cancelled(无 worker 替它收尾);
+    /// **running 只置标志**——终态由 worker 在安全点发布,guard 释放前
+    /// `any_active` 保持为真(评审 P0-3:提前终态会放行更新闸/错乱前端互斥)。
+    /// 返回请求后的快照(终态作业原样返回)。
+    /// R2 P2:已终态的作业不再置取消标志——那会让「已完成」的作业带着
+    /// 无意义的 cancel 位,调用方也能据 state 终态给出「无需取消」的真话反馈。
     pub fn request_cancel(&self, id: &str) -> Option<JobSnapshot> {
         let handle = self.get(id)?;
+        if handle.snapshot().state.is_terminal() {
+            return Some(handle.snapshot());
+        }
         handle.cancel.store(true, Ordering::SeqCst);
-        // queued 的作业没有 worker 替它收尾,这里直接终态化;
-        // running 的由 worker 在安全点调 finish_cancelled(锁内 CAS 防竞争)
-        handle.transition(JobState::Cancelled)
+        if let Some(s) = handle.transition_from(JobState::Queued, JobState::Cancelled) {
+            return Some(s);
+        }
+        Some(handle.snapshot())
     }
 
     fn lane(&self, kind: JobKind) -> Arc<Mutex<()>> {
@@ -536,6 +565,36 @@ mod tests {
         assert!(!mgr.has_active(JobKind::Delivery, "p2"));
         assert!(!mgr.has_active(JobKind::Transcode, "p1"));
         mgr.request_cancel(&h.snapshot().id);
+        assert!(!mgr.any_active());
+    }
+
+    #[test]
+    fn cancel_running_keeps_active_until_worker_finalizes() {
+        // 评审 P0-3:running 取消期间 any_active 必须仍为真(更新闸依赖它)
+        let mgr = Arc::new(JobManager::default());
+        let h = mgr.create(JobKind::Delivery, "p1");
+        let (tx, rx) = mpsc::channel::<()>();
+        mgr.run(
+            h.clone(),
+            || Ok(()),
+            move |_| {
+                let _ = rx.recv_timeout(Duration::from_secs(5));
+                Ok(serde_json::Value::Null)
+            },
+            |_| {},
+        );
+        for _ in 0..100 {
+            if h.snapshot().state == JobState::Running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let s = mgr.request_cancel(&h.snapshot().id).unwrap();
+        assert_eq!(s.state, JobState::Running, "running 取消只置标志不终态");
+        assert!(mgr.any_active(), "worker 收尾前必须仍算活跃");
+        tx.send(()).unwrap();
+        let fin = wait_terminal(&h);
+        assert_eq!(fin.state, JobState::Cancelled);
         assert!(!mgr.any_active());
     }
 }

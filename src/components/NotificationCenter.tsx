@@ -8,9 +8,10 @@
  * - 对**未知 code 通用呈现**：后端随时会加新 code，前端不做白名单
  */
 
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { IconBell, IconClose } from "./Icon";
 import { formatTimestamp } from "../lib/format";
+import { withViewTransition } from "../lib/motion";
 import type { NoticeLevel } from "../api/types";
 import { useStore, type NoticeEntry } from "../state/store";
 
@@ -125,16 +126,21 @@ export function NoticeBell() {
   const hasError = notices.some((n) => n.level === "error" && !n.read);
   const wrapRef = useRef<HTMLDivElement>(null);
 
+  /* 收起走视图过渡（退场淡出），弹出由 CSS 关键帧从铃铛一侧长出来。
+     不支持视图过渡时就是一次普通 dispatch，行为一致。 */
+  const closePanel = useCallback(
+    () => withViewTransition(() => dispatch({ type: "noticesPanelClosed" })),
+    [dispatch],
+  );
+
   // 点外部/Esc 关闭
   useEffect(() => {
     if (!noticesOpen) return;
     const onDown = (e: MouseEvent) => {
-      if (!wrapRef.current?.contains(e.target as Node)) {
-        dispatch({ type: "noticesPanelClosed" });
-      }
+      if (!wrapRef.current?.contains(e.target as Node)) closePanel();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") dispatch({ type: "noticesPanelClosed" });
+      if (e.key === "Escape") closePanel();
     };
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
@@ -142,7 +148,7 @@ export function NoticeBell() {
       document.removeEventListener("mousedown", onDown);
       document.removeEventListener("keydown", onKey);
     };
-  }, [noticesOpen, dispatch]);
+  }, [noticesOpen, closePanel]);
 
   return (
     <div className="notice-bell" ref={wrapRef}>
@@ -153,11 +159,15 @@ export function NoticeBell() {
         aria-label={unread > 0 ? `通知，${unread} 条未读` : "通知"}
         aria-expanded={noticesOpen}
         title="通知"
-        onClick={() => dispatch({ type: "noticesPanelToggled" })}
+        onClick={() =>
+          noticesOpen ? closePanel() : dispatch({ type: "noticesPanelToggled" })
+        }
       >
         <IconBell />
         {unread > 0 ? (
+          /* key 让计数变化时角标重新落位一次：降级/失败不允许悄无声息地累积 */
           <span
+            key={unread}
             className={`notice-bell__badge${hasError ? " notice-bell__badge--error" : ""}`}
             data-testid="notice-unread"
           >

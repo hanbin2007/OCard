@@ -9,8 +9,33 @@ import { ProjectsScreen } from "./screens/ProjectsScreen";
 import { SortingScreen } from "./screens/SortingScreen";
 import { TranscodeScreen } from "./screens/TranscodeScreen";
 import { TrashScreen } from "./screens/TrashScreen";
-import { StoreProvider, useStore, type AppState } from "./state/store";
+import { useRef } from "react";
+import { ROUTE_ORDER, StoreProvider, useStore, type AppState } from "./state/store";
+import type { RouteName } from "./state/store";
 import { ThemeProvider } from "./state/theme";
+
+/**
+ * 屏间过渡的方向。
+ *
+ * 侧栏是一列纵向导航，所以"往下走"就该看见新屏从下方进来、"往回走"从上方进来
+ * ——中间帧要指向结果，而不是每次都用同一个方向糊弄过去。
+ * 顺序取自 ROUTE_ORDER，与侧栏排布同源，不会出现"侧栏在下、动画说在上"。
+ *
+ * 用 ref 在渲染期比对上一条路由，是因为 `.content` 与路由是**同一次提交**里
+ * 挂载的：放到 effect 里算方向，属性会晚一帧，动画就用不上了。
+ * 判据是幂等的（相等即不动），StrictMode 双渲染下结果一致。
+ */
+function useNavDirection(route: RouteName): "forward" | "back" | "none" {
+  const previous = useRef(route);
+  const direction = useRef<"forward" | "back" | "none">("none");
+  if (previous.current !== route) {
+    const from = ROUTE_ORDER.indexOf(previous.current);
+    const to = ROUTE_ORDER.indexOf(route);
+    direction.current = to > from ? "forward" : "back";
+    previous.current = route;
+  }
+  return direction.current;
+}
 
 function Routes() {
   const { state, reload, dispatch } = useStore();
@@ -120,8 +145,11 @@ function Routes() {
 }
 
 export function Shell() {
+  const { state } = useStore();
+  const navDirection = useNavDirection(state.route);
+
   return (
-    <div className="shell">
+    <div className="shell" data-nav={navDirection}>
       <Sidebar />
       <main className="main">
         <NoticeToasts />

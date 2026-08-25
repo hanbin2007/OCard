@@ -55,6 +55,9 @@ pub struct CopyManifest {
     /// 只有整批成功后置位,不宣称 exactly-once——skip 语义容忍重复)。
     #[serde(default)]
     pub proxy_completed: bool,
+    /// 自动转代理已尝试次数(≥3 放弃并可见告知,防永久失败无限重投)。
+    #[serde(default)]
+    pub proxy_attempts: u32,
     pub entries: Vec<ManifestEntry>,
 }
 
@@ -80,6 +83,7 @@ impl CopyManifest {
             completed: false,
             auto_proxy: false,
             proxy_completed: false,
+            proxy_attempts: 0,
             entries: Vec::new(),
         }
     }
@@ -110,7 +114,8 @@ pub fn manifest_dir(project_root: &Path) -> PathBuf {
 
 pub fn save(project_root: &Path, m: &CopyManifest) -> Result<()> {
     let dir = manifest_dir(project_root);
-    fs::create_dir_all(&dir)?;
+    // R2 P0:`.ocard`/`manifests` 中间段防符号链接偷渡,落地闸后再写
+    super::paths::ensure_dir_within(project_root, &dir).map_err(super::CoreError::Invalid)?;
     let tmp = dir.join(format!("{}.json.tmp", m.id));
     fs::write(&tmp, serde_json::to_vec_pretty(m)?)?;
     fs::rename(&tmp, dir.join(format!("{}.json", m.id)))?;
@@ -156,6 +161,25 @@ pub fn list(project_root: &Path) -> Result<ManifestList> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// R3:save 的 `.ocard` 落地闸接线回归——中间段被换成指向项目外的
+    /// 符号链接时必须拒写(在 save 里删掉 ensure_dir_within 调用本测试红)。
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_symlinked_state_dir() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, project.join(STATE_DIR)).unwrap();
+        let m = CopyManifest::new("2. 原始素材/x", "card", "A7M4_A_ZS", "ZS", "");
+        assert!(save(&project, &m).is_err(), "符号链接 .ocard 必须拒写");
+        assert!(
+            !outside.join(MANIFEST_DIR).exists(),
+            "manifest 不得经链接写到项目外"
+        );
+    }
 
     fn sample() -> CopyManifest {
         let mut m = CopyManifest::new(

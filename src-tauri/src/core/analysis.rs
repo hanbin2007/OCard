@@ -18,7 +18,7 @@ pub const ANALYSIS_DIR: &str = "analysis";
 /// 特征 schema 版本:字段变更时递增,旧记录自动视为未分析。
 pub const SCHEMA_VERSION: u32 = 1;
 /// 算法版本:评分/哈希算法变更时递增。
-pub const ALGO_VERSION: u32 = 1;
+pub const ALGO_VERSION: u32 = 2; // v2:解码统一 EXIF 摆正(dHash/清晰度口径随之变化)
 
 /// 连拍聚类的时间窗(秒)与 dHash 汉明距阈值。
 pub const BURST_GAP_SECS: i64 = 3;
@@ -86,15 +86,24 @@ pub fn append_feature(
 }
 
 /// 读取合并全部机器的特征(版本全匹配才采信;同键冲突按计划 D4 规则)。
-/// 返回 (指纹→记录, 坏行数)。
+/// 返回 (指纹→记录, 坏行数, 目录读错)。R2 P1:`.ocard/analysis` 存在但
+/// 不可读(NAS 抖动/权限)时以前静默返回空表——界面上全部 AI 角标凭空消失
+/// 且零提示;现在把 IO 错误如实上浮,由命令层给可见 warning。
+/// `NotFound` 仍是正常态(项目从未分析过)。
 pub fn load_features(
     project_root: &Path,
-) -> (std::collections::HashMap<u64, FeatureRecord>, usize) {
+) -> (
+    std::collections::HashMap<u64, FeatureRecord>,
+    usize,
+    Option<String>,
+) {
     let mut out: std::collections::HashMap<u64, FeatureRecord> = Default::default();
     let mut skipped = 0usize;
     let dir = analysis_dir(project_root);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return (out, 0);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (out, 0, None),
+        Err(e) => return (out, 0, Some(format!("分析缓存目录不可读: {e}"))),
     };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
@@ -128,7 +137,7 @@ pub fn load_features(
             }
         }
     }
-    (out, skipped)
+    (out, skipped, None)
 }
 
 // ---------- 单次解码的特征提取(纯函数) ----------
@@ -192,10 +201,17 @@ pub fn sharpness_region(img: &image::DynamicImage, x: f32, y: f32, w: f32, h: f3
     // 外扩 20% 再裁,防框贴边切掉高频细节
     let ex = (w * 0.2).max(0.02);
     let ey = (h * 0.2).max(0.02);
-    let x0 = ((x - ex) * iw).max(0.0) as u32;
-    let y0 = ((y - ey) * ih).max(0.0) as u32;
-    let cw = (((w + 2.0 * ex) * iw) as u32).clamp(8, img.width() - x0.min(img.width() - 1));
-    let ch = (((h + 2.0 * ey) * ih) as u32).clamp(8, img.height() - y0.min(img.height() - 1));
+    // 边界数学(评审 #23):先夹 x0 保证右侧至少 8px,再夹宽度,杜绝 clamp(min>max) panic
+    let x0 = (((x - ex) * iw).max(0.0) as u32).min(img.width().saturating_sub(8));
+    let y0 = (((y - ey) * ih).max(0.0) as u32).min(img.height().saturating_sub(8));
+    let max_w = img.width() - x0;
+    let max_h = img.height() - y0;
+    let cw = (((w + 2.0 * ex) * iw) as u32)
+        .clamp(1, max_w)
+        .max(max_w.min(8));
+    let ch = (((h + 2.0 * ey) * ih) as u32)
+        .clamp(1, max_h)
+        .max(max_h.min(8));
     laplacian_score(&image::imageops::grayscale(&img.crop_imm(x0, y0, cw, ch)))
 }
 
@@ -336,6 +352,26 @@ pub fn judge(
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    /// R2 P1 接线回归:`.ocard/analysis` 存在但不可读(此处用文件占位模拟)
+    /// 时必须上浮 read_err——此前静默返回空表,AI 角标凭空消失且零提示。
+    /// 把 load_features 的 IO 错误分支改回静默空表本测试红。
+    #[test]
+    fn load_features_surfaces_unreadable_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".ocard")).unwrap();
+        std::fs::write(analysis_dir(tmp.path()), b"not-a-dir").unwrap();
+        let (map, skipped, read_err) = load_features(tmp.path());
+        assert!(map.is_empty());
+        assert_eq!(skipped, 0);
+        assert!(
+            read_err.is_some_and(|e| e.contains("分析缓存目录不可读")),
+            "目录读错必须如实上浮"
+        );
+        // NotFound 仍是正常态(从未分析过)
+        let fresh = tempfile::tempdir().unwrap();
+        assert!(load_features(fresh.path()).2.is_none());
+    }
 
     fn feat(dhash: u64, sharp: f32) -> FeatureRecord {
         FeatureRecord {
@@ -492,10 +528,59 @@ mod tests {
         text.push_str("{corrupt\n");
         std::fs::write(&p, text).unwrap();
 
-        let (map, skipped) = load_features(&root);
+        let (map, skipped, _) = load_features(&root);
         assert_eq!(map.len(), 1);
         assert_eq!(map[&777].sharpness, 66.0, "冲突取最新");
         assert_eq!(skipped, 1);
+    }
+
+    /// R2 变异复核(P2-新1):旧冲突断言依赖 read_dir 的目录序,把规则改成
+    /// 「先到先得」照样绿。现把新旧两条记录写进**同一个文件**,并两种行序
+    /// 各验一遍——只有真按 (analyzedAt, machineId) 取最新才能双向通过。
+    #[test]
+    fn conflict_rule_is_order_independent_within_one_file() {
+        for reversed in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("proj");
+            std::fs::create_dir_all(&root).unwrap();
+            let mut older = feat(1, 11.0);
+            older.rel = "1. 待分类/a.jpg".into();
+            older.src_fingerprint = 999;
+            let mut newer = older.clone();
+            newer.sharpness = 22.0;
+            newer.analyzed_at = older.analyzed_at + chrono::Duration::seconds(9);
+            newer.machine_id = "MZ".into();
+            let (first, second) = if reversed {
+                (&newer, &older)
+            } else {
+                (&older, &newer)
+            };
+            append_feature(&root, "M1", first).unwrap();
+            append_feature(&root, "M1", second).unwrap();
+            let (map, _, _) = load_features(&root);
+            assert_eq!(
+                map[&999].sharpness, 22.0,
+                "行序 reversed={reversed} 下也必须取 analyzedAt 最新"
+            );
+        }
+    }
+
+    /// R2 变异复核(收敛 #23):sharpness_region 在极小图与贴边框上不得 panic,
+    /// 且返回有限值。
+    #[test]
+    fn sharpness_region_survives_tiny_images_and_edge_rects() {
+        for (w, h) in [(1u32, 1u32), (4, 4), (8, 3), (16, 16)] {
+            let img = image::DynamicImage::new_rgb8(w, h);
+            for (x, y, rw, rh) in [
+                (0.0f32, 0.0f32, 1.0f32, 1.0f32),
+                (0.95, 0.95, 0.2, 0.2), // 贴右下边、外扩越界
+                (0.0, 0.0, 0.01, 0.01), // 近零宽高
+                (0.5, 0.9, 1.0, 0.5),   // 高度越界
+            ] {
+                let v = sharpness_region(&img, x, y, rw, rh);
+                assert!(v.is_finite(), "{w}x{h} rect=({x},{y},{rw},{rh}) → {v}");
+            }
+        }
     }
 
     #[cfg(unix)]

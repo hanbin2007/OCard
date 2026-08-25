@@ -11,7 +11,8 @@ import type {
   ProxyResult,
   TranscodeJob,
 } from "./types";
-import { mockDelivery } from "./mock";
+import { isJobTerminal } from "./types";
+import { mockArchiveResult, mockDelivery } from "./mock";
 
 const TICK_MS = 120;
 const TOTAL_FILES = 769;
@@ -103,6 +104,9 @@ export function mockStartDelivery(projectId: string): DeliveryJob {
 export function mockCancelJob(jobId: string): JobSnapshot {
   const current = jobs.get(jobId);
   if (!current) throw new Error(`作业不存在：${jobId}`);
+  // 与后端 request_cancel 对齐：已经是终态的作业原样返回，
+  // 绝不把一个已完成的作业改写成「已取消」——那是对历史的篡改
+  if (isJobTerminal(current.state)) return current;
   const timer = timers.get(jobId);
   if (timer) {
     clearInterval(timer);
@@ -133,6 +137,7 @@ export function resetMockJobs() {
 const TRANSCODE_TOTAL = 48;
 
 export const mockProxyResult: ProxyResult = {
+  mode: "proxy",
   converted: 44,
   alreadyTranscoded: 2,
   skipped: [
@@ -213,6 +218,9 @@ export const mockAnalysisResult: AnalysisResult = {
   failed: [
     { rel: "1. 待分类/0824上午_NikonZ9_E_CQ/DSC_00099.NEF", message: "RAW 解码失败" },
   ],
+  videoThumbs: 26,
+  // 演示「转码引擎缺失导致视频抽帧被跳过」：这类降级必须在完成时说出来
+  videoThumbsSkipped: 4,
   cacheSkippedLines: 3,
 };
 
@@ -257,6 +265,55 @@ export function mockStartAnalysis(projectId: string): AnalyzeJob {
     }
     const done = Math.floor((ANALYZE_TOTAL * step) / STEPS);
     emit(bump(current, { state: "running", done, message: `分析中 ${done}` }));
+  }, TICK_MS);
+  timers.set(id, timer);
+
+  return job;
+}
+
+
+/** 归档作业时间线（kind 仍是 transcode，result 是 ArchiveResult） */
+export function mockStartArchive(projectId: string): TranscodeJob {
+  seq += 1;
+  const id = `job-${seq}`;
+  const job: TranscodeJob = {
+    id,
+    kind: "transcode",
+    projectId,
+    state: "queued",
+    done: 0,
+    total: 44,
+    bytesDone: 0,
+    revision: 1,
+    startedAt: new Date().toISOString(),
+  };
+  jobs.set(id, job);
+
+  let step = 0;
+  const timer = setInterval(() => {
+    const current = jobs.get(id);
+    if (!current || current.kind !== "transcode" || current.state === "cancelled") {
+      clearInterval(timer);
+      timers.delete(id);
+      return;
+    }
+    step += 1;
+    if (step >= STEPS) {
+      clearInterval(timer);
+      timers.delete(id);
+      emit(
+        bump(current, {
+          state: "done",
+          done: 44,
+          message: undefined,
+          finishedAt: new Date().toISOString(),
+          result: mockArchiveResult,
+        }),
+      );
+      return;
+    }
+    const done = Math.floor((44 * step) / STEPS);
+    emit(bump(current, { state: "running", done, message: `归档中 ${done}` }));
   }, TICK_MS);
   timers.set(id, timer);
 

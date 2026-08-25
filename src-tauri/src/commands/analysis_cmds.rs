@@ -1,4 +1,5 @@
-//! AI 客观分析作业(M3 W7a):单次解码流水线(rayon 并行、逐项 catch_unwind)、
+//! AI 客观分析作业(M3 W7a):单次解码流水线(rayon 并行——逻辑核-1,
+//! 计划「物理核」按标准库能力收窄为逻辑核并记录;逐项 catch_unwind)、
 //! 特征入每机纯追加缓存、缩略图顺带回填共享缓存。
 //! 分析不进互斥(计划 D3):只读素材,文件被并发分类移走按 missing 处理。
 
@@ -21,6 +22,9 @@ pub struct AnalysisResultDto {
     /// 分析期间被移走/删除(不是失败)。
     pub missing: usize,
     pub failed: Vec<AnalysisFailureDto>,
+    /// 视频首帧图已就绪数 / 引擎缺失未抽帧数(零静默)。
+    pub video_thumbs: usize,
+    pub video_thumbs_skipped: usize,
     /// 特征缓存坏行(零静默)。
     pub cache_skipped_lines: usize,
 }
@@ -32,6 +36,28 @@ pub struct AnalysisFailureDto {
     pub message: String,
 }
 
+/// AI 硬禁用标志(D1:模型哈希不符=篡改/损坏,禁用整个 AI 功能;
+/// 模型「缺失」是打包问题,降级为无人脸分析并可见 error——两种语义分开)。
+static AI_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 人脸推理失败计数(R2 P1:失败=faces None,聚合为可见 warning,不伪装成 0 人脸)。
+static FACE_DETECT_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+/// 启动校验:模型存在但哈希不符 → 禁用 AI + 可见 error(计划 D1)。
+pub fn verify_models_on_startup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Ok(p) = resolve_model_path(app) {
+        if let Err(e) = crate::core::yunet::verify_model(&p) {
+            AI_DISABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+            notify::error(
+                app,
+                "ai-models-corrupt",
+                format!("AI 模型校验失败({e}):AI 选片功能已禁用;请重新安装应用"),
+            );
+        }
+    }
+    // 模型缺失不在此禁用:分析仍可跑纯算法指标,人脸缺席在作业内可见上报
+}
+
 /// 发起分析作业(工况 B「待分类」全量;幂等:指纹命中即缓存)。
 #[tauri::command]
 pub fn start_analysis<R: tauri::Runtime>(
@@ -39,6 +65,9 @@ pub fn start_analysis<R: tauri::Runtime>(
     state: tauri::State<super::AppState>,
     project_id: String,
 ) -> std::result::Result<JobSnapshot, String> {
+    if AI_DISABLED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("AI 选片功能已禁用(模型校验失败,详见通知);请重新安装应用".into());
+    }
     let jobs = app.state::<Arc<JobManager>>().inner().clone();
     if jobs.has_active(JobKind::Analyze, &project_id) {
         return Err("该项目已有分析作业在进行中".into());
@@ -51,6 +80,10 @@ pub fn start_analysis<R: tauri::Runtime>(
     // 人脸模型:资源目录解析(测试/E2E 用 OCARD_MODELS_DIR 覆盖);
     // 校验/加载失败=可见 error + 本轮 faces=None(客观分析继续,零静默)
     let model_path = resolve_model_path(&app);
+    // 视频首帧抽取用捆绑 ffmpeg(缺失=保持占位,启动期已有可见提示)
+    let ffmpeg_bin = crate::core::ffmpeg::detect()
+        .ok()
+        .map(|i| PathBuf::from(i.ffmpeg_path));
     let handle = jobs.create(JobKind::Analyze, &project_id);
     let body_app = app.clone();
     let event_app = app.clone();
@@ -82,7 +115,14 @@ pub fn start_analysis<R: tauri::Runtime>(
                 }
             };
             let detector = detector.as_ref();
-            let (features, skipped) = analysis::load_features(&root);
+            let (features, skipped, read_err) = analysis::load_features(&root);
+            if let Some(e) = read_err {
+                notify::warn(
+                    &body_app,
+                    "analysis-cache-degraded",
+                    format!("{e};本轮将全量重新分析"),
+                );
+            }
             if skipped > 0 {
                 notify::warn(
                     &body_app,
@@ -94,6 +134,8 @@ pub fn start_analysis<R: tauri::Runtime>(
             let done = AtomicUsize::new(0);
             let cached = AtomicUsize::new(0);
             let missing = AtomicUsize::new(0);
+            let vthumbs = AtomicUsize::new(0);
+            let vthumbs_skipped = AtomicUsize::new(0);
             let failures = std::sync::Mutex::new(Vec::<AnalysisFailureDto>::new());
             let new_features = std::sync::Mutex::new(Vec::<analysis::FeatureRecord>::new());
             let last_emit = std::sync::Mutex::new(std::time::Instant::now());
@@ -113,7 +155,16 @@ pub fn start_analysis<R: tauri::Runtime>(
                         return;
                     }
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        analyze_one(&root, &machine_id, rel, *size, *mtime, &features, detector)
+                        analyze_one(
+                            &root,
+                            &machine_id,
+                            rel,
+                            *size,
+                            *mtime,
+                            &features,
+                            detector,
+                            ffmpeg_bin.as_ref(),
+                        )
                     }));
                     match outcome {
                         Ok(AnalyzeOne::Cached) => {
@@ -121,6 +172,13 @@ pub fn start_analysis<R: tauri::Runtime>(
                         }
                         Ok(AnalyzeOne::Missing) => {
                             missing.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(AnalyzeOne::VideoThumb(ok)) => {
+                            if ok {
+                                vthumbs.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                vthumbs_skipped.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         Ok(AnalyzeOne::Fresh(rec)) => {
                             new_features
@@ -167,7 +225,17 @@ pub fn start_analysis<R: tauri::Runtime>(
                     &body_app,
                     "analysis-cache-degraded",
                     format!(
-                        "{cache_write_failed} 条分析结果写入缓存失败(结果本轮可用,重启后这些素材会重新分析)"
+                        "{cache_write_failed} 条分析结果写入缓存失败:这些素材的角标本轮不会出现,下次分析会重算"
+                    ),
+                );
+            }
+            let face_fail = FACE_DETECT_FAILURES.swap(0, Ordering::Relaxed);
+            if face_fail > 0 {
+                notify::warn(
+                    &body_app,
+                    "face-detect-degraded",
+                    format!(
+                        "{face_fail} 张图片人脸检测失败(已按「人脸信息不可用」记录,客观指标不受影响)"
                     ),
                 );
             }
@@ -175,6 +243,8 @@ pub fn start_analysis<R: tauri::Runtime>(
                 analyzed,
                 cached: cached.load(Ordering::Relaxed),
                 missing: missing.load(Ordering::Relaxed),
+                video_thumbs: vthumbs.load(Ordering::Relaxed),
+                video_thumbs_skipped: vthumbs_skipped.load(Ordering::Relaxed),
                 failed: failures.into_inner().unwrap_or_default(),
                 cache_skipped_lines: skipped,
             };
@@ -198,7 +268,70 @@ enum AnalyzeOne {
     Cached,
     Missing,
     Fresh(analysis::FeatureRecord),
+    /// 视频:只补首帧图进缩略图缓存(M2 media.rs 记账;不参与聚类评分)。
+    VideoThumb(bool),
     Failed(String),
+}
+
+/// 视频首帧抽取进共享缩略图缓存(引擎缺失=false,保持占位——
+/// 启动期已有 ffmpeg-missing 可见提示,这里不重复轰炸)。
+fn extract_video_thumb(
+    root: &std::path::Path,
+    rel: &str,
+    size: u64,
+    mtime: u128,
+    abs: &std::path::Path,
+    ffmpeg_bin: Option<&PathBuf>,
+) -> bool {
+    let Some(bin) = ffmpeg_bin else { return false };
+    let cache = media::cached_thumb_path(root, rel, size, mtime);
+    if cache.is_file() {
+        return true;
+    }
+    let Some(dir) = cache.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let tmp = dir.join(format!(".{}.vthumb.jpg", uuid::Uuid::new_v4()));
+    let args = [
+        "-nostdin",
+        "-hide_banner",
+        "-v",
+        "error",
+        "-ss",
+        "0.5",
+        "-i",
+        &abs.to_string_lossy(),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=-2:320",
+        "-q:v",
+        "5",
+        "-n",
+        &tmp.to_string_lossy(),
+    ];
+    let ok = matches!(
+        crate::core::ffmpeg::run_with_timeout(bin, &args, std::time::Duration::from_secs(30)),
+        Ok(out) if out.status.success()
+    ) && tmp.is_file();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    match crate::core::fsx::rename_no_replace(&tmp, &cache) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&tmp);
+            true
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            false
+        }
+    }
 }
 
 fn resolve_model_path<R: tauri::Runtime>(
@@ -226,6 +359,7 @@ fn resolve_model_path<R: tauri::Runtime>(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_one(
     root: &std::path::Path,
     machine_id: &str,
@@ -234,6 +368,7 @@ fn analyze_one(
     mtime: u128,
     features: &std::collections::HashMap<u64, analysis::FeatureRecord>,
     detector: Option<&yunet::FaceDetector>,
+    ffmpeg_bin: Option<&PathBuf>,
 ) -> AnalyzeOne {
     let fp = analysis::src_fingerprint(rel, size, mtime);
     if features.contains_key(&fp) {
@@ -243,30 +378,46 @@ fn analyze_one(
     if !abs.exists() {
         return AnalyzeOne::Missing;
     }
-    // 只分析可解码的照片(RAW 用内嵌预览归 W7b;视频不参与聚类评分)
-    if !matches!(media::classify(rel), media::AssetKind::Photo) {
-        return AnalyzeOne::Failed("非照片类型,客观分析暂不支持".into());
+    match media::classify(rel) {
+        media::AssetKind::Photo => {}
+        media::AssetKind::Video => {
+            // 视频:补首帧图(M2 记账),不参与聚类评分
+            return AnalyzeOne::VideoThumb(extract_video_thumb(
+                root, rel, size, mtime, &abs, ffmpeg_bin,
+            ));
+        }
+        _ => return AnalyzeOne::Failed("非照片类型,客观分析暂不支持".into()),
     }
     let img = match image::open(&abs) {
         Ok(i) => i,
         Err(_) if !abs.exists() => return AnalyzeOne::Missing,
         Err(e) => return AnalyzeOne::Failed(format!("解码失败: {e}")),
     };
+    // EXIF 方向摆正(评审:竖拍不摆正会毁掉 dHash 聚类与人脸检测)
+    let img = media::apply_orientation(img, media::exif_orientation(&abs));
     // 单次解码产出全部特征 + 回填共享缩略图缓存
     let (dhash, mut sharpness, over, under) = analysis::extract_features(&img);
-    // 人脸在场:清晰度改按最大脸区域(对焦在脸=可用;检测失败按不可用处理)
-    let faces = detector.map(|d| match d.detect(&img) {
-        Ok(list) => {
-            if let Some(best) = list
-                .iter()
-                .max_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h)))
-            {
-                sharpness = analysis::sharpness_region(&img, best.x, best.y, best.w, best.h);
+    // 人脸在场:清晰度改按最大脸区域(对焦在脸=可用)。
+    // R2 P1:推理失败必须记 None(=不可用)并计数上报——记 0 会被永久缓存成
+    // 「确实没有人脸」,与字段语义相悖且不可辨别。
+    let faces = match detector {
+        None => None,
+        Some(d) => match d.detect(&img) {
+            Ok(list) => {
+                if let Some(best) = list
+                    .iter()
+                    .max_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h)))
+                {
+                    sharpness = analysis::sharpness_region(&img, best.x, best.y, best.w, best.h);
+                }
+                Some(list.len() as u32)
             }
-            list.len() as u32
-        }
-        Err(_) => 0,
-    });
+            Err(_) => {
+                FACE_DETECT_FAILURES.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        },
+    };
     let _ = media::store_thumb_from_image(root, rel, size, mtime, &img);
     let shot_at_epoch = media::exif_shot_at(&abs)
         .map(|t| t.timestamp())
@@ -290,4 +441,109 @@ fn analyze_one(
         analyzed_at: chrono::Utc::now(),
         machine_id: machine_id.to_string(),
     })
+}
+
+#[cfg(test)]
+mod exif_orientation_tests {
+    use super::*;
+    use crate::core::{analysis, media};
+
+    /// 生成带 EXIF Orientation 的不对称 JPEG 样张(SOI 后拼接 APP1 段)。
+    fn write_oriented_jpeg(path: &std::path::Path, orientation: u16) {
+        let img = image::RgbImage::from_fn(80, 40, |x, y| {
+            if x < 20 && y < 10 {
+                image::Rgb([250, 250, 250])
+            } else {
+                image::Rgb([10, 10, 10])
+            }
+        });
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let field = exif::Field {
+            tag: exif::Tag::Orientation,
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Short(vec![orientation]),
+        };
+        let mut w = exif::experimental::Writer::new();
+        w.push_field(&field);
+        let mut tiff = std::io::Cursor::new(Vec::new());
+        w.write(&mut tiff, false).unwrap();
+        let tiff = tiff.into_inner();
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&tiff);
+        let mut out = Vec::with_capacity(jpeg.len() + payload.len() + 4);
+        out.extend_from_slice(&jpeg[..2]); // SOI
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&jpeg[2..]);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// R2 P0-7 / R3-F2:EXIF 方向样张——索引路径(decode_oriented)与
+    /// 分析路径(analyze_one 的内联摆正,为区分 Missing/Failed 而复制)
+    /// 必须同向。任一路丢掉摆正,两路 dhash 对不上,本测试红。
+    #[test]
+    fn index_and_analysis_orient_identically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join("素材")).unwrap();
+        let rel = "素材/竖拍.jpg";
+        let abs = root.join("素材").join("竖拍.jpg");
+        write_oriented_jpeg(&abs, 6);
+
+        // 样张自证:EXIF 必须真的读得出 Orientation=6(拼接失败即恒真,先挡住)
+        assert_eq!(
+            media::exif_orientation(&abs),
+            6,
+            "样张 EXIF 不可读,fixture 失效"
+        );
+
+        // 索引路径:Orientation=6 是 90° 旋转,宽高必须互换
+        let oriented = media::decode_oriented(&abs).unwrap();
+        assert_eq!(
+            (oriented.width(), oriented.height()),
+            (40, 80),
+            "Orientation=6 必须旋转"
+        );
+        // 样张自证判别力:摆正前后 dhash 必须不同
+        let raw = image::open(&abs).unwrap();
+        assert_ne!(
+            analysis::extract_features(&raw).0,
+            analysis::extract_features(&oriented).0,
+            "样张摆正前后 dhash 相同,本测试无判别力"
+        );
+
+        // 分析路径:经真实 analyze_one 提取的 dhash 与索引路径一致(两路同向)
+        let meta = std::fs::metadata(&abs).unwrap();
+        let out = analyze_one(
+            &root,
+            "TEST-MACHINE",
+            rel,
+            meta.len(),
+            media::mtime_nanos(&meta),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        );
+        let AnalyzeOne::Fresh(rec) = out else {
+            panic!("分析应产出 Fresh 特征");
+        };
+        assert_eq!(
+            rec.dhash,
+            analysis::extract_features(&oriented).0,
+            "分析路径与索引路径必须同向(dhash 一致)"
+        );
+        // ALGO_VERSION 断言:EXIF 统一摆正自 v2 起进入算法口径;改变方向
+        // 语义或特征口径时必须递增 ALGO_VERSION,并让缓存整体失效。
+        const {
+            assert!(analysis::ALGO_VERSION >= 2, "EXIF 统一摆正要求 algo v2+");
+        }
+        assert_eq!(rec.algo_version, analysis::ALGO_VERSION);
+    }
 }

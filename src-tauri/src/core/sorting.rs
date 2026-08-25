@@ -341,6 +341,9 @@ pub fn curate_assets(
                 }
                 let tmp = dir.join(format!(".{}.curatepart", uuid::Uuid::new_v4()));
                 fs::copy(&src, &tmp).map_err(|e| format!("复制失败: {e}"))?;
+                if let Ok(m) = fs::metadata(&src) {
+                    fsx::preserve_times_counted(&m, &tmp);
+                }
                 fsx::rename_no_replace(&tmp, &dst).map_err(|e| {
                     let _ = fs::remove_file(&tmp);
                     if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -790,6 +793,36 @@ mod tests {
     // ---------- 分类 ----------
 
     #[test]
+    fn scenario_a_namespace_gate() {
+        // 评审 #13:resolve_asset_a_in_project 零测试 → 补齐
+        let tmp = tempdir().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        let root = project::create_project(tmp.path(), date, "晚会", Scenario::A, &[]).unwrap();
+        let meta = project::load_meta(&root).unwrap();
+        fs::create_dir_all(root.join("2. 原始素材/cam")).unwrap();
+        fs::write(root.join("2. 原始素材/cam/v.mp4"), b"v").unwrap();
+
+        assert!(resolve_asset_a_in_project(&root, &meta, "2. 原始素材/cam/v.mp4").is_ok());
+        assert!(resolve_asset_a_in_project(&root, &meta, "3. 特别素材/x.mp4").is_ok());
+        // 素材夹之外的一律拒(成片/工程文件/内部区/逃逸)
+        for bad in [
+            "6. 成片/a.mp4",
+            "1. 工程文件/p.prproj",
+            ".ocard/manifests/m.json",
+            "../外面.mp4",
+            "2. 原始素材/../6. 成片/a.mp4",
+        ] {
+            assert!(
+                resolve_asset_a_in_project(&root, &meta, bad).is_err(),
+                "{bad} 必须被拒"
+            );
+        }
+        // 工况 B 项目走 A 闸必须拒
+        let (_t2, broot, bmeta) = setup_project();
+        assert!(resolve_asset_a_in_project(&broot, &bmeta, "2. 原始素材/x.mp4").is_err());
+    }
+
+    #[test]
     fn categories_layout_and_hotkeys() {
         let (_t, root, meta) = setup_project();
         let cats = list_categories(&root, &meta).unwrap();
@@ -881,10 +914,30 @@ mod tests {
     #[test]
     fn curate_copies_and_original_stays() {
         let (_t, root, meta) = setup_project();
+        // R2 变异复核:精选复制也要保留源时间戳。
+        // R3 声明:生产路径用 fs::copy 落临时文件,macOS 的 fs::copy 本身克隆
+        // 时间戳——本断言在 macOS 恒真,判别力由 CI 三平台矩阵的 Linux/Windows
+        // 腿提供(删 preserve_times_counted 在那两腿必红)。
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 30);
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(root.join(asset("b.jpg")))
+            .unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(old)).unwrap();
+        drop(f);
         let out = curate_assets(&root, &meta, &[asset("b.jpg")]);
         assert!(out[0].result.is_ok());
         assert!(root.join(asset("b.jpg")).is_file(), "精选是复制,原件保留");
         assert!(root.join("4. 精选/待修/b.jpg").is_file());
+        let dm = fs::metadata(root.join("4. 精选/待修/b.jpg"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let diff = dm
+            .duration_since(old)
+            .unwrap_or_else(|e| e.duration())
+            .as_secs();
+        assert!(diff <= 2, "精选产物 mtime 必须保留源值(差 {diff}s)");
         // 没有残留临时文件
         let leftovers: Vec<_> = fs::read_dir(root.join("4. 精选/待修"))
             .unwrap()

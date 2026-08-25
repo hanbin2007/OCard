@@ -6,7 +6,9 @@
  */
 
 import { useEffect, useState } from "react";
+import { withViewTransition } from "../lib/motion";
 import * as api from "../api";
+import { isJobTerminal } from "../api/types";
 import type { DeliveryJob, DeliverySummary } from "../api/types";
 import { formatBytes } from "../lib/format";
 import { classifyFailures, deliveryHeadline } from "../lib/delivery";
@@ -62,10 +64,31 @@ export function DeliveryButton({
 
   async function cancel() {
     if (!job || cancelling) return;
+    /*
+     * 作业可能在你按下去的那一瞬间刚好跑完（按钮的显隐与点击之间有一帧）。
+     * 对终态作业再发取消，后端会回一句「将在当前文件完成后停止」——
+     * 对一个已经结束的作业，这是假话。这里先自己拦住。
+     */
+    if (isJobTerminal(job.state)) {
+      dispatch({ type: "jobProgress", job });
+      return;
+    }
     setCancelling(true);
     try {
       const snapshot = await api.cancelJob(job.id);
       dispatch({ type: "jobProgress", job: snapshot });
+      // 取消请求在路上时作业自己跑完了：如实说没生效，别让人以为是自己取消掉的
+      if (isJobTerminal(snapshot.state) && snapshot.state !== "cancelled") {
+        dispatch({
+          type: "noticeReceived",
+          notice: {
+            level: "info",
+            code: "job-cancel-too-late",
+            message: "交付作业在取消生效前已经结束，本次取消未生效。",
+            occurredAt: new Date().toISOString(),
+          },
+        });
+      }
     } catch (err) {
       dispatch({
         type: "noticeReceived",
@@ -124,7 +147,7 @@ export function DeliveryButton({
         <DeliveryResult
           job={job}
           error={startError ?? job.error ?? null}
-          onClose={() => setDismissed(job.id)}
+          onClose={() => withViewTransition(() => setDismissed(job.id))}
         />
       ) : null}
 
@@ -132,7 +155,7 @@ export function DeliveryButton({
         <DeliveryResult
           job={null}
           error={startError}
-          onClose={() => setStartError(null)}
+          onClose={() => withViewTransition(() => setStartError(null))}
         />
       ) : null}
     </>

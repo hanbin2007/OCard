@@ -4,15 +4,64 @@
 //!   规则显式、逐文件给理由、跳过件必须可见);
 //! - 代理/归档参数构造(纯函数;逐 backend 质量映射表);
 //! - `-progress pipe:1` 解析(out_time_us 优先、progress=end 判终);
-//! - 执行器:stderr 并发消费(防管道死锁)、取消强杀、staging 带机器标识、
-//!   落位前 ffprobe 全量验证(codec/尺寸/pix_fmt/音频/时长);
-//! - 幂等:输出已存在 = `already-transcoded` skip(计划 D2);
-//!   覆盖只有显式「强制重转」一个入口(命令层二次确认后先删后转)。
+//! - 执行器:stderr/stdout 双读线程 + 看门狗(取消不依赖 progress 行,
+//!   4h 总时长上限强杀)、staging 带机器标识、落位前 ffprobe 验证
+//!   (codec/高度/pix_fmt/音频存在性/时长;色彩标签未纳入,属声明边界);
+//! - 幂等:输出已存在 = `already-transcoded` skip;覆盖唯一入口=显式
+//!   `retranscode`(前端二次确认,先删后转)——均已接线(计划 D2)。
 
 use super::ffmpeg;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex as StdMutex;
+
+/// 活跃 ffmpeg 子进程登记(强退路径 kill/reap 用,计划 D2/评审 #18)。
+static ACTIVE_CHILDREN: StdMutex<Vec<u32>> = StdMutex::new(Vec::new());
+
+fn register_child(pid: u32) {
+    ACTIVE_CHILDREN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(pid);
+}
+
+fn unregister_child(pid: u32) {
+    ACTIVE_CHILDREN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|p| *p != pid);
+}
+
+/// 强退清场:杀掉全部登记的 ffmpeg 子进程(半成品 staging 由下次作业清理)。
+pub fn kill_all_children() {
+    let pids: Vec<u32> = ACTIVE_CHILDREN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .drain(..)
+        .collect();
+    for pid in pids {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output();
+        }
+    }
+}
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// 取消错误的唯一字符串:生产(run_transcode)与消费(命令层分流)两侧共用,
+/// 防文案漂移把「取消」静默降级成「失败」(R2 P2)。
+pub const CANCELLED_ERR: &str = "已取消";
+
+/// 判定错误是否为取消(命令层用它分流,不许直接比字符串字面量)。
+pub fn is_cancelled_err(e: &str) -> bool {
+    e == CANCELLED_ERR
+}
 
 /// ffprobe 出的媒体信息(转码判定所需的子集)。
 #[derive(Debug, Clone, Default, Serialize)]
@@ -86,6 +135,10 @@ pub fn probe_file(ffprobe: &PathBuf, file: &Path) -> Result<MediaInfo, String> {
     let out = ffmpeg::run_with_timeout(
         ffprobe,
         &[
+            // 供应链纪律(计划 D 波):素材路径是外部输入,协议白名单钉死本地文件,
+            // 杜绝构造 URL 状文件名打开网络/设备协议
+            "-protocol_whitelist",
+            "file",
             "-v",
             "error",
             "-print_format",
@@ -202,25 +255,42 @@ pub fn proxy_args(src: &Path, encoder: &str, dst_tmp: &Path) -> Vec<String> {
         "-hide_banner".into(),
         "-v".into(),
         "error".into(),
+        // 协议白名单(计划安全合同):输入只许本地文件,进度走 pipe
+        "-protocol_whitelist".into(),
+        "file,pipe".into(),
         "-progress".into(),
         "pipe:1".into(),
         "-n".into(),
-        "-i".into(),
-        src.to_string_lossy().into_owned(),
-        "-vf".into(),
-        "scale=-2:1080".into(),
-        "-c:v".into(),
-        encoder.into(),
     ];
+    // VAAPI 需要设备初始化 + hwupload 滤镜链(评审 #22:否则 Linux 硬编必然白跑)
+    if encoder.ends_with("_vaapi") {
+        a.extend([
+            "-init_hw_device".into(),
+            "vaapi=va:/dev/dri/renderD128".into(),
+            "-filter_hw_device".into(),
+            "va".into(),
+        ]);
+    }
+    a.extend(["-i".into(), src.to_string_lossy().into_owned()]);
+    if encoder.ends_with("_vaapi") {
+        a.extend([
+            "-vf".into(),
+            "format=nv12,hwupload,scale_vaapi=w=-2:h=1080".into(),
+        ]);
+    } else {
+        a.extend(["-vf".into(), "scale=-2:1080".into()]);
+    }
+    a.extend(["-c:v".into(), encoder.into()]);
     // 代理码率档:硬编给显式码率,软编 CRF(代理不追求极致,统一观感即可)
     if encoder == "libx264" {
         a.extend(["-crf".into(), "22".into(), "-preset".into(), "fast".into()]);
     } else {
         a.extend(["-b:v".into(), "10M".into(), "-maxrate".into(), "16M".into()]);
     }
+    if !encoder.ends_with("_vaapi") {
+        a.extend(["-pix_fmt".into(), "yuv420p".into()]);
+    }
     a.extend([
-        "-pix_fmt".into(),
-        "yuv420p".into(),
         "-c:a".into(),
         "aac".into(),
         "-b:a".into(),
@@ -243,27 +313,45 @@ pub fn archive_args(
         "-hide_banner".into(),
         "-v".into(),
         "error".into(),
+        "-protocol_whitelist".into(),
+        "file,pipe".into(),
         "-progress".into(),
         "pipe:1".into(),
         "-n".into(),
+    ];
+    // R2:归档此前缺 VAAPI 输入链(评审 #22 只修了代理)——hevc_vaapi 会必然白跑
+    if encoder.ends_with("_vaapi") {
+        a.extend([
+            "-init_hw_device".into(),
+            "vaapi=va:/dev/dri/renderD128".into(),
+            "-filter_hw_device".into(),
+            "va".into(),
+        ]);
+    }
+    a.extend([
         "-i".into(),
         src.to_string_lossy().into_owned(),
         "-c:v".into(),
         encoder.into(),
-    ];
+    ]);
     a.extend(quality_args(encoder, tier));
-    let pix = if ten_bit {
-        if encoder.starts_with("lib") {
-            "yuv420p10le"
-        } else {
-            "p010le"
-        }
+    if encoder.ends_with("_vaapi") {
+        // VAAPI 走上传滤镜链定表面格式,不用 -pix_fmt
+        let surface = if ten_bit { "p010le" } else { "nv12" };
+        a.extend(["-vf".into(), format!("format={surface},hwupload")]);
     } else {
-        "yuv420p"
-    };
+        let pix = if ten_bit {
+            if encoder.starts_with("lib") {
+                "yuv420p10le"
+            } else {
+                "p010le"
+            }
+        } else {
+            "yuv420p"
+        };
+        a.extend(["-pix_fmt".into(), pix.into()]);
+    }
     a.extend([
-        "-pix_fmt".into(),
-        pix.into(),
         "-c:a".into(),
         "copy".into(),
         dst_tmp.to_string_lossy().into_owned(),
@@ -322,6 +410,18 @@ pub fn verify_output(
     if src_info.has_audio && !out_info.has_audio {
         return Err("源有音频但输出缺失音频流".into());
     }
+    // 色彩标签验证(计划 §5.6 合同;R2:此前被错误声明为边界)——HDR 源
+    // (HLG/PQ)的 transfer 标签必须保留,丢失会被播放器按 SDR 解释导致亮度错误
+    if let Some(st) = src_info.color_transfer.as_deref() {
+        if (st == "arib-std-b67" || st == "smpte2084")
+            && out_info.color_transfer.as_deref() != Some(st)
+        {
+            return Err(format!(
+                "HDR 色彩传递标签未保留:源 {st},输出 {}",
+                out_info.color_transfer.as_deref().unwrap_or("(无)")
+            ));
+        }
+    }
     if let (Some(a), Some(b)) = (src_info.duration_secs, out_info.duration_secs) {
         if (a - b).abs() > 1.0 {
             return Err(format!("输出时长偏差过大:源 {a:.2}s,输出 {b:.2}s"));
@@ -349,6 +449,16 @@ pub fn run_transcode(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("启动 ffmpeg 失败: {e}"))?;
+    let child_pid = child.id();
+    register_child(child_pid);
+    // 任何返回路径都要注销登记
+    struct Unregister(u32);
+    impl Drop for Unregister {
+        fn drop(&mut self) {
+            unregister_child(self.0);
+        }
+    }
+    let _unreg = Unregister(child_pid);
 
     // stderr 并发消费(计划 B5 首坑:不读会填满管道死锁),尾部 4KB 留作错误报文
     let mut stderr = child.stderr.take().unwrap();
@@ -369,34 +479,72 @@ pub fn run_transcode(
         }
     });
 
+    // stdout 也走独立读线程 + 通道:取消/看门狗不依赖 ffmpeg 吐 progress
+    // (评审 #21:卡死不吐行时取消要能生效,并设总时长上限)
     let stdout = child.stdout.take().unwrap();
-    let reader = BufReader::new(stdout);
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+    let out_thread = std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    const MAX_WALL: Duration = Duration::from_secs(4 * 3600);
+    let started = std::time::Instant::now();
     let mut saw_end = false;
-    for line in reader.lines() {
-        if cancelled() {
+    let status = loop {
+        if cancelled() || started.elapsed() > MAX_WALL {
+            let timed_out = started.elapsed() > MAX_WALL;
             let _ = child.kill();
             let _ = child.wait();
+            drop(line_rx);
+            let _ = out_thread.join();
             let _ = err_thread.join();
             let _ = std::fs::remove_file(tmp_out);
-            return Err("已取消".into());
+            return Err(if timed_out {
+                format!("转码超时({}h 上限)已强杀", MAX_WALL.as_secs() / 3600)
+            } else {
+                CANCELLED_ERR.into()
+            });
         }
-        let Ok(line) = line else { break };
-        match parse_progress_line(&line) {
-            ProgressLine::OutTimeUs(us) => {
-                let frac = total_duration_secs
-                    .filter(|d| *d > 0.0)
-                    .map(|d| ((us as f64 / 1_000_000.0) / d).clamp(0.0, 1.0) as f32);
-                on_progress(frac); // None = 不确定态(无时长流)
+        match line_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => match parse_progress_line(&line) {
+                ProgressLine::OutTimeUs(us) => {
+                    let frac = total_duration_secs
+                        .filter(|d| *d > 0.0)
+                        .map(|d| ((us as f64 / 1_000_000.0) / d).clamp(0.0, 1.0) as f32);
+                    on_progress(frac); // None = 不确定态(无时长流)
+                }
+                ProgressLine::End => saw_end = true,
+                ProgressLine::Other => {}
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(Some(st)) = child.try_wait() {
+                    break st;
+                }
             }
-            ProgressLine::End => saw_end = true,
-            ProgressLine::Other => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break child.wait().map_err(|e| format!("等待 ffmpeg 失败: {e}"))?;
+            }
         }
-    }
-    let status = child.wait().map_err(|e| format!("等待 ffmpeg 失败: {e}"))?;
+        if let Ok(Some(st)) = child.try_wait() {
+            // 进程已退:清空余量行再收尾
+            while let Ok(line) = line_rx.try_recv() {
+                if parse_progress_line(&line) == ProgressLine::End {
+                    saw_end = true;
+                }
+            }
+            break st;
+        }
+    };
+    let _ = out_thread.join();
     let _ = err_thread.join();
     if cancelled() {
         let _ = std::fs::remove_file(tmp_out);
-        return Err("已取消".into());
+        return Err(CANCELLED_ERR.into());
     }
     if !status.success() || !saw_end {
         let tail = err_tail.lock().unwrap_or_else(|p| p.into_inner());
@@ -577,5 +725,158 @@ mod tests {
         assert!(!is_hw_init_failure(
             "Invalid data found when processing input"
         ));
+    }
+
+    /// R2 变异复核(收敛 #22):VAAPI 代理参数必须带设备初始化 + 上传滤镜链,
+    /// 且不得出现 -pix_fmt(表面格式由滤镜链决定)。
+    #[test]
+    fn vaapi_proxy_args_have_device_and_upload_chain() {
+        let a = proxy_args(
+            Path::new("/in/a.MP4"),
+            "h264_vaapi",
+            Path::new("/out/t.mp4"),
+        );
+        let joined = a.join(" ");
+        assert!(joined.contains("-init_hw_device vaapi=va:/dev/dri/renderD128"));
+        assert!(joined.contains("format=nv12,hwupload,scale_vaapi=w=-2:h=1080"));
+        assert!(!joined.contains("-pix_fmt"), "VAAPI 不得再塞 -pix_fmt");
+        // 软编基线仍然有 -pix_fmt 与普通 scale
+        let sw = proxy_args(Path::new("/in/a.MP4"), "libx264", Path::new("/out/t.mp4"));
+        let sj = sw.join(" ");
+        assert!(sj.contains("scale=-2:1080") && sj.contains("-pix_fmt yuv420p"));
+        assert!(!sj.contains("hwupload"));
+    }
+
+    /// R2:归档 VAAPI 同样要有输入链(此前只修了代理)。
+    #[test]
+    fn vaapi_archive_args_have_upload_chain() {
+        let a = archive_args(
+            Path::new("/in/a.MOV"),
+            "hevc_vaapi",
+            ArchiveTier::Balanced,
+            false,
+            Path::new("/out/t.mp4"),
+        );
+        let j = a.join(" ");
+        assert!(j.contains("-init_hw_device vaapi=va:/dev/dri/renderD128"));
+        assert!(j.contains("format=nv12,hwupload"));
+        assert!(!j.contains("-pix_fmt"));
+        let ten = archive_args(
+            Path::new("/in/a.MOV"),
+            "hevc_vaapi",
+            ArchiveTier::Balanced,
+            true,
+            Path::new("/out/t.mp4"),
+        );
+        assert!(ten.join(" ").contains("format=p010le,hwupload"));
+    }
+
+    /// 协议白名单必须在参数里(供应链纪律;三个构建器都要有)。
+    #[test]
+    fn args_carry_protocol_whitelist() {
+        for args in [
+            proxy_args(Path::new("/in/a.MP4"), "libx264", Path::new("/o.mp4")),
+            archive_args(
+                Path::new("/in/a.MOV"),
+                "libx265",
+                ArchiveTier::Quality,
+                false,
+                Path::new("/o.mp4"),
+            ),
+        ] {
+            assert!(args.join(" ").contains("-protocol_whitelist file,pipe"));
+        }
+    }
+
+    /// R2:HDR 源(HLG/PQ)的色彩传递标签必须保留,丢失=验证失败(计划合同)。
+    #[test]
+    fn verify_output_requires_hdr_transfer_preserved() {
+        let src = MediaInfo {
+            codec: "prores".into(),
+            width: 3840,
+            height: 2160,
+            pix_fmt: "yuv422p10le".into(),
+            bit_rate: None,
+            duration_secs: Some(10.0),
+            color_transfer: Some("arib-std-b67".into()),
+            has_audio: false,
+        };
+        let mut out = MediaInfo {
+            codec: "h264".into(),
+            width: 1920,
+            height: 1080,
+            pix_fmt: "yuv420p".into(),
+            bit_rate: None,
+            duration_secs: Some(10.0),
+            color_transfer: None,
+            has_audio: false,
+        };
+        assert!(
+            verify_output(&out, "h264", Some(1080), "yuv420p", &src).is_err(),
+            "HLG 标签丢失必须报错"
+        );
+        out.color_transfer = Some("arib-std-b67".into());
+        assert!(verify_output(&out, "h264", Some(1080), "yuv420p", &src).is_ok());
+        // SDR 源不做该项检查
+        let sdr_src = MediaInfo {
+            color_transfer: Some("bt709".into()),
+            ..src.clone()
+        };
+        let sdr_out = MediaInfo {
+            color_transfer: None,
+            ..out.clone()
+        };
+        assert!(verify_output(&sdr_out, "h264", Some(1080), "yuv420p", &sdr_src).is_ok());
+    }
+
+    /// 取消字符串单一来源:两侧共用判定函数(防文案漂移降级成「失败」)。
+    #[test]
+    fn cancelled_err_is_single_source_of_truth() {
+        assert!(is_cancelled_err(CANCELLED_ERR));
+        assert!(!is_cancelled_err("转码失败"));
+    }
+
+    /// R2 变异复核(收敛 #21):看门狗/取消不依赖 progress 行——
+    /// 用一个只 sleep 不出任何 progress 的假 ffmpeg,请求取消后必须在
+    /// 秒级返回「已取消」,而不是等进程自然结束。变异(看门狗关闭)会让
+    /// 本测试超时红。
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_cancels_without_progress_lines() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("fake-ffmpeg.sh");
+        {
+            let mut f = std::fs::File::create(&fake).unwrap();
+            // exec:让 sleep 顶替 sh 的 PID(kill 才能同时收走管道;
+            // 真 ffmpeg 没有子进程,不存在这个测试特有的孤儿问题)
+            f.write_all(b"#!/bin/sh\nexec sleep 300\n").unwrap();
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out_tmp = tmp.path().join("t.mp4");
+        let started = std::time::Instant::now();
+        let cancel_after = std::time::Duration::from_millis(600);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fake2 = fake.clone();
+        let out2 = out_tmp.clone();
+        std::thread::spawn(move || {
+            let r = run_transcode(
+                &fake2,
+                &["-i".into(), "/dev/null".into()],
+                &out2,
+                None,
+                |_| {},
+                &|| started.elapsed() > cancel_after,
+            );
+            let _ = tx.send(r);
+        });
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("看门狗必须在秒级响应取消,不等 sleep 300 自然结束");
+        assert!(
+            matches!(&r, Err(e) if is_cancelled_err(e)),
+            "应返回取消: {r:?}"
+        );
     }
 }

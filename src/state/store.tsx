@@ -45,6 +45,21 @@ export type RouteName =
   | "transcode";
 
 /**
+ * 导航的**空间顺序**：侧栏就是按这个顺序排的，屏间过渡的方向也由它算。
+ * 往下走 → 新屏从下方进来；往回走 → 从上方进来。
+ * 两处共用同一个常量，改了顺序不会出现"侧栏在下、动画说在上"的错位。
+ */
+export const ROUTE_ORDER: RouteName[] = [
+  "projects",
+  "new-project",
+  "devices",
+  "copy",
+  "sorting",
+  "transcode",
+  "trash",
+];
+
+/**
  * 通知中心条目：同 code 连续重复会折叠成一条并计数，避免刷屏。
  * `live` 表示还在即时呈现区（error 需手动确认，warning 数秒后自动收进铃铛）。
  */
@@ -539,6 +554,8 @@ interface StoreValue {
   reload: () => void;
   /** 与后端对账某个任务的最新快照 */
   refreshTask: (taskId: string) => Promise<void>;
+  /** 与后端对账后台作业列表 */
+  reconcileJobs: () => Promise<void>;
 }
 
 const StoreContext = createContext<StoreValue | null>(null);
@@ -740,6 +757,32 @@ export function StoreProvider({
     };
   }, []);
 
+  /** 与后端对账一次作业列表（focus 恢复、手动刷新都走它） */
+  const reconcileJobs = useCallback(async () => {
+    try {
+      dispatch({ type: "jobsLoaded", jobs: await api.listJobs() });
+    } catch (err) {
+      dispatch({
+        type: "noticeReceived",
+        notice: {
+          level: "warning",
+          code: "jobs-reconcile-failed",
+          message: `读取后台作业列表失败：${
+            err instanceof Error ? err.message : String(err)
+          }。进行中的作业状态可能不准确。`,
+          occurredAt: new Date().toISOString(),
+        },
+      });
+    }
+  }, []);
+
+  // 窗口重新获得焦点时对账：期间可能错过了终态事件
+  useEffect(() => {
+    const onFocus = () => void reconcileJobs();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [reconcileJobs]);
+
   /** 拉一次任务快照与后端对账（start/resume/retry 之后调用） */
   const refreshTask = useCallback(async (taskId: string) => {
     try {
@@ -850,8 +893,8 @@ export function StoreProvider({
   }, [orphanIdsKey]);
 
   const value = useMemo(
-    () => ({ state, dispatch, reload, refreshTask }),
-    [state, reload, refreshTask],
+    () => ({ state, dispatch, reload, refreshTask, reconcileJobs }),
+    [state, reload, refreshTask, reconcileJobs],
   );
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;
 }

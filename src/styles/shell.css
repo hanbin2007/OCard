@@ -4,7 +4,7 @@
   display: grid;
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   height: 100%;
-  background: var(--bg);
+  background: var(--surface-shell);
 }
 
 /* ---------- 左侧边栏 ---------- */
@@ -70,7 +70,37 @@
   letter-spacing: 0.04em;
 }
 
+/* 导航区是"选中底块"的定位参照系（列表本身不定位，量到的 offsetTop 才是这里的坐标） */
+.sidebar__nav {
+  position: relative;
+}
+
+/*
+ * 选中态是**一块会移动的底**，不是七块各自亮灭的底。
+ * 切屏时它从上一项滑到下一项，导航的空间关系因此是连续可读的（§7 空间一致性）：
+ * 你能看见"从哪来、到哪去"，而不是两次无关的闪烁。
+ * 只动 transform，尺寸由 JS 量一次写死，永不引发重排。
+ */
+.nav-rail {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  z-index: 0;
+  border-radius: var(--radius-md);
+  background: var(--selected);
+  pointer-events: none;
+  will-change: transform;
+}
+
+/* 首次落位不能有过渡，否则它会从列表顶端"飞"到当前项 */
+.nav-rail--ready {
+  transition: transform var(--dur-spring) var(--spring);
+}
+
 .nav-item {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -83,11 +113,12 @@
   font-size: var(--text-sm);
   text-align: left;
   transition:
-    background var(--transition),
-    color var(--transition);
+    background var(--dur-micro) var(--ease-out),
+    color var(--dur-micro) var(--ease-out),
+    transform var(--dur-spring-fast) var(--spring);
 }
 
-.nav-item:hover {
+.nav-item:hover:not(:disabled) {
   background: var(--hover);
   color: var(--text-primary);
 }
@@ -96,6 +127,11 @@
   background: var(--selected);
   color: var(--text-primary);
   font-weight: var(--weight-medium);
+}
+
+/* 底块量出来了就由它供底色；量不到（无 JS 布局信息）时保留原来的逐项底色 */
+.sidebar__nav-list[data-rail="on"] .nav-item[aria-current="page"] {
+  background: transparent;
 }
 
 .nav-item__icon {
@@ -131,10 +167,12 @@
   background: transparent;
   color: var(--text-secondary);
   text-align: left;
-  transition: background var(--transition);
+  transition:
+    background var(--dur-micro) var(--ease-out),
+    transform var(--dur-spring-fast) var(--spring);
 }
 
-.sidebar__project:hover {
+.sidebar__project:hover:not(:disabled) {
   background: var(--hover);
 }
 
@@ -189,6 +227,8 @@
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+  /* 内容区比侧栏亮一档 */
+  background: var(--bg);
 }
 
 .topbar {
@@ -200,6 +240,13 @@
   padding: 0 var(--space-6);
   border-bottom: 1px solid var(--border);
   background: var(--bg);
+}
+
+/* 标题栏是"框"，不跟着内容一起位移：只做交叉淡入，
+   否则整块 chrome 一起跳会削弱"内容换了、框没换"的层级关系。 */
+.topbar__title,
+.topbar__sub {
+  animation: chrome-fade-in var(--dur-quick) var(--ease-out);
 }
 
 .topbar__title {
@@ -225,10 +272,49 @@
   margin-left: auto;
 }
 
+/*
+ * 屏与屏之间的方向一致性（§7 空间一致性 + §8 中间帧指向结果）：
+ * 在侧栏里往下走，新屏从下方进来；往回走，从上方进来。
+ * 位移只有 12px —— 桌面工具要的是"知道往哪走了"，不是搬家式的大位移。
+ * 只动 transform / opacity，网格再大也不会因此重排。
+ */
 .content {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+}
+
+.shell[data-nav="forward"] .content {
+  animation: screen-in-below var(--dur-spring-fast) var(--spring);
+}
+
+.shell[data-nav="back"] .content {
+  animation: screen-in-above var(--dur-spring-fast) var(--spring);
+}
+
+/* 首屏 / 非导航引起的整屏替换（加载完成、首跑引导）只淡入，不给方向 */
+.shell[data-nav="none"] .content {
+  animation: chrome-fade-in var(--dur-quick) var(--ease-out);
+}
+
+@keyframes screen-in-below {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 12px, 0);
+  }
+}
+
+@keyframes screen-in-above {
+  from {
+    opacity: 0;
+    transform: translate3d(0, -12px, 0);
+  }
+}
+
+@keyframes chrome-fade-in {
+  from {
+    opacity: 0;
+  }
 }
 
 .content__inner {

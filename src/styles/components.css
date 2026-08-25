@@ -11,16 +11,18 @@
   padding: 0 var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  background: var(--panel);
+  /* 次级按钮比所在面高一档，不靠阴影也能读作可点控件 */
+  background: var(--panel-raised);
   color: var(--text-primary);
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
   white-space: nowrap;
   transition:
-    background var(--transition),
-    border-color var(--transition),
-    color var(--transition),
-    opacity var(--transition);
+    background var(--dur-micro) var(--ease-out),
+    border-color var(--dur-micro) var(--ease-out),
+    color var(--dur-micro) var(--ease-out),
+    opacity var(--dur-micro) var(--ease-out),
+    transform var(--dur-spring-fast) var(--spring);
 }
 
 .btn:hover:not(:disabled) {
@@ -92,6 +94,42 @@
 
 .btn--danger {
   color: var(--danger);
+}
+
+/* ---------- 按压反馈：pointer-down 就响应，不等 release ---------- */
+
+/*
+ * Apple 的第一条要求是"按下的那一刻"就有反馈——等 click/mouseup 再亮，
+ * 直接感就"掉下悬崖"。CSS 的 :active 正是在 pointer-down 命中，
+ * 所以这里一行 JS 都不需要。
+ *
+ * 两段时长故意不对称：按下去 90ms（快到读作即时），松手回弹走临界阻尼弹簧
+ * （350ms，但位移在前 40% 就走完）。这就是"按得下、弹得回"的手感来源；
+ * 对称的机械插值只会像开关，不像实体。
+ * 全部只动 transform，任何一格都不会牵动布局。
+ */
+.btn:active:not(:disabled),
+.chip:active:not(:disabled),
+.segmented__item:active:not(:disabled) {
+  transform: scale(0.97);
+  transition-duration: var(--dur-instant);
+  transition-timing-function: var(--ease-out);
+}
+
+.nav-item:active:not(:disabled),
+.sidebar__project:active:not(:disabled),
+.asset:active {
+  transform: scale(0.98);
+  transition-duration: var(--dur-instant);
+  transition-timing-function: var(--ease-out);
+}
+
+/* 整行/整卡这类大面积控件缩得更少：位移一样可读，文字不会糊 */
+.choice:active,
+.volume-row:active {
+  transform: scale(0.995);
+  transition-duration: var(--dur-instant);
+  transition-timing-function: var(--ease-out);
 }
 
 /* ---------- 卡片 / 面板 ---------- */
@@ -167,12 +205,11 @@
   padding: 0 var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  background: var(--bg);
+  /* 输入面比所在面板沉一档，形成"凹"的层次 */
+  background: var(--field);
   color: var(--text-primary);
   font-size: var(--text-sm);
-  transition:
-    border-color var(--transition),
-    box-shadow var(--transition);
+  transition: border-color var(--dur-micro) var(--ease-out);
 }
 
 .textarea {
@@ -194,11 +231,11 @@
   border-color: var(--border-strong);
 }
 
+/* 焦点不再用光晕阴影：边框变色 + 全局 :focus-visible 轮廓已经够清楚 */
 .input:focus,
 .select:focus,
 .textarea:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
   outline: none;
 }
 
@@ -254,8 +291,9 @@
   color: var(--text-secondary);
   font-size: var(--text-xs);
   transition:
-    background var(--transition),
-    color var(--transition);
+    background var(--dur-micro) var(--ease-out),
+    color var(--dur-micro) var(--ease-out),
+    transform var(--dur-spring-fast) var(--spring);
 }
 
 .segmented__item[aria-checked="true"],
@@ -275,8 +313,9 @@
   background: var(--panel);
   text-align: left;
   transition:
-    border-color var(--transition),
-    background var(--transition);
+    border-color var(--dur-micro) var(--ease-out),
+    background var(--dur-micro) var(--ease-out),
+    transform var(--dur-spring-fast) var(--spring);
 }
 
 .choice:hover {
@@ -346,6 +385,39 @@
   letter-spacing: -0.01em;
 }
 
+/*
+ * 状态徽标"换档"时轻轻落位一次。
+ * 只在 tone 真的变了（如 运行中 → 已完成）时触发，首次挂载不触发——
+ * 否则一进屏几十个徽标一起弹，是噪音不是反馈（§13 utility）。
+ */
+.badge[data-pulse] {
+  animation: badge-settle var(--dur-spring-fast) var(--spring);
+}
+
+@keyframes badge-settle {
+  from {
+    opacity: 0.25;
+    transform: scale(0.9);
+  }
+}
+
+/*
+ * 数字变化（分类计数、导航计数、待分类余量）的因果反馈（§13 causality）：
+ * 你按了一下分类键，是"那个数"动了一下告诉你生效了，
+ * 而不是全屏刷新一遍让你自己找差别。
+ */
+.pulse-value {
+  display: inline-block;
+  animation: value-settle var(--dur-spring-pop) var(--spring-pop);
+}
+
+@keyframes value-settle {
+  from {
+    opacity: 0.15;
+    transform: scale(0.7);
+  }
+}
+
 .dot {
   width: 6px;
   height: 6px;
@@ -364,11 +436,22 @@
   overflow: hidden;
 }
 
+/*
+ * 进度条走 scaleX 而不是 width：width 每帧都要重排，
+ * 拷卡屏一屏几十条进度同时在动时，那是实打实的掉帧来源。
+ * transform 只在合成层跑，且 CSS transition 天生从"当前呈现值"继续——
+ * 进度事件密集到来时不断改目标也不会跳帧，正是 Apple 说的可中断。
+ */
 .progress__bar {
+  width: 100%;
   height: 100%;
   border-radius: var(--radius-pill);
   background: var(--accent);
-  transition: width var(--transition);
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition:
+    transform var(--dur-spring-fast) var(--spring),
+    background var(--dur-micro) var(--ease-out);
 }
 
 .progress--thin {
@@ -403,7 +486,7 @@
   background: transparent;
   color: inherit;
   text-align: left;
-  transition: background var(--transition);
+  transition: background var(--dur-micro) var(--ease-out);
 }
 
 .list__row:first-child,
@@ -414,6 +497,12 @@
 
 .list__row:hover {
   background: var(--hover);
+}
+
+/* 整行不做缩放（文字会糊），但按下必须立刻有反馈 */
+.list__row:active {
+  background: var(--active);
+  transition-duration: var(--dur-instant);
 }
 
 .list__row[aria-selected="true"] {
@@ -621,6 +710,12 @@
 
 /* ---------- 确认对话框 ---------- */
 
+/*
+ * 遮罩与对话框分成两层动：遮罩只做纯淡入（"背景被压下去"），
+ * 对话框自己从下方 8px、0.97 倍长出来。
+ * 两者都只碰 opacity / transform，且终态就是静态样式——
+ * 减少动效时直接是静止的最终样子，功能一处不少。
+ */
 .overlay {
   position: fixed;
   inset: 0;
@@ -629,6 +724,13 @@
   place-items: center;
   padding: var(--space-6);
   background: var(--overlay);
+  animation: scrim-in var(--dur-quick) var(--ease-out);
+}
+
+@keyframes scrim-in {
+  from {
+    opacity: 0;
+  }
 }
 
 .dialog {
@@ -638,6 +740,16 @@
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
   background: var(--panel);
+  /* 浮层是唯一允许阴影的层级 */
+  box-shadow: var(--shadow-overlay);
+  animation: dialog-in var(--dur-spring-fast) var(--spring);
+}
+
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0) scale(0.97);
+  }
 }
 
 .dialog__title {
@@ -751,7 +863,9 @@
   display: flex;
 }
 
+/* 新通知到达时角标"落"一下：降级/失败不允许悄悄发生 */
 .notice-bell__badge {
+  animation: value-settle var(--dur-spring-pop) var(--spring-pop);
   position: absolute;
   top: 1px;
   right: 1px;
@@ -772,6 +886,10 @@
   color: var(--on-danger);
 }
 
+/*
+ * 面板从铃铛那儿"长"出来：transform-origin 锚在触发它的按钮一侧（§7）。
+ * 从中心放大会切断按钮与内容的空间关系——你会不知道它是谁弹出来的。
+ */
 .notice-panel {
   position: absolute;
   top: calc(100% + var(--space-2));
@@ -782,7 +900,17 @@
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
   background: var(--panel);
+  box-shadow: var(--shadow-overlay);
   overflow: hidden;
+  transform-origin: top right;
+  animation: popover-in var(--dur-spring-fast) var(--spring);
+}
+
+@keyframes popover-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, -6px, 0) scale(0.95);
+  }
 }
 
 .notice-panel__head {
@@ -891,6 +1019,7 @@
   gap: 1px;
 }
 
+/* 从 chrome 一侧压下来落到内容顶部：来向与它在版面里的位置一致 */
 .toast {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
@@ -899,6 +1028,14 @@
   padding: var(--space-3) var(--space-6);
   border-bottom: 1px solid var(--border);
   background: var(--warn-soft);
+  animation: toast-in var(--dur-spring-fast) var(--spring);
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, -6px, 0);
+  }
 }
 
 .toast--error {

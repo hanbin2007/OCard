@@ -53,6 +53,7 @@ macro_rules! ocard_invoke_handler {
             $crate::commands::transcode_cmds::transcode_capabilities,
             $crate::commands::transcode_cmds::transcode_diagnostics,
             $crate::commands::transcode_cmds::start_proxy_transcode,
+            $crate::commands::transcode_cmds::start_archive_transcode,
             $crate::commands::analysis_cmds::start_analysis,
             $crate::commands::finalcut_cmds::check_final_cuts,
             $crate::commands::finalcut_cmds::curated_flow_hints,
@@ -83,6 +84,8 @@ pub fn run() {
             });
             // sidecar 缺失立即可见(零静默 ffmpeg-missing)
             commands::transcode_cmds::notify_ffmpeg_missing_on_startup(app.handle());
+            // AI 模型启动校验(D1:哈希不符=禁用 AI,硬失败可见)
+            commands::analysis_cmds::verify_models_on_startup(app.handle());
             // auto_proxy 意图补投递(at-least-once:整批成功才置位,skip 语义容忍重复)
             {
                 let app_handle = app.handle().clone();
@@ -91,10 +94,32 @@ pub fn run() {
                 let machine_id = state.machine_id.clone();
                 std::thread::spawn(move || {
                     let (cfg, _) = core::config::load_checked(&config_dir);
+                    // 未配置 NAS = 正常初始态,无声跳过(声明);其余失败必须可见(R2 P2:
+                    // NAS 未连时整条 at-least-once 补投递静默失效是零静默违规)
                     let Some(nas) = cfg.nas_root else { return };
-                    let Ok(scan) = core::catalog::scan_cached(&nas) else { return };
+                    let scan = match core::catalog::scan_cached(&nas) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            commands::notify::warn(
+                                &app_handle,
+                                "auto-proxy-deferred",
+                                format!("启动补投递未执行(NAS 扫描失败: {e});自动转代理将在下次启动重试"),
+                            );
+                            return;
+                        }
+                    };
                     for p in scan.projects {
-                        let Ok(listing) = core::manifest::list(&p.root) else { continue };
+                        let listing = match core::manifest::list(&p.root) {
+                            Ok(l) => l,
+                            Err(e) => {
+                                commands::notify::warn(
+                                    &app_handle,
+                                    "auto-proxy-deferred",
+                                    format!("「{}」的拷卡清单读取失败({e}),该项目的自动转代理本次未检查", p.meta.name),
+                                );
+                                continue;
+                            }
+                        };
                         for m in listing.manifests {
                             commands::transcode_cmds::dispatch_auto_proxy(
                                 &app_handle,
@@ -163,6 +188,56 @@ pub fn run() {
                     }
                 }
             });
+        })
+        .on_window_event(|window, event| {
+            // D2/评审 #18:有活跃后台作业时关窗先拦 + 可见提示;
+            // 15 秒内再次关闭 = 确认强退:取消全部作业、杀 ffmpeg 子进程后放行
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                use tauri::Manager as _;
+                static LAST_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+                let app = window.app_handle();
+                let jobs_active = app
+                    .try_state::<std::sync::Arc<core::jobs::JobManager>>()
+                    .map(|j| j.any_active())
+                    .unwrap_or(false);
+                let tasks_running = app
+                    .try_state::<commands::AppState>()
+                    .map(|s| s.tasks.any_running())
+                    .unwrap_or(false);
+                if !jobs_active && !tasks_running {
+                    return;
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let last = LAST_ATTEMPT.swap(now, Ordering::SeqCst);
+                if now.saturating_sub(last) <= 15 {
+                    // 确认强退:请求取消全部活跃作业 + 暂停拷贝任务(安全点停笔,
+                    // R2 P1:此前拷贝线程被硬杀在半写 .part 上)+ 杀子进程,放行关闭
+                    if let Some(jobs) =
+                        app.try_state::<std::sync::Arc<core::jobs::JobManager>>()
+                    {
+                        for s in jobs.snapshots() {
+                            if !s.state.is_terminal() {
+                                let _ = jobs.request_cancel(&s.id);
+                            }
+                        }
+                    }
+                    if let Some(state) = app.try_state::<commands::AppState>() {
+                        state.tasks.pause_all();
+                    }
+                    core::transcode::kill_all_children();
+                    return;
+                }
+                api.prevent_close();
+                commands::notify::warn(
+                    app,
+                    "close-blocked-active-jobs",
+                    "有后台作业(拷卡/交付/转码/分析)进行中,已阻止关闭;15 秒内再次关闭将取消作业并退出".into(),
+                );
+            }
         })
         .invoke_handler(crate::ocard_invoke_handler!())
         .run(tauri::generate_context!())

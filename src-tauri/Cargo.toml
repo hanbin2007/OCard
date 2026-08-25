@@ -22,7 +22,12 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 声明边界(R2 P2 台账):download-binaries 让 ort-sys 构建期从 pyke CDN 拉取
+# ONNX Runtime 预编译静态库,该制品未纳入本仓侧 SHA-256 校验——制品身份仅由
+# Cargo.lock 钉死的 ort-sys 精确版本间接决定(模型文件本身仍有启动期 SHA 校验,
+# 见 core/yunet.rs)。钉死方案(vendored 库 + ORT_LIB_LOCATION)留待有真实需求时评估。
 ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "download-binaries", "tls-rustls"] }
+percent-encoding = "2"
 rayon = "1.10"
 sha2 = "0.10"
 hex = "0.4"

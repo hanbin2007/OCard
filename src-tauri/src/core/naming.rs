@@ -221,8 +221,8 @@ pub fn parse_final_cut(file_name: &str) -> std::result::Result<FinalCutName, Vec
     {
         issues.push(format!("日期段「{date}」不是有效的 YYYYMMDD"));
     }
-    if title.trim().is_empty() {
-        issues.push("片名为空".into());
+    if title.trim().trim_matches('_').is_empty() {
+        issues.push("片名为空(或只含下划线)".into());
     }
     let res_upper = resolution.to_ascii_uppercase();
     let res_entry = RESOLUTIONS.iter().find(|(r, _)| *r == res_upper);

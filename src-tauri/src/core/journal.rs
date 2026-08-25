@@ -116,9 +116,11 @@ fn project_journal_dir(project_root: &Path) -> PathBuf {
     project_root.join(STATE_DIR).join(JOURNAL_DIR)
 }
 
-/// 项目级日志:追加。
+/// 项目级日志:追加(R2 P0:`.ocard`/`journal` 中间段防符号链接偷渡)。
 pub fn append(project_root: &Path, event: &Event) -> Result<()> {
-    append_in(&project_journal_dir(project_root), event)
+    let dir = project_journal_dir(project_root);
+    super::paths::ensure_dir_within(project_root, &dir).map_err(super::CoreError::Invalid)?;
+    append_in(&dir, event)
 }
 
 /// 项目级日志:合并读取。
@@ -131,6 +133,25 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::tempdir;
+
+    /// R3:append 的 `.ocard` 落地闸接线回归——中间段被换成指向项目外的
+    /// 符号链接时必须拒写(在 append 里删掉 ensure_dir_within 调用本测试红)。
+    #[cfg(unix)]
+    #[test]
+    fn append_refuses_symlinked_state_dir() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, project.join(STATE_DIR)).unwrap();
+        let ev = Event::new("mac-01", "E2E", kind::COPY_STARTED, json!({}));
+        assert!(append(&project, &ev).is_err(), "符号链接 .ocard 必须拒写");
+        assert!(
+            !outside.join(JOURNAL_DIR).exists(),
+            "日志不得经链接写到项目外"
+        );
+    }
 
     #[test]
     fn append_and_merge_multiple_machines() {
