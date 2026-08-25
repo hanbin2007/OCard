@@ -219,10 +219,16 @@ fn m3_commands_wired_and_gated() {
     let (window, _tmp, nas) = mock_app();
     let pid = create_b_project(&window);
 
-    // ffmpeg_status:mock 环境无 sidecar → missing 且原因可见(零静默形状)
-    let st = invoke(&window, "ffmpeg_status", json!({})).unwrap();
-    assert_eq!(st["status"], "missing");
-    assert!(st["error"].as_str().unwrap_or_default().len() > 3);
+    // ffmpeg_status:mock 环境无 sidecar → missing 且原因可见(零静默形状)。
+    // 持环境锁:并行的真 ffmpeg 测试会临时设 OCARD_FFMPEG_DIR,撞上会假红
+    {
+        let _g = crate::core::ffmpeg::FFMPEG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let st = invoke(&window, "ffmpeg_status", json!({})).unwrap();
+        assert_eq!(st["status"], "missing");
+        assert!(st["error"].as_str().unwrap_or_default().len() > 3);
+    }
 
     // 转码/归档只认工况 A:B 项目必须被拒且报文点名
     let e = invoke(
@@ -680,6 +686,12 @@ fn stage_sidecar_dir(tmp: &std::path::Path) -> Option<std::path::PathBuf> {
 fn proxy_transcode_end_to_end_with_real_ffmpeg() {
     let (window, tmp, nas) = mock_app();
     let Some(ffdir) = stage_sidecar_dir(tmp.path()) else {
+        // CI 上 sidecar 必须在 cargo test 前就位(各 job 的 fetch-ffmpeg 步骤);
+        // 缺失=流程坏了,硬失败——绝不允许在 CI 静默空转
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI 上缺 sidecar:fetch-ffmpeg 步骤未生效,拒绝静默跳过"
+        );
         eprintln!("跳过:src-tauri/binaries 无 sidecar(先跑 scripts/fetch-ffmpeg.sh)");
         return;
     };
