@@ -75,10 +75,13 @@ function useSvgId(): string {
 export function SpeedSparkline({
   samples,
   label = "速度曲线",
+  className,
 }: {
   /** 速度采样（字节/秒），时间从左到右 */
   samples: number[];
   label?: string;
+  /** 摆放上下文的尺寸覆盖（如拷卡 hero 的角落紧凑版） */
+  className?: string;
 }) {
   const gradientId = useSvgId();
   const [hover, setHover] = useState<number | null>(null);
@@ -102,16 +105,17 @@ export function SpeedSparkline({
   const summary = `${label}：当前 ${formatSpeed(current)}，峰值 ${formatSpeed(peak)}`;
 
   const hovered = hover !== null ? points[hover] : null;
-  // 靠边时提示翻向另一侧、贴顶时翻到点下方，保证始终完整可见
+  // 靠边时提示翻向另一侧；点在上半区就翻到点下方——提示必须留在图内，
+  // 矮个的角落版探出去会压住旁边的文字
   const tipTransform = hovered
     ? `translate(${hovered[0] > 82 ? "-100%" : hovered[0] < 18 ? "0" : "-50%"}, ${
-        hovered[1] < 30 ? "30%" : "-135%"
+        hovered[1] < 50 ? "30%" : "-135%"
       })`
     : undefined;
 
   return (
     <div
-      className="sparkline"
+      className={`sparkline${className ? ` ${className}` : ""}`}
       role="img"
       aria-label={summary}
       data-testid="speed-sparkline"

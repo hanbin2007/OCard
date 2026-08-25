@@ -774,26 +774,33 @@ export function CopyTaskScreen() {
                               {Math.round(ratio(task.copiedBytes, task.totalBytes) * 100)}
                               <span className="copy-hero__unit">%</span>
                             </div>
-                            <div className="copy-hero__vitals">
-                              <div className="copy-hero__vital">
-                                <span className="stat__label">速度</span>
-                                <span className="copy-hero__vital-value">
-                                  {formatSpeed(task.speedBytesPerSec)}
-                                </span>
+                            <div className="copy-hero__side">
+                              <div className="copy-hero__vitals">
+                                <div className="copy-hero__vital">
+                                  <span className="stat__label">速度</span>
+                                  <span className="copy-hero__vital-value">
+                                    {formatSpeed(task.speedBytesPerSec)}
+                                  </span>
+                                </div>
+                                <div className="copy-hero__vital">
+                                  <span className="stat__label">预计剩余</span>
+                                  <span className="copy-hero__vital-value">
+                                    {formatEta(
+                                      task.totalBytes - task.copiedBytes,
+                                      task.speedBytesPerSec,
+                                    )}
+                                  </span>
+                                </div>
                               </div>
-                              <div className="copy-hero__vital">
-                                <span className="stat__label">预计剩余</span>
-                                <span className="copy-hero__vital-value">
-                                  {formatEta(
-                                    task.totalBytes - task.copiedBytes,
-                                    task.speedBytesPerSec,
-                                  )}
-                                </span>
-                              </div>
+                              {/* 速度曲线收在速度数字正下方的角落：跟着数字读就是
+                                  「速度的历史」，也不会和下面的总进度条混成一回事 */}
+                              <SpeedSparkline
+                                samples={speedSamples}
+                                label="拷贝速度曲线"
+                                className="copy-hero__spark"
+                              />
                             </div>
                           </div>
-                          {/* 写入节奏一眼可见：掉速、断流在曲线上比在跳动的数字里明显得多 */}
-                          <SpeedSparkline samples={speedSamples} label="拷贝速度曲线" />
                           <div className="copy-hero__bar">
                             <ProgressBar
                               value={task.copiedBytes}
