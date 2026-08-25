@@ -132,9 +132,10 @@ pub fn run() {
             // 打包后 stderr 不可见,远程排障只能靠这份日志)
             #[cfg(target_os = "linux")]
             log::info!(
-                "Linux WebKit 规避: DMABUF_RENDERER 禁用={} 加速合成禁用={} AppImage={}",
+                "Linux WebKit 规避: DMABUF_RENDERER 禁用={} 加速合成禁用={} EGL_PLATFORM={:?} AppImage={}",
                 std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").as_deref() == Ok("1"),
                 std::env::var("WEBKIT_DISABLE_COMPOSITING_MODE").as_deref() == Ok("1"),
+                std::env::var("EGL_PLATFORM").unwrap_or_default(),
                 std::env::var_os("APPIMAGE").is_some(),
             );
             let machine_id = core::machine::machine_id(&config_dir)

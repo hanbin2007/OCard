@@ -79,8 +79,11 @@ jobs:
       - name: Install Linux system deps (Tauri v2)
         run: |
           sudo apt-get update
+          # squashfs-tools/zstd/xvfb/dbus:AppImage 重打包修复 + 冒烟
+          # (scripts/fix-appimage-wayland.sh)
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+            squashfs-tools zstd xvfb dbus
 
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
@@ -117,6 +120,12 @@ jobs:
           releaseName: "OCard ${{ github.ref_name }}"
           releaseDraft: true
           prerelease: false
+          # 包装脚本:build 结束后、tauri-action 收集产物/生成 latest.json 之前,
+          # 就地剔除 AppImage 捆绑的 libwayland-* 并重签名 —— 根治 Mesa 25+/
+          # Wayland 宿主上 WebKitWebProcess 的 EGL_BAD_PARAMETER 崩溃
+          # (tauri-apps/tauri#15665,实机 coredump 复现)。后置 step 来不及,
+          # 只能走 tauriScript。
+          tauriScript: bash scripts/tauri-build-wrapper.sh
 
       # 与 CI 共用同一脚本:真正发给用户的产物也必须逐字节钉死。
       # 失败即让 job 红 —— 宁可不发版,也不发一个 sidecar/模型对不上的包。
