@@ -1,6 +1,7 @@
 /** 屏 1：项目列表（列表 + 详情，↑/↓ 键盘导航）。 */
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { AuditLogDrawer } from "../components/AuditLogDrawer";
 import {
   DeliveryStatusToggle,
   FinalCutPanel,
@@ -24,6 +25,13 @@ export function ProjectsScreen() {
   const { state, dispatch } = useStore();
   const { projects, selectedProjectId } = state;
   const selected = projects.find((p) => p.id === selectedProjectId) ?? null;
+
+  /* 审计日志抽屉的开合是这一屏的局部视图状态，不进全局 store：
+     换项目时必须自动收起——否则抽屉里显示的还是上一个项目的时间线。 */
+  const [auditOpen, setAuditOpen] = useState(false);
+  useEffect(() => {
+    setAuditOpen(false);
+  }, [selectedProjectId]);
 
   const nav = useListNavigation({
     ids: projects.map((p) => p.id),
@@ -161,6 +169,17 @@ export function ProjectsScreen() {
                     <div className="card__head">
                       <span className="card__title">{selected.name}</span>
                       <div className="card__actions">
+                        {/* 全量业务事件（含他机）的入口，紧挨着「最近事件」那一行 */}
+                        <button
+                          type="button"
+                          className="btn btn--sm"
+                          data-testid="audit-open"
+                          aria-haspopup="dialog"
+                          aria-expanded={auditOpen}
+                          onClick={() => setAuditOpen(true)}
+                        >
+                          审计日志
+                        </button>
                         <Badge tone={PROJECT_STATUS_TONE[selected.status]}>
                           {PROJECT_STATUS_LABEL[selected.status]}
                         </Badge>
@@ -275,6 +294,14 @@ export function ProjectsScreen() {
           </div>
         </div>
       </div>
+
+      {auditOpen && selected ? (
+        <AuditLogDrawer
+          projectId={selected.id}
+          projectName={selected.folderName}
+          onClose={() => setAuditOpen(false)}
+        />
+      ) : null}
     </>
   );
 }

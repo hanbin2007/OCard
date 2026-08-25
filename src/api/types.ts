@@ -742,3 +742,53 @@ export interface DeliveryStatus {
   updatedBy?: string;
   updatedAt?: string;
 }
+
+/* ------------------------------------------------------------------ *
+ * 业务审计日志（PRD §5.10）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 项目级审计事件的 kind。
+ *
+ * **这是一份"已知清单"，不是白名单**：后端随时可能加新 kind，
+ * 界面必须对未收录的值也给出体面呈现（回落到原始字符串 + 中性语气），
+ * 绝不能因为不认识就丢掉一条记录——丢记录就是静默 fail-open。
+ * 登记类事件（相机/存储卡）落在全局 registry 日志里，不出现在项目级。
+ */
+export type KnownAuditKind =
+  | "copy_started"
+  | "copy_completed"
+  | "copy_file_failed"
+  | "assets_moved"
+  | "assets_curated"
+  | "assets_trashed"
+  | "assets_restored"
+  | "trash_emptied"
+  | "delivery_built"
+  | "delivery_cancelled"
+  | "transcode_started"
+  | "transcode_completed"
+  | "transcode_cancelled"
+  | "transcode_failed";
+
+/**
+ * 一条审计事件。
+ *
+ * `kind` 用 `KnownAuditKind | (string & {})` 而不是纯枚举：既保留已知值的
+ * 自动补全，又如实表达"后端可能下发新值"这一事实——把它约束成闭集会诱使
+ * 调用方写出无处理分支的穷举，等新 kind 上线时界面就哑了。
+ */
+export interface AuditEventDto {
+  /** RFC3339 时间戳 */
+  ts: string;
+  /** 产生该事件的工作站标识 */
+  machine: string;
+  /** 当时登记的操作人（DIT 名） */
+  operator: string;
+  kind: KnownAuditKind | (string & {});
+  /**
+   * 事件明细。**结构随 kind 而异且不受前端约束**，因此类型只能是 unknown：
+   * 任何取值都必须先做运行时探测（见 `lib/audit.ts`），不许直接断言。
+   */
+  data: unknown;
+}

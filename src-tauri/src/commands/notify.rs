@@ -34,7 +34,12 @@ pub fn emit_notice<R: tauri::Runtime>(
     code: &str,
     message: String,
 ) {
-    eprintln!("[{level}] {code}: {message}");
+    // 每条通知镜像进运行日志(v0.3.1:事后排障可复原用户当时看到了什么)
+    match level {
+        "error" => log::error!("[{code}] {message}"),
+        "warning" => log::warn!("[{code}] {message}"),
+        _ => log::info!("[{code}] {message}"),
+    }
     let mut dto = NoticeDto {
         level,
         code: code.to_string(),

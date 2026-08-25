@@ -1201,6 +1201,52 @@ pub struct RemoteActivityDto {
 
 /// 其他工作站在本项目上进行中的拷卡(copy_started 无对应 copy_completed,24h 内)。
 /// 前端在拷卡屏轮询(约 10s),用于「避免重复拷同一张卡」。
+/// 审计日志条目(v0.3.1 审计查看器;项目级 journal 合并倒序)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEventDto {
+    pub ts: String,
+    pub machine: String,
+    pub operator: String,
+    pub kind: String,
+    pub data: serde_json::Value,
+}
+
+/// 项目全量审计日志(最新在前)。读取降级(坏行/坏文件)零静默上浮为 warning。
+#[tauri::command]
+pub fn list_audit_log<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<AppState>,
+    project_id: String,
+) -> CmdResult<Vec<AuditEventDto>> {
+    let nas = nas_root(&app, &state)?;
+    let stats = find_project(&nas, &project_id)?;
+    let read = crate::core::journal::read_all(&stats.root).map_err(err)?;
+    if read.skipped_lines > 0 || read.unreadable_files > 0 {
+        notify::warn(
+            &app,
+            "audit-log-degraded",
+            format!(
+                "审计日志有 {} 行损坏、{} 个文件不可读被跳过,列表可能不完整",
+                read.skipped_lines, read.unreadable_files
+            ),
+        );
+    }
+    let mut out: Vec<AuditEventDto> = read
+        .events
+        .into_iter()
+        .map(|e| AuditEventDto {
+            ts: e.ts.to_rfc3339(),
+            machine: e.machine,
+            operator: e.operator,
+            kind: e.kind,
+            data: e.data,
+        })
+        .collect();
+    out.reverse(); // read_all 升序 → 最新在前
+    Ok(out)
+}
+
 #[tauri::command]
 pub fn list_remote_activity<R: tauri::Runtime>(
     app: AppHandle<R>,

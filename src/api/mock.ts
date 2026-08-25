@@ -4,6 +4,7 @@
  */
 
 import type {
+  AuditEventDto,
   CameraReg,
   ArchiveResult,
   CapabilityReport,
@@ -621,6 +622,220 @@ export const mockFlowHints: CuratedFlowHint[] = [
 export const mockDeliveryStatus: DeliveryStatus = {
   uploaded: false,
 };
+
+/**
+ * 项目级审计日志（PRD §5.10）。
+ *
+ * 一条真实工作日的时间线：本机（WS-7C4A21 / 张涵斌）与他机
+ * （WS-1F93B0 / 李萌）交替作业——审计日志的用处正是"谁在哪台机上动了什么"，
+ * 全是本机记录就演不出双岗互相监督这件事。
+ *
+ * 刻意留了两处"不好看"的数据，它们不是疏漏而是断言：
+ *   ① 有一条 `data: null`（旧版本补录的事件没带明细）；
+ *   ② 有一条 kind 是前端尚未收录的值（后端随时会加新 kind）。
+ * 界面对这两条都必须照常渲染——不认识不等于可以丢掉。
+ *
+ * 按 ts 倒序（最新在前），与后端约定一致。
+ */
+export const mockAuditLog: AuditEventDto[] = [
+  {
+    ts: "2026-08-24T17:05:59+08:00",
+    machine: "WS-7C4A21",
+    operator: "张涵斌",
+    // 前端尚未收录的 kind：必须回落成体面呈现，而不是消失
+    kind: "project_note_added",
+    data: { note: "颁奖环节补拍素材明天上午补入", scope: "project" },
+  },
+  {
+    ts: "2026-08-24T16:38:03+08:00",
+    machine: "WS-1F93B0",
+    operator: "李萌",
+    kind: "transcode_cancelled",
+    data: {
+      mode: "archive",
+      converted: 21,
+      total: 64,
+      reason: "操作人在归档过半时取消",
+      usedEncoder: "hevc_videotoolbox",
+    },
+  },
+  {
+    ts: "2026-08-24T16:20:11+08:00",
+    machine: "WS-1F93B0",
+    operator: "李萌",
+    kind: "transcode_started",
+    data: {
+      mode: "archive",
+      tier: "balanced",
+      total: 64,
+      encoder: "hevc_videotoolbox",
+      outputDir: "/Volumes/ARCHIVE-2026/20260824_校运会",
+    },
+  },
+  {
+    ts: "2026-08-24T15:44:26+08:00",
+    machine: "WS-7C4A21",
+    operator: "张涵斌",
+    kind: "delivery_built",
+    data: {
+      packages: 6,
+      files: 769,
+      totalBytes: 84 * GB,
+      outputDir: "5. 交付",
+      durationSec: 412,
+    },
+  },
+  {
+    ts: "2026-08-24T15:10:00+08:00",
+    machine: "WS-7C4A21",
+    operator: "张涵斌",
+    kind: "delivery_cancelled",
+    data: {
+      packages: 2,
+      reason: "NAS 断连，已按实况写清单",
+      totalBytes: 21 * GB,
+    },
+  },
+  {
+    ts: "2026-08-24T14:32:40+08:00",
+    machine: "WS-7C4A21",
+    operator: "张涵斌",
+    kind: "trash_emptied",
+    data: { removed: 33, failed: 0, freedBytes: 12.4 * GB },
+  },
+  {
+    ts: "2026-08-24T14:07:12+08:00",
+    machine: "WS-7C4A21",
+    operator: "张涵斌",
+    kind: "assets_restored",
+    data: { succeeded: 4, failed: 0 },
+  },
+  {
+    ts: "2026-08-24T14:02:56+08:00",
+    machine: "WS-7C4A21",
+    operator: "张涵斌",
+    kind: "assets_trashed",
+    data: { count: 37, reason: "重复与糊片" },
+  },
+  {
+    ts: "2026-08-24T13:52:30+08:00",
+    machine: "WS-1F93B0",
+    operator: "李萌",
+    kind: "assets_moved",
+    // 旧版本补录的事件没带明细：界面只显示时间/事件/人，绝不能因此报错
+    data: null,
+  },
+  {
+    ts: "2026-08-24T13:31:08+08:00",
+    machine: "WS-1F93B0",
+    operator: "李萌",
+    kind: "assets_curated",
+    data: { succeeded: 86, failed: 0, categoryName: "精选/待修" },
+  },
+  {
+    ts: "2026-08-24T13:05:44+08:00",
+    machine: "WS-1F93B0",
+    operator: "李萌",
+    kind: "assets_moved",
+    data: { count: 240, categoryName: "开幕式" },
+  },
+  {
+    ts: "2026-08-24T12:03:19+08:00",
+    machine: "WS-7C4A21",
+    operator: "张涵斌",
+    kind: "transcode_completed",
+    data: {
+      mode: "proxy",
+      converted: 127,
+      failed: 1,
+      alreadyTranscoded: 12,
+      encoder: "h264_videotoolbox",
+      outputDir: "3. 代理",
+      durationSec: 2594,
+    },
+  },
+  {
+    ts: "2026-08-24T11:47:52+08:00",
+    machine: "WS-7C4A21",
+    operator: "张涵斌",
+    kind: "transcode_failed",
+    data: {
+      rel: "2. 原始素材/20260824_DJIRonin4D_B_ZS/DJI_0602.MOV",
+      message: "ffmpeg 退出码 1：unsupported pixel format yuv422p10le",
+      encoder: "h264_videotoolbox",
+    },
+  },
+  {
+    ts: "2026-08-24T11:20:05+08:00",
+    machine: "WS-7C4A21",
+    operator: "张涵斌",
+    kind: "transcode_started",
+    data: { mode: "proxy", total: 128, encoder: "h264_videotoolbox" },
+  },
+  {
+    ts: "2026-08-24T10:52:31+08:00",
+    machine: "WS-1F93B0",
+    operator: "李萌",
+    kind: "copy_completed",
+    data: {
+      succeeded: 962,
+      failed: 0,
+      totalBytes: 118 * GB,
+      durationSec: 2241,
+      verified: true,
+    },
+  },
+  {
+    ts: "2026-08-24T10:15:10+08:00",
+    machine: "WS-1F93B0",
+    operator: "李萌",
+    kind: "copy_started",
+    data: {
+      volumeName: "SD-03",
+      targetFolder: "上午_A7M4_A_LM",
+      fileCount: 962,
+      totalBytes: 118 * GB,
+      destinations: 2,
+    },
+  },
+  {
+    ts: "2026-08-24T09:58:47+08:00",
+    machine: "WS-7C4A21",
+    operator: "张涵斌",
+    kind: "copy_completed",
+    data: {
+      succeeded: 1283,
+      failed: 1,
+      totalBytes: 411.6 * GB,
+      durationSec: 2804,
+      verified: true,
+    },
+  },
+  {
+    ts: "2026-08-24T09:41:22+08:00",
+    machine: "WS-7C4A21",
+    operator: "张涵斌",
+    kind: "copy_file_failed",
+    data: {
+      rel: "DCIM/100MEDIA/DJI_0421.MOV",
+      message: "读取超时：源卡 I/O 错误",
+      attempt: 2,
+    },
+  },
+  {
+    ts: "2026-08-24T09:12:03+08:00",
+    machine: "WS-7C4A21",
+    operator: "张涵斌",
+    kind: "copy_started",
+    data: {
+      volumeName: "CFE-01",
+      targetFolder: "上午_DJIRonin4D_B_ZS",
+      fileCount: 1284,
+      totalBytes: 412 * GB,
+      destinations: 2,
+    },
+  },
+];
 
 /** 归档转码 mock 结果 */
 export const mockArchiveResult: ArchiveResult = {

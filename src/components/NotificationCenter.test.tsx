@@ -263,6 +263,22 @@ describe("通知中心", () => {
     );
   });
 
+  it("审计日志降级有专属中文抬头，不落到通用回落上", async () => {
+    render(<App preloaded={preloaded} />);
+    send(
+      notice({
+        code: "audit-log-degraded",
+        message: "审计日志有 2 行损坏、1 个文件不可读被跳过，列表可能不完整",
+      }),
+    );
+
+    const toast = await screen.findByTestId("notice-toast-warning");
+    expect(toast.textContent).toContain("审计日志有损坏行被跳过");
+    expect(toast.textContent).not.toContain("降级提示");
+    // 抽屉里的列表因此可能不全，这句必须原样送到用户眼前
+    expect(toast.textContent).toContain("列表可能不完整");
+  });
+
   it("打开面板即视为已读，未读计数清零", async () => {
     const user = userEvent.setup();
     render(<App preloaded={preloaded} />);

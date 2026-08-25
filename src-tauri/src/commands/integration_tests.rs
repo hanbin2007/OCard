@@ -323,6 +323,22 @@ fn m3_commands_wired_and_gated() {
     let acts = invoke(&window, "list_remote_activity", json!({"projectId": pid})).unwrap();
     assert!(acts.is_array(), "{acts}");
     assert_eq!(acts.as_array().unwrap().len(), 0, "分析不产生远端活动条目");
+
+    // list_audit_log 挂网(v0.3.1):建项目事件在账,最新在前,形状齐全
+    let audit = invoke(&window, "list_audit_log", json!({"projectId": pid})).unwrap();
+    let events = audit.as_array().unwrap();
+    assert!(!events.is_empty(), "至少有 project_created: {audit}");
+    assert!(
+        events.iter().any(|e| e["kind"] == "project_created"),
+        "{audit}"
+    );
+    for e in events {
+        assert!(e["ts"].is_string() && e["machine"].is_string() && e["operator"].is_string());
+    }
+    let ts: Vec<&str> = events.iter().map(|e| e["ts"].as_str().unwrap()).collect();
+    let mut sorted = ts.clone();
+    sorted.sort_by(|a, b| b.cmp(a));
+    assert_eq!(ts, sorted, "必须最新在前");
 }
 
 // ---------- R3-F2 闸接线回归(评审缺口 3:修复点必须有命令层网) ----------

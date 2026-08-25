@@ -169,7 +169,8 @@ kbd,
 :root[data-vt] .lightbox__bar,
 :root[data-vt] .lightbox__image,
 :root[data-vt] .overlay,
-:root[data-vt] .dialog {
+:root[data-vt] .dialog,
+:root[data-vt] .drawer {
   animation: none !important;
 }
 

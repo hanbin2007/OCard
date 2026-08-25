@@ -17,6 +17,7 @@ import {
   mockSubscribeJobs,
 } from "./mockJobs";
 import {
+  mockAuditLog,
   mockCameras,
   mockCopyTasks,
   mockCapabilities,
@@ -44,6 +45,7 @@ import {
   inferTimeSlot,
 } from "../lib/naming";
 import type {
+  AuditEventDto,
   CameraReg,
   CopyFileItem,
   CopyProgressEvent,
@@ -836,6 +838,24 @@ export function getDeliveryStatus(projectId: string): Promise<DeliveryStatus> {
   // 返回副本：真实 IPC 每次都是新对象，mock 若返回同一引用会让调用方
   // 「不回读也能看到更新」，测试因此丧失分辨力
   return reply({ ...mockDeliveryStatus });
+}
+
+/* ------------------------------------------------------------------ *
+ * 业务审计日志（PRD §5.10）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 列出该项目的全量业务审计事件（拷卡/分类/交付/转码），**倒序**（最新在前）。
+ *
+ * 后端合并各机 journal 后重放，因此列表里会出现别台工作站产生的事件——
+ * 这正是它的用处：谁在哪台机上动了什么，事后能对得上。
+ * 登记类事件（相机/存储卡）属于全局 registry，不在项目级日志里。
+ */
+export function listAuditLog(projectId: string): Promise<AuditEventDto[]> {
+  if (IS_TAURI) return ipc("list_audit_log", { projectId });
+  // mock 回退：与 listTrash 等同构，单一样例时间线，不按项目分叉
+  void projectId;
+  return reply(mockAuditLog);
 }
 
 /** 人工勾选「已上传网盘」——OCard 不代传，只记录状态（PRD §5.7） */

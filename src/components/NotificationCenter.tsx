@@ -22,6 +22,8 @@ const AUTO_HIDE_MS = 6000;
 const NOTICE_TITLES: Record<string, string> = {
   "audit-outbox": "审计日志暂存本机",
   "audit-lost": "审计链存在缺口",
+  // 后端读审计 journal 时跳过了坏行/坏文件：抽屉里的列表可能不完整，必须说出来
+  "audit-log-degraded": "审计日志有损坏行被跳过",
   "registry-journal-degraded": "登记表日志有损坏行被跳过",
   "project-meta-corrupt": "项目元数据损坏被跳过",
   "rebuild-scan-failed": "启动重建扫描降级",

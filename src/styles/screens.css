@@ -496,6 +496,29 @@
   cursor: default;
 }
 
+/* 选中的过滤 chip：只加深底色 + 收边，不上强调色——
+   强调色在本应用是稀缺资源（主按钮/焦点环/进度条），过滤器不配占用它 */
+.chip[aria-pressed="true"] {
+  background: var(--selected);
+  border-color: var(--border-focus);
+  font-weight: var(--weight-medium);
+}
+
+.chip[aria-pressed="true"] .chip__count {
+  color: var(--text-secondary);
+}
+
+/* 「只看失败与取消」按下时用琥珀收边，与它筛出来的内容同一语气 */
+.chip--abnormal[aria-pressed="true"] {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.chip--abnormal[aria-pressed="true"] .chip__count {
+  color: var(--warn);
+}
+
 .chip__count {
   font-family: var(--font-mono);
   font-size: var(--text-2xs);

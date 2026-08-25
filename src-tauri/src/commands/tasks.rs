@@ -158,7 +158,7 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
             }
             snap.speed_bytes_per_sec = 0;
             drop(snap);
-            eprintln!("拷卡任务中断: {e}");
+            log::warn!("拷卡任务中断: {e}");
         }
         // 终态事件在 running=false 之后发(复核 P1-9):此刻点「继续」已能启动新 worker;
         // 事件读的是实时快照,若新 worker 已接手则发出的就是其当前状态,不会回退 UI

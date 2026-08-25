@@ -41,6 +41,8 @@ tokio = { version = "1.53.1", features = ["time"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 kamadak-exif = "0.6.1"
 libc = "0.2.189"
+tauri-plugin-log = "2"
+log = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

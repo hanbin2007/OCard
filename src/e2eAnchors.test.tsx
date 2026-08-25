@@ -76,10 +76,26 @@ describe("E2E 锚点", () => {
     expectAnchors(["trash-row", "trash-restore", "trash-empty", "trash-back"]);
   });
 
-  it("项目列表行", () => {
+  it("项目列表行 + 详情面板的审计日志入口", () => {
     render(<App preloaded={{ ...base, route: "projects" }} />);
-    expectAnchors(["project-row"]);
+    expectAnchors(["project-row", "audit-open"]);
     expect(screen.getAllByTestId("project-row")).toHaveLength(mockProjects.length);
+  });
+
+  it("审计日志抽屉锚点", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={{ ...base, route: "projects" }} />);
+    await user.click(screen.getByTestId("audit-open"));
+    await screen.findByTestId("audit-list");
+    expectAnchors([
+      "audit-log-drawer",
+      "audit-close",
+      "audit-filter",
+      "audit-filter-abnormal",
+      "audit-list",
+      "audit-item",
+      "audit-count",
+    ]);
   });
 
   it("设置对话框字段", async () => {

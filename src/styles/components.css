@@ -808,6 +808,178 @@
   opacity: 0.9;
 }
 
+/* ---------- 右侧抽屉（审计日志） ---------- */
+
+/*
+ * 与对话框同属浮层，但来向不同：对话框在正中央长出来，抽屉贴着右边缘滑进来——
+ * 它是"从项目详情那一侧拉出的一层"，来向必须和它在版面里的位置一致（§7 同路径进出）。
+ * 层次全靠遮罩压暗 + 1px 左边界，不引入第二个阴影：阴影白名单只有 dialog / notice-panel。
+ */
+.overlay--drawer {
+  padding: 0;
+  place-items: stretch end;
+}
+
+.drawer {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  width: min(560px, 100vw);
+  height: 100%;
+  border-left: 1px solid var(--border-strong);
+  background: var(--panel);
+  animation: drawer-in var(--dur-spring-fast) var(--spring);
+}
+
+@keyframes drawer-in {
+  from {
+    opacity: 0;
+    transform: translate3d(24px, 0, 0);
+  }
+}
+
+.drawer__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border);
+}
+
+.drawer__titles {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  margin-right: auto;
+}
+
+/* 栅格子项的自动最小尺寸会顶住 truncate：长项目夹名必须能收成省略号 */
+.drawer__titles > * {
+  min-width: 0;
+}
+
+.drawer__filters {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.drawer__body {
+  overflow-y: auto;
+  padding: var(--space-4) var(--space-5);
+}
+
+.drawer__foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-5);
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.drawer__foot > :last-child {
+  margin-left: auto;
+}
+
+/* ---------- 审计事件列表 ---------- */
+
+.audit-list {
+  display: grid;
+}
+
+/*
+ * 时间独占左列且等宽：一列时间上下对齐，眼睛才能顺着扫下去找那一刻发生了什么。
+ * 行与行之间只用 1px 分隔——日志是密集信息，卡片化会把二十条撑成两屏。
+ */
+.audit-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: start;
+  padding: var(--space-3) 0;
+  border-top: 1px solid var(--border);
+}
+
+.audit-item:first-child {
+  border-top: 0;
+}
+
+.audit-item__time {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  /* 与右侧首行徽标的视觉基线对齐 */
+  padding-top: 2px;
+}
+
+.audit-item__body {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.audit-item__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+/* min-width:0 让它成为这一行里先让步的那个：机器名可以省略，事件标签不行 */
+.audit-item__who {
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-secondary);
+}
+
+.audit-item__at {
+  color: var(--text-tertiary);
+}
+
+/* 他机标记：审计日志的用处一半在这儿——谁在哪台机上动的手 */
+.audit-item__remote {
+  flex: none;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-medium);
+}
+
+.audit-item__detail {
+  min-width: 0;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.audit-item__detail--none {
+  color: var(--text-tertiary);
+}
+
+.audit-item__part + .audit-item__part::before {
+  content: "·";
+  margin: 0 var(--space-2);
+  color: var(--text-tertiary);
+}
+
+.audit-item__part-key {
+  margin-right: var(--space-1);
+  color: var(--text-tertiary);
+}
+
+.audit-item__part-val {
+  font-family: var(--font-mono);
+}
+
 /* 提示条：用于「本卡可格式化」这类必须被看见的流程节点 */
 .notice {
   display: grid;

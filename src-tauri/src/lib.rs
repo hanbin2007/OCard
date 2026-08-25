@@ -60,16 +60,72 @@ macro_rules! ocard_invoke_handler {
             $crate::commands::finalcut_cmds::get_delivery_status,
             $crate::commands::finalcut_cmds::set_delivery_status,
             $crate::commands::sorting_cmds::list_remote_activity,
+            $crate::commands::sorting_cmds::list_audit_log,
         ]
     };
+}
+
+/// 修剪轮转日志:按修改时间保留最新 keep 份 `ocard*` 文件(尽力而为,
+/// 失败只记日志不阻塞启动)。
+fn prune_rotated_logs(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter(|e| {
+            e.file_name().to_string_lossy().starts_with("ocard")
+                && e.file_type().map(|t| t.is_file()).unwrap_or(false)
+        })
+        .filter_map(|e| {
+            let m = e.metadata().ok()?.modified().ok()?;
+            Some((m, e.path()))
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
+    for (_, p) in files.into_iter().skip(keep) {
+        if let Err(e) = std::fs::remove_file(&p) {
+            log::warn!("旧日志清理失败 {}: {e}", p.display());
+        }
+    }
 }
 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // 应用运行日志(v0.3.1):平台日志目录轮转文件(单文件 ≤5MB,KeepAll +
+        // 启动期修剪),级别 Info;业务可见性仍以通知中心为准,日志是事后排障用
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("ocard".into()),
+                    },
+                ))
+                .level(log::LevelFilter::Info)
+                .max_file_size(5_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
+                .build(),
+        )
         .setup(|app| {
+            // panic 也要落日志(默认 hook 只打 stderr,打包后不可见)
+            {
+                let default_hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| {
+                    log::error!("panic: {info}");
+                    default_hook(info);
+                }));
+            }
             let config_dir = app.path().app_config_dir()?;
+            // 轮转日志修剪:按修改时间只留最新 10 份(KeepAll 不自清)
+            if let Ok(log_dir) = app.path().app_log_dir() {
+                prune_rotated_logs(&log_dir, 10);
+            }
+            log::info!("OCard 启动,版本 {}", env!("CARGO_PKG_VERSION"));
             let machine_id = core::machine::machine_id(&config_dir)
                 .map_err(|e| format!("初始化机器 ID 失败: {e}"))?;
             app.manage(commands::updater::PendingUpdate::default());

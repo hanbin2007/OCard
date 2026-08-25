@@ -117,15 +117,30 @@ pub fn transcode_capabilities<R: tauri::Runtime>(
     Ok(probe_state_dto())
 }
 
-/// 诊断导出(计划可选建议):版本/探测明细/最近状态,不含任何素材路径。
+/// 诊断导出(计划可选建议):版本/探测明细/最近状态 + 最近运行日志尾
+/// (32KB,v0.3.1),不含任何素材路径。
 #[tauri::command]
-pub fn transcode_diagnostics() -> serde_json::Value {
+pub fn transcode_diagnostics<R: tauri::Runtime>(app: AppHandle<R>) -> serde_json::Value {
+    use tauri::Manager as _;
+    let recent_log = app
+        .path()
+        .app_log_dir()
+        .ok()
+        .map(|d| d.join("ocard.log"))
+        .and_then(|p| std::fs::read(&p).ok())
+        .map(|bytes| {
+            let tail = &bytes[bytes.len().saturating_sub(32 * 1024)..];
+            String::from_utf8_lossy(tail).into_owned()
+        })
+        .unwrap_or_else(|| "(暂无运行日志)".into());
     serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
         "ffmpeg": match ffmpeg::detect() {
             Ok(i) => serde_json::to_value(i).unwrap_or_default(),
             Err(e) => serde_json::json!({"error": e}),
         },
         "capabilities": serde_json::to_value(probe_state_dto()).unwrap_or_default(),
+        "recentLog": recent_log,
     })
 }
 
