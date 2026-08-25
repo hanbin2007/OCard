@@ -128,7 +128,17 @@ export function Sidebar() {
     <aside className="sidebar">
       {/* data-tauri-drag-region：无边框窗口下品牌区空白处可拖动窗口（仅命中元素本身，不影响子元素点击） */}
       <div className="sidebar__brand" data-tauri-drag-region>
-        <span className="sidebar__mark">OC</span>
+        <span className="sidebar__mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="20" height="20" role="img">
+            {/* 品牌字标:存储卡剪影(右上斜切)+ O 环 + 强调蓝点,与应用图标同几何 */}
+            <path
+              fill="currentColor"
+              fillRule="evenodd"
+              d="M7.8 3h5.9l4.6 4.6v11.3a2.1 2.1 0 0 1-2.1 2.1H7.8a2.1 2.1 0 0 1-2.1-2.1V5.1A2.1 2.1 0 0 1 7.8 3Zm4.2 5.8a3.6 3.6 0 1 0 0 7.2 3.6 3.6 0 0 0 0-7.2Z"
+            />
+            <circle cx="12" cy="12.4" r="1.55" fill="var(--accent)" />
+          </svg>
+        </span>
         <span className="sidebar__name">OCard</span>
       </div>
 
