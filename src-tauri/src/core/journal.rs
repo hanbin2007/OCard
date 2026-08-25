@@ -95,6 +95,10 @@ pub fn read_all_in(dir: &Path) -> Result<JournalRead> {
         if !(name.starts_with("journal-") && name.ends_with(".jsonl")) {
             continue;
         }
+        if super::paths::is_symlink(&path) {
+            out.unreadable_files += 1; // R5:链接日志文件不读,计数上报
+            continue;
+        }
         let Ok(bytes) = fs::read(&path) else {
             out.unreadable_files += 1;
             continue; // 单文件读取失败不中断整目录,但计数上报

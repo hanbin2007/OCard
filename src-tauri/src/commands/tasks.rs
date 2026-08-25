@@ -304,7 +304,8 @@ fn run_worker<R: tauri::Runtime>(
         snap.finished_at = None;
         let mut done_bytes = 0u64;
         for f in snap.files.iter_mut() {
-            if copy::file_done(&m, &f.id, f.size_bytes, &req.destinations) {
+            // 轻量预判(仅 UI 快照口径);权威裁决在引擎 file_done(R5:免双重哈希)
+            if copy::file_done_light(&m, &f.id, f.size_bytes, &req.destinations) {
                 f.status = "verified";
                 done_bytes += f.size_bytes;
             } else if f.status == "verified" {

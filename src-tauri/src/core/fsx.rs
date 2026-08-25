@@ -317,4 +317,39 @@ mod times_tests {
         // 计数器全局共享,并行测试可能有额外增量——只断下界,不断精确值
         assert!(take_times_preserve_failures() >= 3, "计数→取数接线必须通");
     }
+
+    /// R5 终审:atime 与(mac)创建时间也是保留承诺的一部分——
+    /// 不只 mtime;新写目标经 preserve_times 后三者都要回到源值。
+    #[test]
+    fn preserve_times_covers_atime_and_created() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src.bin");
+        let dst = tmp.path().join("dst.bin");
+        fs::write(&src, b"data").unwrap();
+        let old_m = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 30);
+        let old_a = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 20);
+        let f = fs::OpenOptions::new().write(true).open(&src).unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(old_m).set_accessed(old_a))
+            .unwrap();
+        drop(f);
+        let src_meta = fs::metadata(&src).unwrap();
+        fs::write(&dst, b"data").unwrap();
+        assert!(matches!(preserve_times(&src_meta, &dst), Ok(true)));
+        let dm = fs::metadata(&dst).unwrap();
+        let close = |a: std::time::SystemTime, b: std::time::SystemTime| {
+            a.duration_since(b)
+                .unwrap_or_else(|e| e.duration())
+                .as_secs()
+                <= 2
+        };
+        assert!(
+            close(dm.accessed().unwrap(), src_meta.accessed().unwrap()),
+            "atime 必须保留"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            close(dm.created().unwrap(), src_meta.created().unwrap()),
+            "macOS 创建时间必须保留"
+        );
+    }
 }

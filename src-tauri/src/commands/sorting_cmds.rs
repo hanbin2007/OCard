@@ -1167,6 +1167,13 @@ pub fn cancel_job<R: tauri::Runtime>(
                     "已请求取消,作业将在当前文件完成后停止".to_string()
                 },
             );
+            // R5 终审:排队期被取消的 auto_proxy 作业没有 body 出口——
+            // 在这里按 job 释放 intent 登记(幂等,运行中作业由出口 guard 负责)
+            if s.kind == crate::core::jobs::JobKind::Transcode
+                && s.state == crate::core::jobs::JobState::Cancelled
+            {
+                super::transcode_cmds::intent_release_by_job(&s.id);
+            }
             let _ = app.emit(JOB_EVENT, &s);
             Ok(s)
         }

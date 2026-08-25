@@ -175,12 +175,38 @@ pub fn curated_flow_hints<R: tauri::Runtime>(
     };
     let list = |d: &PathBuf| -> Vec<String> {
         match std::fs::read_dir(d) {
-            Ok(es) => es
-                .flatten()
-                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .filter(|n| !n.starts_with('.'))
-                .collect(),
+            Ok(es) => {
+                let mut names = Vec::new();
+                let mut errs = 0usize;
+                for e in es {
+                    let Ok(e) = e else {
+                        errs += 1;
+                        continue;
+                    };
+                    match e.file_type() {
+                        Ok(t) if t.is_file() => {
+                            let n = e.file_name().to_string_lossy().to_string();
+                            if !n.starts_with('.') {
+                                names.push(n);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => errs += 1,
+                    }
+                }
+                if errs > 0 {
+                    // R5:目录项错误不再静默当不存在(漏提示=让人漏删原稿)
+                    notify::warn(
+                        &app,
+                        "curated-hints-degraded",
+                        format!(
+                            "读取 {} 时有 {errs} 个条目失败,流转提示可能不完整",
+                            d.display()
+                        ),
+                    );
+                }
+                names
+            }
             Err(e) => {
                 // 读错不许静默当空(零静默):提示后按空处理
                 notify::warn(

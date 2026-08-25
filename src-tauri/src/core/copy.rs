@@ -128,11 +128,36 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> Result<()> {
     Ok(())
 }
 
-/// 判定文件是否「真正完成」:manifest 已验证 **且** 每个目的地上最终文件都在、
-/// 尺寸一致、**xxh3 与清单一致**(R4 终审 P0-1:只查存在+尺寸时,目标被替换成
-/// 同大小内容会被静默当成功;重验哈希是续传跳过的资格,不是可选项)。
-/// 只信 manifest 会在备份盘被拔/目标被删后产生假绿灯(评审 H2/P0-1)。
-pub fn file_done(m: &CopyManifest, rel: &str, size: u64, destinations: &[PathBuf]) -> bool {
+/// 轻量完成预判(UI 快照/任务重建用):只看 manifest 与目的地存在+尺寸,
+/// **不做哈希**——权威裁决只在引擎的 [`file_done`] 一处(R5:消除预统计与
+/// 正式复制的双重全量哈希)。
+pub fn file_done_light(m: &CopyManifest, rel: &str, size: u64, destinations: &[PathBuf]) -> bool {
+    if !m.is_done(rel, size) {
+        return false;
+    }
+    destinations.iter().all(|d| {
+        let p = d.join(rel_to_native(rel));
+        !super::paths::is_symlink(&p)
+            && fs::metadata(&p)
+                .map(|meta| meta.is_file() && meta.len() == size)
+                .unwrap_or(false)
+    })
+}
+
+/// 续传跳过的一次性裁决(R4 哈希重验 → R5 终审收口):manifest 已验证 **且**
+/// - **源**:非链接、canonical 在源根内、xxh3 与清单一致(R5:源被同大小
+///   篡改时旧目标虽与清单一致,但新内容会被漏拷——必须重拷并走冲突可见);
+/// - **每个目的地**:目的地根非链接、目标 canonical 在该根内(中间祖先链接
+///   同拒)、非链接、尺寸一致、绕缓存回读 xxh3 与清单一致。
+///
+/// 任何一条不满足=不算完成,引擎按正常路径重拷(既有目标不同内容=可见冲突)。
+pub fn file_done(
+    m: &CopyManifest,
+    source_root: &Path,
+    rel: &str,
+    size: u64,
+    destinations: &[PathBuf],
+) -> bool {
     let Some(entry) = m
         .entries
         .iter()
@@ -140,10 +165,24 @@ pub fn file_done(m: &CopyManifest, rel: &str, size: u64, destinations: &[PathBuf
     else {
         return false;
     };
+    let src = source_root.join(rel_to_native(rel));
+    if super::paths::is_symlink(&src) || super::paths::assert_within(source_root, &src).is_err() {
+        return false;
+    }
+    let src_ok = hash::xxh3_file(&src)
+        .map(|h| h == entry.xxh3)
+        .unwrap_or(false);
+    if !src_ok {
+        return false;
+    }
     destinations.iter().all(|d| {
+        if super::paths::is_symlink(d) {
+            return false;
+        }
         let p = d.join(rel_to_native(rel));
-        if super::paths::is_symlink(&p) {
-            return false; // 链接目标不作数(经链接读外部文件会误判完成)
+        // R5:中间祖先链接同样拒(canonical 断言),不只看末节点
+        if super::paths::is_symlink(&p) || super::paths::assert_within(d, &p).is_err() {
+            return false;
         }
         let size_ok = fs::metadata(&p)
             .map(|meta| meta.is_file() && meta.len() == size)
@@ -151,8 +190,6 @@ pub fn file_done(m: &CopyManifest, rel: &str, size: u64, destinations: &[PathBuf
         if !size_ok {
             return false;
         }
-        // 绕页缓存重验:尽量读介质;哈希不符=目标被替换/损坏 → 不算完成,
-        // 引擎会走既有目标裁决路径(可见冲突,绝不覆盖)
         hash::xxh3_file_uncached(&p)
             .map(|h| h == entry.xxh3)
             .unwrap_or(false)
@@ -198,7 +235,7 @@ pub fn run_copy(
             break;
         }
 
-        let status = if file_done(m, rel, *size, &req.destinations) {
+        let status = if file_done(m, &req.source_root, rel, *size, &req.destinations) {
             FileStatus::SkippedResume
         } else {
             match copy_one(
@@ -306,6 +343,13 @@ fn copy_one(
     // planned 项经 resume 并回后仍会读到卡外)——canonical 断言真实位置在源根内
     super::paths::assert_within(source_root, &src_path).map_err(super::CoreError::Invalid)?;
 
+    // 时间戳快照必须在**任何读取源之前**采集(R5:pre_existing 分支也会先
+    // 哈希源——读源刷新 atime;获取失败计入保留失败聚合告警)
+    let src_meta = fs::metadata(&src_path).ok();
+    if src_meta.is_none() {
+        super::fsx::note_times_preserve_failures(destinations.len() as u64);
+    }
+
     let finals: Vec<PathBuf> = destinations
         .iter()
         .map(|d| d.join(rel_to_native(rel)))
@@ -373,12 +417,6 @@ fn copy_one(
         })
         .collect();
 
-    // 时间戳快照必须在打开/读取源之前采集(R2 P1:读源本身会刷新 atime,
-    // 读后采集保留下来的是「拷贝时刻」而非原值);获取失败计入保留失败聚合告警
-    let src_meta = fs::metadata(&src_path).ok();
-    if src_meta.is_none() {
-        super::fsx::note_times_preserve_failures(destinations.len() as u64);
-    }
     let mut src = File::open(&src_path)?;
     let result = (|| -> Result<String> {
         let mut writers = Vec::with_capacity(parts.len());
@@ -1057,15 +1095,94 @@ mod review_regression_tests {
             |_| CopyControl::Continue,
         )
         .unwrap();
-        assert!(file_done(&m, "CLIP0001.MP4", 9000, &req.destinations));
+        assert!(file_done(
+            &m,
+            &req.source_root,
+            "CLIP0001.MP4",
+            9000,
+            &req.destinations
+        ));
         // 同大小篡改:内容换、长度不变
         let victim = req.destinations[1].join("CLIP0001.MP4");
         let mut bytes = fs::read(&victim).unwrap();
         bytes[0] ^= 0xFF;
         fs::write(&victim, &bytes).unwrap();
         assert!(
-            !file_done(&m, "CLIP0001.MP4", 9000, &req.destinations),
+            !file_done(
+                &m,
+                &req.source_root,
+                "CLIP0001.MP4",
+                9000,
+                &req.destinations
+            ),
             "同大小篡改必须让完成判定失效(哈希重验)"
+        );
+    }
+
+    /// R5 终审:源文件被**同大小**篡改后,resume 不许再跳过——旧目标与清单
+    /// 一致但新内容会被漏拷;file_done 必须重验源哈希。
+    #[test]
+    fn resume_skip_reverifies_source_hash() {
+        let (_t, req, mut m, project) = setup();
+        run_copy(
+            &req,
+            &scan_source(&req.source_root).unwrap(),
+            &mut m,
+            &project,
+            |_| CopyControl::Continue,
+        )
+        .unwrap();
+        assert!(file_done(
+            &m,
+            &req.source_root,
+            "CLIP0001.MP4",
+            9000,
+            &req.destinations
+        ));
+        let src = req.source_root.join("CLIP0001.MP4");
+        let mut bytes = fs::read(&src).unwrap();
+        bytes[100] ^= 0xFF;
+        fs::write(&src, &bytes).unwrap();
+        assert!(
+            !file_done(
+                &m,
+                &req.source_root,
+                "CLIP0001.MP4",
+                9000,
+                &req.destinations
+            ),
+            "源被同大小篡改后不得跳过(会漏拷新内容)"
+        );
+    }
+
+    /// R5 终审:目的地**中间祖先**是链接时,file_done 不许把链下文件当已完成。
+    #[cfg(unix)]
+    #[test]
+    fn file_done_rejects_dest_ancestor_symlink() {
+        let (tmp, req, mut m, project) = setup();
+        run_copy(
+            &req,
+            &scan_source(&req.source_root).unwrap(),
+            &mut m,
+            &project,
+            |_| CopyControl::Continue,
+        )
+        .unwrap();
+        let rel = "DCIM/IMG_0001.JPG";
+        assert!(
+            file_done(&m, &req.source_root, rel, 3000, &req.destinations),
+            "基线:正常拷完必须判完成"
+        );
+        // 把 dest0 的 DCIM 换成指向外部同构树的链接(链下同内容文件)
+        let outside = tmp.path().join("outside-tree");
+        fs::create_dir_all(&outside).unwrap();
+        fs::copy(req.destinations[0].join(rel), outside.join("IMG_0001.JPG")).unwrap();
+        let dcim = req.destinations[0].join("DCIM");
+        fs::remove_dir_all(&dcim).unwrap();
+        std::os::unix::fs::symlink(&outside, &dcim).unwrap();
+        assert!(
+            !file_done(&m, &req.source_root, rel, 3000, &req.destinations),
+            "目的地中间祖先为链接时不得判完成(经链接读的是外部文件)"
         );
     }
 

@@ -401,6 +401,25 @@ pub fn verify_output(
         if out_info.height != h && src_info.height > h {
             return Err(format!("输出高度不符:期望 {h},实际 {}", out_info.height));
         }
+    } else {
+        // 归档语义:不缩放——输出几何必须与源完全一致(R5 终审:同时长
+        // 不同分辨率的「合法」冒充产物在这里拦)
+        if (out_info.width, out_info.height) != (src_info.width, src_info.height) {
+            return Err(format!(
+                "输出分辨率不符:源 {}×{},输出 {}×{}",
+                src_info.width, src_info.height, out_info.width, out_info.height
+            ));
+        }
+    }
+    // 宽高比核对(两侧几何有效时;缩放路径宽度按 -2 取整,容差 2%)
+    if src_info.width > 0 && src_info.height > 0 && out_info.width > 0 && out_info.height > 0 {
+        let src_ar = src_info.width as f64 / src_info.height as f64;
+        let out_ar = out_info.width as f64 / out_info.height as f64;
+        if (src_ar - out_ar).abs() / src_ar > 0.02 {
+            return Err(format!(
+                "宽高比不符:源 {src_ar:.4},输出 {out_ar:.4}(疑似他源产物)"
+            ));
+        }
     }
     if out_info.pix_fmt != expect_pix_fmt {
         return Err(format!(

@@ -286,8 +286,12 @@ fn extract_video_thumb(
     let Some(bin) = ffmpeg_bin else { return false };
     let cache = media::cached_thumb_path(root, rel, size, mtime);
     if cache.is_file() {
-        // R4(终审 P0-4):已有缓存也要验完整性——半截/损坏 JPEG 不许计成功
-        return media::looks_like_valid_jpeg(&cache);
+        // R4→R5(终审):首尾标记挡不住「标记完好、数据烂掉」——真实解码验真;
+        // 坏缓存当场删除,走下方原子重建(不删=永远占着缓存键)
+        if image::open(&cache).is_ok() {
+            return true;
+        }
+        let _ = std::fs::remove_file(&cache);
     }
     let Some(dir) = cache.parent() else {
         return false;
@@ -327,12 +331,19 @@ fn extract_video_thumb(
         return false;
     }
     match crate::core::fsx::rename_no_replace(&tmp, &cache) {
-        Ok(()) => true,
+        Ok(()) => {
+            // R5:落位后的成品也真解码验一次(ffmpeg 声称成功≠可解码)
+            if image::open(&cache).is_ok() {
+                true
+            } else {
+                let _ = std::fs::remove_file(&cache);
+                false
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // 别机先落位:验一下成品再采信(R4:既有文件可能是坏缓存,
-            // 与照片路径 write_jpeg 同一规矩)
+            // 别机先落位:真解码验既有成品再采信(R4/R5)
             let _ = std::fs::remove_file(&tmp);
-            media::looks_like_valid_jpeg(&cache)
+            image::open(&cache).is_ok()
         }
         Err(_) => {
             let _ = std::fs::remove_file(&tmp);

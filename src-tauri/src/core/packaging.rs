@@ -124,15 +124,12 @@ fn collect(dir: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf> {
 fn deliver_one(
     project_root: &Path,
     src: &Path,
+    src_meta: &fs::Metadata,
     dst_dir: &Path,
     dst: &Path,
 ) -> std::result::Result<bool, (&'static str, String)> {
-    // R4(终审 P0-7):时间戳快照必须在**首次读取源之前**采集——复制/哈希都会
-    // 刷新 atime,读后采集保留下来的是「打包时刻」;取不到也要计数可见
-    let src_meta = fs::metadata(src).ok();
-    if src_meta.is_none() {
-        fsx::note_times_preserve_failures(1);
-    }
+    // R5(终审 P0-7):时间戳快照由调用方在**任何读源之前**(含 EXIF 半天
+    // 判定的那次打开)采集并传入——本函数内不再二次采集
     let verdict_existing = |src: &Path, dst: &Path| {
         let sh = hash::xxh3_file(src).map_err(|e| ("error", format!("源文件校验失败: {e}")))?;
         let dh =
@@ -183,10 +180,8 @@ fn deliver_one(
     }
     match fsx::rename_no_replace(&tmp, dst) {
         Ok(()) => {
-            // 保留源时间戳(快照在读源之前采集,见函数开头)
-            if let Some(m) = &src_meta {
-                fsx::preserve_times_counted(m, dst);
-            }
+            // 保留源时间戳(快照由调用方在读源前采集)
+            fsx::preserve_times_counted(src_meta, dst);
             Ok(true)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -312,7 +307,7 @@ pub fn build_delivery_with(
         let dst_dir = delivery_root.join(&package).join(category);
         let dst = dst_dir.join(file.file_name().unwrap_or_default());
 
-        match deliver_one(project_root, file, &dst_dir, &dst) {
+        match deliver_one(project_root, file, &meta_fs, &dst_dir, &dst) {
             Ok(newly_copied) => {
                 if !out.packages.contains(&package) {
                     out.packages.push(package.clone());

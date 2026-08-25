@@ -241,6 +241,50 @@ fn collect_videos_recursive(
     }
 }
 
+/// 产物来源指纹 sidecar(R5 终审):`<产物>.src.json` 记录源 rel 与
+/// 指纹 xxh3(rel+size+mtime)。同时长同几何的「合法」视频仍可能来自另一
+/// 源文件——完整属性校验之外,身份由 sidecar 绑定;缺失/不符=不计完成。
+fn provenance_path(final_out: &Path) -> PathBuf {
+    let mut os = final_out.as_os_str().to_os_string();
+    os.push(".src.json");
+    PathBuf::from(os)
+}
+
+fn src_provenance_fp(rel: &str, abs: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(abs).ok()?;
+    Some(crate::core::analysis::src_fingerprint(
+        rel,
+        meta.len(),
+        crate::core::media::mtime_nanos(&meta),
+    ))
+}
+
+fn write_provenance(final_out: &Path, rel: &str, abs: &Path) {
+    let Some(fp) = src_provenance_fp(rel, abs) else {
+        return; // 源元数据读不出:sidecar 缺席会让后续 skip 判失败,方向 fail-closed
+    };
+    let body = serde_json::json!({ "srcRel": rel, "srcFingerprint": fp.to_string() });
+    let tmp = provenance_path(final_out).with_extension("json.tmp");
+    if std::fs::write(&tmp, serde_json::to_vec(&body).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&tmp, provenance_path(final_out));
+    }
+}
+
+/// 校验既有产物的来源身份;Err 携带人话原因。
+fn provenance_matches(final_out: &Path, rel: &str, abs: &Path) -> std::result::Result<(), String> {
+    let p = provenance_path(final_out);
+    let text = std::fs::read_to_string(&p)
+        .map_err(|_| "缺少来源指纹记录(.src.json),无法确认产物属于当前源".to_string())?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| "来源指纹记录损坏".to_string())?;
+    let want = src_provenance_fp(rel, abs).ok_or("源文件元数据不可读")?;
+    if v["srcFingerprint"].as_str() == Some(want.to_string().as_str()) {
+        Ok(())
+    } else {
+        Err("来源指纹不符:该产物属于另一版本/另一文件的源".into())
+    }
+}
+
 /// 转码作业出口保证(R4 终审 P1):body 从任何一条 `?` 提前失败退出时,
 /// terminal 审计(transcode_failed)与 auto_proxy intent 登记都必须归位——
 /// 否则他机「正在转码」横幅假活跃 24h,intent 卡到进程重启。
@@ -253,7 +297,6 @@ struct TranscodeExitGuard<R: tauri::Runtime> {
     machine_id: String,
     op: String,
     job_id: String,
-    intent: Option<String>,
     armed: bool,
 }
 
@@ -265,23 +308,22 @@ impl<R: tauri::Runtime> TranscodeExitGuard<R> {
 
 impl<R: tauri::Runtime> Drop for TranscodeExitGuard<R> {
     fn drop(&mut self) {
-        if let Some(mid) = &self.intent {
-            intent_end(mid);
+        // R5 终审:先持久化终态审计,**再**释放 intent——反序会留下
+        // 「intent 已空、审计未落」的重调度窗口
+        if self.armed {
+            super::tasks::append_audit(
+                &self.app,
+                &self.root,
+                &self.config_dir,
+                &crate::core::journal::Event::new(
+                    self.machine_id.clone(),
+                    self.op.clone(),
+                    "transcode_failed",
+                    serde_json::json!({ "jobId": self.job_id }),
+                ),
+            );
         }
-        if !self.armed {
-            return;
-        }
-        super::tasks::append_audit(
-            &self.app,
-            &self.root,
-            &self.config_dir,
-            &crate::core::journal::Event::new(
-                self.machine_id.clone(),
-                self.op.clone(),
-                "transcode_failed",
-                serde_json::json!({ "jobId": self.job_id }),
-            ),
-        );
+        intent_release_by_job(&self.job_id);
     }
 }
 
@@ -417,6 +459,10 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
         return Err("代理转码仅适用于工况 A(视频)项目".into());
     }
     let handle = jobs.create(JobKind::Transcode, &input.project_id);
+    // intent 绑定到作业(R5:排队期被取消也能按 job 释放,不再卡到重启)
+    if let Some(mid) = &intent_manifest {
+        intent_bind(mid, &handle.snapshot().id);
+    }
     let body_app = app.clone();
     let event_app = app.clone();
     let ret = handle.clone();
@@ -452,7 +498,6 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                 machine_id: machine_id.clone(),
                 op: op.clone(),
                 job_id: h.snapshot().id.clone(),
-                intent: intent_manifest.clone(),
                 armed: true,
             };
             let caps = capabilities_blocking()?;
@@ -657,6 +702,7 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                 if final_out.exists() {
                     if input.retranscode.unwrap_or(false) {
                         // 唯一覆盖入口(D2):显式强制重转,先删后转(前端已二次确认)
+                        let _ = std::fs::remove_file(provenance_path(&final_out));
                         if let Err(e) = std::fs::remove_file(&final_out) {
                             result.failures.push(FailureDto {
                                 rel: rel.clone(),
@@ -667,9 +713,10 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                     } else {
                         // 幂等 skip(计划 D2)。R2 P1:「存在即成功」会永久采信坏产物——
                         // 计入完成前 ffprobe 验一次,坏产物如实报失败(覆盖仍只走重转入口)
-                        // R4(终审 P0-6):只验 codec 不够——时长/分辨率/像素/
-                        // 音频/HDR 标签任何一项不符的「合法视频」都不许计入完成
-                        let verdict = transcode::probe_file(&ffprobe_bin, &final_out)
+                        // R4/R5(终审 P0-6):属性完整校验 + 来源指纹绑定——
+                        // 「合法但他源」的视频也不许计入完成
+                        let verdict = provenance_matches(&final_out, rel, abs)
+                            .and_then(|_| transcode::probe_file(&ffprobe_bin, &final_out))
                             .and_then(|out_info| {
                                 let pix_ok = out_info.pix_fmt == "yuv420p"
                                     || out_info.pix_fmt == "nv12";
@@ -763,6 +810,7 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                             });
                         match verdict {
                             Ok(()) => {
+                                write_provenance(&final_out, rel, abs);
                                 result.converted += 1;
                                 // R2 P2:末文件覆写会把混合批报成单一编码器——如实标「混合」
                                 if result.converted == 1 {
@@ -806,7 +854,6 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
             } else {
                 "transcode_completed"
             };
-            exit_guard.disarm(); // 正常收尾:terminal 审计由下方写入
             super::tasks::append_audit(
                 &body_app,
                 &root,
@@ -825,6 +872,7 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                     }),
                 ),
             );
+            exit_guard.disarm(); // 终态审计已落,兜底解除(R5:顺序不许反)
             if !result.skipped.is_empty() {
                 notify::info(
                     &body_app,
@@ -868,26 +916,54 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
     Ok(ret.snapshot())
 }
 
-/// 在途 intent 去重(R2/评审 P1-7:拷卡完成钩子与启动补投递可能对同一
-/// manifest 双投——排队两份作业虽最终收敛(幂等 skip),但白跑一整轮探测)。
-/// 进程内语义:成功派发时登记,作业体收尾时移除;进程崩溃由重启自然清零。
-static INTENTS_IN_FLIGHT: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+/// 在途 intent 登记(R2/评审 P1-7 → R5 终审):job_id → manifest id。
+/// 登记与去重在**创建作业的同一临界区**内原子完成(spawn_proxy_job);
+/// 释放有三条腿:作业体出口 guard、排队期被取消(cancel_job 按 job 释放)、
+/// 进程重启自然清零。
+static INTENTS_IN_FLIGHT: Mutex<Option<std::collections::HashMap<String, Option<String>>>> =
+    Mutex::new(None);
 
-fn intent_begin(id: &str) -> bool {
-    INTENTS_IN_FLIGHT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(Default::default)
-        .insert(id.to_string())
+/// 原子占位:同一 manifest 已在途则拒(返回 false)。占位发生在创建作业前,
+/// 拿到 job id 后用 [`intent_bind`] 绑定,取消/出口按 job 释放。
+fn intent_claim(mid: &str) -> bool {
+    let mut g = INTENTS_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(Default::default);
+    if map.contains_key(mid) {
+        return false;
+    }
+    map.insert(mid.to_string(), None);
+    true
 }
 
-fn intent_end(id: &str) {
-    if let Some(set) = INTENTS_IN_FLIGHT
+fn intent_bind(mid: &str, job_id: &str) {
+    if let Some(map) = INTENTS_IN_FLIGHT
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
     {
-        set.remove(id);
+        map.insert(mid.to_string(), Some(job_id.to_string()));
+    }
+}
+
+/// 直接按 manifest 释放(spawn 失败回滚用)。
+fn intent_release_mid(mid: &str) {
+    if let Some(map) = INTENTS_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        map.remove(mid);
+    }
+}
+
+/// 按作业释放登记(出口 guard 与排队取消共用;幂等)。
+pub(crate) fn intent_release_by_job(job_id: &str) {
+    if let Some(map) = INTENTS_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        map.retain(|_, v| v.as_deref() != Some(job_id));
     }
 }
 
@@ -965,7 +1041,7 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
         force_all: Some(false),
         retranscode: Some(false),
     };
-    if !intent_begin(&m.id) {
+    if !intent_claim(&m.id) {
         return; // 同一意图已在排队/执行(P1-7 去重),双投只会白跑一轮
     }
     if let Err(e) = spawn_proxy_job(
@@ -978,7 +1054,7 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
         input,
         Some(m.id.clone()),
     ) {
-        intent_end(&m.id);
+        intent_release_mid(&m.id);
         notify::warn(
             app,
             "auto-proxy-deferred",
@@ -1095,7 +1171,6 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                 machine_id: machine_id.clone(),
                 op: op.clone(),
                 job_id: h.snapshot().id.clone(),
-                intent: None,
                 armed: true,
             };
             let caps = capabilities_blocking()?;
@@ -1269,8 +1344,9 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                 if final_out.exists() {
                     // R2 P1:「存在即成功」会永久采信坏产物(预置空文件也算完成)——
                     // 计入完成前用 ffprobe 验一次有效性,坏产物如实报失败
-                    // R4(终审 P0-6):完整校验,合法但错误的产物不许计入完成
-                    let verdict = transcode::probe_file(&ffprobe_bin, &final_out)
+                    // R4/R5(终审 P0-6):属性完整校验 + 来源指纹绑定
+                    let verdict = provenance_matches(&final_out, rel, abs)
+                        .and_then(|_| transcode::probe_file(&ffprobe_bin, &final_out))
                         .and_then(|out_info| {
                             let pix_ok = matches!(
                                 out_info.pix_fmt.as_str(),
@@ -1372,6 +1448,7 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                             });
                         match verdict {
                             Ok(()) => {
+                                write_provenance(&final_out, rel, abs);
                                 result.converted += 1;
                                 if result.converted == 1 {
                                     result.used_encoder = used.clone();
@@ -1405,7 +1482,6 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                 Some(if cancelled { "已取消" } else { "收尾" }.into()),
             );
             super::sorting_cmds::notify_if_unsafe_fallback(&body_app);
-            exit_guard.disarm(); // 正常收尾:terminal 审计由下方写入
             super::tasks::append_audit(
                 &body_app,
                 &root,
@@ -1425,6 +1501,7 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                     }),
                 ),
             );
+            exit_guard.disarm(); // 终态审计已落,兜底解除(R5:顺序不许反)
             if !result.failures.is_empty() {
                 notify::warn(
                     &body_app,
@@ -1535,6 +1612,20 @@ mod scan_tests {
         );
         // 根不可读=顶层 Err(作业级失败,不静默)
         assert!(list_camera_folders(&tmp.path().join("不存在"), "x").is_err());
+    }
+
+    /// R5 终审:intent 占位/绑定/按 job 释放语义——排队取消路径靠它不卡死。
+    #[test]
+    fn intent_claim_bind_release_semantics() {
+        let mid = format!("mid-{}", uuid::Uuid::new_v4());
+        assert!(intent_claim(&mid), "首次占位成功");
+        assert!(!intent_claim(&mid), "重复占位必须拒(去重)");
+        intent_bind(&mid, "job-1");
+        intent_release_by_job("job-别人");
+        assert!(!intent_claim(&mid), "释放别的 job 不影响本意图");
+        intent_release_by_job("job-1");
+        assert!(intent_claim(&mid), "按 job 释放后可再次占位");
+        intent_release_mid(&mid);
     }
 
     /// R2 P1-6:仅大小写不同的源文件映射同一输出名——后到者必须被剔除并可见。

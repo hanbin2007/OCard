@@ -80,7 +80,8 @@ describe("OCard M3 转码冒烟", () => {
       { timeout: 60000, timeoutMsg: "重跑未报告非零的已转码跳过数" },
     );
     expect(statSync(proxyPath).mtimeMs).toBe(mtimeBefore);
-    const files = readdirSync(out).filter((f) => !f.startsWith("."));
-    expect(files).toEqual(["clip1_MOV_proxy.mp4"]);
+    const files = readdirSync(out).filter((f) => !f.startsWith(".")).sort();
+    // R5:产物旁多一份来源指纹 sidecar(existence≠success 的身份绑定)
+    expect(files).toEqual(["clip1_MOV_proxy.mp4", "clip1_MOV_proxy.mp4.src.json"]);
   });
 });

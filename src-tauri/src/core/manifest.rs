@@ -143,8 +143,15 @@ pub fn list(project_root: &Path) -> Result<ManifestList> {
     if !dir.exists() {
         return Ok(out);
     }
+    // R5 终审:目录整段 + 逐文件闸——清单驱动 resume/统计/auto_proxy,
+    // 任何一环经链接读入外部内容都不许
+    super::paths::assert_within(project_root, &dir).map_err(super::CoreError::Invalid)?;
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
+        if super::paths::is_symlink(&path) {
+            out.skipped += 1; // 链接清单不读,按损坏口径计数上报
+            continue;
+        }
         if path.extension().is_some_and(|e| e == "json") {
             match fs::read(&path) {
                 Ok(bytes) => match serde_json::from_slice::<CopyManifest>(&bytes) {
@@ -253,5 +260,21 @@ mod tests {
             load(&project, &mid).is_err(),
             "链接 .ocard 下的清单读取必须被拒"
         );
+    }
+
+    /// R5 终审:整目录闸之外,**单个清单文件**是链接也不许读(计入 skipped)。
+    #[cfg(unix)]
+    #[test]
+    fn list_skips_symlinked_manifest_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(manifest_dir(&project)).unwrap();
+        let outside = tmp.path().join("outside.json");
+        let m = CopyManifest::new("1. 待分类/x", "SD", "A7M4_A_ZS", "ZS", "");
+        std::fs::write(&outside, serde_json::to_vec(&m).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, manifest_dir(&project).join("evil.json")).unwrap();
+        let list = list(&project).unwrap();
+        assert!(list.manifests.is_empty(), "链接清单不得读入");
+        assert_eq!(list.skipped, 1, "跳过必须计数上报");
     }
 }

@@ -888,6 +888,52 @@ fn proxy_transcode_end_to_end_with_real_ffmpeg() {
         r4["result"]["alreadyTranscoded"], 1,
         "C0001 的真产物照常计入完成: {r4}"
     );
+
+    // 第五轮(R5 终审):**同时长同几何的他源产物**——先修好 C0002(重转出
+    // 真 3s 代理),再造 C0003(同参数另一画面),把 C0002 的真代理冒充给
+    // C0003(无 sidecar):属性全对,必须由来源指纹拒绝
+    std::fs::remove_file(&fake_done).unwrap();
+    let r5a = run_job();
+    assert_eq!(r5a["result"]["converted"], 1, "C0002 重转应成功: {r5a}");
+    let src3 = cam_dir.join("C0003.MP4");
+    let out3 = std::process::Command::new(ffdir.join("ffmpeg"))
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=640x360:rate=25:duration=3",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            &src3.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out3.status.success(), "生成 C0003 失败");
+    std::fs::copy(&fake_done, final_out.with_file_name("C0003_MP4_proxy.mp4")).unwrap();
+    let r5 = run_job();
+    let fails5 = r5["result"]["failures"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        fails5.iter().any(|f| {
+            f["rel"].as_str().unwrap_or_default().ends_with("C0003.MP4")
+                && f["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("来源指纹")
+        }),
+        "同时长他源产物必须被来源指纹拒绝: {r5}"
+    );
+    assert_eq!(
+        r5["result"]["alreadyTranscoded"], 2,
+        "C0001/C0002 照常: {r5}"
+    );
 }
 
 /// R2 P1 行为级(真模型 + 真 ort 推理):YuNet 检测器加载仓内模型

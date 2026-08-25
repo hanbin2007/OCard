@@ -52,10 +52,27 @@ pub struct FeatureRecord {
     pub machine_id: String,
 }
 
-/// 缓存命中判定(R4 终审 P0-9):faces=None 的记录只有在检测器缺席时才算命中,
-/// 检测器在场必须重算——一次失败/缺模不许永久冻结成「无人脸信息」。
+/// 当前人脸模型身份(SHA-256 前 8 位;与 FeatureRecord.faces_model 同口径)。
+pub fn current_faces_model() -> &'static str {
+    &super::yunet::YUNET_SHA256[..8]
+}
+
+/// 缓存记录的「人脸信息等级」:2=当前模型的有效结果;1=旧模型结果;0=无。
+/// 冲突合并与缓存命中共用同一把尺(R5 终审:模型身份必须进裁决,
+/// 旧模型的 Some 不许永久命中,也不许在合并里压过当前模型)。
+fn faces_rank(rec: &FeatureRecord) -> u8 {
+    match (&rec.faces, rec.faces_model.as_deref()) {
+        (Some(_), Some(m)) if m == current_faces_model() => 2,
+        (Some(_), _) => 1,
+        _ => 0,
+    }
+}
+
+/// 缓存命中判定(R4/R5 终审 P0-9):检测器缺席=任何记录都命中(无从重算);
+/// 检测器在场=只有**当前模型**的有效人脸结果才命中——faces=None、
+/// 旧模型结果、失败记录都必须重算(模型修复/更换后自愈)。
 pub fn cache_hit(rec: &FeatureRecord, detector_present: bool) -> bool {
-    rec.faces.is_some() || !detector_present
+    !detector_present || faces_rank(rec) == 2
 }
 
 pub fn src_fingerprint(rel: &str, size: u64, mtime_nanos: u128) -> u64 {
@@ -123,9 +140,17 @@ pub fn load_features(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (out, 0, None),
         Err(e) => return (out, 0, Some(format!("分析缓存目录不可读: {e}"))),
     };
-    for e in entries.flatten() {
+    for e in entries {
+        let Ok(e) = e else {
+            skipped += 1; // R5:目录项错误不再静默 flatten
+            continue;
+        };
         let name = e.file_name().to_string_lossy().to_string();
         if !name.starts_with("features-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        if super::paths::is_symlink(&e.path()) {
+            skipped += 1; // R5:链接特征文件不读(防外部特征注入)
             continue;
         }
         let Ok(text) = std::fs::read_to_string(e.path()) else {
@@ -141,14 +166,14 @@ pub fn load_features(
                     if rec.schema_version == SCHEMA_VERSION && rec.algo_version == ALGO_VERSION =>
                 {
                     match out.get(&rec.src_fingerprint) {
-                        // R4 终审 P0-9 修正:**有人脸信息优先于新鲜度**(双向对称,
-                        // 与读入顺序无关)——无模型机器的 faces=None 记录不许抹掉
-                        // 有效人脸,不论谁新谁旧;两侧信息等级相同时才比新鲜度
-                        // (analyzedAt 最新胜;持平 machineId 字典序大者胜,确定性)。
-                        Some(cur) if cur.faces.is_none() && rec.faces.is_some() => {
+                        // R4/R5 终审 P0-9:**人脸信息等级优先于新鲜度**(双向对称,
+                        // 与读入顺序无关):当前模型结果 > 旧模型结果 > 无信息;
+                        // 等级相同才比新鲜度(analyzedAt 最新胜;持平 machineId
+                        // 字典序大者胜,确定性)。
+                        Some(cur) if faces_rank(cur) < faces_rank(&rec) => {
                             out.insert(rec.src_fingerprint, rec);
                         }
-                        Some(cur) if rec.faces.is_none() && cur.faces.is_some() => {}
+                        Some(cur) if faces_rank(&rec) < faces_rank(cur) => {}
                         Some(cur)
                             if (cur.analyzed_at, &cur.machine_id)
                                 >= (rec.analyzed_at, &rec.machine_id) => {}
@@ -613,11 +638,27 @@ mod tests {
         let (map, _, _) = load_features(&root);
         assert_eq!(map[&555].faces, Some(2), "有人脸信息优先于新鲜度");
 
-        assert!(cache_hit(&with_faces, true));
+        assert!(cache_hit(&with_faces, true), "当前模型结果命中");
         assert!(!cache_hit(&newer_none, true), "检测器在场时 None 必须重算");
         assert!(
             cache_hit(&newer_none, false),
             "检测器缺席时 None 记录照常命中"
+        );
+        // R5:旧模型的 Some 不许命中(模型更换后必须重算),合并里也输给当前模型
+        let mut old_model = with_faces.clone();
+        old_model.faces_model = Some("deadbeef".into());
+        old_model.analyzed_at = with_faces.analyzed_at + chrono::Duration::seconds(120);
+        assert!(!cache_hit(&old_model, true), "旧模型结果必须重算");
+        let tmp2 = tempfile::tempdir().unwrap();
+        let root2 = tmp2.path().join("proj");
+        std::fs::create_dir_all(&root2).unwrap();
+        append_feature(&root2, "M1", &old_model).unwrap();
+        append_feature(&root2, "M1", &with_faces).unwrap();
+        let (map2, _, _) = load_features(&root2);
+        assert_eq!(
+            map2[&555].faces_model.as_deref(),
+            Some(current_faces_model()),
+            "当前模型结果在合并里胜过更新的旧模型结果"
         );
     }
 

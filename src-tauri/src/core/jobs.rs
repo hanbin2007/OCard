@@ -119,22 +119,6 @@ impl JobHandle {
         s.revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
     }
 
-    /// 仅当当前状态为 `from` 时转移(request_cancel 用:queued 直接终态,
-    /// running 绝不代 worker 发终态——评审 P0-3)。
-    fn transition_from(&self, from: JobState, to: JobState) -> Option<JobSnapshot> {
-        let mut s = self.lock();
-        if s.state != from || !s.state.can_transition(to) {
-            return None;
-        }
-        s.state = to;
-        s.revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
-        if to.is_terminal() {
-            s.finished_at = Some(chrono::Utc::now().to_rfc3339());
-            s.message = None;
-        }
-        Some(s.clone())
-    }
-
     /// 终态原子裁决(R4 终审 P1):在**同一把快照锁内**读取消标志、写结果、
     /// 选择并发布终态——消除「检查取消 → 发布 Done」间隙里取消静默输掉的窗口。
     fn finish(&self, outcome: Result<serde_json::Value, String>) -> Option<JobSnapshot> {
@@ -264,14 +248,20 @@ impl JobManager {
     /// 无意义的 cancel 位,调用方也能据 state 终态给出「无需取消」的真话反馈。
     pub fn request_cancel(&self, id: &str) -> Option<JobSnapshot> {
         let handle = self.get(id)?;
-        if handle.snapshot().state.is_terminal() {
-            return Some(handle.snapshot());
+        // R5 终审:读状态、置取消标志、queued 直转终态在**同一把快照锁内**完成,
+        // 与 finish 互斥——不存在「取消读到 Running、finish 读到 false」的交错
+        let mut s = handle.lock();
+        if s.state.is_terminal() {
+            return Some(s.clone());
         }
         handle.cancel.store(true, Ordering::SeqCst);
-        if let Some(s) = handle.transition_from(JobState::Queued, JobState::Cancelled) {
-            return Some(s);
+        if s.state == JobState::Queued {
+            s.state = JobState::Cancelled;
+            s.revision = handle.revision.fetch_add(1, Ordering::SeqCst) + 1;
+            s.finished_at = Some(chrono::Utc::now().to_rfc3339());
+            s.message = None;
         }
-        Some(handle.snapshot())
+        Some(s.clone())
     }
 
     fn lane(&self, kind: JobKind) -> Arc<Mutex<()>> {
@@ -332,10 +322,10 @@ impl JobManager {
             let _guard = match acquire_guard() {
                 Ok(g) => g,
                 Err(e) => {
-                    // 互斥获取失败=可见失败:走合法路径 queued→running→failed
+                    // 互斥获取失败=可见失败:走合法路径 queued→running,
+                    // 终态经统一的 finish 原子裁决(R5:不再旁路手写 Failed)
                     if handle.transition(JobState::Running).is_some() {
-                        handle.lock().error = Some(e);
-                        if let Some(s) = handle.transition(JobState::Failed) {
+                        if let Some(s) = handle.finish(Err(e)) {
                             on_change(s);
                         }
                     }
