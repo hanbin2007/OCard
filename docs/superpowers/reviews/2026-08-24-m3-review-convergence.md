@@ -129,3 +129,29 @@ jobs guard 释放窗口的后果在模块文档如实声明;ORT download-binarie
 
 按 P0 全修 + P1 全修 + 测试补齐开 R2 修复波;前端四项待 apple-design 动画批次交付后排它落地;
 修复完成后进入 R3 复验(双路),通过后终审双票(gpt-5.6-sol max + fable-5)。
+
+---
+
+# A1-A14 宣称/实况台账(逐项映射,R1 源报告已归档)
+
+源:R1 opus 实现评审报告(archives/2026-08-24-m3-r1-opus-report.md,自中断会话
+机器的任务记录中完整恢复,解除 R3 的 Blocked 项)。逐项在当前 HEAD 的闭合映射:
+
+| # | 原始发现(摘) | 闭合证据(HEAD) | 状态 |
+|---|---|---|---|
+| A1 | 测试网 W2 后冻结,9 个新命令零覆盖 | `m3_commands_wired_and_gated` 全命令挂网 + R3 M13a/b、M14a/b 行为级(cancel_job/dup/remote_activity) | ✅ |
+| A2 | 归档只有纯函数,无命令/UI/落地闸 | `start_archive_transcode` + UI 三档 + validate_dest_layout + R2 canonical 祖先闸 + R3 M9 删闸红 | ✅ |
+| A3 | 视频首帧图零实现 | analysis 作业 ffmpeg 抽帧进共享缓存(`AnalyzeOne::VideoThumb`),skipped 计数进结果与前端告警 | ✅ |
+| A4 | 他机转码不呈现 | `list_remote_activity` 折叠 transcode_started/completed + 前端措辞;R3 M14a/b 删折叠/过滤均红 | ✅ |
+| A5 | 宣称写入 PRD 实未改 | PRD 闭眼砍/embedding→纯算法/GPU 顺延全部落盘;R2 再修 libraw/GPU 矛盾与「草案」页眉;脚本替换纪律入 memory | ✅ |
+| A6 | 无退出确认 | `on_window_event` CloseRequested 拦截 + 15s 二次确认强退(取消作业 + kill ffmpeg + R2 拷贝任务安全点暂停) | ✅ |
+| A7 | 无启动期 staging 清理与提示 | 代理全输出根启动清理 + `transcode-staging-cleaned` notice;R2 归档补对称清理 | ✅ |
+| A8 | disk-space-insufficient 不存在 | 代理/归档两路空间预检,不足与无法探测都发该 code | ✅ |
+| A9 | 无 D 波裁决文档 | `2026-08-24-m3-decision-gate.md` | ✅ |
+| A10 | CI 校验假绿/无 SHA/查错对象 | fail-closed 重写 → `scripts/verify-bundle.sh` 双边共用(ffmpeg/ffprobe/模型 SHA;dpkg 解包;release 三平台接入) | ✅ |
+| A11 | W3 指纹收窄,失效路径测 1/3 | 收窄经裁决接受(理由已改写);缓存失效补测(worker/config-switch) | ✅(裁决) |
+| A12 | 幂等断言为空 | E2E mtime 严格相等 + 目录精确清单;R3 M16 真 ffmpeg 行为级(验真/坏产物拒采信) | ✅ |
+| A13 | 「不跨页」注释与实况不符 | 分页窗口尾部按组延展,注释与实况一致 | ✅ |
+| A14 | finish_cancelled 幽灵注释 | `transition_from` 实现取消语义,注释清除;R3 M13a 行为级 | ✅ |
+
+R2 codex 全量核验报告同批归档(archives/2026-08-24-m3-r2-codex-report.md)。
