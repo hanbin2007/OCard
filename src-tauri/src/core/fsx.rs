@@ -193,6 +193,11 @@ pub fn take_times_preserve_failures() -> u64 {
     TIMES_PRESERVE_FAILURES.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// 外部记入 N 次保留失败(如:源元数据在读取前就拿不到,时间戳注定无法保留)。
+pub fn note_times_preserve_failures(n: u64) {
+    TIMES_PRESERVE_FAILURES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 把源文件的时间戳复制到目标(拷卡/交付/精选的复制路径都要调):
 /// - mtime/atime:三平台;
 /// - **创建时间**:macOS/Windows 可设,Linux 文件系统不支持设置 btime
@@ -237,38 +242,55 @@ mod times_tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// R2 变异复核:旧版用 `fs::copy` 造场景,而 macOS 的 `fs::copy` 本身就
+    /// 克隆时间戳——把 `preserve_times` 改成空操作断言照样通过(恒真)。
+    /// 现在按生产形状造场景:目标是**新写出的文件**(时间戳=现在),
+    /// `preserve_times` 必须把它拉回源的旧值,空操作必红。
     #[test]
-    fn copied_file_keeps_source_mtime_and_creation_where_supported() {
+    fn preserve_times_actually_rewrites_target_mtime() {
         let tmp = tempdir().unwrap();
         let src = tmp.path().join("src.bin");
         let dst = tmp.path().join("dst.bin");
         fs::write(&src, b"data").unwrap();
-        // 让源的 mtime 明显早于现在
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 30);
         let f = fs::OpenOptions::new().write(true).open(&src).unwrap();
         f.set_times(fs::FileTimes::new().set_modified(old)).unwrap();
         drop(f);
-
-        fs::copy(&src, &dst).unwrap();
         let src_meta = fs::metadata(&src).unwrap();
-        preserve_times(&src_meta, &dst).unwrap();
 
+        // 生产形状:目标是刚写出的新文件(mtime=现在,与源相差 30 天)
+        fs::write(&dst, b"data").unwrap();
+        let before = fs::metadata(&dst).unwrap().modified().unwrap();
+        assert!(
+            before
+                .duration_since(src_meta.modified().unwrap())
+                .map(|d| d.as_secs() > 86400)
+                .unwrap_or(false),
+            "前置:新写目标的 mtime 必须明显晚于源,否则本测试退化为恒真"
+        );
+
+        preserve_times(&src_meta, &dst).unwrap();
         let dm = fs::metadata(&dst).unwrap().modified().unwrap();
         let sm = src_meta.modified().unwrap();
         let diff = dm
             .duration_since(sm)
             .unwrap_or_else(|e| e.duration())
             .as_secs();
-        assert!(diff <= 2, "mtime 必须与源一致(差 {diff}s)");
-        #[cfg(target_os = "macos")]
-        {
-            let dc = fs::metadata(&dst).unwrap().created().unwrap();
-            let sc = src_meta.created().unwrap();
-            let cdiff = dc
-                .duration_since(sc)
-                .unwrap_or_else(|e| e.duration())
-                .as_secs();
-            assert!(cdiff <= 2, "macOS 上创建时间也要保留(差 {cdiff}s)");
-        }
+        assert!(diff <= 2, "mtime 必须被改写为源值(差 {diff}s)");
+    }
+
+    /// 计数→告警取数的接线(R2 变异复核:取数改常量 0 时此测试红)。
+    #[test]
+    fn times_failure_counter_roundtrip() {
+        let _ = take_times_preserve_failures(); // 清零(其它测试可能污染)
+        note_times_preserve_failures(2);
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("s");
+        fs::write(&src, b"x").unwrap();
+        let meta = fs::metadata(&src).unwrap();
+        // 目标不存在 → preserve_times_counted 记 1 次失败
+        preserve_times_counted(&meta, &tmp.path().join("不存在"));
+        // 计数器全局共享,并行测试可能有额外增量——只断下界,不断精确值
+        assert!(take_times_preserve_failures() >= 3, "计数→取数接线必须通");
     }
 }

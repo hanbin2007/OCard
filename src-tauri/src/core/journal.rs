@@ -116,9 +116,11 @@ fn project_journal_dir(project_root: &Path) -> PathBuf {
     project_root.join(STATE_DIR).join(JOURNAL_DIR)
 }
 
-/// 项目级日志:追加。
+/// 项目级日志:追加(R2 P0:`.ocard`/`journal` 中间段防符号链接偷渡)。
 pub fn append(project_root: &Path, event: &Event) -> Result<()> {
-    append_in(&project_journal_dir(project_root), event)
+    let dir = project_journal_dir(project_root);
+    super::paths::ensure_dir_within(project_root, &dir).map_err(super::CoreError::Invalid)?;
+    append_in(&dir, event)
 }
 
 /// 项目级日志:合并读取。

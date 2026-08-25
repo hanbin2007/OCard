@@ -464,7 +464,21 @@ pub fn list_pending_assets<R: tauri::Runtime>(
     // 客观分析判定:特征缓存 + 查询时确定性聚类(计划 C5)。
     // 有分析结果时列表改按拍摄时间排序;分页窗口尾部按组延展(评审 #25:
     // 「不跨页」由这里真正保证,不再只是注释宣称)。
-    let (features, _) = cached_features(&stats.root);
+    let (features, feat_skipped, feat_read_err) = cached_features(&stats.root);
+    // R2 P1:分析缓存读不了/坏行时,AI 角标会整体消失——必须可见,不许静默
+    if let Some(e) = feat_read_err {
+        notify::warn(
+            &app,
+            "analysis-cache-degraded",
+            format!("{e};本页 AI 分析结果暂不可用"),
+        );
+    } else if feat_skipped > 0 {
+        notify::warn(
+            &app,
+            "analysis-cache-degraded",
+            format!("分析特征缓存有 {feat_skipped} 行损坏被跳过,相关素材显示为未分析"),
+        );
+    }
     let judgements = if features.is_empty() {
         Default::default()
     } else {
@@ -524,11 +538,13 @@ pub fn list_pending_assets<R: tauri::Runtime>(
 }
 
 /// 特征内存缓存(评审 #25 性能项):键=项目根,失效=features-*.jsonl 的
-/// (数量, 最大 mtime) 变化——分页翻页不再每页全量重读 NAS。
+/// (数量, 最大 mtime, mtime+大小指纹和) 变化——分页翻页不再每页全量重读 NAS。
+/// (R2 P1:仅 (数量,最大 mtime) 对「非最大文件变化」与粗粒度 NAS mtime 失明,
+/// 指纹和补上这两个盲区;目录读错如实上浮,不缓存错误态。)
 type FeaturesCacheMap = HashMap<
     PathBuf,
     (
-        (usize, std::time::SystemTime),
+        (usize, std::time::SystemTime, u64),
         std::collections::HashMap<u64, crate::core::analysis::FeatureRecord>,
         usize,
     ),
@@ -540,10 +556,12 @@ fn cached_features(
 ) -> (
     std::collections::HashMap<u64, crate::core::analysis::FeatureRecord>,
     usize,
+    Option<String>,
 ) {
     let dir = crate::core::analysis::analysis_dir(project_root);
     let mut count = 0usize;
     let mut max_mtime = std::time::SystemTime::UNIX_EPOCH;
+    let mut fp_sum = 0u64;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
@@ -552,29 +570,38 @@ fn cached_features(
                 if let Ok(m) = e.metadata() {
                     if let Ok(t) = m.modified() {
                         max_mtime = max_mtime.max(t);
+                        let nanos = t
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0);
+                        fp_sum = fp_sum.wrapping_add(xxhash_rust::xxh3::xxh3_64(
+                            format!("{name}\u{0}{}\u{0}{nanos}", m.len()).as_bytes(),
+                        ));
                     }
                 }
             }
         }
     }
-    let key = (count, max_mtime);
+    let key = (count, max_mtime, fp_sum);
     {
         let cache = FEATURES_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(map) = cache.as_ref() {
             if let Some((k, feats, skipped)) = map.get(project_root) {
                 if *k == key {
-                    return (feats.clone(), *skipped);
+                    return (feats.clone(), *skipped, None);
                 }
             }
         }
     }
-    let (feats, skipped) = crate::core::analysis::load_features(project_root);
-    FEATURES_CACHE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get_or_insert_with(Default::default)
-        .insert(project_root.to_path_buf(), (key, feats.clone(), skipped));
-    (feats, skipped)
+    let (feats, skipped, read_err) = crate::core::analysis::load_features(project_root);
+    if read_err.is_none() {
+        FEATURES_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(project_root.to_path_buf(), (key, feats.clone(), skipped));
+    }
+    (feats, skipped, read_err)
 }
 
 #[tauri::command]
@@ -1106,12 +1133,15 @@ pub fn cancel_job<R: tauri::Runtime>(
     // running 的作业由 worker 在安全点收尾;这里返回请求后的快照
     match jobs.request_cancel(&job_id) {
         Some(s) => {
-            // 零静默:取消请求本身可见(排队取消立即终态,运行中在安全点生效)
+            // 零静默:取消请求本身可见(排队取消立即终态,运行中在安全点生效;
+            // R2 P2:已终态的作业如实说「无需取消」,不许谎称「将停止」)
             notify::info(
                 &app,
                 "job-cancelled",
                 if s.state == crate::core::jobs::JobState::Cancelled {
                     "作业已取消".to_string()
+                } else if s.state.is_terminal() {
+                    "该作业已经结束,无需取消".to_string()
                 } else {
                     "已请求取消,作业将在当前文件完成后停止".to_string()
                 },

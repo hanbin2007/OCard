@@ -914,10 +914,27 @@ mod tests {
     #[test]
     fn curate_copies_and_original_stays() {
         let (_t, root, meta) = setup_project();
+        // R2 变异复核:精选复制也要保留源时间戳(删 preserve_times_counted 必红)
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 30);
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(root.join(asset("b.jpg")))
+            .unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(old)).unwrap();
+        drop(f);
         let out = curate_assets(&root, &meta, &[asset("b.jpg")]);
         assert!(out[0].result.is_ok());
         assert!(root.join(asset("b.jpg")).is_file(), "精选是复制,原件保留");
         assert!(root.join("4. 精选/待修/b.jpg").is_file());
+        let dm = fs::metadata(root.join("4. 精选/待修/b.jpg"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let diff = dm
+            .duration_since(old)
+            .unwrap_or_else(|e| e.duration())
+            .as_secs();
+        assert!(diff <= 2, "精选产物 mtime 必须保留源值(差 {diff}s)");
         // 没有残留临时文件
         let leftovers: Vec<_> = fs::read_dir(root.join("4. 精选/待修"))
             .unwrap()

@@ -40,6 +40,9 @@ pub struct AnalysisFailureDto {
 /// 模型「缺失」是打包问题,降级为无人脸分析并可见 error——两种语义分开)。
 static AI_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 人脸推理失败计数(R2 P1:失败=faces None,聚合为可见 warning,不伪装成 0 人脸)。
+static FACE_DETECT_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
 /// 启动校验:模型存在但哈希不符 → 禁用 AI + 可见 error(计划 D1)。
 pub fn verify_models_on_startup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Ok(p) = resolve_model_path(app) {
@@ -112,7 +115,14 @@ pub fn start_analysis<R: tauri::Runtime>(
                 }
             };
             let detector = detector.as_ref();
-            let (features, skipped) = analysis::load_features(&root);
+            let (features, skipped, read_err) = analysis::load_features(&root);
+            if let Some(e) = read_err {
+                notify::warn(
+                    &body_app,
+                    "analysis-cache-degraded",
+                    format!("{e};本轮将全量重新分析"),
+                );
+            }
             if skipped > 0 {
                 notify::warn(
                     &body_app,
@@ -216,6 +226,16 @@ pub fn start_analysis<R: tauri::Runtime>(
                     "analysis-cache-degraded",
                     format!(
                         "{cache_write_failed} 条分析结果写入缓存失败:这些素材的角标本轮不会出现,下次分析会重算"
+                    ),
+                );
+            }
+            let face_fail = FACE_DETECT_FAILURES.swap(0, Ordering::Relaxed);
+            if face_fail > 0 {
+                notify::warn(
+                    &body_app,
+                    "face-detect-degraded",
+                    format!(
+                        "{face_fail} 张图片人脸检测失败(已按「人脸信息不可用」记录,客观指标不受影响)"
                     ),
                 );
             }
@@ -377,19 +397,27 @@ fn analyze_one(
     let img = media::apply_orientation(img, media::exif_orientation(&abs));
     // 单次解码产出全部特征 + 回填共享缩略图缓存
     let (dhash, mut sharpness, over, under) = analysis::extract_features(&img);
-    // 人脸在场:清晰度改按最大脸区域(对焦在脸=可用;检测失败按不可用处理)
-    let faces = detector.map(|d| match d.detect(&img) {
-        Ok(list) => {
-            if let Some(best) = list
-                .iter()
-                .max_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h)))
-            {
-                sharpness = analysis::sharpness_region(&img, best.x, best.y, best.w, best.h);
+    // 人脸在场:清晰度改按最大脸区域(对焦在脸=可用)。
+    // R2 P1:推理失败必须记 None(=不可用)并计数上报——记 0 会被永久缓存成
+    // 「确实没有人脸」,与字段语义相悖且不可辨别。
+    let faces = match detector {
+        None => None,
+        Some(d) => match d.detect(&img) {
+            Ok(list) => {
+                if let Some(best) = list
+                    .iter()
+                    .max_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h)))
+                {
+                    sharpness = analysis::sharpness_region(&img, best.x, best.y, best.w, best.h);
+                }
+                Some(list.len() as u32)
             }
-            list.len() as u32
-        }
-        Err(_) => 0,
-    });
+            Err(_) => {
+                FACE_DETECT_FAILURES.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        },
+    };
     let _ = media::store_thumb_from_image(root, rel, size, mtime, &img);
     let shot_at_epoch = media::exif_shot_at(&abs)
         .map(|t| t.timestamp())

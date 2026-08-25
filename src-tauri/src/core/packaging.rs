@@ -555,6 +555,36 @@ mod tests {
         assert!(manifest.contains("文件数: 3") || manifest.contains("文件数: 2"),);
     }
 
+    /// R2 变异复核:交付复制必须保留源 mtime(删 deliver_one 的
+    /// preserve_times_counted 本测试红)。源 mtime 被改会影响半天分包,
+    /// 所以在**全部包**里找落点,不假设它进第一个包。
+    #[test]
+    fn delivery_preserves_source_mtime() {
+        let (_t, root, meta) = setup();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 30);
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("2. 开幕式/a.jpg"))
+            .unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(old)).unwrap();
+        drop(f);
+        let out = build_delivery(&root, &meta).unwrap();
+        assert!(out.failures.is_empty(), "{:?}", out.failures);
+        let delivery = root.join(DELIVERY_DIR);
+        let delivered = out
+            .packages
+            .iter()
+            .map(|p| delivery.join(p).join("2. 开幕式/a.jpg"))
+            .find(|p| p.is_file())
+            .expect("a.jpg 必须被交付到某个包");
+        let dm = fs::metadata(&delivered).unwrap().modified().unwrap();
+        let diff = dm
+            .duration_since(old)
+            .unwrap_or_else(|e| e.duration())
+            .as_secs();
+        assert!(diff <= 2, "交付产物 mtime 必须保留源值(差 {diff}s)");
+    }
+
     #[test]
     fn truncated_leftover_is_name_collision_not_silent_success() {
         // codex P0 场景:包内已有同名**不同内容**(如上次断连的半截文件被手工改名),

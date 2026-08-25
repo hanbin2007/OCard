@@ -162,14 +162,23 @@ fn delivery_job_end_to_end_through_real_handler() {
         invoke(&window, "start_delivery", json!({"projectId": pid})).expect("发起交付作业应成功");
     let job_id = snap["id"].as_str().unwrap().to_string();
 
-    // 重复投递必须被拒(同项目同 kind 已有活跃作业)
+    // 重复投递:同项目同 kind 不允许两个活跃作业并存(R2 P2:原断言恒真,改为
+    // 真不变量——无论 dup 被拒还是首个已完成后合法接受,活跃 delivery ≤ 1)
     let dup = invoke(&window, "start_delivery", json!({"projectId": pid}));
-    assert!(
-        dup.is_err() || {
-            // 若首个作业已飞速完成,重复投递合法——两种结局都可接受,但不允许并行两个活跃
-            true
-        }
-    );
+    {
+        let jobs = window.state::<std::sync::Arc<crate::core::jobs::JobManager>>();
+        let active = jobs
+            .snapshots()
+            .iter()
+            .filter(|s| {
+                s.kind == crate::core::jobs::JobKind::Delivery && !s.state.is_terminal()
+            })
+            .count();
+        assert!(
+            active <= 1,
+            "同项目不允许两个活跃交付作业并存(active={active}, dup={dup:?})"
+        );
+    }
 
     // 轮询到终态
     let mut last = json!(null);
@@ -286,4 +295,18 @@ fn m3_commands_wired_and_gated() {
     // 诊断导出无素材路径字段
     let diag = invoke(&window, "transcode_diagnostics", json!({})).unwrap();
     assert!(diag.get("ffmpeg").is_some());
+
+    // cancel_job 挂网(R2:此前零测试):不存在的作业必须报错;
+    // 对已终态作业请求取消要拿回原状态,不得谎称已取消
+    let e = invoke(&window, "cancel_job", json!({"jobId": "不存在的作业"}))
+        .expect_err("未知 jobId 必须报错");
+    assert!(e.as_str().unwrap().len() > 3);
+    let done = invoke(&window, "cancel_job", json!({"jobId": job_id})).unwrap();
+    assert_eq!(done["state"], "done", "终态作业的取消请求必须原样返回终态");
+
+    // list_remote_activity 挂网(R2:此前零测试):形状可用,分析作业不产生
+    // copy/transcode 活动条目
+    let acts = invoke(&window, "list_remote_activity", json!({"projectId": pid})).unwrap();
+    assert!(acts.is_array(), "{acts}");
+    assert_eq!(acts.as_array().unwrap().len(), 0, "分析不产生远端活动条目");
 }

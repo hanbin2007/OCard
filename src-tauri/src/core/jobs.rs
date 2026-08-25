@@ -10,6 +10,10 @@
 //! 互斥 guard(OpsMutex 等)由**running worker** 在 `queued→running` 时获取,
 //! 在终态快照生成后、事件发布回调前释放(先 transition 后 drop——语义上
 //! guard 覆盖全部实际工作;绝不进入历史 Job 记录,计划 D2)。
+//! 声明边界(R2):终态发布→guard 释放之间有微秒级窗口,期间新投递会通过
+//! `has_active` 检查、在获取 guard 时失败——表现为一条带明确原因的失败作业
+//! (「已有交付打包在进行中」),不产生数据风险;换序(先 drop 后 transition)
+//! 会让 guard 在作业名义上仍 running 时旁落,更糟。
 //!
 //! 作业不持久化:幂等由输出语义承担(转码 already-transcoded skip、
 //! 交付 verified-skip)。本模块 tauri 无关,事件发射由命令层包装。
@@ -229,8 +233,13 @@ impl JobManager {
     /// **running 只置标志**——终态由 worker 在安全点发布,guard 释放前
     /// `any_active` 保持为真(评审 P0-3:提前终态会放行更新闸/错乱前端互斥)。
     /// 返回请求后的快照(终态作业原样返回)。
+    /// R2 P2:已终态的作业不再置取消标志——那会让「已完成」的作业带着
+    /// 无意义的 cancel 位,调用方也能据 state 终态给出「无需取消」的真话反馈。
     pub fn request_cancel(&self, id: &str) -> Option<JobSnapshot> {
         let handle = self.get(id)?;
+        if handle.snapshot().state.is_terminal() {
+            return Some(handle.snapshot());
+        }
         handle.cancel.store(true, Ordering::SeqCst);
         if let Some(s) = handle.transition_from(JobState::Queued, JobState::Cancelled) {
             return Some(s);

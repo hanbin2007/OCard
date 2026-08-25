@@ -191,8 +191,8 @@ pub fn index_asset(project_root: &Path, asset_abs: &Path, rel_path: &str) -> Res
     }
 
     let thumb = match kind {
-        AssetKind::Photo => make_photo_thumb(asset_abs, &dir, &cache),
-        AssetKind::Raw => make_raw_thumb(asset_abs, &dir, &cache),
+        AssetKind::Photo => make_photo_thumb(project_root, asset_abs, &dir, &cache),
+        AssetKind::Raw => make_raw_thumb(project_root, asset_abs, &dir, &cache),
         AssetKind::Video | AssetKind::Other => None,
     };
 
@@ -204,17 +204,31 @@ pub fn index_asset(project_root: &Path, asset_abs: &Path, rel_path: &str) -> Res
     })
 }
 
-fn make_photo_thumb(abs: &Path, dir: &Path, cache: &Path) -> Option<PathBuf> {
+/// 解码并按 EXIF 摆正(R2 P0:索引路径与分析路径此前一条摆正一条不摆,
+/// 写同一个缓存键先到先得,竖拍缩略图方向随机——所有解码入口统一走这里)。
+pub fn decode_oriented(abs: &Path) -> Option<image::DynamicImage> {
     let img = image::open(abs).ok()?;
-    let thumb = img.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE);
-    write_jpeg(&thumb, dir, cache)
+    Some(apply_orientation(img, exif_orientation(abs)))
 }
 
-fn make_raw_thumb(abs: &Path, dir: &Path, cache: &Path) -> Option<PathBuf> {
+fn make_photo_thumb(
+    project_root: &Path,
+    abs: &Path,
+    dir: &Path,
+    cache: &Path,
+) -> Option<PathBuf> {
+    let img = decode_oriented(abs)?;
+    let thumb = img.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE);
+    write_jpeg(project_root, &thumb, dir, cache)
+}
+
+fn make_raw_thumb(project_root: &Path, abs: &Path, dir: &Path, cache: &Path) -> Option<PathBuf> {
     let bytes = exif_thumbnail_bytes(abs)?;
     let img = image::load_from_memory(&bytes).ok()?;
+    // RAW 内嵌预览通常未摆正,方向以 RAW 自身的 EXIF Orientation 为准
+    let img = apply_orientation(img, exif_orientation(abs));
     let thumb = img.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE);
-    write_jpeg(&thumb, dir, cache)
+    write_jpeg(project_root, &thumb, dir, cache)
 }
 
 /// 轻量 JPEG 完整性检查:SOI(FFD8)开头 + EOI(FFD9)结尾。
@@ -235,8 +249,14 @@ pub(crate) fn looks_like_valid_jpeg(path: &Path) -> bool {
     head == [0xFF, 0xD8] && tail == [0xFF, 0xD9]
 }
 
-fn write_jpeg(img: &image::DynamicImage, dir: &Path, cache: &Path) -> Option<PathBuf> {
-    fs::create_dir_all(dir).ok()?;
+fn write_jpeg(
+    project_root: &Path,
+    img: &image::DynamicImage,
+    dir: &Path,
+    cache: &Path,
+) -> Option<PathBuf> {
+    // R2 P0:`.ocard`/`thumbs` 中间段可能被换成符号链接——落地闸后再写
+    super::paths::ensure_dir_within(project_root, dir).ok()?;
     // 临时名带随机后缀:thumbs 在 NAS 上多机共享,固定 tmp 名会互相截断(评审 M2)
     let tmp = dir.join(format!(
         ".{}.{}.thumbpart",
@@ -282,7 +302,7 @@ pub fn store_thumb_from_image(
         return true;
     }
     let thumb = img.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE);
-    write_jpeg(&thumb, &dir, &cache).is_some()
+    write_jpeg(project_root, &thumb, &dir, &cache).is_some()
 }
 
 /// 素材对应的缩略图缓存路径(存在与否由调用方检查)。

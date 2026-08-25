@@ -61,6 +61,17 @@ impl TaskManager {
         }
     }
 
+    /// 请求暂停全部在跑的拷贝任务(确认退出用,R2 P1:此前退出只管
+    /// 作业与 ffmpeg,拷卡线程被硬杀在半写 .part 上;暂停走引擎安全点,
+    /// part 残留由同任务重启清理,manifest 支持续传)。
+    pub fn pause_all(&self) {
+        for h in self.inner.lock().unwrap().values() {
+            if h.running.load(Ordering::SeqCst) {
+                h.pause_requested.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
     /// 是否有任务的工作线程正在运行(安装更新前的安全闸)。
     pub fn any_running(&self) -> bool {
         self.inner

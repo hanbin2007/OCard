@@ -585,6 +585,15 @@ pub fn start_copy_task<R: tauri::Runtime>(
 
     let source_root = PathBuf::from(&input.volume_id);
     let files = copy::scan_source(&source_root).map_err(err)?;
+    // 零静默:扫描跳过的符号链接必须让用户知道(链接目标不会被拷贝)
+    let symlinks_skipped = copy::take_scan_symlinks_skipped();
+    if symlinks_skipped > 0 {
+        notify::warn(
+            &app,
+            "copy-symlinks-skipped",
+            format!("源卷上发现 {symlinks_skipped} 个符号链接,已跳过(链接目标不会被拷贝)"),
+        );
+    }
     if files.is_empty() {
         return Err("源卷上没有可拷贝的素材".into());
     }
@@ -750,7 +759,28 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         // 刷新清单:源卡内容可能在暂停期间变化,快照与引擎必须消费同一份新清单。
         // 与持久化的计划清单取并集:计划内但已从源消失的文件必须进清单
         // (引擎会因打不开源文件将其记为失败,绝不静默漏拷,复核 P0)。
+        // R2 P0:持久化清单是外部可篡改输入——任何非法相对路径(`..`/绝对/空段)
+        // 都说明清单损坏或被篡改,整单拒绝续传(fail-closed,可见报错),
+        // 绝不静默丢弃单条(丢弃=静默漏拷)。
+        if let Some(bad) = m
+            .planned
+            .iter()
+            .find(|p| !crate::core::paths::is_safe_rel(&p.rel_path))
+        {
+            return Err(err(format!(
+                "任务清单损坏或被篡改(非法相对路径 {:?}),拒绝续传;请重新发起拷贝",
+                bad.rel_path
+            )));
+        }
         let mut files = copy::scan_source(&resolved).map_err(err)?;
+        let symlinks_skipped = copy::take_scan_symlinks_skipped();
+        if symlinks_skipped > 0 {
+            notify::warn(
+                &app,
+                "copy-symlinks-skipped",
+                format!("源卷上发现 {symlinks_skipped} 个符号链接,已跳过(链接目标不会被拷贝)"),
+            );
+        }
         for p in &m.planned {
             if !files.iter().any(|(rel, _)| rel == &p.rel_path) {
                 files.push((p.rel_path.clone(), p.size));

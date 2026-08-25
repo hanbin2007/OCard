@@ -114,7 +114,8 @@ pub fn manifest_dir(project_root: &Path) -> PathBuf {
 
 pub fn save(project_root: &Path, m: &CopyManifest) -> Result<()> {
     let dir = manifest_dir(project_root);
-    fs::create_dir_all(&dir)?;
+    // R2 P0:`.ocard`/`manifests` 中间段防符号链接偷渡,落地闸后再写
+    super::paths::ensure_dir_within(project_root, &dir).map_err(super::CoreError::Invalid)?;
     let tmp = dir.join(format!("{}.json.tmp", m.id));
     fs::write(&tmp, serde_json::to_vec_pretty(m)?)?;
     fs::rename(&tmp, dir.join(format!("{}.json", m.id)))?;
