@@ -731,6 +731,20 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         // 续传身份核对(评审 M10/P0-1)+ 按卷名重解析挂载点(复核必修 A:
         // 卡后插/换挂载口场景,插回原卡即可续传,无需重启应用)
         let m = manifest::load(&handle.project_root, &handle.manifest_id).map_err(err)?;
+        // R2 P0:持久化清单是外部可篡改输入——任何非法相对路径(`..`/绝对/空段)
+        // 都说明清单损坏或被篡改,整单拒绝续传(fail-closed,可见报错),
+        // 绝不静默丢弃单条(丢弃=静默漏拷)。闸在卷重解析之前:清单坏了就该
+        // 直说,不能先让用户「插回原卡」再报废(R3-F2:也让闸不依赖挂载环境)。
+        if let Some(bad) = m
+            .planned
+            .iter()
+            .find(|p| !crate::core::paths::is_safe_rel(&p.rel_path))
+        {
+            return Err(err(format!(
+                "任务清单损坏或被篡改(非法相对路径 {:?}),拒绝续传;请重新发起拷贝",
+                bad.rel_path
+            )));
+        }
         // 只看可移动卷:系统盘永远在场,混进来会让「没有检测到可移动卷」
         // 分支永不可达,报文失真(复验 18)
         let vols: Vec<(PathBuf, String)> = volumes::removable_volumes()
@@ -759,19 +773,7 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         // 刷新清单:源卡内容可能在暂停期间变化,快照与引擎必须消费同一份新清单。
         // 与持久化的计划清单取并集:计划内但已从源消失的文件必须进清单
         // (引擎会因打不开源文件将其记为失败,绝不静默漏拷,复核 P0)。
-        // R2 P0:持久化清单是外部可篡改输入——任何非法相对路径(`..`/绝对/空段)
-        // 都说明清单损坏或被篡改,整单拒绝续传(fail-closed,可见报错),
-        // 绝不静默丢弃单条(丢弃=静默漏拷)。
-        if let Some(bad) = m
-            .planned
-            .iter()
-            .find(|p| !crate::core::paths::is_safe_rel(&p.rel_path))
-        {
-            return Err(err(format!(
-                "任务清单损坏或被篡改(非法相对路径 {:?}),拒绝续传;请重新发起拷贝",
-                bad.rel_path
-            )));
-        }
+        // (planned 的合法性已在上方 manifest 加载后整单校验。)
         let mut files = copy::scan_source(&resolved).map_err(err)?;
         let symlinks_skipped = copy::take_scan_symlinks_skipped();
         if symlinks_skipped > 0 {

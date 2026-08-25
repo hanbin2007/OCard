@@ -353,6 +353,26 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
+    /// R2 P1 接线回归:`.ocard/analysis` 存在但不可读(此处用文件占位模拟)
+    /// 时必须上浮 read_err——此前静默返回空表,AI 角标凭空消失且零提示。
+    /// 把 load_features 的 IO 错误分支改回静默空表本测试红。
+    #[test]
+    fn load_features_surfaces_unreadable_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".ocard")).unwrap();
+        std::fs::write(analysis_dir(tmp.path()), b"not-a-dir").unwrap();
+        let (map, skipped, read_err) = load_features(tmp.path());
+        assert!(map.is_empty());
+        assert_eq!(skipped, 0);
+        assert!(
+            read_err.is_some_and(|e| e.contains("分析缓存目录不可读")),
+            "目录读错必须如实上浮"
+        );
+        // NotFound 仍是正常态(从未分析过)
+        let fresh = tempfile::tempdir().unwrap();
+        assert!(load_features(fresh.path()).2.is_none());
+    }
+
     fn feat(dhash: u64, sharp: f32) -> FeatureRecord {
         FeatureRecord {
             rel: String::new(),

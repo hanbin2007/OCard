@@ -71,6 +71,13 @@ jobs:
         run: cargo test
         working-directory: src-tauri
 
+      # M3 计划兑现:小集性能非回退回归。阈值宽松(外推千张 <300s,按核数
+      # 归一),防数量级回退而非 SLA(SLA 须用户真实素材)。本地 4 核实测
+      # 126s;release 产物由 rust-cache 复用,增量成本一次编译。
+      - name: perf non-regression (24MP 单张小集,宽松阈值)
+        run: cargo test --release --lib bench_single_24mp -- --ignored --nocapture
+        working-directory: src-tauri
+
   build:
     name: Build (${{ matrix.platform }})
     needs: lint
