@@ -15,10 +15,12 @@ on:
       - "**.md"
 
 # PR 分支:新 push 顶掉旧 head 的在途 run(旧 head 不再需要验证)。
-# main:绝不取消,排队跑完——每个落地 commit 都必须拿到完整绿章
-# (教训:R2 波连推时多个 main run 被顶成 cancelled,代码落地却从未被 CI 完整验证)。
+# main:每个 push 用自己的组(按 SHA)——GitHub 并发组「最多一个排队 run,
+# 新排队顶掉旧排队」的规则会在连推 3+ commit 时把中间 commit 的 run 取消,
+# cancel-in-progress:false 防不住这种(实证:85d2243 被顶成 cancelled)。
+# 按 SHA 分组后 main 的 run 互不排队、并行跑,每个落地 commit 都拿完整绿章。
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # 默认最小权限:只有 e2e job 因需推 e2e-shots 分支单独提权到 contents: write
