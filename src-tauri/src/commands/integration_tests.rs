@@ -645,3 +645,196 @@ fn archive_output_ancestor_symlink_refused_through_real_handler() {
         "拒绝路径不得留下转码作业"
     );
 }
+
+// ---------- 真实链路行为级(完整网络会话兑现:行为级验证不再只属于 E2E/CI) ----------
+
+/// 把仓内 target-triple 命名的 sidecar 以裸名注入独立目录,返回该目录。
+/// sidecar 缺失(未跑 scripts/fetch-ffmpeg.sh)时返回 None,调用方如实跳过。
+#[cfg(unix)]
+fn stage_sidecar_dir(tmp: &std::path::Path) -> Option<std::path::PathBuf> {
+    let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries");
+    let dir = tmp.join("ffmpeg-dir");
+    std::fs::create_dir_all(&dir).ok()?;
+    for name in ["ffmpeg", "ffprobe"] {
+        let src = std::fs::read_dir(&bins)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with(&format!("{name}-")))
+                    .unwrap_or(false)
+                    && p.extension().is_none_or(|e| e != "txt")
+            })?;
+        std::os::unix::fs::symlink(src, dir.join(name)).ok()?;
+    }
+    Some(dir)
+}
+
+/// R2 P1 行为级(真 ffmpeg):代理转码端到端——转出真产物;重跑幂等且
+/// 「既有产物」经 ffprobe 验真才计完成;坏产物如实报失败绝不采信;
+/// 无硬件编码器时 hwenc-fallback 告警可见。
+/// sidecar 由 scripts/fetch-ffmpeg.sh 拉取(CI 在 cargo test 前已就位)。
+#[cfg(unix)]
+#[test]
+fn proxy_transcode_end_to_end_with_real_ffmpeg() {
+    let (window, tmp, nas) = mock_app();
+    let Some(ffdir) = stage_sidecar_dir(tmp.path()) else {
+        eprintln!("跳过:src-tauri/binaries 无 sidecar(先跑 scripts/fetch-ffmpeg.sh)");
+        return;
+    };
+    // env 是进程全局:与 ffmpeg.rs 的 env 测试共用进程级互斥,持锁贯穿全程
+    let _g = crate::core::ffmpeg::FFMPEG_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    std::env::set_var("OCARD_FFMPEG_DIR", &ffdir);
+
+    let pid = create_a_project(&window);
+    let cam_dir = nas.join(&pid).join("2. 原始素材/20260824_A7M4_A_ZS");
+    std::fs::create_dir_all(&cam_dir).unwrap();
+    // 真视频源:1s 640x360 纯色(低负载,不触发高负载跳过规则)
+    let src = cam_dir.join("C0001.MP4");
+    let out = std::process::Command::new(ffdir.join("ffmpeg"))
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=640x360:d=1:r=25",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+        ])
+        .arg(&src)
+        .output()
+        .expect("生成测试视频失败");
+    assert!(
+        out.status.success() && src.is_file(),
+        "ffmpeg 生成源视频失败: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let run_job = || {
+        let snap = invoke(
+            &window,
+            "start_proxy_transcode",
+            // 代理默认只转高负载素材;测试片是低负载,走「整夹强制全转」
+            json!({"input": {"projectId": pid, "forceAll": true}}),
+        )
+        .expect("发起代理转码应成功");
+        let job_id = snap["id"].as_str().unwrap().to_string();
+        let mut last = json!(null);
+        // 首轮含编码器真探针(逐 encoder 带超时),预算放宽
+        for _ in 0..2400 {
+            last = invoke(&window, "get_job", json!({"jobId": job_id})).unwrap();
+            if ["done", "failed", "cancelled"].contains(&last["state"].as_str().unwrap_or_default())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        last
+    };
+
+    // 第一轮:真转码出产物
+    let r1 = run_job();
+    assert_eq!(r1["state"], "done", "{r1}");
+    assert_eq!(r1["result"]["converted"], 1, "{r1}");
+    let final_out = nas
+        .join(&pid)
+        .join("4. 转码素材/20260824_A7M4_A_ZS/C0001_MP4_proxy.mp4");
+    assert!(final_out.is_file(), "代理产物必须落盘");
+    // 容器/CI runner 无硬件编码器:软编回退必须可见告警(R2 P1 hwenc-fallback)
+    let notices = invoke(&window, "list_notices", json!({})).unwrap();
+    assert!(
+        notices
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["code"] == "hwenc-fallback"),
+        "软编回退必须可见: {notices}"
+    );
+
+    // 第二轮:幂等——既有产物 ffprobe 验真通过才计 alreadyTranscoded
+    let r2 = run_job();
+    assert_eq!(r2["state"], "done", "{r2}");
+    assert_eq!(r2["result"]["alreadyTranscoded"], 1, "{r2}");
+    assert_eq!(r2["result"]["converted"], 0, "{r2}");
+
+    // 第三轮:坏产物绝不采信(R2 P1「存在即成功」修复的行为级证据)
+    std::fs::write(&final_out, b"garbage-not-a-video").unwrap();
+    let r3 = run_job();
+    assert_eq!(r3["state"], "done", "{r3}");
+    assert_eq!(
+        r3["result"]["alreadyTranscoded"], 0,
+        "坏产物不得计入完成: {r3}"
+    );
+    assert_eq!(r3["result"]["converted"], 0, "{r3}");
+    let msg = r3["result"]["failures"][0]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(msg.contains("无法通过校验"), "坏产物必须如实报失败: {r3}");
+
+    std::env::remove_var("OCARD_FFMPEG_DIR");
+}
+
+/// R2 P1 行为级(真模型 + 真 ort 推理):YuNet 检测器加载仓内模型
+/// (SHA 钉死)并真实跑推理——faces 必须是 Some(数字)而非 None,
+/// 且不得出现 ai-models-corrupt 告警。合成图无脸,0 即正确;
+/// 判别点在「检测器在场时 faces 绝不为 null」。
+#[test]
+fn analysis_runs_real_yunet_inference() {
+    let models = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/models");
+    assert!(
+        models.join(crate::core::yunet::YUNET_FILE).is_file(),
+        "仓内应有 YuNet 模型"
+    );
+    std::env::set_var("OCARD_MODELS_DIR", &models);
+
+    let (window, _tmp, nas) = mock_app();
+    let pid = create_b_project(&window);
+    let inbox = nas.join(&pid).join("1. 待分类/x");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(320, 240, |x, y| {
+        image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+    }));
+    img.save(inbox.join("a.jpg")).unwrap();
+
+    let snap = invoke(&window, "start_analysis", json!({"projectId": pid})).unwrap();
+    let job_id = snap["id"].as_str().unwrap().to_string();
+    let mut last = json!(null);
+    for _ in 0..600 {
+        last = invoke(&window, "get_job", json!({"jobId": job_id})).unwrap();
+        if ["done", "failed", "cancelled"].contains(&last["state"].as_str().unwrap_or_default()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(last["state"], "done", "{last}");
+    assert_eq!(last["result"]["analyzed"], 1, "{last}");
+
+    // 特征落盘里 faces 必须是数字(检测器在场,推理真实跑过)
+    let text = std::fs::read_to_string(
+        nas.join(&pid)
+            .join(".ocard/analysis/features-TEST-MACHINE.jsonl"),
+    )
+    .unwrap();
+    let rec: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert!(
+        rec["faces"].is_number(),
+        "检测器在场时 faces 必须为数字(推理失败才是 null): {rec}"
+    );
+    // 模型校验/加载不得报损坏
+    let notices = invoke(&window, "list_notices", json!({})).unwrap();
+    assert!(
+        !notices
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["code"] == "ai-models-corrupt"),
+        "真模型不得报损坏: {notices}"
+    );
+}
