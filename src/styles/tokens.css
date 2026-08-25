@@ -36,9 +36,14 @@
   --leading-normal: 1.5;
   --leading-relaxed: 1.7;
 
+  /* 字重台阶按 CJK 现实校准：中文系统字体（微软雅黑 / Noto CJK）大多只有
+     Regular(400) 和 Bold(700) 两档，CSS 对 500 的匹配是"就近向下"落回 400——
+     所以 500 在中文上与正文毫无区别，层级等于不存在。
+     medium 取 600（就近向上命中 Bold / PingFang Semibold），semibold 取 700，
+     保证三档在所有平台的中文里至少呈现两档、拉丁文三档。 */
   --weight-normal: 400;
-  --weight-medium: 500;
-  --weight-semibold: 600;
+  --weight-medium: 600;
+  --weight-semibold: 700;
 
   /* ---- 间距（4 的倍数） ---- */
   --space-1: 4px;
