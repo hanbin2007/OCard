@@ -321,6 +321,135 @@ fn m3_commands_wired_and_gated() {
 
 // ---------- R3-F2 闸接线回归(评审缺口 3:修复点必须有命令层网) ----------
 
+/// R3-F2 集成断言加强:cancel_job 行为级(此前仅「未知 id 报错/终态原样
+/// 返回」形状级)——排队中的活跃作业请求取消必须真进 cancelled 终态;
+/// dup 拒绝确定性化(此前依赖「首个作业尚未完成」的时序):活跃作业在场
+/// 时同项目必拒,终态后必须重新放行。
+#[test]
+fn cancel_and_dup_assertions_are_behavior_level() {
+    let (window, _tmp, _nas) = mock_app();
+    let pid = create_b_project(&window);
+
+    // 排队中的真实作业(不启动 worker):活跃态确定,无时序竞争
+    let jobs = window.state::<std::sync::Arc<crate::core::jobs::JobManager>>();
+    let queued = jobs.create(crate::core::jobs::JobKind::Delivery, &pid);
+    let dup = invoke(&window, "start_delivery", json!({"projectId": pid}))
+        .expect_err("已有活跃交付作业时必须拒绝");
+    assert!(
+        dup.as_str()
+            .unwrap_or_default()
+            .contains("已有交付打包作业"),
+        "{dup}"
+    );
+
+    let s = invoke(
+        &window,
+        "cancel_job",
+        json!({"jobId": queued.snapshot().id}),
+    )
+    .unwrap();
+    assert_eq!(s["state"], "cancelled", "排队作业取消必须真进终态: {s}");
+
+    // 终态解除活跃:同项目必须重新放行(空项目交付会正常跑完,不影响断言)
+    invoke(&window, "start_delivery", json!({"projectId": pid}))
+        .expect("取消进入终态后必须允许重新发起");
+}
+
+/// R3-F2 集成断言加强:list_remote_activity 折叠正例(此前仅空表形状)——
+/// 他机 started 必须出现(copy 与 transcode 两类),completed 后必须折叠
+/// 消失,本机事件不上榜。
+#[test]
+fn remote_activity_folds_started_completed_pairs() {
+    let (window, _tmp, nas) = mock_app();
+    let pid = create_b_project(&window);
+    let root = nas.join(&pid);
+    let ev = |machine: &str, kind: &str, data: Value| {
+        crate::core::journal::append(
+            &root,
+            &crate::core::journal::Event::new(machine, "远端操作员", kind, data),
+        )
+        .unwrap()
+    };
+
+    ev(
+        "REMOTE-1",
+        crate::core::journal::kind::COPY_STARTED,
+        json!({"taskId": "t1", "volume": "SD01", "camera": "A7M4_A_ZS", "targetFolder": "x"}),
+    );
+    ev(
+        "TEST-MACHINE",
+        crate::core::journal::kind::COPY_STARTED,
+        json!({"taskId": "t9"}),
+    );
+    ev(
+        "REMOTE-2",
+        "transcode_started",
+        json!({"jobId": "j1", "folders": "20260824_A7M4_A_ZS"}),
+    );
+    let acts = invoke(&window, "list_remote_activity", json!({"projectId": pid})).unwrap();
+    let arr = acts.as_array().unwrap();
+    assert_eq!(
+        arr.len(),
+        2,
+        "他机 copy+transcode 各一条,本机不上榜: {acts}"
+    );
+    assert!(arr
+        .iter()
+        .any(|a| a["activity"] == "copy" && a["machine"] == "REMOTE-1"));
+    assert!(arr
+        .iter()
+        .any(|a| a["activity"] == "transcode" && a["machine"] == "REMOTE-2"));
+
+    ev(
+        "REMOTE-1",
+        crate::core::journal::kind::COPY_COMPLETED,
+        json!({"taskId": "t1"}),
+    );
+    ev("REMOTE-2", "transcode_completed", json!({"jobId": "j1"}));
+    let acts = invoke(&window, "list_remote_activity", json!({"projectId": pid})).unwrap();
+    assert_eq!(
+        acts.as_array().unwrap().len(),
+        0,
+        "started/completed 配对后必须折叠: {acts}"
+    );
+}
+
+/// R3-F2 闸族接线:delivery-status 读写闸——`.ocard` 被换成指向项目外的
+/// 符号链接时 set/get 都必须拒绝,状态文件不得写到项目外。在
+/// set_delivery_status 里删掉 ensure_dir_within、get 里删掉 assert_within,
+/// 本测试红。
+#[cfg(unix)]
+#[test]
+fn delivery_status_refuses_symlinked_state_dir() {
+    let (window, tmp, nas) = mock_app();
+    let pid = create_b_project(&window);
+    let root = nas.join(&pid);
+    let outside = tmp.path().join("outside");
+
+    // 把真实 .ocard 挪到项目外再换链接:项目 meta 经链接仍可读,
+    // 使测试确实走到 delivery-status 的落地闸而不是死在 find_project
+    let state_dir = root.join(".ocard");
+    std::fs::rename(&state_dir, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &state_dir).unwrap();
+
+    let e = invoke(
+        &window,
+        "set_delivery_status",
+        json!({"projectId": pid, "uploaded": true}),
+    )
+    .expect_err("符号链接 .ocard 必须拒写");
+    assert!(
+        e.as_str().unwrap_or_default().contains("根之外"),
+        "报文必须点名落地闸: {e}"
+    );
+    assert!(
+        !outside.join("delivery-status.json").exists(),
+        "状态不得经链接写到项目外"
+    );
+    invoke(&window, "get_delivery_status", json!({"projectId": pid}))
+        .expect_err("符号链接 .ocard 读取同样必须拒绝");
+}
+
 /// R2 P0-1 接线回归:持久化清单被篡改(`../` 项)后,resume 必须整单拒绝,
 /// 且闸在卷重解析之前——报文点名篡改,而不是让用户「插回原卡」。
 /// (拷卡发起要求源恰为真实挂载卷,mock 环境不可伪造;任务句柄按生产
