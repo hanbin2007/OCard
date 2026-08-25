@@ -12,6 +12,7 @@ import type {
   UpdateCheckResult,
 } from "../api/types";
 import * as api from "../api";
+import { withViewTransition } from "../lib/motion";
 import { validateWorkstation } from "../lib/validation";
 import { useStore } from "../state/store";
 import { Badge, Field } from "./ui";
@@ -48,6 +49,16 @@ export function SettingsDialog() {
   const [caps, setCaps] = useState<TranscodeCapabilities | null>(null);
   const [probing, setProbing] = useState(false);
   const [diagnostics, setDiagnostics] = useState<string | null>(null);
+
+  /**
+   * 关闭走视图过渡：进场由 CSS 关键帧负责（缩放 + 淡入），退场在这里淡出，
+   * 两头是同一条路径的正反两向。不支持视图过渡、或用户要求减少动效时，
+   * 这就是一次普通的同步 dispatch，行为分毫不差。
+   */
+  const close = useCallback(
+    () => withViewTransition(() => dispatch({ type: "settingsClosed" })),
+    [dispatch],
+  );
 
   // 每次打开都以当前配置为准重置表单
   useEffect(() => {
@@ -170,11 +181,11 @@ export function SettingsDialog() {
   useEffect(() => {
     if (!settingsOpen) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") dispatch({ type: "settingsClosed" });
+      if (e.key === "Escape") close();
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [settingsOpen, dispatch]);
+  }, [settingsOpen, close]);
 
   if (!settingsOpen) return null;
 
@@ -200,7 +211,7 @@ export function SettingsDialog() {
   }
 
   return (
-    <div className="overlay" onClick={() => dispatch({ type: "settingsClosed" })}>
+    <div className="overlay" onClick={close}>
       <div
         className="dialog"
         role="dialog"
@@ -414,7 +425,7 @@ export function SettingsDialog() {
             <button
               type="button"
               className="btn"
-              onClick={() => dispatch({ type: "settingsClosed" })}
+              onClick={close}
             >
               取消
             </button>

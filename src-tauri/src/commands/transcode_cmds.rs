@@ -143,6 +143,8 @@ use tauri::{Emitter, Manager};
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyResultDto {
+    /// 显式判别字段(代理与归档共用 kind "transcode",前端按此分流,不做结构嗅探)。
+    pub mode: &'static str,
     pub converted: usize,
     pub already_transcoded: usize,
     /// 未选中(非高负载)文件与逐条理由——跳过必须可见(计划 B6)。
@@ -185,6 +187,85 @@ fn is_video(p: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| VIDEO_EXTS.contains(&e.to_ascii_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// 递归收集相机夹下全部视频(R2 P0:真实相机结构是嵌套的——
+/// 典型 `PRIVATE/M4ROOT/CLIP/*.MP4`;只读第一层会把整夹判成零素材,
+/// auto_proxy 反复触顶后错误放弃)。规则与拷卡扫描同源:
+/// 点开头隐藏项跳过;符号链接不跟随(进 skipped,可见);
+/// 目录/目录项读取错误进 errors(零静默,阻止 intent 标完成)。
+fn collect_videos_recursive(
+    dir: &Path,
+    rel_dir: &str,
+    out: &mut Vec<(PathBuf, String)>,
+    errors: &mut Vec<String>,
+    symlinks: &mut Vec<String>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            errors.push(format!("{rel_dir}: 目录读取失败: {e}"));
+            return;
+        }
+    };
+    for e in entries {
+        let e = match e {
+            Ok(e) => e,
+            Err(ee) => {
+                errors.push(format!("{rel_dir}: 目录项读取失败: {ee}"));
+                continue;
+            }
+        };
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let child_rel = format!("{rel_dir}/{name}");
+        let ft = match e.file_type() {
+            Ok(t) => t,
+            Err(ee) => {
+                errors.push(format!("{child_rel}: 类型读取失败: {ee}"));
+                continue;
+            }
+        };
+        if ft.is_symlink() {
+            symlinks.push(child_rel);
+            continue;
+        }
+        let p = e.path();
+        if ft.is_dir() {
+            collect_videos_recursive(&p, &child_rel, out, errors, symlinks);
+        } else if ft.is_file() && is_video(&p) {
+            out.push((p, child_rel));
+        }
+    }
+}
+
+/// 批内输出名碰撞预检(R2 P1-6:大小写敏感文件系统上 `clip.mov` 与 `clip.MOV`
+/// 会映射到同一个输出名——后到者会把先到者的产物误判为「已完成」)。
+/// 返回被剔除的冲突项(rel 列表),调用方逐条入失败清单。
+fn split_name_collisions(work: &mut Vec<(String, PathBuf, String)>) -> Vec<String> {
+    let mut seen: std::collections::HashSet<(String, String)> = Default::default();
+    let mut clashed: Vec<String> = Vec::new();
+    work.retain(|(folder, abs, rel)| {
+        let stem = abs
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        let ext = abs
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        if seen.insert((folder.clone(), format!("{stem}.{ext}"))) {
+            true
+        } else {
+            clashed.push(rel.clone());
+            false
+        }
+    });
+    clashed
 }
 
 /// 磁盘可用空间(sysinfo:挂载点前缀最长匹配)。
@@ -316,42 +397,49 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                     .collect(),
             };
 
-            // 收集视频文件(逐夹过工况 A 命名空间闸)
+            // 收集视频文件(逐夹过工况 A 命名空间闸;R2 P0:递归收集,
+            // 目录/目录项错误入失败清单并阻止 intent 标完成,符号链接入 skipped)
             let mut dir_errors: Vec<FailureDto> = Vec::new();
+            let mut symlink_skips: Vec<String> = Vec::new();
             let mut work: Vec<(String, PathBuf, String)> = Vec::new(); // (folder, abs, rel)
             for folder in &folders {
                 let rel_dir = format!("{raw_dir}/{folder}");
                 let dir = sorting::resolve_asset_a_in_project(&root, &meta, &rel_dir)?;
-                let entries = match std::fs::read_dir(&dir) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        // 目录读错不许静默吞:入失败清单,且阻止 intent 标完成(评审 P0-4)
-                        dir_errors.push(FailureDto {
-                            rel: rel_dir.clone(),
-                            message: format!("目录读取失败: {e}"),
-                        });
-                        continue;
-                    }
-                };
-                for e in entries.flatten() {
-                    let p = e.path();
-                    if e.file_type().map(|t| t.is_file()).unwrap_or(false) && is_video(&p) {
-                        let rel = format!(
-                            "{rel_dir}/{}",
-                            p.file_name().unwrap_or_default().to_string_lossy()
-                        );
-                        work.push((folder.clone(), p, rel));
-                    }
+                let mut vids: Vec<(PathBuf, String)> = Vec::new();
+                let mut errs: Vec<String> = Vec::new();
+                collect_videos_recursive(&dir, &rel_dir, &mut vids, &mut errs, &mut symlink_skips);
+                for msg in errs {
+                    dir_errors.push(FailureDto {
+                        rel: rel_dir.clone(),
+                        message: msg,
+                    });
+                }
+                for (p, rel) in vids {
+                    work.push((folder.clone(), p, rel));
                 }
             }
             work.sort_by(|a, b| a.2.cmp(&b.2));
+            let clashed = split_name_collisions(&mut work);
 
             let mut result = ProxyResultDto {
+                mode: "proxy",
                 used_encoder: encoder.clone(),
                 output_dir: root.join(&out_root_rel).display().to_string(),
                 failures: dir_errors,
                 ..Default::default()
             };
+            for rel in clashed {
+                result.failures.push(FailureDto {
+                    rel,
+                    message: "与同夹另一文件仅大小写不同,输出名会互相覆盖;请改名后再转".into(),
+                });
+            }
+            for rel in symlink_skips {
+                result.skipped.push(SkippedDto {
+                    rel,
+                    reason: "符号链接,不追踪(不会被转码)".into(),
+                });
+            }
 
             // 空间预检(启发式:代理约为源 1/8,再留 2GB 余量;不足=可见失败)
             let total_src: u64 = work
@@ -413,10 +501,12 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
 
             let total = work.len();
             let mut sw_fallback_notified = false;
+            let mut units_done = 0usize;
             for (i, (folder, abs, rel)) in work.iter().enumerate() {
                 if h.cancel_requested() {
                     break;
                 }
+                units_done = i;
                 h.progress(i, total, 0, Some(rel.clone()));
                 let _ = body_app.emit(JOB_EVENT, &h.snapshot());
 
@@ -481,8 +571,26 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                             continue;
                         }
                     } else {
-                        // 幂等 skip(计划 D2):不覆盖、不比对——已有输出即已完成
-                        result.already_transcoded += 1;
+                        // 幂等 skip(计划 D2)。R2 P1:「存在即成功」会永久采信坏产物——
+                        // 计入完成前 ffprobe 验一次,坏产物如实报失败(覆盖仍只走重转入口)
+                        match transcode::probe_file(&ffprobe_bin, &final_out) {
+                            Ok(out_info) if out_info.codec == "h264" => {
+                                result.already_transcoded += 1;
+                            }
+                            Ok(out_info) => result.failures.push(FailureDto {
+                                rel: rel.clone(),
+                                message: format!(
+                                    "既有代理编码不符({}),未计入完成;可用「重新转码」覆盖",
+                                    out_info.codec
+                                ),
+                            }),
+                            Err(e) => result.failures.push(FailureDto {
+                                rel: rel.clone(),
+                                message: format!(
+                                    "既有代理无法通过校验({e}),未计入完成;可用「重新转码」覆盖"
+                                ),
+                            }),
+                        }
                         continue;
                     }
                 }
@@ -540,16 +648,17 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                 }
                 match run_result {
                     Ok(()) => {
-                        // 落位前全量验证(计划复审 #5)
+                        // 落位前全量验证(计划复审 #5)。R2 P1:VAAPI 输出 nv12,
+                        // 统一要求 yuv420p 会把全部 VAAPI 代理误判失败——按实际编码器放行
                         let verdict = transcode::probe_file(&ffprobe_bin, &tmp)
                             .and_then(|out_info| {
-                                transcode::verify_output(
-                                    &out_info,
-                                    "h264",
-                                    Some(1080),
-                                    "yuv420p",
-                                    &info,
-                                )
+                                let pix_ok = out_info.pix_fmt == "yuv420p"
+                                    || (used.contains("vaapi") && out_info.pix_fmt == "nv12");
+                                if !pix_ok {
+                                    return Err(format!("输出像素格式不符: {}", out_info.pix_fmt));
+                                }
+                                let pix = out_info.pix_fmt.clone();
+                                transcode::verify_output(&out_info, "h264", Some(1080), &pix, &info)
                             })
                             .and_then(|_| {
                                 crate::core::fsx::rename_no_replace(&tmp, &final_out)
@@ -558,7 +667,12 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                         match verdict {
                             Ok(()) => {
                                 result.converted += 1;
-                                result.used_encoder = used.clone();
+                                // R2 P2:末文件覆写会把混合批报成单一编码器——如实标「混合」
+                                if result.converted == 1 {
+                                    result.used_encoder = used.clone();
+                                } else if result.used_encoder != used {
+                                    result.used_encoder = "混合".into(); // 一旦混编,保持「混合」
+                                }
                             }
                             Err(e) => {
                                 let _ = std::fs::remove_file(&tmp);
@@ -569,7 +683,7 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                             }
                         }
                     }
-                    Err(e) if e == "已取消" => break,
+                    Err(e) if transcode::is_cancelled_err(&e) => break,
                     Err(e) => {
                         result.failures.push(FailureDto {
                             rel: rel.clone(),
@@ -579,7 +693,14 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                 }
             }
             let cancelled = h.cancel_requested();
-            h.progress(total, total, 0, Some("收尾".into()));
+            // R2 P1:取消不许发布 total/total 假进度——按真实完成量收尾
+            let final_units = if cancelled { units_done } else { total };
+            h.progress(
+                final_units,
+                total,
+                0,
+                Some(if cancelled { "已取消" } else { "收尾" }.into()),
+            );
 
             crate::core::catalog::invalidate_cache(root.parent().unwrap_or(&root));
             super::sorting_cmds::notify_if_unsafe_fallback(&body_app);
@@ -625,6 +746,7 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
             }
             // auto_proxy intent:整批成功才置位(计划 D2 at-least-once)
             if let Some(mid) = &intent_manifest {
+                intent_end(mid);
                 // 评审 P0-4:空清单/读错/取消都不许标完成——attempts 上限负责最终放弃
                 if !cancelled && result.failures.is_empty() && total > 0 {
                     if let Ok(mut m) = crate::core::manifest::load(&root, mid) {
@@ -648,6 +770,29 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
     Ok(ret.snapshot())
 }
 
+/// 在途 intent 去重(R2/评审 P1-7:拷卡完成钩子与启动补投递可能对同一
+/// manifest 双投——排队两份作业虽最终收敛(幂等 skip),但白跑一整轮探测)。
+/// 进程内语义:成功派发时登记,作业体收尾时移除;进程崩溃由重启自然清零。
+static INTENTS_IN_FLIGHT: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+fn intent_begin(id: &str) -> bool {
+    INTENTS_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(id.to_string())
+}
+
+fn intent_end(id: &str) {
+    if let Some(set) = INTENTS_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        set.remove(id);
+    }
+}
+
 /// auto_proxy 意图派发(拷卡完成钩子与启动补投递共用)。
 /// 失败不炸调用方:派发失败给可见 warning(如已有作业在跑,下次启动仍会补投)。
 pub fn dispatch_auto_proxy<R: tauri::Runtime>(
@@ -665,7 +810,14 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
     if m.proxy_attempts >= 3 {
         let mut done = m.clone();
         done.proxy_completed = true;
-        let _ = crate::core::manifest::save(project_root, &done);
+        if let Err(e) = crate::core::manifest::save(project_root, &done) {
+            // R2 P2:放弃标记写不进去=这条放弃告警每次启动都会重放,必须可见
+            notify::warn(
+                app,
+                "auto-proxy-state-unsaved",
+                format!("自动转代理放弃标记写入失败({e}),下次启动会重复本条提示"),
+            );
+        }
         notify::warn(
             app,
             "auto-proxy-abandoned",
@@ -679,10 +831,26 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
     {
         let mut bump = m.clone();
         bump.proxy_attempts += 1;
-        let _ = crate::core::manifest::save(project_root, &bump);
+        if let Err(e) = crate::core::manifest::save(project_root, &bump) {
+            // R2 P2:计数写不进去=放弃上限失效,存在无限重投风险,必须可见
+            notify::warn(
+                app,
+                "auto-proxy-state-unsaved",
+                format!("自动转代理重试计数写入失败({e}),放弃上限可能失效"),
+            );
+        }
     }
-    let Ok(meta) = project::load_meta(project_root) else {
-        return;
+    let meta = match project::load_meta(project_root) {
+        Ok(m) => m,
+        Err(e) => {
+            // R2 P2:元数据读不出时意图会静默蒸发——如实告知
+            notify::warn(
+                app,
+                "auto-proxy-deferred",
+                format!("自动转代理未启动(项目元数据读取失败: {e});下次启动会重试"),
+            );
+            return;
+        }
     };
     let raw_prefix = format!("{}/", project::SCENARIO_A_DIRS[1]);
     let Some(folder) = m.target_rel.strip_prefix(&raw_prefix) else {
@@ -699,6 +867,9 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
         force_all: Some(false),
         retranscode: Some(false),
     };
+    if !intent_begin(&m.id) {
+        return; // 同一意图已在排队/执行(P1-7 去重),双投只会白跑一轮
+    }
     if let Err(e) = spawn_proxy_job(
         app,
         project_root.to_path_buf(),
@@ -709,6 +880,7 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
         input,
         Some(m.id.clone()),
     ) {
+        intent_end(&m.id);
         notify::warn(
             app,
             "auto-proxy-deferred",
@@ -732,6 +904,8 @@ pub struct ArchiveInput {
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ArchiveResultDto {
+    /// 显式判别字段(同上)。
+    pub mode: &'static str,
     pub converted: usize,
     pub already_archived: usize,
     pub failures: Vec<FailureDto>,
@@ -768,6 +942,21 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
     std::fs::create_dir_all(&out_root).map_err(|e| format!("创建输出目录失败: {e}"))?;
     if paths::is_symlink(&out_root) {
         return Err("输出目录是符号链接,拒绝".into());
+    }
+    // R2 P0:上面的检查全是字符串/末节点级——祖先段是符号链接时
+    // `/tmp/link/sub` 可指进项目区。canonicalize 后用真实位置复核全部禁令。
+    let out_root =
+        std::fs::canonicalize(&out_root).map_err(|e| format!("输出目录解析失败: {e}"))?;
+    {
+        let canon_project =
+            std::fs::canonicalize(&stats.root).map_err(|e| format!("项目目录解析失败: {e}"))?;
+        if out_root.starts_with(&canon_project) {
+            return Err("归档输出目录实际位于项目内部(经符号链接),拒绝".into());
+        }
+        paths::validate_dest_layout(
+            &canon_project.join(project::SCENARIO_A_DIRS[1]),
+            std::slice::from_ref(&out_root),
+        )?;
     }
 
     let handle = jobs.create(JobKind::Transcode, &input.project_id);
@@ -830,6 +1019,7 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                     .collect(),
             };
             let mut result = ArchiveResultDto {
+                mode: "archive",
                 output_dir: out_root.display().to_string(),
                 ..Default::default()
             };
@@ -837,26 +1027,34 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
             for folder in &folders {
                 let rel_dir = format!("{raw_dir}/{folder}");
                 let dir = sorting::resolve_asset_a_in_project(&root, &meta, &rel_dir)?;
-                match std::fs::read_dir(&dir) {
-                    Ok(entries) => {
-                        for e in entries.flatten() {
-                            let p = e.path();
-                            if e.file_type().map(|t| t.is_file()).unwrap_or(false) && is_video(&p) {
-                                let rel = format!(
-                                    "{rel_dir}/{}",
-                                    p.file_name().unwrap_or_default().to_string_lossy()
-                                );
-                                work.push((folder.clone(), p, rel));
-                            }
-                        }
-                    }
-                    Err(e) => result.failures.push(FailureDto {
+                // R2 P0:递归收集(真实相机结构嵌套);错误与符号链接都可见
+                let mut vids: Vec<(PathBuf, String)> = Vec::new();
+                let mut errs: Vec<String> = Vec::new();
+                let mut links: Vec<String> = Vec::new();
+                collect_videos_recursive(&dir, &rel_dir, &mut vids, &mut errs, &mut links);
+                for msg in errs {
+                    result.failures.push(FailureDto {
                         rel: rel_dir.clone(),
-                        message: format!("目录读取失败: {e}"),
-                    }),
+                        message: msg,
+                    });
+                }
+                for rel in links {
+                    result.failures.push(FailureDto {
+                        rel,
+                        message: "符号链接,不追踪(不会被归档)".into(),
+                    });
+                }
+                for (p, rel) in vids {
+                    work.push((folder.clone(), p, rel));
                 }
             }
             work.sort_by(|a, b| a.2.cmp(&b.2));
+            for rel in split_name_collisions(&mut work) {
+                result.failures.push(FailureDto {
+                    rel,
+                    message: "与同夹另一文件仅大小写不同,输出名会互相覆盖;请改名后再归档".into(),
+                });
+            }
 
             // 空间预检:归档可接近源体积
             let total_src: u64 = work
@@ -885,10 +1083,13 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
             }
 
             let total = work.len();
+            let mut sw_fallback_notified = false;
+            let mut units_done = 0usize;
             for (i, (folder, abs, rel)) in work.iter().enumerate() {
                 if h.cancel_requested() {
                     break;
                 }
+                units_done = i;
                 h.progress(i, total, 0, Some(rel.clone()));
                 let _ = body_app.emit(JOB_EVENT, &h.snapshot());
                 let info = match transcode::probe_file(&ffprobe_bin, abs) {
@@ -909,13 +1110,24 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                     });
                     continue;
                 };
+                // R2 P0:相机子夹可能被预置为符号链接把写入导出根外——落地闸创建
                 let out_dir = out_root.join(folder);
-                if let Err(e) = std::fs::create_dir_all(&out_dir) {
+                if let Err(e) = paths::ensure_dir_within(&out_root, &out_dir) {
                     result.failures.push(FailureDto {
                         rel: rel.clone(),
                         message: format!("创建输出夹失败: {e}"),
                     });
                     continue;
+                }
+                // 本机残留 staging 清理(与代理路径同源;R2:归档此前缺席)
+                if let Ok(entries) = std::fs::read_dir(&out_dir) {
+                    for e in entries.flatten() {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.starts_with(&format!(".{machine_id}.")) && name.contains(".transpart")
+                        {
+                            let _ = std::fs::remove_file(e.path());
+                        }
+                    }
                 }
                 let stem = abs
                     .file_stem()
@@ -941,28 +1153,82 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                     continue;
                 }
                 if final_out.exists() {
-                    result.already_archived += 1;
+                    // R2 P1:「存在即成功」会永久采信坏产物(预置空文件也算完成)——
+                    // 计入完成前用 ffprobe 验一次有效性,坏产物如实报失败
+                    match transcode::probe_file(&ffprobe_bin, &final_out) {
+                        Ok(out_info) if out_info.codec == "hevc" => {
+                            result.already_archived += 1;
+                        }
+                        Ok(out_info) => result.failures.push(FailureDto {
+                            rel: rel.clone(),
+                            message: format!(
+                                "既有归档产物编码不符({}),未计入完成;请人工确认后删除再归档",
+                                out_info.codec
+                            ),
+                        }),
+                        Err(e) => result.failures.push(FailureDto {
+                            rel: rel.clone(),
+                            message: format!(
+                                "既有归档产物无法通过校验({e}),未计入完成;请人工确认后删除再归档"
+                            ),
+                        }),
+                    }
                     continue;
+                }
+                // R2 P1:硬编缺位/失败不许静默退软编——与代理路径同一套可见性
+                let hw_key = if ten_bit { "hevc10_hw" } else { "hevc_hw" };
+                if !caps.winners.contains_key(hw_key) && !sw_fallback_notified {
+                    notify::warn(
+                        &body_app,
+                        "hwenc-fallback",
+                        "无可用硬件 HEVC 编码器,归档使用软件编码(明显较慢)".into(),
+                    );
+                    sw_fallback_notified = true;
                 }
                 let job_short = h.snapshot().id[..8].to_string();
                 let tmp = out_dir.join(format!(".{machine_id}.{job_short}.transpart.mp4"));
-                let args = transcode::archive_args(abs, &encoder, tier, ten_bit, &tmp);
-                let frac_rel = rel.clone();
-                let hh = h;
-                let run = transcode::run_transcode(
-                    &ffmpeg_bin,
-                    &args,
-                    &tmp,
-                    info.duration_secs,
-                    move |frac| {
-                        let msg = match frac {
-                            Some(f) => format!("{frac_rel} ({:.0}%)", f * 100.0),
-                            None => format!("{frac_rel} (时长未知)"),
-                        };
-                        hh.progress(i, total, 0, Some(msg));
-                    },
-                    &|| hh.cancel_requested(),
-                );
+                let run_once = |enc: &str| -> std::result::Result<(), String> {
+                    let args = transcode::archive_args(abs, enc, tier, ten_bit, &tmp);
+                    let frac_rel = rel.clone();
+                    let hh = h;
+                    transcode::run_transcode(
+                        &ffmpeg_bin,
+                        &args,
+                        &tmp,
+                        info.duration_secs,
+                        move |frac| {
+                            let msg = match frac {
+                                Some(f) => format!("{frac_rel} ({:.0}%)", f * 100.0),
+                                None => format!("{frac_rel} (时长未知)"),
+                            };
+                            hh.progress(i, total, 0, Some(msg));
+                        },
+                        &|| hh.cancel_requested(),
+                    )
+                };
+                let mut used = encoder.clone();
+                let mut run = run_once(&encoder);
+                if let Err(e) = &run {
+                    let sw_key = if ten_bit { "hevc10_sw" } else { "hevc_sw" };
+                    if let Some(sw) = caps.winners.get(sw_key) {
+                        if sw != &encoder
+                            && transcode::is_hw_init_failure(e)
+                            && !h.cancel_requested()
+                        {
+                            // 硬编运行时失败:同文件至多一次软编重试+可见告警(与代理同源)
+                            if !sw_fallback_notified {
+                                notify::warn(
+                                    &body_app,
+                                    "hwenc-runtime-fallback",
+                                    format!("硬件编码在实际素材上初始化失败({e}),归档改用软件编码继续(明显较慢)"),
+                                );
+                                sw_fallback_notified = true;
+                            }
+                            used = sw.clone();
+                            run = run_once(sw);
+                        }
+                    }
+                }
                 match run {
                     Ok(()) => {
                         let expect_pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
@@ -989,7 +1255,11 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                         match verdict {
                             Ok(()) => {
                                 result.converted += 1;
-                                result.used_encoder = encoder.clone();
+                                if result.converted == 1 {
+                                    result.used_encoder = used.clone();
+                                } else if result.used_encoder != used {
+                                    result.used_encoder = "混合".into(); // 一旦混编,保持「混合」
+                                }
                             }
                             Err(e) => {
                                 let _ = std::fs::remove_file(&tmp);
@@ -1000,7 +1270,7 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                             }
                         }
                     }
-                    Err(e) if e == "已取消" => break,
+                    Err(e) if transcode::is_cancelled_err(&e) => break,
                     Err(e) => result.failures.push(FailureDto {
                         rel: rel.clone(),
                         message: e,
@@ -1008,6 +1278,15 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                 }
             }
             let cancelled = h.cancel_requested();
+            // R2 P1:取消不许发布 total/total 假进度;归档同样补 fsx 回退标记消费
+            let final_units = if cancelled { units_done } else { total };
+            h.progress(
+                final_units,
+                total,
+                0,
+                Some(if cancelled { "已取消" } else { "收尾" }.into()),
+            );
+            super::sorting_cmds::notify_if_unsafe_fallback(&body_app);
             super::tasks::append_audit(
                 &body_app,
                 &root,
@@ -1044,4 +1323,102 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
         },
     );
     Ok(ret.snapshot())
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    /// R2 P0:真实相机嵌套结构必须被递归收集(变异:改回单层 read_dir 本测试红)。
+    #[test]
+    fn recursive_scan_finds_nested_camera_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cam = tmp.path().join("A7M4_A");
+        std::fs::create_dir_all(cam.join("PRIVATE/M4ROOT/CLIP")).unwrap();
+        std::fs::write(cam.join("PRIVATE/M4ROOT/CLIP/C0001.MP4"), b"v").unwrap();
+        std::fs::write(cam.join("TOP.MOV"), b"v").unwrap();
+        std::fs::create_dir_all(cam.join(".hidden")).unwrap();
+        std::fs::write(cam.join(".hidden/x.mp4"), b"v").unwrap();
+        std::fs::write(cam.join("note.txt"), b"t").unwrap();
+        let mut out = Vec::new();
+        let mut errs = Vec::new();
+        let mut links = Vec::new();
+        collect_videos_recursive(&cam, "2. 原始素材/A7M4_A", &mut out, &mut errs, &mut links);
+        let mut rels: Vec<&str> = out.iter().map(|(_, r)| r.as_str()).collect();
+        rels.sort();
+        assert_eq!(
+            rels,
+            vec![
+                "2. 原始素材/A7M4_A/PRIVATE/M4ROOT/CLIP/C0001.MP4",
+                "2. 原始素材/A7M4_A/TOP.MOV",
+            ]
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(links.is_empty());
+    }
+
+    /// 符号链接不追踪:进 links(上层转可见 skipped/failure),不入清单。
+    #[cfg(unix)]
+    #[test]
+    fn recursive_scan_reports_symlinks_without_following() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cam = tmp.path().join("CAM");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&cam).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("evil.MP4"), b"v").unwrap();
+        std::os::unix::fs::symlink(&outside, cam.join("LINKED")).unwrap();
+        let mut out = Vec::new();
+        let mut errs = Vec::new();
+        let mut links = Vec::new();
+        collect_videos_recursive(&cam, "2. 原始素材/CAM", &mut out, &mut errs, &mut links);
+        assert!(out.is_empty(), "链接目标不得被收集: {out:?}");
+        assert_eq!(links, vec!["2. 原始素材/CAM/LINKED".to_string()]);
+    }
+
+    /// 目录不可读必须进 errors(零静默;阻止 auto_proxy intent 标完成)。
+    #[cfg(unix)]
+    #[test]
+    fn recursive_scan_surfaces_unreadable_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let cam = tmp.path().join("CAM");
+        let sealed = cam.join("SEALED");
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut out = Vec::new();
+        let mut errs = Vec::new();
+        let mut links = Vec::new();
+        collect_videos_recursive(&cam, "r", &mut out, &mut errs, &mut links);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            errs.iter().any(|e| e.contains("SEALED")),
+            "不可读目录必须入 errors: {errs:?}"
+        );
+    }
+
+    /// R2 P1-6:仅大小写不同的源文件映射同一输出名——后到者必须被剔除并可见。
+    #[test]
+    fn name_collisions_are_split_out() {
+        let mut work = vec![
+            (
+                "CAM".to_string(),
+                PathBuf::from("/x/clip.mov"),
+                "2. 原始素材/CAM/clip.mov".to_string(),
+            ),
+            (
+                "CAM".to_string(),
+                PathBuf::from("/x/CLIP.MOV"),
+                "2. 原始素材/CAM/CLIP.MOV".to_string(),
+            ),
+            (
+                "CAM2".to_string(),
+                PathBuf::from("/y/clip.mov"),
+                "2. 原始素材/CAM2/clip.mov".to_string(),
+            ),
+        ];
+        let clashed = split_name_collisions(&mut work);
+        assert_eq!(clashed, vec!["2. 原始素材/CAM/CLIP.MOV".to_string()]);
+        assert_eq!(work.len(), 2, "不同夹的同名不冲突");
+    }
 }

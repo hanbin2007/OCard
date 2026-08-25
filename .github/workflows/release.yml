@@ -7,10 +7,71 @@ on:
 permissions:
   contents: write
 
+# 同一 tag 被重推(force-push tag)时不得并发:两轮会同时往同一个 draft release
+# 传产物、互相覆盖。cancel-in-progress 取 false —— 宁可排队,也不要在上传中途
+# 掐断留下半截 release。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # 发版门禁:tag 一推就直接构建太危险,先过一遍与 CI lint job 同构的检查。
+  # 三个平台 job 全部 needs 它 —— 门禁不过,一个产物都不发。
+  gate:
+    name: Gate (fmt + clippy + tsc + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux system deps (Tauri v2)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm test
+
+      # build.rs(tauri-build)会校验 externalBin 路径存在,cargo 侧检查也需要 sidecar
+      - name: Cache ffmpeg sidecar
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/binaries
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('src-tauri/binaries/SHA256SUMS.txt') }}
+
+      - name: Fetch ffmpeg sidecar (SHA-256 校验)
+        shell: bash
+        run: bash scripts/fetch-ffmpeg.sh
+
+      - name: cargo fmt
+        run: cargo fmt --check
+        working-directory: src-tauri
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: src-tauri
+
+      - name: cargo test
+        run: cargo test
+        working-directory: src-tauri
+
   # Linux / Windows 完全接触不到 Apple 凭据(凭据只进 release-macos)
   release-linux:
     name: Release (linux)
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -32,6 +93,19 @@ jobs:
           workspaces: src-tauri
       - run: pnpm install --frozen-lockfile
 
+      # tauri.conf.json 的 externalBin 指向 src-tauri/binaries/ffmpeg|ffprobe,
+      # 干净 runner 上这些文件不存在 → 不拉取则 tauri build 必失败。
+      # 与 CI 保持同一套拉取+SHA-256 校验(fail-closed,scripts/fetch-ffmpeg.sh)。
+      - name: Cache ffmpeg sidecar
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/binaries
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('src-tauri/binaries/SHA256SUMS.txt') }}
+
+      - name: Fetch ffmpeg sidecar (SHA-256 校验)
+        shell: bash
+        run: bash scripts/fetch-ffmpeg.sh
+
       - name: Build and attach to GitHub Release
         uses: tauri-apps/tauri-action@v1
         env:
@@ -44,8 +118,15 @@ jobs:
           releaseDraft: true
           prerelease: false
 
+      # 与 CI 共用同一脚本:真正发给用户的产物也必须逐字节钉死。
+      # 失败即让 job 红 —— 宁可不发版,也不发一个 sidecar/模型对不上的包。
+      - name: Verify sidecars & model in release bundle (fail-closed)
+        shell: bash
+        run: bash scripts/verify-bundle.sh
+
   release-windows:
     name: Release (windows)
+    needs: gate
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -60,6 +141,18 @@ jobs:
           workspaces: src-tauri
       - run: pnpm install --frozen-lockfile
 
+      # 同 release-linux:externalBin 前置,干净 runner 必须先拉 sidecar。
+      # fetch 脚本是 bash,windows runner 默认 shell 为 pwsh → 显式 shell: bash(git-bash)
+      - name: Cache ffmpeg sidecar
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/binaries
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('src-tauri/binaries/SHA256SUMS.txt') }}
+
+      - name: Fetch ffmpeg sidecar (SHA-256 校验)
+        shell: bash
+        run: bash scripts/fetch-ffmpeg.sh
+
       - name: Build and attach to GitHub Release
         uses: tauri-apps/tauri-action@v1
         env:
@@ -72,8 +165,14 @@ jobs:
           releaseDraft: true
           prerelease: false
 
+      # 同 release-linux:发出去的产物必须过同一套 SHA-256 钉死校验
+      - name: Verify sidecars & model in release bundle (fail-closed)
+        shell: bash
+        run: bash scripts/verify-bundle.sh
+
   release-macos:
     name: Release (macos, signed + notarized)
+    needs: gate
     # 固定 macos-15:签名链对 runner 镜像/Xcode 迁移敏感,升级走定期 PR 而非跟随 latest
     runs-on: macos-15
     steps:
@@ -106,6 +205,17 @@ jobs:
           workspaces: src-tauri
       - run: pnpm install --frozen-lockfile
 
+      # 同 release-linux:externalBin 前置,干净 runner 必须先拉 sidecar
+      - name: Cache ffmpeg sidecar
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/binaries
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('src-tauri/binaries/SHA256SUMS.txt') }}
+
+      - name: Fetch ffmpeg sidecar (SHA-256 校验)
+        shell: bash
+        run: bash scripts/fetch-ffmpeg.sh
+
       - name: Build, sign, notarize and attach to GitHub Release
         uses: tauri-apps/tauri-action@v1
         env:
@@ -126,9 +236,21 @@ jobs:
 
       # 构建后验证:签名、Gatekeeper 评估、公证 staple 三关全过才算合格产物
       - name: Verify signature and notarization
+        shell: bash
         run: |
-          APP=$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name "*.app" | head -1)
+          set -euo pipefail
+          # -print -quit 而非 `| head -1`(无管道、不吃 SIGPIPE),末尾 || true
+          # 保证 find 自身失败也落到下面的显式判空,而不是无注解终止
+          APP=$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name "*.app" -print -quit || true)
+          [ -n "$APP" ] || { echo "::error::未找到 .app"; exit 1; }
           echo "Verifying: $APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
           spctl -a -t exec -vv "$APP"
           xcrun stapler validate "$APP"
+
+      # 同 linux/windows,但走 --signed:codesign 会重写 .app 内嵌 Mach-O 字节,
+      # 包内 sidecar 哈希必然与钉死值不同 → 脚本改验签名有效性 + 钉死源字节,
+      # 并打 ::warning:: 明示这层降级(禁止无提示 fail-open)
+      - name: Verify sidecars & model in release bundle (fail-closed)
+        shell: bash
+        run: bash scripts/verify-bundle.sh --signed

@@ -16,7 +16,8 @@ const MERGE_WINDOW_SECS: i64 = 30;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoticeDto {
-    /// "warning" | "error"
+    /// "info" | "warning" | "error"(R2 P2:info 用于取消确认/清理完成等
+    /// 非告警可见性;与前端 types.ts 的 NoticeLevel 保持一致)
     pub level: &'static str,
     /// 稳定的机器码,前端按它去重/分组,如 "audit-outbox"
     pub code: String,

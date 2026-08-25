@@ -484,6 +484,8 @@ export interface DeliverySummary {
 export interface RemoteActivity {
   machine: string;
   operator: string;
+  /** 活动类型：拷卡 vs 转码，界面措辞不同 */
+  activity: "copy" | "transcode";
   /** 源卷名 */
   volume: string;
   /** 相机编码 */
@@ -499,6 +501,17 @@ export interface RemoteActivity {
 export type JobKind = "delivery" | "transcode" | "analyze";
 
 export type JobState = "queued" | "running" | "done" | "failed" | "cancelled";
+
+/**
+ * 终态：done / failed / cancelled。
+ *
+ * 与后端 `JobState::is_terminal` 同义。取消路径必须先问这一句——
+ * 对已经结束的作业发取消，后端会回一句「将在当前文件完成后停止」，
+ * 而它根本不会再停任何东西，那是假话。
+ */
+export function isJobTerminal(state: JobState): boolean {
+  return state === "done" || state === "failed" || state === "cancelled";
+}
 
 /** 作业快照的公共字段 */
 interface JobBase {
@@ -532,7 +545,12 @@ export interface DeliveryJob extends JobBase {
 
 export interface TranscodeJob extends JobBase {
   kind: "transcode";
-  result?: ProxyResult;
+  /**
+   * 代理与归档共用 kind = "transcode"，结果因此是两种之一，
+   * 由结果自带的 `mode` 判别字段分流（后端 ProxyResultDto / ArchiveResultDto
+   * 都显式写死这个值）。不做结构嗅探——字段有无是实现细节，判别字段才是契约。
+   */
+  result?: ProxyResult | ArchiveResult;
 }
 
 export interface AnalyzeJob extends JobBase {
@@ -541,6 +559,13 @@ export interface AnalyzeJob extends JobBase {
 }
 
 export type JobSnapshot = DeliveryJob | TranscodeJob | AnalyzeJob;
+
+/** 归档结果与代理结果的判别：认后端显式下发的 `mode`，不认字段结构 */
+export function isArchiveResult(
+  result: ProxyResult | ArchiveResult | undefined,
+): result is ArchiveResult {
+  return result?.mode === "archive";
+}
 
 /** 判别辅助：拿到具体 kind 才能安全读 result */
 export function isDeliveryJob(job: JobSnapshot): job is DeliveryJob {
@@ -596,6 +621,8 @@ export interface ProxyFailure {
 
 /** 代理转码作业的结果（kind = "transcode" 且 done 时） */
 export interface ProxyResult {
+  /** 判别字段：代理与归档共用 kind，靠它分流 */
+  mode: "proxy";
   converted: number;
   alreadyTranscoded: number;
   skipped: ProxySkipped[];
@@ -604,10 +631,34 @@ export interface ProxyResult {
   outputDir: string;
 }
 
+/** 归档转码档位（PRD §5.6 三档压缩） */
+export type ArchiveTier = "quality" | "balanced" | "compact";
+
+export interface ArchiveResult {
+  /** 判别字段：代理与归档共用 kind，靠它分流 */
+  mode: "archive";
+  converted: number;
+  alreadyArchived: number;
+  failures: ProxyFailure[];
+  usedEncoder: string;
+  outputDir: string;
+}
+
+export interface StartArchiveInput {
+  projectId: string;
+  cameraFolders?: string[];
+  tier: ArchiveTier;
+  /** 归档输出目录，必须是项目**之外**的绝对路径 */
+  outputDir: string;
+}
+
 export interface StartProxyInput {
   projectId: string;
   cameraFolders?: string[];
+  /** 忽略「高负载」判定，把所有素材都纳入——**不会**重转已有输出 */
   forceAll?: boolean;
+  /** 强制重转：先删除已有代理再转。破坏性操作，必须经二次确认 */
+  retranscode?: boolean;
 }
 
 /* ------------------------------------------------------------------ *
@@ -616,8 +667,19 @@ export interface StartProxyInput {
 
 export interface AssetJudgement {
   groupId?: string;
-  /** 综合质量分（0–1）；界面只用区间，不显示数值 */
+  /**
+   * 综合质量分，量纲 **0–100**（后端 `(sharpness - penalty).clamp(0, 100)`）。
+   * 界面只用区间表达，不显示数值。
+   */
   score: number;
+  /**
+   * 检出人脸数。
+   *
+   * `null` / 缺省 = **本次分析时人脸检测不可用**（模型缺失、推理失败），
+   * 与「检出 0 张脸」是两回事：前者是不知道，后者是知道没有。
+   * 界面不许把 null 呈现成「无人脸」。
+   */
+  faces?: number | null;
   blurry: boolean;
   overExposed: boolean;
   underExposed: boolean;
@@ -635,6 +697,10 @@ export interface AnalysisResult {
   cached: number;
   missing: number;
   failed: AnalysisFailure[];
+  /** 已抽好首帧图的视频数 */
+  videoThumbs: number;
+  /** 因转码引擎缺失而没抽成首帧图的视频数；>0 必须让用户看见，不能静默 */
+  videoThumbsSkipped: number;
   /** 分析缓存里被跳过的损坏行数（降级但不阻断） */
   cacheSkippedLines: number;
 }
@@ -650,8 +716,12 @@ export interface FinalCutItem {
   /** 识别出的用途/版本分类，如 "预览版" / "成品" */
   class?: string;
   parsed?: Record<string, string>;
-  /** 分辨率与命名声明不符（如名字写 4K 实际 720p） */
-  resolutionMismatch?: boolean;
+  /**
+   * 分辨率与命名声明不符时的**说明原文**（如「名字写 4K，实际 1280x720」）。
+   * 缺省 = 相符或未核对。后端下发的是原因字符串，不是布尔——
+   * 只当真假用会把唯一能说清「哪儿不符」的信息丢掉。
+   */
+  resolutionMismatch?: string;
   /** 无法校验（探测失败等），附原因 */
   uncheckable?: string;
 }

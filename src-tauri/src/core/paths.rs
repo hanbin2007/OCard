@@ -220,6 +220,46 @@ pub(crate) fn ensure_dir_within(root: &Path, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 只读落点闸(R2 P0:`.ocard` 链中间组件可被替换为符号链接):
+/// 把 target 的「最深已存在祖先」canonicalize 后断言仍在 root 之内。
+/// 与 [`ensure_dir_within`] 同源,但不产生任何副作用(读路径用)。
+pub(crate) fn assert_within(root: &Path, target: &Path) -> Result<(), String> {
+    let canon_root = std::fs::canonicalize(root).map_err(|e| format!("根目录解析失败: {e}"))?;
+    let root_key = comparison_key(&canon_root);
+    let mut probe = target.to_path_buf();
+    while !probe.exists() {
+        match probe.parent() {
+            Some(p) => probe = p.to_path_buf(),
+            None => return Err(format!("路径不在任何已存在位置下: {}", target.display())),
+        }
+    }
+    let canon = std::fs::canonicalize(&probe).map_err(|e| format!("路径解析失败: {e}"))?;
+    if comparison_key(&canon).starts_with(&root_key) {
+        Ok(())
+    } else {
+        Err(format!(
+            "路径实际位置在根之外(疑似符号链接),拒绝: {}",
+            target.display()
+        ))
+    }
+}
+
+/// 清单/外部输入相对路径闸(R2 P0:resume 清单可被篡改为 `../../…` 逃逸):
+/// 仅允许普通非空组件——拒绝绝对路径、`..`、`.`、空段,以及含反斜杠的段
+/// (清单统一 `/` 分隔;反斜杠段在 Windows 上会被路径层二次拆分,产生歧义)。
+pub(crate) fn is_safe_rel(rel: &str) -> bool {
+    if rel.is_empty() || rel.contains('\\') {
+        return false;
+    }
+    let p = Path::new(rel);
+    !p.is_absolute()
+        && p.components()
+            .all(|c| matches!(c, std::path::Component::Normal(s) if !s.is_empty()))
+        && !rel
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+}
+
 /// 判定路径自身是否为符号链接(不存在视为否)。
 pub(crate) fn is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
@@ -231,6 +271,26 @@ pub(crate) fn is_symlink(path: &Path) -> bool {
 mod dir_gate_tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn safe_rel_accepts_normal_and_rejects_escapes() {
+        assert!(is_safe_rel("DCIM/100MSDCF/A0001.ARW"));
+        assert!(is_safe_rel("单文件.MP4"));
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../x",
+            "a/../b",
+            "a/./b",
+            "a//b",
+            "a/",
+            "..",
+            r"a\..\b",
+            r"..\x",
+        ] {
+            assert!(!is_safe_rel(bad), "应拒绝: {bad:?}");
+        }
+    }
 
     #[cfg(unix)]
     #[test]

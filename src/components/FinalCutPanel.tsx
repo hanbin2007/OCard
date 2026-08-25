@@ -1,6 +1,6 @@
 /** 成片命名校验（工况 A，PRD §5.8）+ 交付状态勾选（PRD §5.7）。 */
 
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as api from "../api";
 import type { DeliveryStatus, FinalCutReport } from "../api/types";
 import { formatTimestamp } from "../lib/format";
@@ -8,31 +8,63 @@ import { Badge } from "./ui";
 
 /** 可见期轮询间隔；页面不可见时停 */
 const POLL_MS = 7000;
+/** 交付状态可见期轮询间隔 */
+const STATUS_POLL_MS = 10000;
 
 export function FinalCutPanel({ projectId }: { projectId: string }) {
   const [report, setReport] = useState<FinalCutReport | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    try {
-      setReport(await api.checkFinalCuts(projectId));
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  }, [projectId]);
-
+  /*
+   * 轮询 7s，但后端要对「6. 成片」下每个文件逐个 ffprobe，最长可到 30s。
+   * 原来的实现无守卫地按点发车，于是会出现两件事：
+   *   ① 请求叠加——一个慢项目能同时压着四五个全量扫描在 NAS 上跑；
+   *   ② 后发先至——早发出的旧响应后回来，把新结果覆盖掉，界面显示过期数据。
+   * 三道闸门：
+   *   in-flight 守卫：上一轮没回来就不发新的（治叠加）；
+   *   pending 合并：被挡下的那一拍不丢，等当前这次回来立刻补跑一次
+   *                （治「扫描比轮询间隔还慢时白等一整个周期」）；
+   *   响应序号：只采纳序号等于「最新一次发车」的返回（治覆盖）。
+   * 都放在 effect 内部，projectId 一变自然全部归零，
+   * 不会出现「切了项目却被上一个项目的在途请求卡住」。
+   */
   useEffect(() => {
     let cancelled = false;
-    const tick = () => {
+    let inFlight = false;
+    let pending = false;
+    let issued = 0;
+
+    const load = async () => {
       // 只在可见期轮询：后台标签页不打扰 NAS
-      if (typeof document !== "undefined" && document.hidden) return;
-      if (!cancelled) void load();
+      if (cancelled || (typeof document !== "undefined" && document.hidden)) return;
+      if (inFlight) {
+        // 这一拍不丢，也不叠加：记下来，等当前这次回来立刻补跑一次
+        pending = true;
+        return;
+      }
+      inFlight = true;
+      const mine = ++issued;
+      try {
+        const next = await api.checkFinalCuts(projectId);
+        if (cancelled || mine !== issued) return;
+        setReport(next);
+        setError(null);
+      } catch (err) {
+        if (cancelled || mine !== issued) return;
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        inFlight = false;
+        if (pending && !cancelled) {
+          pending = false;
+          void load();
+        }
+      }
     };
-    tick();
-    const timer = setInterval(tick, POLL_MS);
+
+    void load();
+    const timer = setInterval(() => void load(), POLL_MS);
     const onVisibility = () => {
-      if (!document.hidden) tick();
+      if (!document.hidden) void load();
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
@@ -40,7 +72,7 @@ export function FinalCutPanel({ projectId }: { projectId: string }) {
       clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [load]);
+  }, [projectId]);
 
   return (
     <div className="card" data-testid="final-cut-panel">
@@ -84,6 +116,12 @@ export function FinalCutPanel({ projectId }: { projectId: string }) {
                     {item.issues.join("；")}
                   </span>
                 ) : null}
+                {/* 后端给的是「哪儿不符」的原文，只标个红角标等于把它扔了 */}
+                {item.resolutionMismatch ? (
+                  <span className="text-2xs dim" data-testid="final-cut-mismatch">
+                    {item.resolutionMismatch}
+                  </span>
+                ) : null}
                 {item.uncheckable ? (
                   <span className="text-2xs dim" data-testid="final-cut-uncheckable">
                     {item.uncheckable}
@@ -118,18 +156,69 @@ export function DeliveryStatusToggle({ projectId }: { projectId: string }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  /*
+   * 轮询与勾选写的是同一个 status，竞态是真会咬人的：
+   * 轮询在 T0 发出 get，用户在 T1 勾了 set，set 先回来把界面点亮，
+   * 随后 T0 那个「还是未勾选」的旧响应回来，勾又自己跳回去了。
+   *
+   * 所以序号必须由**轮询和勾选共用**：谁后发车谁号大，只有号最大的
+   * 那次返回能写 status。projectId 变化时号自增一次，把在途的全部作废。
+   * pollInFlight 只管轮询自己不叠加；勾选另有 busy 守着。
+   */
+  const issuedRef = useRef(0);
+  const pollInFlightRef = useRef(false);
+  const pollPendingRef = useRef(false);
+
+  useEffect(() => {
+    // 切项目：在途响应一律作废，并放开轮询闸门（否则新项目会被旧请求卡住）
+    issuedRef.current += 1;
+    pollInFlightRef.current = false;
+    pollPendingRef.current = false;
+    setStatus(null);
+    setError(null);
+  }, [projectId]);
+
+  // 可见期轮询：别台工作站可能也在勾这个状态，页面不可见时不打 NAS
   useEffect(() => {
     let cancelled = false;
-    void (async () => {
+
+    const load = async () => {
+      if (cancelled) return;
+      if (typeof document !== "undefined" && document.hidden) return;
+      if (pollInFlightRef.current) {
+        // 这一拍不丢也不叠加：当前这次回来后立刻补跑
+        pollPendingRef.current = true;
+        return;
+      }
+      pollInFlightRef.current = true;
+      const mine = ++issuedRef.current;
       try {
         const value = await api.getDeliveryStatus(projectId);
-        if (!cancelled) setStatus(value);
+        if (cancelled || mine !== issuedRef.current) return;
+        setStatus(value);
+        setError(null);
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+        if (cancelled || mine !== issuedRef.current) return;
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        pollInFlightRef.current = false;
+        if (pollPendingRef.current && !cancelled) {
+          pollPendingRef.current = false;
+          void load();
+        }
       }
-    })();
+    };
+
+    void load();
+    const timer = setInterval(() => void load(), STATUS_POLL_MS);
+    const onVisibility = () => {
+      if (!document.hidden) void load();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       cancelled = true;
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [projectId]);
 
@@ -137,9 +226,14 @@ export function DeliveryStatusToggle({ projectId }: { projectId: string }) {
     if (busy) return;
     setBusy(true);
     setError(null);
+    // 与轮询共用同一个号：勾选晚于在途的 get，那个 get 的返回就不该再落地
+    const mine = ++issuedRef.current;
     try {
-      setStatus(await api.setDeliveryStatus(projectId, next));
+      const value = await api.setDeliveryStatus(projectId, next);
+      if (mine !== issuedRef.current) return;
+      setStatus(value);
     } catch (err) {
+      if (mine !== issuedRef.current) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);

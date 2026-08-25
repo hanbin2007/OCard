@@ -341,6 +341,9 @@ pub fn curate_assets(
                 }
                 let tmp = dir.join(format!(".{}.curatepart", uuid::Uuid::new_v4()));
                 fs::copy(&src, &tmp).map_err(|e| format!("复制失败: {e}"))?;
+                if let Ok(m) = fs::metadata(&src) {
+                    fsx::preserve_times_counted(&m, &tmp);
+                }
                 fsx::rename_no_replace(&tmp, &dst).map_err(|e| {
                     let _ = fs::remove_file(&tmp);
                     if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -911,10 +914,30 @@ mod tests {
     #[test]
     fn curate_copies_and_original_stays() {
         let (_t, root, meta) = setup_project();
+        // R2 变异复核:精选复制也要保留源时间戳。
+        // R3 声明:生产路径用 fs::copy 落临时文件,macOS 的 fs::copy 本身克隆
+        // 时间戳——本断言在 macOS 恒真,判别力由 CI 三平台矩阵的 Linux/Windows
+        // 腿提供(删 preserve_times_counted 在那两腿必红)。
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 30);
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(root.join(asset("b.jpg")))
+            .unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(old)).unwrap();
+        drop(f);
         let out = curate_assets(&root, &meta, &[asset("b.jpg")]);
         assert!(out[0].result.is_ok());
         assert!(root.join(asset("b.jpg")).is_file(), "精选是复制,原件保留");
         assert!(root.join("4. 精选/待修/b.jpg").is_file());
+        let dm = fs::metadata(root.join("4. 精选/待修/b.jpg"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let diff = dm
+            .duration_since(old)
+            .unwrap_or_else(|e| e.duration())
+            .as_secs();
+        assert!(diff <= 2, "精选产物 mtime 必须保留源值(差 {diff}s)");
         // 没有残留临时文件
         let leftovers: Vec<_> = fs::read_dir(root.join("4. 精选/待修"))
             .unwrap()

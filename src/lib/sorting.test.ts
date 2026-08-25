@@ -4,6 +4,8 @@ import {
   actionTargets,
   buildGridEntries,
   filterBySuggestion,
+  flattenEntries,
+  GROUP_ID_PREFIX,
   resolveEntryIds,
   clickSelection,
   emptySelection,
@@ -338,7 +340,7 @@ describe("连拍折叠（网格条目）", () => {
     // a / [b,c,d] / e / f → 4 格
     expect(entries).toHaveLength(4);
     expect(entries[1].kind).toBe("group");
-    expect(entries[1].id).toBe("group:g1");
+    expect(entries[1].id).toBe(`${GROUP_ID_PREFIX}g1`);
   });
 
   it("单件组不折叠，仍是普通格", () => {
@@ -350,7 +352,11 @@ describe("连拍折叠（网格条目）", () => {
 
   it("组 id 展开成全部成员 assetId", () => {
     const entries = buildGridEntries(assets);
-    expect(resolveEntryIds(entries, ["group:g1"])).toEqual(["b", "c", "d"]);
+    expect(resolveEntryIds(entries, [`${GROUP_ID_PREFIX}g1`])).toEqual([
+      "b",
+      "c",
+      "d",
+    ]);
   });
 
   it("普通条目原样返回，未知 id 被忽略", () => {
@@ -364,7 +370,7 @@ describe("连拍折叠（网格条目）", () => {
     const sel = moveCursor(ids, emptySelection, "ArrowRight", 4);
     expect(sel.cursor).toBe("a");
     const next = moveCursor(ids, sel, "ArrowRight", 4);
-    expect(next.cursor).toBe("group:g1");
+    expect(next.cursor).toBe(`${GROUP_ID_PREFIX}g1`);
     // 对组条目的操作会展开成 3 个真实素材
     expect(resolveEntryIds(entries, actionTargets(next))).toEqual(["b", "c", "d"]);
   });
@@ -384,5 +390,63 @@ describe("filterBySuggestion", () => {
   it("开启时保留「建议保留」与尚无判定的", () => {
     const out = filterBySuggestion(list, true);
     expect(out.map((a) => a.id)).toEqual(["1", "3"]);
+  });
+});
+
+
+describe("组 id 空间的健壮性（P2 防御）", () => {
+  it("裸素材 id 也能被 resolveEntryIds 认出（展开层选中）", () => {
+    const entries = buildGridEntries([
+      { id: "a" },
+      { id: "b", groupId: "g1" },
+      { id: "c", groupId: "g1" },
+    ]);
+    // 展开层里选中的是组内单件，没有自己的条目 id
+    expect(resolveEntryIds(entries, ["b"])).toEqual(["b"]);
+    expect(resolveEntryIds(entries, ["b", "c"])).toEqual(["b", "c"]);
+  });
+
+  it("组与成员同时选中时去重，不会重复下发", () => {
+    const entries = buildGridEntries([
+      { id: "b", groupId: "g1" },
+      { id: "c", groupId: "g1" },
+    ]);
+    const ids = resolveEntryIds(entries, [`${GROUP_ID_PREFIX}g1`, "b"]);
+    expect(ids).toEqual(["b", "c"]);
+  });
+
+  it("素材 id 撞上组前缀时停用折叠并告警", () => {
+    const reasons: string[] = [];
+    const entries = buildGridEntries(
+      [
+        { id: `${GROUP_ID_PREFIX}fake`, groupId: "g1" },
+        { id: "x", groupId: "g1" },
+      ],
+      (r) => reasons.push(r),
+    );
+    expect(entries.every((e) => e.kind === "asset")).toBe(true);
+    expect(reasons[0]).toContain("冲突");
+  });
+
+  it("素材 id 重复时停用折叠并告警（Map 覆盖会让一格永远选不中）", () => {
+    const reasons: string[] = [];
+    const entries = buildGridEntries(
+      [{ id: "dup" }, { id: "dup" }],
+      (r) => reasons.push(r),
+    );
+    expect(entries).toHaveLength(2);
+    expect(reasons[0]).toContain("重复");
+  });
+});
+
+describe("flattenEntries（预览的唯一下标空间）", () => {
+  it("按显示顺序摊平，组成员按组内顺序展开", () => {
+    const entries = buildGridEntries([
+      { id: "a" },
+      { id: "b", groupId: "g1" },
+      { id: "c", groupId: "g1" },
+      { id: "d" },
+    ]);
+    expect(flattenEntries(entries).map((a) => a.id)).toEqual(["a", "b", "c", "d"]);
   });
 });

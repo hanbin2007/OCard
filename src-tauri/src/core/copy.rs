@@ -77,8 +77,18 @@ pub enum CopyControl {
     Pause,
 }
 
+/// 扫描期跳过的符号链接计数(R2 P0:`metadata()` 跟随链接会把卡外目录树
+/// 卷进拷贝清单,甚至链接环死循环)。零静默:命令层取走后聚合为可见 warning。
+static SCAN_SYMLINKS_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 取走扫描期符号链接跳过数(swap 清零)。
+pub fn take_scan_symlinks_skipped() -> u64 {
+    SCAN_SYMLINKS_SKIPPED.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 扫描源:递归列出全部普通文件(相对路径统一 `/` 分隔)。
-/// 跳过点开头的隐藏项(存储卡上的 .Trashes/.fseventsd 等系统残留)。
+/// 跳过点开头的隐藏项(存储卡上的 .Trashes/.fseventsd 等系统残留);
+/// 符号链接不跟随(存储卡不产生合法链接),跳过并计数供上层告警。
 pub fn scan_source(root: &Path) -> Result<Vec<(String, u64)>> {
     let mut out = Vec::new();
     walk(root, root, &mut out)?;
@@ -95,6 +105,12 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> Result<()> {
             continue;
         }
         let path = entry.path();
+        // file_type() 不跟随链接;链接一律跳过+计数(跟随会把根外树卷进来或死循环)
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            SCAN_SYMLINKS_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
         let meta = entry.metadata()?;
         if meta.is_dir() {
             walk(root, &path, out)?;
@@ -254,7 +270,20 @@ fn copy_one(
     task_tag: &str,
     on_chunk: &mut dyn FnMut(u64),
 ) -> Result<String> {
+    // R2 P0:rel 可能来自持久化清单(resume),被篡改为 `../../…` 即任意读写。
+    // 引擎层兜底闸:非法相对路径直接拒绝(入口处 resume 合并另有前置校验)。
+    if !super::paths::is_safe_rel(rel) {
+        return Err(super::CoreError::Invalid(format!(
+            "清单相对路径非法,拒绝执行: {rel}"
+        )));
+    }
     let src_path = source_root.join(rel_to_native(rel));
+    // 扫描已跳过链接;这里再挡一道(清单项可能指向后来被替换成链接的路径)
+    if super::paths::is_symlink(&src_path) {
+        return Err(super::CoreError::Invalid(format!(
+            "源文件是符号链接,拒绝拷贝: {rel}"
+        )));
+    }
 
     let finals: Vec<PathBuf> = destinations
         .iter()
@@ -310,12 +339,30 @@ fn copy_one(
         })
         .collect();
 
+    // 时间戳快照必须在打开/读取源之前采集(R2 P1:读源本身会刷新 atime,
+    // 读后采集保留下来的是「拷贝时刻」而非原值);获取失败计入保留失败聚合告警
+    let src_meta = fs::metadata(&src_path).ok();
+    if src_meta.is_none() {
+        super::fsx::note_times_preserve_failures(destinations.len() as u64);
+    }
     let mut src = File::open(&src_path)?;
     let result = (|| -> Result<String> {
         let mut writers = Vec::with_capacity(parts.len());
-        for part in &parts {
+        for (part, &i) in parts.iter().zip(&missing) {
             if let Some(parent) = part.parent() {
-                fs::create_dir_all(parent)?;
+                // R2 P0:目的地中间目录可能被预置为符号链接,把写入导向根外——
+                // 走 canonicalize 落地闸(闸在副作用之前),不再裸 create_dir_all。
+                // 目的地根是任务级已验证的用户目标(validate_dest_layout),
+                // 可能尚不存在:拒链接后创建,再对根下段落闸
+                let root = &destinations[i];
+                if super::paths::is_symlink(root) {
+                    return Err(super::CoreError::Invalid(format!(
+                        "目的地根是符号链接,拒绝写入: {}",
+                        root.display()
+                    )));
+                }
+                fs::create_dir_all(root)?;
+                super::paths::ensure_dir_within(root, parent).map_err(super::CoreError::Invalid)?;
             }
             // 同任务崩溃残留的 part 是自己的,清掉;create_new 拦截跨任务冲突
             let _ = fs::remove_file(part);
@@ -363,9 +410,15 @@ fn copy_one(
                 )));
             }
         }
-        // 全部通过,原子防覆盖落位
+        // 全部通过,原子防覆盖落位;落位后保留源时间戳
+        // (mtime/atime 三平台;创建时间 mac/win——用户明确要求,Linux btime
+        //  不可设置为声明边界;失败计数聚合为可见 warning,不阻塞拷贝;
+        //  快照在读源之前采集,见 copy_one 开头)
         for (part, &i) in parts.iter().zip(&missing) {
             finalize_no_replace(part, &finals[i])?;
+            if let Some(m) = &src_meta {
+                super::fsx::preserve_times_counted(m, &finals[i]);
+            }
         }
         Ok(src_hash)
     })();
@@ -834,5 +887,126 @@ mod review_regression_tests {
         assert!(!out.all_verified);
         let saved = manifest::load(&project, &m.id).unwrap();
         assert!(!saved.completed);
+    }
+
+    /// R2 变异复核:删掉 copy_one 落位后的 preserve_times_counted,本测试必红。
+    #[test]
+    fn copy_preserves_source_mtime_end_to_end() {
+        let (_tmp, req, mut m, project) = setup();
+        let src = req.source_root.join("CLIP0001.MP4");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 30);
+        let f = fs::OpenOptions::new().write(true).open(&src).unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(old)).unwrap();
+        drop(f);
+        run_copy(
+            &req,
+            &scan_source(&req.source_root).unwrap(),
+            &mut m,
+            &project,
+            |_| CopyControl::Continue,
+        )
+        .unwrap();
+        for d in &req.destinations {
+            let dm = fs::metadata(d.join("CLIP0001.MP4"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            let diff = dm
+                .duration_since(old)
+                .unwrap_or_else(|e| e.duration())
+                .as_secs();
+            assert!(diff <= 2, "拷贝产物 mtime 必须保留源值(差 {diff}s)");
+        }
+    }
+
+    /// R2 P0:扫描不得跟随符号链接(卡外树/链接环),跳过要计数(供告警)。
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_symlinks_and_counts() {
+        let tmp = tempdir().unwrap();
+        make_card(tmp.path());
+        std::os::unix::fs::symlink(tmp.path().join("DCIM"), tmp.path().join("LINKDIR")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("CLIP0001.MP4"), tmp.path().join("LINK.MP4"))
+            .unwrap();
+        let files = scan_source(tmp.path()).unwrap();
+        assert!(
+            files.iter().all(|(r, _)| !r.contains("LINK")),
+            "符号链接不得进入拷贝清单: {files:?}"
+        );
+        assert!(take_scan_symlinks_skipped() >= 2, "跳过必须计数");
+    }
+
+    /// R2 P0:清单(可被篡改的持久化输入)里的 `../` 项必须被引擎拒绝,
+    /// 且不得在目的地根外产生任何写入。
+    /// R3 修订:逃逸源文件必须真实存在,且断言闸缺席时写入实际会落到的
+    /// 解析位置——否则源不存在时 File::open 一样失败,断言恒真,
+    /// 闸被回退也测不红(R2 点名的恒真机理同型)。
+    #[test]
+    fn manifest_rel_escape_is_refused_by_engine() {
+        let (tmp, req, mut m, project) = setup();
+        // card/../escape.bin = tmp/escape.bin,真实存在(与清单里的 size 一致)
+        fs::write(tmp.path().join("escape.bin"), b"boom").unwrap();
+        let mut files = scan_source(&req.source_root).unwrap();
+        files.push(("../escape.bin".into(), 4));
+        let out = run_copy(&req, &files, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(!out.all_verified);
+        assert!(
+            out.files.iter().any(|f| f.rel_path == "../escape.bin"
+                && matches!(f.status, FileStatus::Failed(_))),
+            "逃逸项必须记为失败: {:?}",
+            out.files
+        );
+        // dest.join("../escape.bin") 的解析位置:两个目的地根的上一级
+        assert!(
+            !tmp.path().join("nas/2. 原始素材/escape.bin").exists()
+                && !tmp.path().join("backup/escape.bin").exists(),
+            "目的地根外不得出现任何写入"
+        );
+    }
+
+    /// R2 P0:目的地中间目录被预置为符号链接时必须拒写(canonical 落地闸),
+    /// 根外目录不得收到文件。
+    #[cfg(unix)]
+    #[test]
+    fn dest_symlinked_middle_dir_is_refused() {
+        let (tmp, req, mut m, project) = setup();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&req.destinations[0]).unwrap();
+        std::os::unix::fs::symlink(&outside, req.destinations[0].join("DCIM")).unwrap();
+        let out = run_copy(
+            &req,
+            &scan_source(&req.source_root).unwrap(),
+            &mut m,
+            &project,
+            |_| CopyControl::Continue,
+        )
+        .unwrap();
+        assert!(!out.all_verified, "经链接的写入必须失败");
+        assert!(
+            !outside.join("100MSDCF").exists(),
+            "不得经符号链接把素材写到目的地根外"
+        );
+    }
+
+    /// R2 P0:清单项指向符号链接源文件时拒拷(不追踪链接目标)。
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_source_file_is_refused() {
+        let (_tmp, req, mut m, project) = setup();
+        std::os::unix::fs::symlink(
+            req.source_root.join("CLIP0001.MP4"),
+            req.source_root.join("ALIAS.MP4"),
+        )
+        .unwrap();
+        let mut files = scan_source(&req.source_root).unwrap();
+        assert!(files.iter().all(|(r, _)| r != "ALIAS.MP4"), "扫描已跳过");
+        files.push(("ALIAS.MP4".into(), 9000));
+        let out = run_copy(&req, &files, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(out
+            .files
+            .iter()
+            .any(|f| f.rel_path == "ALIAS.MP4" && matches!(f.status, FileStatus::Failed(_))));
+        assert!(!req.destinations[0].join("ALIAS.MP4").exists());
     }
 }

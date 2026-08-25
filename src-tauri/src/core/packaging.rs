@@ -176,7 +176,13 @@ fn deliver_one(
         }
     }
     match fsx::rename_no_replace(&tmp, dst) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            // 保留源时间戳(mtime/atime 三平台;创建时间 mac/win,Linux 声明边界)
+            if let Ok(m) = fs::metadata(src) {
+                fsx::preserve_times_counted(&m, dst);
+            }
+            Ok(true)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // 并发竞争:别机先落位。弃临时文件,按既有文件裁决
             let _ = fs::remove_file(&tmp);
@@ -547,6 +553,38 @@ mod tests {
         let manifest = fs::read_to_string(delivery.join(pkg).join(MANIFEST_NAME)).unwrap();
         assert!(manifest.contains("a.jpg") && manifest.contains("hero.jpg"));
         assert!(manifest.contains("文件数: 3") || manifest.contains("文件数: 2"),);
+    }
+
+    /// R2 变异复核:交付复制必须保留源 mtime。源 mtime 被改会影响半天分包,
+    /// 所以在**全部包**里找落点,不假设它进第一个包。
+    /// R3 声明:生产路径用 fs::copy 落临时文件,macOS 的 fs::copy 本身克隆
+    /// 时间戳——本断言在 macOS 恒真,判别力由 CI 三平台矩阵的 Linux/Windows
+    /// 腿提供(删 preserve_times_counted 在那两腿必红)。
+    #[test]
+    fn delivery_preserves_source_mtime() {
+        let (_t, root, meta) = setup();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 30);
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("2. 开幕式/a.jpg"))
+            .unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(old)).unwrap();
+        drop(f);
+        let out = build_delivery(&root, &meta).unwrap();
+        assert!(out.failures.is_empty(), "{:?}", out.failures);
+        let delivery = root.join(DELIVERY_DIR);
+        let delivered = out
+            .packages
+            .iter()
+            .map(|p| delivery.join(p).join("2. 开幕式/a.jpg"))
+            .find(|p| p.is_file())
+            .expect("a.jpg 必须被交付到某个包");
+        let dm = fs::metadata(&delivered).unwrap().modified().unwrap();
+        let diff = dm
+            .duration_since(old)
+            .unwrap_or_else(|e| e.duration())
+            .as_secs();
+        assert!(diff <= 2, "交付产物 mtime 必须保留源值(差 {diff}s)");
     }
 
     #[test]

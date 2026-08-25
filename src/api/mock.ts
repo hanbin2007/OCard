@@ -5,6 +5,7 @@
 
 import type {
   CameraReg,
+  ArchiveResult,
   CapabilityReport,
   CuratedFlowHint,
   DeliveryStatus,
@@ -416,7 +417,9 @@ export const mockPendingAssets: SortingAsset[] = Array.from(
         i >= 40 && i <= 44
           ? {
               groupId: "burst-1",
-              score: i === 42 ? 0.86 : 0.31,
+              score: i === 42 ? 86 : 31,
+              // 组里混一张 null：人脸检测不可用与「检出 0 张」必须能分辨
+              faces: i === 43 ? null : i === 42 ? 3 : 2,
               blurry: i === 41,
               overExposed: i === 43,
               underExposed: false,
@@ -424,13 +427,26 @@ export const mockPendingAssets: SortingAsset[] = Array.from(
             }
           : i === 5
             ? {
-                score: 0.22,
+                score: 22,
+                // 确实检出 0 张脸——与下面的 null 是两回事
+                faces: 0,
                 blurry: true,
                 overExposed: false,
                 underExposed: true,
                 suggestedKeep: false,
               }
-            : undefined,
+            : i === 7
+              ? {
+                  // 客观指标算出来了，但这轮人脸检测不可用（模型缺失/推理失败）：
+                  // faces = null 是「不知道」，界面不许说成「没有人脸」
+                  score: 58,
+                  faces: null,
+                  blurry: false,
+                  overExposed: true,
+                  underExposed: false,
+                  suggestedKeep: false,
+                }
+              : undefined,
     } satisfies SortingAsset;
   },
 );
@@ -578,7 +594,7 @@ export const mockFinalCuts: FinalCutReport = {
       valid: true,
       issues: [],
       class: "成品",
-      resolutionMismatch: true,
+      resolutionMismatch: "命名声明 4K，实际探测为 1280x720",
     },
     {
       fileName: "20260822_年中发布会_720p_预览_v1.mov",
@@ -604,4 +620,16 @@ export const mockFlowHints: CuratedFlowHint[] = [
 
 export const mockDeliveryStatus: DeliveryStatus = {
   uploaded: false,
+};
+
+/** 归档转码 mock 结果 */
+export const mockArchiveResult: ArchiveResult = {
+  mode: "archive",
+  converted: 38,
+  alreadyArchived: 6,
+  failures: [
+    { rel: "2. 原始素材/20260822_A7M4_A_LM/C0044.MP4", message: "写入目标磁盘空间不足" },
+  ],
+  usedEncoder: "hevc_videotoolbox",
+  outputDir: "/Volumes/ARCHIVE-2026/20260822_年中发布会",
 };

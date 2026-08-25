@@ -16,6 +16,11 @@ use std::time::{Duration, Instant};
 /// 探针超时(单个 encoder)。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 
+/// 测试内 `OCARD_FFMPEG_DIR` 的进程级互斥:env 是进程全局,并行测试
+/// 同时改写会互相踩——所有触碰该变量的测试都必须先持有本锁。
+#[cfg(test)]
+pub(crate) static FFMPEG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub const EXE_SUFFIX: &str = if cfg!(windows) { ".exe" } else { "" };
 
 /// 定位 sidecar 二进制:`OCARD_FFMPEG_DIR` 覆盖优先(测试/E2E),
@@ -305,6 +310,9 @@ mod tests {
 
     #[test]
     fn sidecar_env_override_and_missing_are_explicit() {
+        let _g = super::FFMPEG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // 不存在的目录:错误信息可见(零静默),不 panic
         std::env::set_var("OCARD_FFMPEG_DIR", "/nonexistent-ocard-test");
         let err = sidecar_path("ffmpeg").unwrap_err();

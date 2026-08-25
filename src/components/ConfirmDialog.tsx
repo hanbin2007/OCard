@@ -4,7 +4,8 @@
  * 默认动作永远是不删。
  */
 
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
+import { withViewTransition } from "../lib/motion";
 
 export interface ConfirmRequest {
   title: string;
@@ -24,20 +25,28 @@ export function ConfirmDialog({
 }) {
   const cancelRef = useRef<HTMLButtonElement>(null);
 
+  /**
+   * 关闭走视图过渡：进场由 CSS 关键帧（缩放 + 淡入）负责，退场由这里淡出。
+   * 浮层没有独立的过渡名，因此背景像素在新旧快照里完全一致——
+   * 交叉淡入淡出的结果就是"只有对话框在消失"，其余部分肉眼无差别。
+   * 内核不支持或用户要求减少动效时，这就是一次普通的同步调用。
+   */
+  const close = useCallback(() => withViewTransition(onCancel), [onCancel]);
+
   useEffect(() => {
     if (!request) return;
     cancelRef.current?.focus();
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancel();
+      if (e.key === "Escape") close();
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [request, onCancel]);
+  }, [request, close]);
 
   if (!request) return null;
 
   return (
-    <div className="overlay" onClick={onCancel}>
+    <div className="overlay" onClick={close}>
       <div
         className="dialog"
         role="alertdialog"
@@ -53,7 +62,7 @@ export function ConfirmDialog({
           {request.message}
         </p>
         <div className="dialog__actions">
-          <button type="button" className="btn" ref={cancelRef} onClick={onCancel}>
+          <button type="button" className="btn" ref={cancelRef} onClick={close}>
             取消
           </button>
           <button
@@ -61,7 +70,7 @@ export function ConfirmDialog({
             className="btn btn--danger-solid"
             onClick={() => {
               void request.onConfirm();
-              onCancel();
+              close();
             }}
           >
             {request.confirmLabel}

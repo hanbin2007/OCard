@@ -54,6 +54,8 @@ pub fn check_final_cuts<R: tauri::Runtime>(
         return Err("成片命名校验仅适用于工况 A(视频)项目".into());
     }
     let dir = stats.root.join(project::SCENARIO_A_DIRS[5]); // 6. 成片
+                                                            // R2 P1:中间段可能被换成符号链接把读取导出项目外——canonical 只读闸
+    paths::assert_within(&stats.root, &dir)?;
     let mut report = FinalCutReportDto {
         items: Vec::new(),
         warnings: Vec::new(),
@@ -163,6 +165,9 @@ pub fn curated_flow_hints<R: tauri::Runtime>(
     let curated = &dirs[dirs.len() - 2];
     let todo_dir = stats.root.join(curated).join(project::CURATED_TODO);
     let done_dir = stats.root.join(curated).join(project::CURATED_DONE);
+    // R2 P1:中间段符号链接闸(canonical 只读断言)
+    paths::assert_within(&stats.root, &todo_dir)?;
+    paths::assert_within(&stats.root, &done_dir)?;
     let stem = |n: &str| {
         n.rsplit_once('.')
             .map(|(s, _)| s.to_string())
@@ -227,6 +232,7 @@ pub fn get_delivery_status<R: tauri::Runtime>(
     let nas = super::nas_root(&app, &state)?;
     let stats = super::find_project(&nas, &project_id)?;
     let path = delivery_status_path(&stats.root);
+    paths::assert_within(&stats.root, &path)?;
     if !path.exists() {
         return Ok(DeliveryStatusDto::default());
     }

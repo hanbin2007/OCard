@@ -71,3 +71,61 @@ TTL 收窄(opus 裁决接受,理由改写如上);探测缓存键不含驱动标�
 Windows 安装包内容核查由 mac/linux 腿覆盖;真实 1000×24MP SLA 报告依赖用户素材
 (收口报告向用户征集);跨机分类重放/RAW 全解码维持 D5 顺延;YuNet 正脸召回率
 以代码审查+空图零误报为界,行为级验收依赖真实样本(与 SLA 同批征集)。
+
+---
+
+# 第 2 轮复验(R2,基准 e267dd3)
+
+双路独立复验(codex gpt-5.6-sol max ~60 万 token 只读核验;opus 腿实跑 148 测试
++ 12 项变异实验)。**双路一致判定:不可收口。**
+两份完整报告存档于会话 scratchpad(m3-r2-codex-report.md / opus 报告见任务记录),
+本节为合并后的处置清单。
+
+## 主要一致结论
+
+- 首轮 4 个 P0 的骨架修复扎实:percent-decode、cancel 语义、路径闸三项变异全部变红。
+- 修复波自身留缺口:归档路径(落地闸/软编告警/staging 清理)系统性缺席代理路径已有的防护。
+- 测试有效性重灾:12 项变异 9 项存活——时间戳保留三个调用点全删测试仍绿
+  (根因:唯一测试用 fs::copy 造场景,macOS fs::copy 本身克隆时间戳,断言恒真);
+  watchdog、VAAPI、sharpness_region、auto_proxy 链、cancel_job、list_remote_activity 零有效覆盖。
+
+## R2 P0(合并,已抽验实锤)
+
+1. **resume 清单任意路径**:planned rel 未校验 `..`/绝对路径即并入并 root.join(commands/mod.rs 合并处、copy.rs copy_one)。
+2. **拷贝符号链接逃逸**:walk() 用跟随链接的 metadata();目的地中间目录无 canonical 闸。
+3. **thumb/.ocard 中间组件无闸**:thumb 只查首尾;缩略图生成器、manifest/journal 直接读写 `.ocard`。
+4. **归档输出祖先符号链接绕过**:validate 只查字符串前缀+末节点,写入 create_dir_all 不过闸。
+5. **代理/归档不递归扫描**:相机夹只读第一层,真实嵌套结构(PRIVATE/M4ROOT/CLIP)零任务,auto_proxy 反复触顶后放弃。
+6. **release.yml 无 sidecar 拉取**:三个 Release job 干净 runner 必失败,v0.3.0 无法出包。
+7. **缩略图 EXIF 方向不定**(opus):索引路径不摆正、分析路径摆正,同一缓存键先到先得,竖拍缩略图方向随机且永久驻缓存。
+
+## R2 P1(合并去重,必修)
+
+后端:归档 hwenc-fallback 告警缺失;analysis 特征目录读错静默(收敛项 20 未兑现);
+faces 推理失败记 0 并永久缓存(应 None+计数上报);已存在产物「存在即成功」不验有效性;
+取消后发布 total/total 假进度;VAAPI 输出 nv12 与统一验证矩阵冲突、archive VAAPI 缺初始化链;
+ffmpeg `-protocol_whitelist` 未落实、色彩标签验证未落实(计划明写,非可豁免边界);
+时间戳:atime 在读后采集已失真、src metadata 获取失败静默;确认退出不停 copy task;
+auto_proxy attempts/abandon 写盘 let _、无 intent 去重;analysis 缓存键 (count,max mtime) 过粗;
+finalcut/delivery-status 路径无 canonical 闸;输出名大小写碰撞(clip.mov/clip.MOV)无测试;
+CI:ffprobe 无 SHA 校验、Windows 模型无 SHA、find|head-1 pipefail SIGPIPE、
+e2e-shots 对 fork PR 必红且 PR 全程持 contents:write。
+前端(待动画批次落地后排它处理):mode 契约半落地(TS 仍结构嗅探);faces 结果无用户面;
+FinalCutPanel 7s 全量扫描可重入+陈旧覆盖;mismatch 前后端类型不一致(string vs bool);
+threshold 注释 0-1 陈旧。
+测试补齐(成对承诺兑现):时间戳三调用点端到端 mtime 断言+告警拆线测;watchdog 卡死模拟;
+VAAPI 参数 assert;sharpness_region 边界;auto_proxy 意图链挂网;cancel_job/list_remote_activity;
+特征冲突断言确定性(现依赖 read_dir 顺序,变异实测无效);恒真断言清除(integration_tests dup)。
+
+## R2 P2(顺手批/账面)
+
+auto_proxy 计数写盘失败可见化;notify.rs level 注释补 info;「已取消」字符串分流改枚举;
+used_encoder 末文件覆写;ALGO_VERSION 随 EXIF 摆正递增;PRD 文档矛盾清理
+(RAW 全解码/GPU 表述与 D5 顺延冲突、「草案待确认」页眉、docs/PRD.md 指针);
+终态 job 再 cancel 的误导反馈;A1-A14 台账在本文档补逐项映射;
+jobs guard 释放窗口的后果在模块文档如实声明;ORT download-binaries 未纳入 SHA 钉死(声明或钉死)。
+
+## 处置
+
+按 P0 全修 + P1 全修 + 测试补齐开 R2 修复波;前端四项待 apple-design 动画批次交付后排它落地;
+修复完成后进入 R3 复验(双路),通过后终审双票(gpt-5.6-sol max + fable-5)。

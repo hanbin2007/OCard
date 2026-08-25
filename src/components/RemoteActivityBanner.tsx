@@ -31,7 +31,7 @@ export function RemoteActivityBanner({
       <div className="remote-banner__head">
         <span className="dot" />
         <span className="text-xs">
-          另有 {activities.length} 台工作站正在本项目拷卡
+          另有 {activities.length} 台工作站正在本项目作业
         </span>
         <button
           type="button"
@@ -54,10 +54,21 @@ export function RemoteActivityBanner({
               data-volume={activity.volume}
             >
               <span className="text-xs">
-                另一台工作站（操作人 {activity.operator}）正在拷
-                <span className="mono">「{activity.volume}」</span>
-                {" → 目标夹 "}
-                <span className="mono">{activity.targetFolder}</span>
+                {activity.activity === "transcode" ? (
+                  <>
+                    ⟳ 另一台工作站（操作人 {activity.operator}）正在转码
+                    <span className="mono">「{activity.camera}」</span>
+                    {" → 输出 "}
+                    <span className="mono">{activity.targetFolder}</span>
+                  </>
+                ) : (
+                  <>
+                    另一台工作站（操作人 {activity.operator}）正在拷
+                    <span className="mono">「{activity.volume}」</span>
+                    {" → 目标夹 "}
+                    <span className="mono">{activity.targetFolder}</span>
+                  </>
+                )}
               </span>
               <span className="text-2xs dim mono">
                 {activity.machine} · {formatTimestamp(activity.startedAt)}

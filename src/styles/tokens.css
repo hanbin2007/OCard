@@ -7,12 +7,19 @@
 
 :root {
   /* ---- 字体 ---- */
+  /*
+   * 全部使用系统自带字体，不引入任何 webfont。
+   * macOS：-apple-system → SF，中文 PingFang SC
+   * Windows：Microsoft YaHei（微软雅黑）拉丁与中文一并接管
+   * Linux：system-ui 取系统默认，中文回退 Noto Sans CJK SC
+   */
   --font-sans:
-    -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, "Helvetica Neue",
-    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+    "Microsoft YaHei", "Microsoft YaHei UI", system-ui, "Noto Sans CJK SC",
+    "Source Han Sans SC", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono:
-    ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono",
-    "Roboto Mono", monospace;
+    ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Cascadia Mono",
+    "DejaVu Sans Mono", "Noto Sans Mono CJK SC", "Liberation Mono", monospace;
 
   /* ---- 字号层级 ---- */
   --text-2xs: 11px;
@@ -48,24 +55,61 @@
   --radius-lg: 12px;
   --radius-pill: 999px;
 
-  /* ---- 过渡 ---- */
+  /* ---- 过渡 ----
+   * PRD §5.9 的「150ms 克制过渡」基线锚点。日常上色/边框过渡现在统一走
+   * 下面动效标尺里的 --dur-micro（140ms，同一量级），这一条保留为基线口径。 */
   --transition: 150ms ease;
+
+  /* ----------------------------------------------------------------
+   * 动效（Apple《Designing Fluid Interfaces》口径）
+   *
+   * 时长不是"随手选的数"，而是两参数弹簧（damping ratio + response）
+   * 解出来的稳定时间：
+   *   --dur-spring-fast  ζ=1.00, response 0.25s → 350ms 稳定
+   *   --dur-spring       ζ=1.00, response 0.35s → 490ms 稳定
+   *   --dur-spring-pop   ζ=0.75, response 0.28s → 350ms 稳定（峰值 1.028）
+   * 弹簧没有"时长"概念：以上是收敛到 ±0.15% 的时刻，人眼看到的位移
+   * 在前 40% 就基本走完了，所以数值大不等于拖沓。
+   *
+   * 按压反馈单独一档 --dur-instant：Apple 的要求是 pointer-down 立刻响应，
+   * 不等 release；90ms 快到读作"即时"，又不会闪。
+   * ---------------------------------------------------------------- */
+  --dur-instant: 90ms;
+  --dur-micro: 140ms;
+  --dur-quick: 200ms;
+  --dur-spring-fast: 350ms;
+  --dur-spring: 490ms;
+  --dur-spring-pop: 350ms;
+
+  /* 曲线。默认一律临界阻尼（ζ=1，无过冲）——本应用没有惯性手势，
+     按 Apple 的规矩就不该有回弹；--spring-pop 只留给"提交完成"这一类
+     离散确认动作，过冲仅 2.8%，是分量而不是弹跳。 */
+  --ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --spring: cubic-bezier(0.22, 1, 0.36, 1);
+  --spring-pop: cubic-bezier(0.34, 1.4, 0.64, 1);
 
   /* ---- 布局尺寸 ---- */
   --sidebar-width: 232px;
   --topbar-height: 52px;
   --content-max: 1180px;
 
-  /* ---- 浅色主题（默认，近白） ---- */
-  --bg: #ffffff;
-  --bg-subtle: #f9f9f9;
-  --bg-sunken: #f4f4f4;
+  /* ----------------------------------------------------------------
+   * 浅色主题：层次靠**灰阶台阶**，不靠阴影。由后到前依次变亮：
+   *   shell #e9eaea → sidebar #eff0f0 → content #f6f6f7 → panel #ffffff
+   * 面板是唯一的纯白，卡片因此天然从内容区里"浮"出来。
+   * ---------------------------------------------------------------- */
+  --surface-shell: #e8e9ea;
+  --bg-subtle: #f0f0f1;
+  --bg: #f7f7f8;
+  --bg-sunken: #e6e7e8;
   --panel: #ffffff;
-  --panel-raised: #fafafa;
+  --panel-raised: #f2f2f3;
+  /* 输入面：比所在卡片沉一档，读起来是"凹"进去的 */
+  --field: #f7f7f8;
 
-  --border: #e5e5e5;
-  --border-strong: #d4d4d4;
-  --border-focus: #b4b4b4;
+  --border: #e0e1e2;
+  --border-strong: #cdcfd1;
+  --border-focus: #adb0b3;
 
   --text-primary: #0d0d0d;
   --text-secondary: #5d5d5d;
@@ -97,18 +141,47 @@
   --on-danger: #ffffff;
 
   --overlay: rgba(13, 13, 13, 0.45);
+  /* 唯一允许的阴影：仅浮层（modal / popover / dropdown），小偏移低不透明度 */
+  --shadow-overlay: 0 4px 16px rgba(15, 15, 15, 0.12);
 
   color-scheme: light;
+}
+
+/*
+ * 真·弹簧曲线。上面的 cubic-bezier 只是形似的兜底；支持 linear() 的内核
+ * （Safari 17.2+ / Chrome 113+，Tauri 的两个 WebView 都在范围内）换成按
+ * x(t) = 1 − (1 + ω₀t)·e^(−ω₀t) 逐点采样出来的真实弹簧位移曲线。
+ * ζ=1 时曲线形状与 response 无关，只随时长缩放，所以临界阻尼只需要一条。
+ */
+@supports (transition-timing-function: linear(0, 1)) {
+  :root {
+    /* ζ=1.00 临界阻尼，27 点采样 */
+    --spring: linear(
+      0, 0.0458, 0.1477, 0.2698, 0.3919, 0.5041, 0.602, 0.6846, 0.7525, 0.8075,
+      0.8512, 0.8858, 0.9127, 0.9336, 0.9497, 0.962, 0.9714, 0.9785, 0.9839,
+      0.988, 0.9911, 0.9933, 0.9951, 0.9963, 0.9973, 0.998, 1
+    );
+    /* ζ=0.75，峰值 1.0283 —— 仅"提交完成"类离散确认使用 */
+    --spring-pop: linear(
+      0, 0.0392, 0.134, 0.2574, 0.3899, 0.5185, 0.6354, 0.7362, 0.8195, 0.8856,
+      0.9359, 0.9726, 0.9979, 1.0141, 1.0234, 1.0276, 1.0283, 1.0266, 1.0237,
+      1.02, 1.0163, 1.0127, 1.0095, 1.0068, 1.0046, 1.0028, 1
+    );
+  }
 }
 
 /* ---- 深色主题：跟随系统 ---- */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
+    /* 深色台阶（保留 PRD 锚点 #0d0d0d / #171717 / #212121）：
+       shell #0a0a0a → sidebar #0d0d0d → content #131313 → panel #171717 */
+    --surface-shell: #0a0a0a;
     --bg: #0d0d0d;
     --bg-subtle: #171717;
-    --bg-sunken: #0a0a0a;
-    --panel: #171717;
-    --panel-raised: #212121;
+    --bg-sunken: #080808;
+    --panel: #212121;
+    --panel-raised: #2a2a2a;
+    --field: #191919;
 
     --border: #2f2f2f;
     --border-strong: #3d3d3d;
@@ -140,6 +213,7 @@
     --on-danger: #0d0d0d;
 
     --overlay: rgba(0, 0, 0, 0.6);
+    --shadow-overlay: 0 4px 16px rgba(0, 0, 0, 0.5);
 
     color-scheme: dark;
   }
@@ -147,11 +221,15 @@
 
 /* ---- 深色主题：手动切换覆盖 ---- */
 :root[data-theme="dark"] {
+  /* 深色台阶（保留 PRD 锚点 #0d0d0d / #171717 / #212121）：
+     shell #0a0a0a → sidebar #0d0d0d → content #131313 → panel #171717 */
+  --surface-shell: #0a0a0a;
   --bg: #0d0d0d;
   --bg-subtle: #171717;
-  --bg-sunken: #0a0a0a;
-  --panel: #171717;
-  --panel-raised: #212121;
+  --bg-sunken: #080808;
+  --panel: #212121;
+  --panel-raised: #2a2a2a;
+  --field: #191919;
 
   --border: #2f2f2f;
   --border-strong: #3d3d3d;
@@ -183,6 +261,7 @@
   --on-danger: #0d0d0d;
 
   --overlay: rgba(0, 0, 0, 0.6);
+  --shadow-overlay: 0 4px 16px rgba(0, 0, 0, 0.5);
 
   color-scheme: dark;
 }

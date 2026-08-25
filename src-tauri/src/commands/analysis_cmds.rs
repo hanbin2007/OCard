@@ -40,6 +40,9 @@ pub struct AnalysisFailureDto {
 /// 模型「缺失」是打包问题,降级为无人脸分析并可见 error——两种语义分开)。
 static AI_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 人脸推理失败计数(R2 P1:失败=faces None,聚合为可见 warning,不伪装成 0 人脸)。
+static FACE_DETECT_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
 /// 启动校验:模型存在但哈希不符 → 禁用 AI + 可见 error(计划 D1)。
 pub fn verify_models_on_startup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Ok(p) = resolve_model_path(app) {
@@ -112,7 +115,14 @@ pub fn start_analysis<R: tauri::Runtime>(
                 }
             };
             let detector = detector.as_ref();
-            let (features, skipped) = analysis::load_features(&root);
+            let (features, skipped, read_err) = analysis::load_features(&root);
+            if let Some(e) = read_err {
+                notify::warn(
+                    &body_app,
+                    "analysis-cache-degraded",
+                    format!("{e};本轮将全量重新分析"),
+                );
+            }
             if skipped > 0 {
                 notify::warn(
                     &body_app,
@@ -216,6 +226,16 @@ pub fn start_analysis<R: tauri::Runtime>(
                     "analysis-cache-degraded",
                     format!(
                         "{cache_write_failed} 条分析结果写入缓存失败:这些素材的角标本轮不会出现,下次分析会重算"
+                    ),
+                );
+            }
+            let face_fail = FACE_DETECT_FAILURES.swap(0, Ordering::Relaxed);
+            if face_fail > 0 {
+                notify::warn(
+                    &body_app,
+                    "face-detect-degraded",
+                    format!(
+                        "{face_fail} 张图片人脸检测失败(已按「人脸信息不可用」记录,客观指标不受影响)"
                     ),
                 );
             }
@@ -377,19 +397,27 @@ fn analyze_one(
     let img = media::apply_orientation(img, media::exif_orientation(&abs));
     // 单次解码产出全部特征 + 回填共享缩略图缓存
     let (dhash, mut sharpness, over, under) = analysis::extract_features(&img);
-    // 人脸在场:清晰度改按最大脸区域(对焦在脸=可用;检测失败按不可用处理)
-    let faces = detector.map(|d| match d.detect(&img) {
-        Ok(list) => {
-            if let Some(best) = list
-                .iter()
-                .max_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h)))
-            {
-                sharpness = analysis::sharpness_region(&img, best.x, best.y, best.w, best.h);
+    // 人脸在场:清晰度改按最大脸区域(对焦在脸=可用)。
+    // R2 P1:推理失败必须记 None(=不可用)并计数上报——记 0 会被永久缓存成
+    // 「确实没有人脸」,与字段语义相悖且不可辨别。
+    let faces = match detector {
+        None => None,
+        Some(d) => match d.detect(&img) {
+            Ok(list) => {
+                if let Some(best) = list
+                    .iter()
+                    .max_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h)))
+                {
+                    sharpness = analysis::sharpness_region(&img, best.x, best.y, best.w, best.h);
+                }
+                Some(list.len() as u32)
             }
-            list.len() as u32
-        }
-        Err(_) => 0,
-    });
+            Err(_) => {
+                FACE_DETECT_FAILURES.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        },
+    };
     let _ = media::store_thumb_from_image(root, rel, size, mtime, &img);
     let shot_at_epoch = media::exif_shot_at(&abs)
         .map(|t| t.timestamp())
@@ -413,4 +441,109 @@ fn analyze_one(
         analyzed_at: chrono::Utc::now(),
         machine_id: machine_id.to_string(),
     })
+}
+
+#[cfg(test)]
+mod exif_orientation_tests {
+    use super::*;
+    use crate::core::{analysis, media};
+
+    /// 生成带 EXIF Orientation 的不对称 JPEG 样张(SOI 后拼接 APP1 段)。
+    fn write_oriented_jpeg(path: &std::path::Path, orientation: u16) {
+        let img = image::RgbImage::from_fn(80, 40, |x, y| {
+            if x < 20 && y < 10 {
+                image::Rgb([250, 250, 250])
+            } else {
+                image::Rgb([10, 10, 10])
+            }
+        });
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let field = exif::Field {
+            tag: exif::Tag::Orientation,
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Short(vec![orientation]),
+        };
+        let mut w = exif::experimental::Writer::new();
+        w.push_field(&field);
+        let mut tiff = std::io::Cursor::new(Vec::new());
+        w.write(&mut tiff, false).unwrap();
+        let tiff = tiff.into_inner();
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&tiff);
+        let mut out = Vec::with_capacity(jpeg.len() + payload.len() + 4);
+        out.extend_from_slice(&jpeg[..2]); // SOI
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&jpeg[2..]);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// R2 P0-7 / R3-F2:EXIF 方向样张——索引路径(decode_oriented)与
+    /// 分析路径(analyze_one 的内联摆正,为区分 Missing/Failed 而复制)
+    /// 必须同向。任一路丢掉摆正,两路 dhash 对不上,本测试红。
+    #[test]
+    fn index_and_analysis_orient_identically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join("素材")).unwrap();
+        let rel = "素材/竖拍.jpg";
+        let abs = root.join("素材").join("竖拍.jpg");
+        write_oriented_jpeg(&abs, 6);
+
+        // 样张自证:EXIF 必须真的读得出 Orientation=6(拼接失败即恒真,先挡住)
+        assert_eq!(
+            media::exif_orientation(&abs),
+            6,
+            "样张 EXIF 不可读,fixture 失效"
+        );
+
+        // 索引路径:Orientation=6 是 90° 旋转,宽高必须互换
+        let oriented = media::decode_oriented(&abs).unwrap();
+        assert_eq!(
+            (oriented.width(), oriented.height()),
+            (40, 80),
+            "Orientation=6 必须旋转"
+        );
+        // 样张自证判别力:摆正前后 dhash 必须不同
+        let raw = image::open(&abs).unwrap();
+        assert_ne!(
+            analysis::extract_features(&raw).0,
+            analysis::extract_features(&oriented).0,
+            "样张摆正前后 dhash 相同,本测试无判别力"
+        );
+
+        // 分析路径:经真实 analyze_one 提取的 dhash 与索引路径一致(两路同向)
+        let meta = std::fs::metadata(&abs).unwrap();
+        let out = analyze_one(
+            &root,
+            "TEST-MACHINE",
+            rel,
+            meta.len(),
+            media::mtime_nanos(&meta),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        );
+        let AnalyzeOne::Fresh(rec) = out else {
+            panic!("分析应产出 Fresh 特征");
+        };
+        assert_eq!(
+            rec.dhash,
+            analysis::extract_features(&oriented).0,
+            "分析路径与索引路径必须同向(dhash 一致)"
+        );
+        // ALGO_VERSION 断言:EXIF 统一摆正自 v2 起进入算法口径;改变方向
+        // 语义或特征口径时必须递增 ALGO_VERSION,并让缓存整体失效。
+        const {
+            assert!(analysis::ALGO_VERSION >= 2, "EXIF 统一摆正要求 algo v2+");
+        }
+        assert_eq!(rec.algo_version, analysis::ALGO_VERSION);
+    }
 }

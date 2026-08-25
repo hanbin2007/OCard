@@ -9,6 +9,7 @@
 import {
   mockCancelJob,
   mockStartAnalysis,
+  mockStartArchive,
   mockStartProxyTranscode,
   mockGetJob,
   mockListJobs,
@@ -57,6 +58,7 @@ import type {
   FinalCutReport,
   JobSnapshot,
   RemoteActivity,
+  StartArchiveInput,
   StartProxyInput,
   TranscodeCapabilities,
   TranscodeJob,
@@ -778,6 +780,17 @@ export function transcodeCapabilities(
 export function transcodeDiagnostics(): Promise<Record<string, unknown>> {
   if (IS_TAURI) return ipc("transcode_diagnostics");
   return reply(mockDiagnostics);
+}
+
+/**
+ * 发起归档转码作业（kind 仍是 "transcode"，结果是 ArchiveResultDto）。
+ * 归档输出到项目之外的目录，是独立副本，不改动原始素材。
+ */
+export function startArchiveTranscode(
+  input: StartArchiveInput,
+): Promise<TranscodeJob> {
+  if (IS_TAURI) return ipc("start_archive_transcode", { input });
+  return reply(mockStartArchive(input.projectId));
 }
 
 /** 发起代理转码作业（kind = "transcode"，进度走既有 job://progress） */
