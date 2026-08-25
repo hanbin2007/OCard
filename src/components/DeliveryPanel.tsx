@@ -323,6 +323,8 @@ function DeliveryResult({
     summary.failures,
   );
   const undelivered = [...nameCollisions, ...errors];
+  /* 量条以最大包为满格；空包列表兜底 1，避免 0/0 */
+  const maxPackageBytes = Math.max(...summary.packages.map((p) => p.bytes), 1);
 
   return (
     <div className="overlay" onClick={onClose}>
@@ -346,18 +348,25 @@ function DeliveryResult({
           <div className="list">
             <div className="list__head delivery__head">
               <span>包</span>
+              {/* 量条列：相对量一眼可比，表头无需命名 */}
+              <span aria-hidden="true" />
               <span>包内文件数</span>
               <span>包内容量</span>
             </div>
             {summary.packages.map((pkg) => (
               <div className="list__row delivery__row" key={pkg.name} data-testid="delivery-package">
                 <span className="mono text-sm">{pkg.name}</span>
+                {/* 以最大包为满格的相对量条：离群的半天包（拷漏/拷重）当场显形 */}
+                <span className="delivery__meter">
+                  <ProgressBar value={pkg.bytes} total={maxPackageBytes} thin decorative />
+                </span>
                 <span className="mono text-xs dim">{pkg.fileCount}</span>
                 <span className="mono text-xs dim">{formatBytes(pkg.bytes)}</span>
               </div>
             ))}
             <div className="list__row delivery__row" data-testid="delivery-total">
               <span className="text-sm">本次新交付</span>
+              <span aria-hidden="true" />
               <span className="mono text-xs">{summary.totalFiles}</span>
               <span className="mono text-xs">{formatBytes(summary.totalBytes)}</span>
             </div>

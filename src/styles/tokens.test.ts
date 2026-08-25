@@ -270,6 +270,9 @@ describe("动效令牌与合成安全", () => {
       "border-color",
       "color",
       "outline-offset",
+      // 进度环的弧长动画：SVG 描边属于纯绘制，不进布局；
+      // 且只作用在一个 56px 的小图形上，重绘代价与 background 同量级
+      "stroke-dashoffset",
     ]);
     for (const [sheet, source] of Object.entries(sheets)) {
       for (const property of transitionedProperties(source)) {

@@ -319,6 +319,24 @@
   margin-left: auto;
 }
 
+/* 速度数值 + 迷你曲线：曲线尾端贴着数字，读法就是「这个数的历史」 */
+.copy-hero__vital-value--spark {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: var(--space-3);
+}
+
+/* 迷你版速度曲线：与 20px 的数字同底线，是数字的注脚而不是另一块图 */
+.copy-hero__spark {
+  width: 180px;
+  height: 30px;
+}
+
+/* 迷你高度装不下峰值直标——留给悬停提示与 aria 语义，不跟曲线抢地方 */
+.copy-hero__spark .sparkline__peak {
+  display: none;
+}
+
 .copy-hero__vital {
   display: grid;
   gap: 2px;
@@ -332,9 +350,9 @@
   color: var(--text-primary);
 }
 
-/* 主进度条比常规粗一档：它是仪表，不是装饰 */
+/* 主进度条明显粗于常规：它是仪表，不是装饰，也不能被角落的曲线抢掉分量 */
 .copy-hero__bar .progress {
-  height: 6px;
+  height: 10px;
 }
 
 .task-stats {

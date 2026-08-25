@@ -440,7 +440,10 @@ export function subscribeCopyProgress(
         revision,
         occurredAt: new Date().toISOString(),
         copiedBytes: copied,
-        speedBytesPerSec: done ? 0 : task.speedBytesPerSec,
+        // 真实读卡速度不是常数：加 ±15% 抖动，速度曲线在浏览器演示里才有形状
+        speedBytesPerSec: done
+          ? 0
+          : Math.round(task.speedBytesPerSec * (0.85 + Math.random() * 0.3)),
         state: done ? "verifying" : "running",
         changedFiles: [],
         changedDestinations: task.destinations.map((d) => ({

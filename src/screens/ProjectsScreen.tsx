@@ -8,6 +8,7 @@ import {
 } from "../components/FinalCutPanel";
 import { FolderTreeView } from "../components/FolderTreeView";
 import { TopBar } from "../components/TopBar";
+import { ProgressRing } from "../components/charts";
 import { Badge, EmptyState, Kbd, ProgressBar } from "../components/ui";
 import { useListNavigation } from "../hooks/useListNavigation";
 import { formatBytes, formatCompactDate, formatTimestamp, ratio } from "../lib/format";
@@ -239,6 +240,26 @@ export function ProjectsScreen() {
                           label="拷卡进度"
                         />
                       </div>
+
+                      {/* 分类进度只在工况 B 有意义，且拷入素材前的 0% 是噪音不是信息 */}
+                      {selected.scenario === "B" && selected.assetCount > 0 ? (
+                        <>
+                          <hr className="divider" />
+                          <div className="ring-stat" data-testid="project-sorting-ring">
+                            <ProgressRing
+                              value={selected.sortedCount}
+                              total={selected.assetCount}
+                              label="分类进度"
+                            />
+                            <div className="ring-stat__meta">
+                              <span className="stat__label">分类进度</span>
+                              <span className="stat__value mono">
+                                {selected.sortedCount}/{selected.assetCount} 张
+                              </span>
+                            </div>
+                          </div>
+                        </>
+                      ) : null}
                     </div>
                   </div>
 

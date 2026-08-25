@@ -8,6 +8,7 @@ import type {
   DestinationKind,
   StartCopyInput,
 } from "../api/types";
+import { SpeedSparkline, useSpeedSamples } from "../components/charts";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { IconPlus, IconRetry, IconTrash } from "../components/Icon";
 import { RemoteActivityBanner } from "../components/RemoteActivityBanner";
@@ -96,6 +97,14 @@ export function CopyTaskScreen() {
 
   const { activities: remoteActivities, unavailable: remoteUnavailable } =
     useRemoteActivity(project?.id ?? null);
+
+  // 速度曲线的采样：只在拷贝真正推进时积累，挂起/完成后冻结供回看
+  const speedSamples = useSpeedSamples(
+    task?.id ?? null,
+    task?.progressRevision ?? 0,
+    task?.speedBytesPerSec ?? 0,
+    task?.state === "running" || task?.state === "verifying",
+  );
 
   const camera = cameras.find((c) => c.id === cameraId) ?? null;
   const validation = useMemo(
@@ -768,7 +777,14 @@ export function CopyTaskScreen() {
                             <div className="copy-hero__vitals">
                               <div className="copy-hero__vital">
                                 <span className="stat__label">速度</span>
-                                <span className="copy-hero__vital-value">
+                                <span className="copy-hero__vital-value copy-hero__vital-value--spark">
+                                  {/* 迷你曲线嵌在速度数字左侧：读法就是「这个数的历史」，
+                                      与下方总进度条隔着整块仪表区，不会混成一回事 */}
+                                  <SpeedSparkline
+                                    samples={speedSamples}
+                                    label="拷贝速度曲线"
+                                    className="copy-hero__spark"
+                                  />
                                   {formatSpeed(task.speedBytesPerSec)}
                                 </span>
                               </div>
