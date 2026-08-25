@@ -12,10 +12,10 @@
 /// 策略:
 /// - 用户已显式设置的变量绝不覆盖(可用 `WEBKIT_DISABLE_DMABUF_RENDERER=0` 关掉);
 /// - `OCARD_NO_WEBKIT_WORKAROUNDS=1` 一键停用全部自动规避(排障用);
-/// - 所有安装形态:禁用 DMA-BUF 渲染器;
-/// - 仅 AppImage(`APPIMAGE` 环境变量存在):再禁用加速合成,整个渲染走软件路径
-///   ——捆绑 webkit + 宿主 GL 的组合里 GL 栈本身不可信,稳定性优先于渲染性能。
-///   .deb/.rpm 用系统 webkit,GL 栈自洽,保留加速合成。
+/// - 全部规避仅限 AppImage(`APPIMAGE` 环境变量存在):捆绑 webkit + 宿主 GL
+///   的组合里 GL 栈本身不可信,禁 DMA-BUF 渲染 + 禁加速合成 + EGL 平台钉 x11,
+///   稳定性优先于渲染性能;
+/// - .deb/.rpm/dev 用系统 webkit,GL 栈自洽,一个开关都不动。
 #[cfg(target_os = "linux")]
 fn apply_linux_webkit_workarounds() {
     if std::env::var_os("OCARD_NO_WEBKIT_WORKAROUNDS").is_some_and(|v| v == "1") {
@@ -28,12 +28,15 @@ fn apply_linux_webkit_workarounds() {
             eprintln!("OCard: 已设置 {key}={value}({why})");
         }
     };
-    set_default(
-        "WEBKIT_DISABLE_DMABUF_RENDERER",
-        "1",
-        "规避 webkit2gtk 2.42+ DMA-BUF 渲染在部分驱动上的 WebKitWebProcess 崩溃",
-    );
+    // 只动 AppImage:.deb/.rpm/dev 用系统 webkit,GL 栈自洽,不该被动这些开关
+    // (CI E2E 实证:系统 webkit 下全局禁 DMA-BUF 反而让 WebKitWebProcess
+    // 中途崩掉,run 32867992556 sorting spec "invalid session id")。
     if std::env::var_os("APPIMAGE").is_some() {
+        set_default(
+            "WEBKIT_DISABLE_DMABUF_RENDERER",
+            "1",
+            "规避 webkit2gtk 2.42+ DMA-BUF 渲染在部分驱动上的 WebKitWebProcess 崩溃",
+        );
         set_default(
             "WEBKIT_DISABLE_COMPOSITING_MODE",
             "1",

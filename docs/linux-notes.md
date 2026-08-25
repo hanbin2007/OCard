@@ -34,12 +34,15 @@ webkit 2.5x 中 EGL 是硬依赖——靶机实测 `WEBKIT_DISABLE_DMABUF_RENDER
   `GDK_BACKEND=x11` 对齐,Mesa 不再因环境里的 `WAYLAND_DISPLAY` 走 Wayland
   平台 —— `src-tauri/src/main.rs`。
 
-### 其他驱动相关规避(启动时自动应用)
+### 其他驱动相关规避(启动时自动应用,仅 AppImage)
 
-- 所有安装形态:`WEBKIT_DISABLE_DMABUF_RENDERER=1`(webkit 2.42+ DMA-BUF
-  渲染在部分驱动上的已知崩溃)
-- 仅 AppImage:追加 `WEBKIT_DISABLE_COMPOSITING_MODE=1`(捆绑 webkit 混用
-  宿主 GL 不可信,强制软件合成)
+- `WEBKIT_DISABLE_DMABUF_RENDERER=1`(webkit 2.42+ DMA-BUF 渲染在部分
+  驱动上的已知崩溃)
+- `WEBKIT_DISABLE_COMPOSITING_MODE=1`(捆绑 webkit 混用宿主 GL 不可信,
+  强制软件合成)
+
+.deb/.rpm 用系统 webkit,GL 栈自洽,不动任何开关(CI E2E 实证:系统
+webkit 下全局禁 DMA-BUF 反而会让 WebKitWebProcess 中途崩掉)。
 
 已显式设置的同名环境变量不会被覆盖——例如想恢复加速合成可
 `WEBKIT_DISABLE_COMPOSITING_MODE=0 ./OCard.AppImage`;
