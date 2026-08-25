@@ -484,6 +484,8 @@ export interface DeliverySummary {
 export interface RemoteActivity {
   machine: string;
   operator: string;
+  /** 活动类型：拷卡 vs 转码，界面措辞不同 */
+  activity: "copy" | "transcode";
   /** 源卷名 */
   volume: string;
   /** 相机编码 */
@@ -532,7 +534,12 @@ export interface DeliveryJob extends JobBase {
 
 export interface TranscodeJob extends JobBase {
   kind: "transcode";
-  result?: ProxyResult;
+  /**
+   * 代理与归档共用 kind = "transcode"，结果因此是两种之一。
+   * 目前靠 `alreadyArchived` 字段区分；**后端若能加一个显式判别字段
+   * （如 mode: "proxy" | "archive"）会更稳**，字符串结构判别是权宜之计。
+   */
+  result?: ProxyResult | ArchiveResult;
 }
 
 export interface AnalyzeJob extends JobBase {
@@ -541,6 +548,13 @@ export interface AnalyzeJob extends JobBase {
 }
 
 export type JobSnapshot = DeliveryJob | TranscodeJob | AnalyzeJob;
+
+/** 归档结果与代理结果的结构判别 */
+export function isArchiveResult(
+  result: ProxyResult | ArchiveResult | undefined,
+): result is ArchiveResult {
+  return result !== undefined && "alreadyArchived" in result;
+}
 
 /** 判别辅助：拿到具体 kind 才能安全读 result */
 export function isDeliveryJob(job: JobSnapshot): job is DeliveryJob {
@@ -601,6 +615,25 @@ export interface ProxyResult {
   skipped: ProxySkipped[];
   failures: ProxyFailure[];
   usedEncoder: string;
+  outputDir: string;
+}
+
+/** 归档转码档位（PRD §5.6 三档压缩） */
+export type ArchiveTier = "quality" | "balanced" | "compact";
+
+export interface ArchiveResult {
+  converted: number;
+  alreadyArchived: number;
+  failures: ProxyFailure[];
+  usedEncoder: string;
+  outputDir: string;
+}
+
+export interface StartArchiveInput {
+  projectId: string;
+  cameraFolders?: string[];
+  tier: ArchiveTier;
+  /** 归档输出目录，必须是项目**之外**的绝对路径 */
   outputDir: string;
 }
 

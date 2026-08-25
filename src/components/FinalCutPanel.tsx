@@ -8,6 +8,8 @@ import { Badge } from "./ui";
 
 /** 可见期轮询间隔；页面不可见时停 */
 const POLL_MS = 7000;
+/** 交付状态可见期轮询间隔 */
+const STATUS_POLL_MS = 10000;
 
 export function FinalCutPanel({ projectId }: { projectId: string }) {
   const [report, setReport] = useState<FinalCutReport | null>(null);
@@ -118,18 +120,30 @@ export function DeliveryStatusToggle({ projectId }: { projectId: string }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // 可见期轮询：别台工作站可能也在勾这个状态，页面不可见时不打 NAS
   useEffect(() => {
     let cancelled = false;
-    void (async () => {
+
+    const load = async () => {
+      if (typeof document !== "undefined" && document.hidden) return;
       try {
         const value = await api.getDeliveryStatus(projectId);
         if (!cancelled) setStatus(value);
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
       }
-    })();
+    };
+
+    void load();
+    const timer = setInterval(() => void load(), STATUS_POLL_MS);
+    const onVisibility = () => {
+      if (!document.hidden) void load();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       cancelled = true;
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [projectId]);
 

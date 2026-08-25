@@ -5,6 +5,7 @@
 
 import type {
   CameraReg,
+  ArchiveResult,
   CapabilityReport,
   CuratedFlowHint,
   DeliveryStatus,
@@ -604,4 +605,15 @@ export const mockFlowHints: CuratedFlowHint[] = [
 
 export const mockDeliveryStatus: DeliveryStatus = {
   uploaded: false,
+};
+
+/** 归档转码 mock 结果 */
+export const mockArchiveResult: ArchiveResult = {
+  converted: 38,
+  alreadyArchived: 6,
+  failures: [
+    { rel: "2. 原始素材/20260822_A7M4_A_LM/C0044.MP4", message: "写入目标磁盘空间不足" },
+  ],
+  usedEncoder: "hevc_videotoolbox",
+  outputDir: "/Volumes/ARCHIVE-2026/20260822_年中发布会",
 };

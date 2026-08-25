@@ -11,7 +11,7 @@ import type {
   ProxyResult,
   TranscodeJob,
 } from "./types";
-import { mockDelivery } from "./mock";
+import { mockArchiveResult, mockDelivery } from "./mock";
 
 const TICK_MS = 120;
 const TOTAL_FILES = 769;
@@ -257,6 +257,55 @@ export function mockStartAnalysis(projectId: string): AnalyzeJob {
     }
     const done = Math.floor((ANALYZE_TOTAL * step) / STEPS);
     emit(bump(current, { state: "running", done, message: `分析中 ${done}` }));
+  }, TICK_MS);
+  timers.set(id, timer);
+
+  return job;
+}
+
+
+/** 归档作业时间线（kind 仍是 transcode，result 是 ArchiveResult） */
+export function mockStartArchive(projectId: string): TranscodeJob {
+  seq += 1;
+  const id = `job-${seq}`;
+  const job: TranscodeJob = {
+    id,
+    kind: "transcode",
+    projectId,
+    state: "queued",
+    done: 0,
+    total: 44,
+    bytesDone: 0,
+    revision: 1,
+    startedAt: new Date().toISOString(),
+  };
+  jobs.set(id, job);
+
+  let step = 0;
+  const timer = setInterval(() => {
+    const current = jobs.get(id);
+    if (!current || current.kind !== "transcode" || current.state === "cancelled") {
+      clearInterval(timer);
+      timers.delete(id);
+      return;
+    }
+    step += 1;
+    if (step >= STEPS) {
+      clearInterval(timer);
+      timers.delete(id);
+      emit(
+        bump(current, {
+          state: "done",
+          done: 44,
+          message: undefined,
+          finishedAt: new Date().toISOString(),
+          result: mockArchiveResult,
+        }),
+      );
+      return;
+    }
+    const done = Math.floor((44 * step) / STEPS);
+    emit(bump(current, { state: "running", done, message: `归档中 ${done}` }));
   }, TICK_MS);
   timers.set(id, timer);
 

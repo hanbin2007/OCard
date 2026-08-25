@@ -12,7 +12,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import * as api from "../api";
-import { mockProjects, mockWorkstation } from "../api/mock";
+import { mockArchiveResult, mockProjects, mockWorkstation } from "../api/mock";
 import { mockProxyResult, resetMockJobs } from "../api/mockJobs";
 import type { JobSnapshot, TranscodeJob } from "../api/types";
 
@@ -374,6 +374,169 @@ describe("结果呈现（result 联合类型判别）", () => {
     await renderDone({ state: "failed", error: "ffmpeg 退出码 1", result: undefined });
     const box = await screen.findByTestId("transcode-failed");
     expect(box.textContent).toContain("ffmpeg 退出码 1");
+  });
+});
+
+describe("归档转码", () => {
+  async function ready() {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded(projectA.id)} />);
+    await waitFor(() =>
+      expect((screen.getByTestId("archive-start") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    return user;
+  }
+
+  it("三档可选，档位说明随之变化", async () => {
+    const user = await ready();
+    expect(screen.getByTestId("archive-tier-balanced").getAttribute("aria-checked")).toBe(
+      "true",
+    );
+
+    await user.click(screen.getByTestId("archive-tier-quality"));
+    expect(screen.getByTestId("archive-tier-quality").getAttribute("aria-checked")).toBe(
+      "true",
+    );
+    expect(screen.getByTestId("archive-section").textContent).toContain(
+      "输出体积可能接近源文件",
+    );
+  });
+
+  it("输出目录必须是绝对路径，相对路径被拦下且不下发", async () => {
+    const user = await ready();
+    const spy = vi.spyOn(api, "startArchiveTranscode");
+
+    await user.type(screen.getByTestId("archive-dir"), "归档/2026");
+    await user.click(screen.getByTestId("archive-start"));
+
+    expect(screen.getByTestId("archive-error").textContent).toContain("绝对路径");
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("二次确认说明体积与不改动原始素材，取消则不下发", async () => {
+    const user = await ready();
+    const spy = vi.spyOn(api, "startArchiveTranscode");
+
+    await user.type(screen.getByTestId("archive-dir"), "/Volumes/ARCHIVE-2026");
+    await user.click(screen.getByTestId("archive-start"));
+
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog.textContent).toContain("接近源文件体积");
+    expect(dialog.textContent).toContain("原始素材不受影响");
+    expect(spy).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("确认后按所选档位与目录下发", async () => {
+    const user = await ready();
+    const spy = vi
+      .spyOn(api, "startArchiveTranscode")
+      .mockResolvedValue(transcodeJob({ state: "running", result: undefined }));
+
+    await user.click(screen.getByTestId("archive-tier-compact"));
+    await user.type(screen.getByTestId("archive-dir"), "/Volumes/ARCHIVE-2026");
+    await user.click(screen.getByTestId("archive-start"));
+    await user.click(
+      within(screen.getByRole("alertdialog")).getByRole("button", {
+        name: "开始归档",
+      }),
+    );
+
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    expect(spy.mock.calls[0][0]).toMatchObject({
+      projectId: projectA.id,
+      tier: "compact",
+      outputDir: "/Volumes/ARCHIVE-2026",
+    });
+    spy.mockRestore();
+  });
+
+  it("归档结果按 ArchiveResult 渲染，不会错当代理结果", async () => {
+    const user = await ready();
+    const spy = vi
+      .spyOn(api, "startArchiveTranscode")
+      .mockResolvedValue(
+        transcodeJob({ state: "done", result: mockArchiveResult, revision: 30 }),
+      );
+
+    await user.type(screen.getByTestId("archive-dir"), "/Volumes/ARCHIVE-2026");
+    await user.click(screen.getByTestId("archive-start"));
+    await user.click(
+      within(screen.getByRole("alertdialog")).getByRole("button", {
+        name: "开始归档",
+      }),
+    );
+
+    const box = await screen.findByTestId("archive-result");
+    expect(within(box).getByTestId("archive-converted").textContent).toBe(
+      String(mockArchiveResult.converted),
+    );
+    expect(within(box).getByTestId("archive-already").textContent).toBe(
+      String(mockArchiveResult.alreadyArchived),
+    );
+    expect(within(box).getByTestId("archive-output").textContent).toBe(
+      mockArchiveResult.outputDir,
+    );
+    // 归档结果不该走代理结果那套字段
+    expect(screen.queryByTestId("transcode-result")).toBeNull();
+    spy.mockRestore();
+  });
+});
+
+describe("作业对账", () => {
+  it("丢了终态事件时，窗口 focus 会对账补回来", async () => {
+    const running = transcodeJob({ state: "running", revision: 2, result: undefined });
+    const finished = transcodeJob({ state: "done", revision: 9 });
+
+    const startSpy = vi
+      .spyOn(api, "startProxyTranscode")
+      .mockResolvedValue(running);
+    // 订阅期间终态事件丢失，listJobs 才拿得到真状态
+    const listSpy = vi
+      .spyOn(api, "listJobs")
+      .mockResolvedValueOnce([]) // 挂载时的对账：还没有作业
+      .mockResolvedValue([finished]);
+
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded(projectA.id)} />);
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId("transcode-start") as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    await user.click(screen.getByTestId("transcode-start"));
+    await screen.findByTestId("transcode-progress");
+
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("transcode-progress")).toBeNull(),
+    );
+    expect(await screen.findByTestId("transcode-result")).toBeDefined();
+    startSpy.mockRestore();
+    listSpy.mockRestore();
+  }, 15000);
+
+  it("手动「刷新作业状态」也能对账", async () => {
+    const user = userEvent.setup();
+    const listSpy = vi.spyOn(api, "listJobs").mockResolvedValue([]);
+    render(<App preloaded={preloaded(projectA.id)} />);
+    await screen.findByTestId("jobs-refresh");
+
+    const before = listSpy.mock.calls.length;
+    await user.click(screen.getByTestId("jobs-refresh"));
+    await waitFor(() =>
+      expect(listSpy.mock.calls.length).toBeGreaterThan(before),
+    );
+    listSpy.mockRestore();
   });
 });
 

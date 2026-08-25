@@ -143,6 +143,8 @@ use tauri::{Emitter, Manager};
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyResultDto {
+    /// 显式判别字段(代理与归档共用 kind "transcode",前端按此分流,不做结构嗅探)。
+    pub mode: &'static str,
     pub converted: usize,
     pub already_transcoded: usize,
     /// 未选中(非高负载)文件与逐条理由——跳过必须可见(计划 B6)。
@@ -347,6 +349,7 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
             work.sort_by(|a, b| a.2.cmp(&b.2));
 
             let mut result = ProxyResultDto {
+                mode: "proxy",
                 used_encoder: encoder.clone(),
                 output_dir: root.join(&out_root_rel).display().to_string(),
                 failures: dir_errors,
@@ -732,6 +735,8 @@ pub struct ArchiveInput {
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ArchiveResultDto {
+    /// 显式判别字段(同上)。
+    pub mode: &'static str,
     pub converted: usize,
     pub already_archived: usize,
     pub failures: Vec<FailureDto>,
@@ -830,6 +835,7 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                     .collect(),
             };
             let mut result = ArchiveResultDto {
+                mode: "archive",
                 output_dir: out_root.display().to_string(),
                 ..Default::default()
             };

@@ -2,15 +2,29 @@
 
 import { useCallback, useEffect, useState } from "react";
 import * as api from "../api";
-import type { FfmpegStatus, TranscodeJob } from "../api/types";
+import type { ArchiveTier, FfmpegStatus, TranscodeJob } from "../api/types";
+import { isArchiveResult } from "../api/types";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { TopBar } from "../components/TopBar";
-import { Badge, EmptyState, ProgressBar } from "../components/ui";
+import { Badge, EmptyState, Field, ProgressBar } from "../components/ui";
+import { isAbsoluteNasRoot } from "../lib/validation";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import { selectLatestTranscodeJob, useStore } from "../state/store";
 
+const TIER_LABEL: Record<ArchiveTier, string> = {
+  quality: "高质量",
+  balanced: "平衡",
+  compact: "高压缩",
+};
+
+const TIER_HINT: Record<ArchiveTier, string> = {
+  quality: "画质优先，输出体积可能接近源文件",
+  balanced: "画质与体积折中，日常归档推荐",
+  compact: "体积优先，画质有可见损失",
+};
+
 export function TranscodeScreen() {
-  const { state, dispatch } = useStore();
+  const { state, dispatch, reconcileJobs } = useStore();
   const project = state.projects.find((p) => p.id === state.selectedProjectId) ?? null;
   const job = project ? selectLatestTranscodeJob(state, project.id) : null;
   const working = job !== null && (job.state === "queued" || job.state === "running");
@@ -21,6 +35,9 @@ export function TranscodeScreen() {
   const [startError, setStartError] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
+  const [tier, setTier] = useState<ArchiveTier>("balanced");
+  const [archiveDir, setArchiveDir] = useState("");
+  const [archiveError, setArchiveError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -49,6 +66,43 @@ export function TranscodeScreen() {
       }),
     [dispatch],
   );
+
+  async function startArchive() {
+    if (!project || starting) return;
+    setStarting(true);
+    setArchiveError(null);
+    try {
+      const snapshot = await api.startArchiveTranscode({
+        projectId: project.id,
+        tier,
+        outputDir: archiveDir.trim(),
+      });
+      dispatch({ type: "jobProgress", job: snapshot });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setArchiveError(message);
+      notify("error", "archive-start-failed", `归档转码未能启动：${message}`);
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  function requestArchive() {
+    if (!project) return;
+    if (!isAbsoluteNasRoot(archiveDir)) {
+      setArchiveError("请填写项目之外的绝对路径，如 /Volumes/ARCHIVE-2026");
+      return;
+    }
+    setConfirm({
+      title: `按「${TIER_LABEL[tier]}」归档转码？`,
+      message:
+        `归档会把原始素材另存一份到 ${archiveDir.trim()}，原始素材不受影响。` +
+        "高质量档的输出可能接近源文件体积，请先确认目标磁盘空间充足。" +
+        "已归档过的文件会跳过。",
+      confirmLabel: "开始归档",
+      onConfirm: () => void startArchive(),
+    });
+  }
 
   function requestRetranscode() {
     if (!project) return;
@@ -132,7 +186,21 @@ export function TranscodeScreen() {
 
   return (
     <>
-      <TopBar title="代理转码" subtitle={project.folderName} subtitleMono />
+      <TopBar
+        title="代理转码"
+        subtitle={project.folderName}
+        subtitleMono
+        actions={
+          <button
+            type="button"
+            className="btn btn--sm"
+            data-testid="jobs-refresh"
+            onClick={() => void reconcileJobs()}
+          >
+            刷新作业状态
+          </button>
+        }
+      />
 
       <div className="content">
         <div className="content__inner">
@@ -210,6 +278,77 @@ export function TranscodeScreen() {
                       data-testid="transcode-start-error"
                     >
                       {startError}
+                    </span>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+
+            {/* 归档转码：输出到项目之外的独立副本 */}
+            <div className="card" data-testid="archive-section">
+              <div className="card__head">
+                <span className="card__title">归档转码</span>
+                <span className="card__hint">HEVC 三档压缩，输出为独立副本</span>
+              </div>
+              <div className="card__body">
+                <div className="stack stack--lg">
+                  <div className="field">
+                    <span className="field__label">压缩档位</span>
+                    <div className="segmented" role="radiogroup" aria-label="压缩档位">
+                      {(Object.keys(TIER_LABEL) as ArchiveTier[]).map((value) => (
+                        <button
+                          key={value}
+                          type="button"
+                          className="segmented__item"
+                          role="radio"
+                          aria-checked={tier === value}
+                          data-testid={`archive-tier-${value}`}
+                          disabled={working || ffmpegMissing}
+                          onClick={() => setTier(value)}
+                        >
+                          {TIER_LABEL[value]}
+                        </button>
+                      ))}
+                    </div>
+                    <span className="field__hint">{TIER_HINT[tier]}</span>
+                  </div>
+
+                  <Field
+                    label="归档输出目录"
+                    htmlFor="archive-dir"
+                    hint="绝对路径，且须在项目之外——归档是独立副本，不放回项目里"
+                  >
+                    <input
+                      id="archive-dir"
+                      data-testid="archive-dir"
+                      className="input input--mono"
+                      type="text"
+                      value={archiveDir}
+                      placeholder="/Volumes/ARCHIVE-2026"
+                      disabled={working || ffmpegMissing}
+                      onChange={(e) => setArchiveDir(e.currentTarget.value)}
+                    />
+                  </Field>
+
+                  <div className="row-inline">
+                    <button
+                      type="button"
+                      className="btn"
+                      data-testid="archive-start"
+                      disabled={working || starting || ffmpegMissing}
+                      onClick={requestArchive}
+                    >
+                      开始归档
+                    </button>
+                  </div>
+
+                  {archiveError ? (
+                    <span
+                      className="field__error"
+                      role="alert"
+                      data-testid="archive-error"
+                    >
+                      {archiveError}
                     </span>
                   ) : null}
                 </div>
@@ -296,6 +435,71 @@ function TranscodeResult({ job }: { job: TranscodeJob }) {
 
   const result = job.result;
   if (!result) return null;
+
+  // 归档与代理共用 kind，结果结构不同，分开渲染
+  if (isArchiveResult(result)) {
+    return (
+      <div className="card" data-testid="archive-result">
+        <div className="card__head">
+          <span className="card__title">归档转码完成</span>
+          <span className="card__hint" data-testid="archive-encoder">
+            编码器 {result.usedEncoder}
+          </span>
+        </div>
+        <div className="card__body">
+          <div className="stack stack--lg">
+            <div className="task-stats">
+              <div>
+                <div className="stat__label">新归档</div>
+                <div className="stat__value" data-testid="archive-converted">
+                  {result.converted}
+                </div>
+              </div>
+              <div>
+                <div className="stat__label">此前已归档</div>
+                <div className="stat__value" data-testid="archive-already">
+                  {result.alreadyArchived}
+                </div>
+              </div>
+              <div>
+                <div className="stat__label">失败</div>
+                <div className="stat__value">{result.failures.length}</div>
+              </div>
+            </div>
+
+            <div className="stack stack--sm">
+              <span className="field__label">归档输出目录</span>
+              <div className="preview__path" data-testid="archive-output">
+                {result.outputDir}
+              </div>
+            </div>
+
+            {result.failures.length > 0 ? (
+              <div
+                className="notice notice--danger"
+                role="alert"
+                data-testid="archive-failures"
+              >
+                <strong>{result.failures.length} 个文件归档失败</strong>
+                <div className="delivery__failures">
+                  {result.failures.map((item) => (
+                    <div className="delivery__failure" key={item.rel}>
+                      <span className="mono text-2xs truncate" title={item.rel}>
+                        {item.rel}
+                      </span>
+                      <span className="text-2xs">{item.message}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
+            <Badge tone="neutral">归档为独立副本，原始素材未改动</Badge>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="card" data-testid="transcode-result">

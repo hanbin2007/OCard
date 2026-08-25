@@ -43,6 +43,7 @@ function activity(over: Partial<RemoteActivity> = {}): RemoteActivity {
   return {
     machine: "WS-9A21",
     operator: "李默",
+    activity: "copy",
     volume: "SONY_A7M4",
     camera: "SonyA7M4_A_LM",
     targetFolder: "0824上午_SonyA7M4_A_LM",
@@ -63,6 +64,37 @@ describe("跨机活动横幅", () => {
     expect(item.textContent).toContain("操作人 李默");
     expect(item.textContent).toContain("SONY_A7M4");
     expect(item.textContent).toContain("0824上午_SonyA7M4_A_LM");
+    spy.mockRestore();
+  });
+
+  it("转码活动用「转码中」措辞并显示相机夹名", async () => {
+    const spy = vi.spyOn(api, "listRemoteActivity").mockResolvedValue([
+      activity({
+        activity: "transcode",
+        camera: "20260822_A7M4_A_LM",
+        targetFolder: "4. 转码素材/20260822_A7M4_A_LM",
+      }),
+    ]);
+    render(<App preloaded={preloaded} />);
+
+    const item = await screen.findByTestId("remote-activity-item");
+    expect(item.textContent).toContain("⟳");
+    expect(item.textContent).toContain("正在转码");
+    expect(item.textContent).toContain("20260822_A7M4_A_LM");
+    // 转码条目不该说成「正在拷」
+    expect(item.textContent).not.toContain("正在拷");
+    spy.mockRestore();
+  });
+
+  it("拷卡活动仍用「正在拷」措辞", async () => {
+    const spy = vi
+      .spyOn(api, "listRemoteActivity")
+      .mockResolvedValue([activity({ activity: "copy" })]);
+    render(<App preloaded={preloaded} />);
+
+    const item = await screen.findByTestId("remote-activity-item");
+    expect(item.textContent).toContain("正在拷");
+    expect(item.textContent).not.toContain("正在转码");
     spy.mockRestore();
   });
 

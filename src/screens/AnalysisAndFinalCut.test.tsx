@@ -441,6 +441,38 @@ describe("交付状态勾选", () => {
     spy.mockRestore();
   });
 
+  it("可见期 10s 轮询，隐藏时不打 NAS", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const spy = vi.spyOn(api, "getDeliveryStatus");
+    render(<App preloaded={projects} />);
+    await screen.findByTestId("delivery-status");
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+
+    const before = spy.mock.calls.length;
+    await act(async () => {
+      vi.advanceTimersByTime(11000);
+    });
+    await waitFor(() => expect(spy.mock.calls.length).toBeGreaterThan(before));
+
+    // 切后台后跨过周期：不再打
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      get: () => true,
+    });
+    const hiddenAt = spy.mock.calls.length;
+    await act(async () => {
+      vi.advanceTimersByTime(30000);
+    });
+    expect(spy.mock.calls.length).toBe(hiddenAt);
+
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      get: () => false,
+    });
+    spy.mockRestore();
+    vi.useRealTimers();
+  }, 15000);
+
   it("写回失败要说出来", async () => {
     const user = userEvent.setup();
     const spy = vi

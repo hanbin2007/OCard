@@ -539,6 +539,8 @@ interface StoreValue {
   reload: () => void;
   /** 与后端对账某个任务的最新快照 */
   refreshTask: (taskId: string) => Promise<void>;
+  /** 与后端对账后台作业列表 */
+  reconcileJobs: () => Promise<void>;
 }
 
 const StoreContext = createContext<StoreValue | null>(null);
@@ -740,6 +742,32 @@ export function StoreProvider({
     };
   }, []);
 
+  /** 与后端对账一次作业列表（focus 恢复、手动刷新都走它） */
+  const reconcileJobs = useCallback(async () => {
+    try {
+      dispatch({ type: "jobsLoaded", jobs: await api.listJobs() });
+    } catch (err) {
+      dispatch({
+        type: "noticeReceived",
+        notice: {
+          level: "warning",
+          code: "jobs-reconcile-failed",
+          message: `读取后台作业列表失败：${
+            err instanceof Error ? err.message : String(err)
+          }。进行中的作业状态可能不准确。`,
+          occurredAt: new Date().toISOString(),
+        },
+      });
+    }
+  }, []);
+
+  // 窗口重新获得焦点时对账：期间可能错过了终态事件
+  useEffect(() => {
+    const onFocus = () => void reconcileJobs();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [reconcileJobs]);
+
   /** 拉一次任务快照与后端对账（start/resume/retry 之后调用） */
   const refreshTask = useCallback(async (taskId: string) => {
     try {
@@ -850,8 +878,8 @@ export function StoreProvider({
   }, [orphanIdsKey]);
 
   const value = useMemo(
-    () => ({ state, dispatch, reload, refreshTask }),
-    [state, reload, refreshTask],
+    () => ({ state, dispatch, reload, refreshTask, reconcileJobs }),
+    [state, reload, refreshTask, reconcileJobs],
   );
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;
 }
