@@ -177,16 +177,23 @@ export function TranscodeScreen() {
             <EmptyState>
               <div className="stack" data-testid="transcode-no-project">
                 <p className="text-sm" role="status">
-                  还没有选择项目。代理转码作用在「当前项目」上——先去项目列表选中一个工况 A（视频剪辑）项目。
+                  {state.projects.length === 0
+                    ? "还没有任何项目。先新建一个工况 A（视频剪辑）项目,拷入素材后再来转代理。"
+                    : "还没有选择项目。代理转码作用在「当前项目」上——先去项目列表选中一个工况 A（视频剪辑）项目。"}
                 </p>
                 <div>
                   <button
                     type="button"
                     className="btn btn--primary"
                     data-testid="transcode-goto-projects"
-                    onClick={() => dispatch({ type: "navigate", route: "projects" })}
+                    onClick={() =>
+                      dispatch({
+                        type: "navigate",
+                        route: state.projects.length === 0 ? "new-project" : "projects",
+                      })
+                    }
                   >
-                    去选择项目
+                    {state.projects.length === 0 ? "去新建项目" : "去选择项目"}
                   </button>
                 </div>
               </div>

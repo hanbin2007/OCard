@@ -3,7 +3,7 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { IconSettings } from "./Icon";
 import { NoticeBell } from "./NotificationCenter";
-import { useStore } from "../state/store";
+import { selectDeliveryWorking, useStore } from "../state/store";
 
 /**
  * 当前操作项目的常驻指示（UX 波）：拷卡/分类/转码全都作用在「当前项目」上，
@@ -49,12 +49,21 @@ function CurrentProjectChip() {
     );
   }
 
+  // 交付打包期间侧栏锁导航,黄标不能成为绕过锁的旁门(codex P1):
+  // 离开会让结果面板(含未交付明细)静默蒸发
+  const deliveryWorking = selectDeliveryWorking(state);
+
   return (
     <button
       type="button"
       className="topbar__project"
       data-testid="current-project-chip"
-      title={`当前操作项目：${project.name}（点击回项目列表）`}
+      disabled={deliveryWorking}
+      title={
+        deliveryWorking
+          ? "交付打包进行中，完成后才能切换页面"
+          : `当前操作项目：${project.name}（点击回项目列表）`
+      }
       onClick={() => dispatch({ type: "navigate", route: "projects" })}
     >
       <span className="topbar__project-label">当前</span>
@@ -87,10 +96,14 @@ export function TopBar({
 
   return (
     <div className="topbar" data-tauri-drag-region>
-      <h1 className="topbar__title">{title}</h1>
-      {subtitle ? (
-        <span className={`topbar__sub${subtitleMono ? " mono" : ""}`}>{subtitle}</span>
-      ) : null}
+      {/* 三列网格:左标题簇 | 中当前项目 | 右动作。三块各占独立轨道,
+          结构上杜绝重叠——绝对定位居中在长标题/长路径下必然压到别人 */}
+      <div className="topbar__lead">
+        <h1 className="topbar__title">{title}</h1>
+        {subtitle ? (
+          <span className={`topbar__sub${subtitleMono ? " mono" : ""}`}>{subtitle}</span>
+        ) : null}
+      </div>
       <CurrentProjectChip />
       <div className="topbar__actions">
         {actions}

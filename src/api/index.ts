@@ -93,8 +93,10 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 const IS_TAURI =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-/** 原生文件夹选择器是否可用（浏览器预览/vitest 里没有） */
-export const canPickFolder = IS_TAURI;
+/** 原生文件夹选择器是否可用（浏览器预览/vitest 里没有）。函数形式便于测试替换。 */
+export function canPickFolder(): boolean {
+  return IS_TAURI;
+}
 
 /**
  * 弹原生「选择文件夹」对话框。用户取消返回 null。

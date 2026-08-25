@@ -557,16 +557,24 @@ describe("源卷过滤与刷新(UX 波)", () => {
       removable: true,
       isSystem: false,
     };
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+    // 先等进屏自动刷新落定,再装「插了新卡」的桩——
+    // 否则自动刷新就能把断言喂饱,点按钮那条路径根本没被测到
+    await screen.findAllByText("SONY_A7M4");
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId("volumes-refresh") as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    expect(screen.queryByText("FX3_CARD")).toBeNull();
     const spy = vi
       .spyOn(api, "listVolumes")
       .mockResolvedValue([...mockVolumes, newCard]);
 
-    const user = userEvent.setup();
-    render(<App preloaded={preloaded} />);
-
     await user.click(screen.getByTestId("volumes-refresh"));
     expect(await screen.findByText("FX3_CARD")).toBeDefined();
-    expect(spy).toHaveBeenCalled();
+    expect(spy).toHaveBeenCalledTimes(1);
     spy.mockRestore();
   });
 

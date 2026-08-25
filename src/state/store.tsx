@@ -344,16 +344,28 @@ export function reducer(state: AppState, action: AppAction): AppState {
     case "loadStarted":
       return { ...state, loading: true, error: null };
 
-    case "bootstrapped":
+    case "bootstrapped": {
+      // 既有选中项必须仍然存在才保留:换 NAS 根后 reload,旧根的项目/任务 id
+      // 在新数据里找不到,保留会让顶栏与各屏显示「未选择」却说不出为什么
+      const keepProject = action.payload.projects.some(
+        (p) => p.id === state.selectedProjectId,
+      );
+      const keepTask = action.payload.tasks.some(
+        (t) => t.id === state.selectedTaskId,
+      );
       return {
         ...state,
         ...action.payload,
         loading: false,
         error: null,
-        selectedProjectId:
-          state.selectedProjectId ?? action.payload.projects[0]?.id ?? null,
-        selectedTaskId: state.selectedTaskId ?? action.payload.tasks[0]?.id ?? null,
+        selectedProjectId: keepProject
+          ? state.selectedProjectId
+          : (action.payload.projects[0]?.id ?? null),
+        selectedTaskId: keepTask
+          ? state.selectedTaskId
+          : (action.payload.tasks[0]?.id ?? null),
       };
+    }
 
     case "loadFailed":
       return { ...state, loading: false, error: action.error };
@@ -591,7 +603,14 @@ export function StoreProvider({
     const onUnhandled = (e: PromiseRejectionEvent) => {
       e.preventDefault();
       const reason = e.reason;
-      const message = reason instanceof Error ? reason.message : String(reason);
+      // preventDefault 会吞掉默认的控制台输出:栈信息只有这里能留下,排障靠它
+      console.error("[unhandled-error]", reason);
+      const message =
+        reason instanceof Error
+          ? reason.message
+          : reason === undefined || reason === null
+            ? "未知原因(无错误对象)"
+            : String(reason);
       dispatch({
         type: "noticeReceived",
         notice: {
@@ -680,15 +699,33 @@ export function StoreProvider({
 
     void (async () => {
       try {
-        const [workstation, projects, cameras, cards, volumes, tasks] =
-          await Promise.all([
-            api.getWorkstationInfo(),
-            api.listProjects(),
-            api.listCameras(),
-            api.listStorageCards(),
-            api.listVolumes(),
-            api.listCopyTasks(),
-          ]);
+        // 先拿工作站配置:真首跑(NAS 根未配置)时项目/设备/任务的后端命令
+        // 会整体拒绝,并发拉会让新用户直接撞上错误页而不是引导向导(codex P1)
+        const workstation = await api.getWorkstationInfo();
+        if (cancelled) return;
+        if (!workstation.nasRoot?.trim()) {
+          const volumes = await api.listVolumes().catch(() => []);
+          if (cancelled) return;
+          dispatch({
+            type: "bootstrapped",
+            payload: {
+              workstation,
+              projects: [],
+              cameras: [],
+              cards: [],
+              volumes,
+              tasks: [],
+            },
+          });
+          return;
+        }
+        const [projects, cameras, cards, volumes, tasks] = await Promise.all([
+          api.listProjects(),
+          api.listCameras(),
+          api.listStorageCards(),
+          api.listVolumes(),
+          api.listCopyTasks(),
+        ]);
         if (cancelled) return;
         dispatch({
           type: "bootstrapped",

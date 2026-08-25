@@ -157,7 +157,7 @@ describe("操作员确认门", () => {
     expect(screen.getByTestId("session-gate")).toBeDefined();
   });
 
-  it("填的还是同一个人:直接恢复,不写配置", async () => {
+  it("手打同名不能绕过二次确认:仍弹确认框,确认后恢复且不写配置", async () => {
     const spy = vi.spyOn(api, "setWorkstationInfo");
     endSession();
 
@@ -165,10 +165,55 @@ describe("操作员确认门", () => {
       target: { value: "张三" },
     });
     fireEvent.click(screen.getByTestId("session-gate-start"));
+    // 不直接放行:同名也要过同一道确认
+    expect(screen.getByText("仍由「张三」操作？")).toBeDefined();
+    expect(screen.getByTestId("session-gate")).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认是 张三" }));
     await act(async () => {
       await Promise.resolve();
     });
     expect(spy).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("session-gate")).toBeNull();
+  });
+
+  it("门弹出时背后的侧栏与主区被 inert 屏蔽,恢复后解除", () => {
+    endSession();
+    const sidebar = document.querySelector(".shell > .sidebar");
+    const main = document.querySelector(".shell > .main");
+    expect(sidebar?.hasAttribute("inert")).toBe(true);
+    expect(main?.hasAttribute("inert")).toBe(true);
+
+    fireEvent.click(screen.getByTestId("session-gate-last"));
+    fireEvent.click(screen.getByRole("button", { name: "确认是 张三" }));
+    expect(sidebar?.hasAttribute("inert")).toBe(false);
+    expect(main?.hasAttribute("inert")).toBe(false);
+  });
+});
+
+describe("计时边界", () => {
+  it("询问期间的鼠标活动不能续命:5 分钟无应答照样终止", () => {
+    render(<App preloaded={preloaded} />);
+    advance(IDLE_PROMPT_MS + IDLE_TICK_MS);
+    expect(screen.getByTestId("session-idle-dialog")).toBeDefined();
+
+    // 疯狂动鼠标但不点按钮——只有显式点「继续会话」才算应答
+    for (let i = 0; i < 10; i++) {
+      act(() => {
+        fireEvent.pointerMove(window);
+      });
+      advance((PROMPT_GRACE_MS / 10) | 0);
+    }
+    advance(IDLE_TICK_MS * 2);
+    expect(screen.getByTestId("session-gate")).toBeDefined();
+  });
+
+  it("询问弹出 4 分钟时还没终止", () => {
+    render(<App preloaded={preloaded} />);
+    advance(IDLE_PROMPT_MS + IDLE_TICK_MS);
+
+    advance(PROMPT_GRACE_MS - 60_000);
+    expect(screen.getByTestId("session-idle-dialog")).toBeDefined();
     expect(screen.queryByTestId("session-gate")).toBeNull();
   });
 });

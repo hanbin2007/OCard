@@ -899,6 +899,9 @@
 .dialog {
   width: 100%;
   max-width: 420px;
+  /* body 已全局禁滚:矮窗口下超高的对话框必须自己能滚,否则内容彻底不可达 */
+  max-height: calc(100dvh - var(--space-8));
+  overflow-y: auto;
   padding: var(--space-5);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
@@ -1346,39 +1349,45 @@
 }
 
 /* 即时呈现层：贴在内容区顶部，不遮挡操作 */
-/* 浮在内容之上、紧贴顶栏之下(.main 为锚)。此前用 sticky 挂在非滚动容器里,
-   等于普通流式布局——toast 一来把顶栏往下顶(UX 波修正) */
+/* 右下角浮动卡片(.main 为锚)。此前通栏覆盖会把分类工作台的工具条整条
+   盖住并拦截点击(opus 评审 P1 + E2E 实证「element click intercepted」);
+   右下是全 App 主动作密度最低的角落,且容器 pointer-events:none,
+   只有卡片本身可点,空白区域绝不挡内容 */
 .toasts {
   position: absolute;
-  top: var(--topbar-height);
-  left: 0;
-  right: 0;
+  bottom: var(--space-3);
+  right: var(--space-3);
+  width: min(380px, calc(100% - var(--space-6)));
   z-index: 30;
   display: grid;
-  gap: 1px;
+  gap: var(--space-2);
+  pointer-events: none;
 }
 
-/* 从 chrome 一侧压下来落到内容顶部：来向与它在版面里的位置一致 */
+/* 从下缘滑入,落位为独立卡片:实底面 + 语气色左沿 */
 .toast {
+  pointer-events: auto;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   gap: var(--space-3);
   align-items: start;
-  padding: var(--space-3) var(--space-6);
-  border-bottom: 1px solid var(--border);
-  background: var(--warn-soft);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--radius-md);
+  background: var(--panel-raised);
   animation: toast-in var(--dur-spring-fast) var(--spring);
 }
 
 @keyframes toast-in {
   from {
     opacity: 0;
-    transform: translate3d(0, -6px, 0);
+    transform: translate3d(0, 6px, 0);
   }
 }
 
 .toast--error {
-  background: var(--danger-soft);
+  border-left-color: var(--danger);
 }
 
 .toast__body {
@@ -1603,6 +1612,12 @@
 /* 会话门必须压过一切浮层(普通 overlay z=50):没确认操作员之前什么都不能点 */
 .overlay--gate {
   z-index: 80;
+}
+
+/* 门之上的二次确认:必须高于 .overlay--gate,否则确认框被门盖住点不到
+   (opus 评审 P0;层叠关系由 stacking.test 静态钉住) */
+.overlay--elevated {
+  z-index: 90;
 }
 
 .dialog--gate {

@@ -19,6 +19,11 @@ export interface ConfirmRequest {
    * 非破坏性的二次确认（如换人确认）用 "primary"，别拿红色吓唬人。
    */
   tone?: "danger" | "primary";
+  /**
+   * 需要压过会话门(z-index 80)等高层浮层时置 true——否则确认框会被
+   * 盖在门后面点不到(opus 评审 P0)。普通调用不用传。
+   */
+  elevated?: boolean;
 }
 
 export function ConfirmDialog({
@@ -51,7 +56,10 @@ export function ConfirmDialog({
   if (!request) return null;
 
   return (
-    <div className="overlay" onClick={close}>
+    <div
+      className={`overlay${request.elevated ? " overlay--elevated" : ""}`}
+      onClick={close}
+    >
       <div
         className="dialog"
         role="alertdialog"

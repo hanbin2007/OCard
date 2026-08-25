@@ -470,6 +470,40 @@ describe("首跑引导", () => {
     expect(screen.getAllByTestId("project-row").length).toBeGreaterThan(0);
   });
 
+  it("真实首跑:引导可达(不撞错误页),完成后自动重拉出项目列表", async () => {
+    // NAS 未配置时后端会拒绝 list_projects:bootstrap 必须先看工作站配置、
+    // 跳过 NAS 依赖的拉取,否则新用户直接进错误页,向导根本到不了(codex P1)
+    const ws = vi
+      .spyOn(api, "getWorkstationInfo")
+      .mockResolvedValueOnce({ machineId: "WS-NEW", operator: "", nasRoot: "" })
+      .mockResolvedValue({
+        machineId: "WS-NEW",
+        operator: "张三",
+        nasRoot: "/Volumes/DIT-NAS/Projects",
+      });
+    vi.spyOn(api, "setWorkstationInfo").mockResolvedValue({
+      machineId: "WS-NEW",
+      operator: "张三",
+      nasRoot: "/Volumes/DIT-NAS/Projects",
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByTestId("first-run-guide")).toBeDefined();
+    await user.type(screen.getByTestId("onboarding-operator"), "张三");
+    await user.click(screen.getByTestId("onboarding-next"));
+    await user.type(
+      screen.getByTestId("onboarding-nas-root"),
+      "/Volumes/DIT-NAS/Projects",
+    );
+    await user.click(screen.getByTestId("onboarding-finish"));
+
+    // 完成设置触发整体重拉:第二台工作站指向已有 NAS 时必须立刻看到项目
+    const rows = await screen.findAllByTestId("project-row", {}, { timeout: 3000 });
+    expect(rows.length).toBeGreaterThan(0);
+    expect(ws).toHaveBeenCalledTimes(2);
+  });
+
   it("引导第 1 步操作人为空时报错并停在原步骤", async () => {
     const user = userEvent.setup();
     render(<App preloaded={firstRun} />);

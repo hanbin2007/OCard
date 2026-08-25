@@ -60,6 +60,14 @@ export function SessionGuard() {
     };
   }, [armed]);
 
+  // 守卫上膛的那一刻重置计时:在引导页耗掉的时间不算闲置,
+  // 否则配完设置十秒后就弹「还在吗」(codex 评审 P2)
+  useEffect(() => {
+    if (!armed) return;
+    lastActivityRef.current = Date.now();
+    setPhase("active");
+  }, [armed]);
+
   // 闲置判定
   useEffect(() => {
     if (!armed || phase === "ended") return;
@@ -82,6 +90,22 @@ export function SessionGuard() {
     setGateError(null);
   }, []);
 
+  /**
+   * 焦点陷阱:询问/门弹出期间把侧栏与主区设为 inert——否则 Tab 一下就能
+   * 绕过门去操作背后的应用,会话终止后的动作仍会记到上一位操作人头上
+   * (opus 评审 P1)。inert 同时挡焦点与点击,是整块屏蔽的正解。
+   */
+  useEffect(() => {
+    if (phase === "active") return;
+    const blocked = document.querySelectorAll<HTMLElement>(
+      ".shell > .sidebar, .shell > .main",
+    );
+    for (const el of blocked) el.setAttribute("inert", "");
+    return () => {
+      for (const el of blocked) el.removeAttribute("inert");
+    };
+  }, [phase]);
+
   async function startAs(operator: string) {
     const name = operator.trim();
     if (!name) {
@@ -92,10 +116,22 @@ export function SessionGuard() {
       setGateError(`操作人不超过 ${OPERATOR_NAME_MAX} 个字符`);
       return;
     }
-    if (!workstation) return;
+    if (!workstation) {
+      // armed 保证到不了这里;真到了也不许无声吞掉(零静默铁律)
+      setGateError("工作站配置丢失,请重启应用");
+      return;
+    }
     if (name === workstation.operator.trim()) {
-      // 同一个人：不必写配置
-      resume();
+      // 同一个人:不必写配置,但沿用上一人一律要二次确认——
+      // 手打同名不能成为绕过确认的后门(codex 评审 P1)
+      setConfirm({
+        title: `仍由「${name}」操作？`,
+        message: "如果换人了请选「取消」并填写新的操作人——审计日志不能记错人。",
+        confirmLabel: `确认是 ${name}`,
+        tone: "primary",
+        elevated: true,
+        onConfirm: resume,
+      });
       return;
     }
     if (starting) return;
@@ -118,7 +154,8 @@ export function SessionGuard() {
 
   if (phase === "prompt") {
     return (
-      <div className="overlay" data-testid="session-idle-dialog">
+      // 与门同层(z=80):闲置询问不能被全屏预览等 z=60 浮层盖住(codex P1)
+      <div className="overlay overlay--gate" data-testid="session-idle-dialog">
         <div
           className="dialog"
           role="alertdialog"
@@ -179,6 +216,7 @@ export function SessionGuard() {
                 type="button"
                 data-testid="session-gate-last"
                 className="btn session-gate__last"
+                autoFocus
                 onClick={() =>
                   setConfirm({
                     title: `仍由「${last}」操作？`,
@@ -186,6 +224,8 @@ export function SessionGuard() {
                       "如果换人了请选「取消」并填写新的操作人——审计日志不能记错人。",
                     confirmLabel: `确认是 ${last}`,
                     tone: "primary",
+                    // 门是 z-80,确认框必须抬到门之上,否则根本点不到(opus P0)
+                    elevated: true,
                     onConfirm: resume,
                   })
                 }
@@ -210,6 +250,7 @@ export function SessionGuard() {
                   data-testid="session-gate-operator"
                   className={`input${gateError ? " input--invalid" : ""}`}
                   type="text"
+                  autoFocus={!last}
                   value={newOperator}
                   placeholder="如：李四"
                   onChange={(e) => {

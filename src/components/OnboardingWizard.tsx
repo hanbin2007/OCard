@@ -6,7 +6,7 @@
 
 import { useState } from "react";
 import * as api from "../api";
-import { isAbsoluteNasRoot, validateWorkstation } from "../lib/validation";
+import { validateWorkstation } from "../lib/validation";
 import { useStore } from "../state/store";
 import { Field } from "./ui";
 import { PathField } from "./PathField";
@@ -14,7 +14,7 @@ import { PathField } from "./PathField";
 type Step = "operator" | "nasRoot";
 
 export function OnboardingWizard() {
-  const { state, dispatch } = useStore();
+  const { state, dispatch, reload } = useStore();
   const [step, setStep] = useState<Step>(
     state.workstation?.operator?.trim() ? "nasRoot" : "operator",
   );
@@ -52,6 +52,9 @@ export function OnboardingWizard() {
         nasRoot.trim(),
       );
       dispatch({ type: "workstationUpdated", workstation });
+      // bootstrap 是在「没配 NAS」时跑的,列表全是空——配完必须整体重拉,
+      // 否则第二台工作站指向已有 NAS 时会看到假的「还没有项目」(opus P1)
+      reload();
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -170,7 +173,9 @@ export function OnboardingWizard() {
                     type="submit"
                     data-testid="onboarding-finish"
                     className="btn btn--primary"
-                    disabled={saving || (touched && !isAbsoluteNasRoot(nasRoot))}
+                    /* 不做「校验不过就禁用」:禁用按钮 = 无提示的死门,
+                       点了由 finish() 里的错误文案说清哪里不对 */
+                    disabled={saving}
                   >
                     {saving ? "保存中…" : "完成设置"}
                   </button>

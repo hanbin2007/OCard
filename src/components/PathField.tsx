@@ -7,6 +7,7 @@
 
 import { useState } from "react";
 import * as api from "../api";
+import { isAbsoluteNasRoot } from "../lib/validation";
 
 export function PathField({
   id,
@@ -42,8 +43,9 @@ export function PathField({
     try {
       const picked = await api.pickFolder({
         title: pickerTitle,
-        // 已填了合法目录时从那里开：改路径通常是挪到隔壁,不是从头翻
-        ...(value.trim() ? { defaultPath: value.trim() } : {}),
+        // 已填了合法绝对路径时从那里开:改路径通常是挪到隔壁,不是从头翻。
+        // 半截手打的相对串不传——部分平台会让对话框整个起不来
+        ...(isAbsoluteNasRoot(value) ? { defaultPath: value.trim() } : {}),
       });
       if (picked !== null) onChange(picked);
     } catch (err) {
@@ -71,7 +73,7 @@ export function PathField({
           aria-label={ariaLabel}
           onChange={(e) => onChange(e.currentTarget.value)}
         />
-        {api.canPickFolder && !readOnly ? (
+        {api.canPickFolder() && !readOnly ? (
           <button
             type="button"
             className="btn"

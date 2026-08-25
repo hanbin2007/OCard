@@ -63,6 +63,8 @@ export function DevicesScreen() {
   async function addCamera() {
     setCameraSubmitted(true);
     if (!cameraValidation.valid) return;
+    // 新一次提交先清旧报错:别让上次的失败横幅一直挂着误导(opus 评审)
+    setSubmitError(null);
     try {
       const camera = await api.createCamera({
         model,
@@ -89,6 +91,7 @@ export function DevicesScreen() {
   async function addCard() {
     setCardSubmitted(true);
     if (!cardLabel.trim() || !cardCameraId) return;
+    setSubmitError(null);
     try {
       const card = await api.createStorageCard({
         label: cardLabel,

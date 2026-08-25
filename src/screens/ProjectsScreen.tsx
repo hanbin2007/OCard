@@ -160,6 +160,9 @@ export function ProjectsScreen() {
                             type="button"
                             className="btn btn--sm projects__switch-btn"
                             data-testid="project-switch"
+                            /* listbox 走 roving tabindex,option 内不能再冒出
+                               tab 停靠点;鼠标可点,键盘用行选中(等价操作) */
+                            tabIndex={-1}
                             onClick={(e) => {
                               e.stopPropagation();
                               dispatch({ type: "selectProject", projectId: project.id });

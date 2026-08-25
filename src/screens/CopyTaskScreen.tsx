@@ -174,6 +174,10 @@ export function CopyTaskScreen() {
   useEffect(() => {
     if (!volumeId || !project || prefixEditedRef.current) return;
     let cancelled = false;
+    // 换卡先清上一张卡的推断结果:上一张成功、这一张失败时,
+    // 旧时段前缀留着会把新卡拷进旧时段目录(codex 评审 P1)
+    setTargetPrefix("");
+    setPrefixInferred(false);
     void (async () => {
       try {
         const inspection = await api.inspectVolume(volumeId);
@@ -498,6 +502,23 @@ export function CopyTaskScreen() {
                         <span className="field__error" role="alert">
                           {startError}
                         </span>
+                      ) : null}
+
+                      {volume?.isSystem ? (
+                        /* 过滤只是「藏」,这里是「拦」:用户显式打开开关选了
+                           系统盘,确认屏必须再敲一次警钟(opus 评审 P2) */
+                        <div
+                          className="notice notice--danger"
+                          role="alert"
+                          data-testid="copy-system-volume-warning"
+                        >
+                          <strong>源卷是系统内置盘</strong>
+                          <span>
+                            「{volume.name}（{volume.mountPath}）」是本机系统盘,
+                            不是相机存储卡。把整台电脑的磁盘当卡拷几乎肯定是误选,
+                            请返回重选源卷。
+                          </span>
+                        </div>
                       ) : null}
 
                       {remoteSameVolume ? (

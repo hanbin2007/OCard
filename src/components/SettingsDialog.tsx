@@ -205,9 +205,9 @@ export function SettingsDialog() {
       const previousRoot = state.workstation?.nasRoot?.trim() ?? "";
       const next = await api.setWorkstationInfo(operator.trim(), nasRoot.trim());
       dispatch({ type: "workstationUpdated", workstation: next });
-      // 换了 NAS 根：项目/设备/任务列表都还指着旧根,必须整体重拉,
-      // 否则界面显示旧 NAS 的项目却往新根建夹(静默错位)
-      if (previousRoot && next.nasRoot.trim() !== previousRoot) {
+      // 换了 NAS 根(含首次配置):项目/设备/任务列表还指着旧根/为空,
+      // 必须整体重拉,否则界面显示旧数据却往新根建夹(静默错位,opus P1)
+      if (next.nasRoot.trim() !== previousRoot) {
         reload();
       }
     } catch (err) {

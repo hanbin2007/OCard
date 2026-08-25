@@ -113,4 +113,31 @@ describe("当前项目的显性指示(UX 波)", () => {
       "未选择项目",
     );
   });
+
+  it("交付打包进行中时黄标禁用:不能成为绕过导航锁的旁门", () => {
+    render(
+      <App
+        preloaded={{
+          ...preloaded,
+          route: "devices" as const,
+          jobs: [
+            {
+              id: "job-d1",
+              kind: "delivery" as const,
+              projectId: mockProjects[0].id,
+              state: "running" as const,
+              done: 1,
+              total: 4,
+              bytesDone: 1024,
+              revision: 1,
+              startedAt: "2026-08-25T10:00:00+08:00",
+            },
+          ],
+        }}
+      />,
+    );
+    const chip = screen.getByTestId("current-project-chip") as HTMLButtonElement;
+    expect(chip.disabled).toBe(true);
+    expect(chip.title).toContain("交付打包进行中");
+  });
 });

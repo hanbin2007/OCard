@@ -18,18 +18,20 @@ pub struct VolumeInfo {
     pub file_system: String,
 }
 
-/// 判定挂载点是否属于系统内置盘。按平台的挂载习惯做保守判定:
+/// 判定挂载点是否属于系统内置盘(启动盘/系统分区)。按平台挂载习惯判定:
 /// - macOS:`/` 与 `/System/Volumes/*`(启动卷组);外接盘都在 `/Volumes/*`。
 /// - Windows:系统盘符(`SystemDrive`,通常 `C:`)。
-/// - Linux:可移动介质挂在 `/media`、`/run/media`、`/mnt` 下,其余(`/`、
-///   `/home`、`/boot` 等)视为系统盘。
+/// - Linux:可移动介质通常挂在 `/media`、`/run/media`、`/mnt` 下,
+///   其余(`/`、`/home`、`/boot`,也包括 `/srv`、`/data` 等手工挂载点)
+///   一律按系统盘对待——误藏可由 UI 开关找回,误露启动盘代价更高。
 ///
-/// 判定只影响默认过滤,UI 提供「显示系统盘」开关兜底——宁可多隐藏、不可漏隐藏。
+/// 口径:只针对「启动卷/系统分区」;第二块内录数据盘不会被标记,
+/// 拷卡确认屏对系统盘另有 danger 提示兜底。判定只影响默认过滤。
 pub fn is_system_mount(mount: &std::path::Path) -> bool {
     #[cfg(target_os = "macos")]
     {
-        let m = mount.to_string_lossy();
-        return m == "/" || m.starts_with("/System/Volumes");
+        // Path::starts_with 按路径组件比对:/System/VolumesFoo 不会误命中
+        return mount == std::path::Path::new("/") || mount.starts_with("/System/Volumes");
     }
     #[cfg(windows)]
     {
@@ -119,8 +121,12 @@ mod tests {
 
     #[test]
     fn current_machine_reports_at_least_one_system_volume() {
-        // 真机上系统盘一定在列且被标记(macOS `/`、Windows C:、Linux `/`)
-        assert!(list_volumes().iter().any(|v| v.system));
+        // 真机上系统盘一定在列且被标记(macOS `/`、Windows C:、Linux `/`)。
+        // 容器环境(overlayfs 被 sysinfo 滤掉)可能一张盘都列不出,不算失败
+        let vols = list_volumes();
+        if !vols.is_empty() {
+            assert!(vols.iter().any(|v| v.system));
+        }
     }
 }
 

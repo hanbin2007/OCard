@@ -137,6 +137,16 @@
   background: transparent;
 }
 
+/* 「当前不适用」(如工况 B 下的代理转码):可点、能进屏看到解释,
+   但视觉降一档,别和可用项长得一模一样(opus 评审 P1) */
+.nav-item[data-inapplicable] {
+  color: var(--text-tertiary);
+}
+
+.nav-item[data-inapplicable] .nav-item__icon {
+  opacity: 0.5;
+}
+
 .nav-item__icon {
   flex: 0 0 auto;
   width: 16px;
@@ -237,17 +247,26 @@
   background: var(--bg);
 }
 
+/* 三列网格:左右两翼各占一条弹性轨道、中间当前项目按内容定宽。
+   三块内容各在自己的轨道里收缩省略,任何窗宽下都不会互相压盖 */
 .topbar {
   flex: 0 0 auto;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
   gap: var(--space-3);
   height: var(--topbar-height);
   padding: 0 var(--space-5);
   border-bottom: 1px solid var(--border);
   background: var(--bg);
-  /* 居中的当前项目指示以它为锚 */
-  position: relative;
+}
+
+.topbar__lead {
+  grid-column: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
 }
 
 /* 标题栏是"框"，不跟着内容一起位移：只做交叉淡入，
@@ -263,6 +282,10 @@
   font-weight: var(--weight-semibold);
   letter-spacing: -0.01em;
   white-space: nowrap;
+  /* 极窄下宁可省略号也不越轨压到中间的当前项目 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
 }
 
 .topbar__sub {
@@ -275,24 +298,24 @@
 }
 
 .topbar__actions {
+  grid-column: 3;
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  margin-left: auto;
+  justify-self: end;
 }
 
 /* ---------- 当前操作项目指示(UX 波) ----------
  * 拷卡/分类/转码都作用在「当前项目」上,这个状态必须常驻可见:
  * 顶栏正中、黄底、加粗;超长跑马灯;点击回项目列表。
- * 绝对定位居中,不挤压标题与右侧动作;窄窗下限宽,必要时被跑马灯接管。 */
+ * 占据网格中列,由轨道分配保证与两翼互不压盖;窄窗下限宽,超长交给跑马灯。 */
 .topbar__project {
-  position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
+  grid-column: 2;
+  justify-self: center;
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
-  max-width: min(34%, 320px);
+  max-width: min(34vw, 320px);
   padding: 3px var(--space-3);
   border: 1px solid var(--warn);
   border-radius: var(--radius-pill);
@@ -304,8 +327,13 @@
   animation: chrome-fade-in var(--dur-quick) var(--ease-out);
 }
 
-.topbar__project:hover {
+.topbar__project:hover:not(:disabled) {
   filter: brightness(1.04);
+}
+
+.topbar__project:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .topbar__project--empty {

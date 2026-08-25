@@ -32,6 +32,12 @@ const NOTICE_TITLES: Record<string, string> = {
   "notice-listen-failed": "通知通道未能建立",
   "notice-replay-failed": "启动通知回放失败",
   "update-ready": "更新已就绪",
+  // 前端自造的兜底网 code,语义固定,给个准确抬头
+  "unhandled-error": "界面未接住的错误",
+  "volumes-refresh-failed": "卷列表刷新失败",
+  "volume-inspect-failed": "卡内素材探查失败",
+  "copy-files-load-failed": "文件明细加载失败",
+  "copy-files-refresh-failed": "文件状态刷新失败",
 };
 
 /** 未知 code 也要有体面的抬头，不能露出空白 */
