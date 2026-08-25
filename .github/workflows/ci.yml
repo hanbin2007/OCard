@@ -243,3 +243,12 @@ jobs:
 
       - name: Run E2E smoke
         run: xvfb-run --auto-servernum pnpm --filter ocard-e2e test
+
+      - name: Upload E2E screenshots (真实界面巡览图+失败现场)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-screenshots
+          if-no-files-found: ignore
+          retention-days: 14
+          path: e2e/screenshots/*.png
