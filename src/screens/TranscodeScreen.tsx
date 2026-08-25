@@ -5,6 +5,7 @@ import * as api from "../api";
 import type { ArchiveTier, FfmpegStatus, TranscodeJob } from "../api/types";
 import { isArchiveResult, isJobTerminal } from "../api/types";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
+import { PathField } from "../components/PathField";
 import { TopBar } from "../components/TopBar";
 import { Badge, EmptyState, Field, ProgressBar } from "../components/ui";
 import { isAbsoluteNasRoot } from "../lib/validation";
@@ -166,15 +167,30 @@ export function TranscodeScreen() {
     }
   }
 
+  // 入口不再从导航上一禁了之(那是无提示的死门):进得来,这里把原因和去路说清楚
   if (!project) {
     return (
       <>
         <TopBar title="代理转码" />
         <div className="content">
           <div className="content__inner">
-            <p className="text-sm" role="alert">
-              尚未选择项目。
-            </p>
+            <EmptyState>
+              <div className="stack" data-testid="transcode-no-project">
+                <p className="text-sm" role="status">
+                  还没有选择项目。代理转码作用在「当前项目」上——先去项目列表选中一个工况 A（视频剪辑）项目。
+                </p>
+                <div>
+                  <button
+                    type="button"
+                    className="btn btn--primary"
+                    data-testid="transcode-goto-projects"
+                    onClick={() => dispatch({ type: "navigate", route: "projects" })}
+                  >
+                    去选择项目
+                  </button>
+                </div>
+              </div>
+            </EmptyState>
           </div>
         </div>
       </>
@@ -187,9 +203,24 @@ export function TranscodeScreen() {
         <TopBar title="代理转码" subtitle={project.folderName} subtitleMono />
         <div className="content">
           <div className="content__inner">
-            <p className="text-sm" role="alert" data-testid="transcode-scenario-b">
-              代理转码只适用于工况 A（视频剪辑）项目。当前项目是工况 B。
-            </p>
+            <EmptyState>
+              <div className="stack" data-testid="transcode-scenario-b">
+                <p className="text-sm" role="status">
+                  代理转码只适用于工况 A（视频剪辑）项目。当前项目「{project.name}」是工况
+                  B（相片精修），素材整理走「分类工作台」。
+                </p>
+                <div>
+                  <button
+                    type="button"
+                    className="btn btn--primary"
+                    data-testid="transcode-goto-projects"
+                    onClick={() => dispatch({ type: "navigate", route: "projects" })}
+                  >
+                    切换到其他项目
+                  </button>
+                </div>
+              </div>
+            </EmptyState>
           </div>
         </div>
       </>
@@ -330,17 +361,16 @@ export function TranscodeScreen() {
                   <Field
                     label="归档输出目录"
                     htmlFor="archive-dir"
-                    hint="绝对路径，且须在项目之外——归档是独立副本，不放回项目里"
+                    hint="选择项目之外的目录——归档是独立副本，不放回项目里"
                   >
-                    <input
+                    <PathField
                       id="archive-dir"
-                      data-testid="archive-dir"
-                      className="input input--mono"
-                      type="text"
+                      testId="archive-dir"
                       value={archiveDir}
+                      onChange={setArchiveDir}
                       placeholder="/Volumes/ARCHIVE-2026"
+                      pickerTitle="选择归档输出目录"
                       disabled={working || ffmpegMissing}
-                      onChange={(e) => setArchiveDir(e.currentTarget.value)}
                     />
                   </Field>
 

@@ -139,13 +139,16 @@ describe("E2E 锚点", () => {
       "copy-note",
       "copy-start",
       "copy-target-preview",
+      "volumes-refresh",
+      "volumes-hide-system",
     ]);
+    // 系统内置盘默认被过滤,不出现在源卷候选里(UX 波)
     expect(screen.getAllByTestId("copy-volume-option")).toHaveLength(
-      mockVolumes.length,
+      mockVolumes.filter((v) => !v.isSystem).length,
     );
   });
 
-  it("首跑引导锚点（未配置 NAS 根路径时）", () => {
+  it("首跑引导锚点（未完成初始设置时）", () => {
     render(
       <App
         preloaded={{
@@ -155,6 +158,11 @@ describe("E2E 锚点", () => {
         }}
       />,
     );
-    expectAnchors(["first-run-guide", "first-run-open-settings", "settings-open"]);
+    expectAnchors([
+      "first-run-guide",
+      "onboarding-operator",
+      "onboarding-next",
+      "settings-open",
+    ]);
   });
 });

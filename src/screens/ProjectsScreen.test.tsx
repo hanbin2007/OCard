@@ -76,3 +76,41 @@ describe("项目列表", () => {
     expect(rows[0].getAttribute("aria-selected")).toBe("false");
   });
 });
+
+describe("当前项目的显性指示(UX 波)", () => {
+  it("当前行显示「当前项目」黄标,其余行显示「切换到此项目」按钮", () => {
+    render(<App preloaded={preloaded} />);
+    expect(screen.getByTestId("project-current-flag")).toBeDefined();
+    expect(screen.getAllByTestId("project-switch")).toHaveLength(
+      mockProjects.length - 1,
+    );
+  });
+
+  it("点「切换到此项目」把该行设为当前,黄标随之移动", () => {
+    render(<App preloaded={preloaded} />);
+    const buttons = screen.getAllByTestId("project-switch");
+    fireEvent.click(buttons[0]);
+
+    const rows = screen.getAllByRole("option");
+    const flaggedRow = rows.find((r) =>
+      r.querySelector('[data-testid="project-current-flag"]'),
+    );
+    expect(flaggedRow?.textContent).toContain(mockProjects[1].folderName);
+  });
+
+  it("顶栏正中常驻当前项目名,点击回项目列表", () => {
+    render(<App preloaded={{ ...preloaded, route: "devices" as const }} />);
+    const chip = screen.getByTestId("current-project-chip");
+    expect(chip.textContent).toContain(mockProjects[0].name);
+
+    fireEvent.click(chip);
+    expect(screen.getByRole("listbox", { name: "项目列表" })).toBeDefined();
+  });
+
+  it("没有选中项目时顶栏指示为「未选择项目」", () => {
+    render(<App preloaded={{ ...preloaded, selectedProjectId: null }} />);
+    expect(screen.getByTestId("current-project-chip").textContent).toContain(
+      "未选择项目",
+    );
+  });
+});

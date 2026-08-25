@@ -87,10 +87,32 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 /** 运行在 Tauri 里时走真实 IPC;浏览器/vitest 环境回退 mock */
 const IS_TAURI =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+/** 原生文件夹选择器是否可用（浏览器预览/vitest 里没有） */
+export const canPickFolder = IS_TAURI;
+
+/**
+ * 弹原生「选择文件夹」对话框。用户取消返回 null。
+ * 所有要填路径的地方都应该挂上它——手打绝对路径只作为兜底（UX 波）。
+ */
+export async function pickFolder(options?: {
+  title?: string;
+  defaultPath?: string;
+}): Promise<string | null> {
+  if (!IS_TAURI) return reply(null);
+  const picked = await openDialog({
+    directory: true,
+    multiple: false,
+    title: options?.title,
+    ...(options?.defaultPath ? { defaultPath: options.defaultPath } : {}),
+  });
+  return typeof picked === "string" ? picked : null;
+}
 
 function ipc<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   return invoke<T>(cmd, args);

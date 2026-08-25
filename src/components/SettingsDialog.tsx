@@ -15,6 +15,7 @@ import * as api from "../api";
 import { withViewTransition } from "../lib/motion";
 import { validateWorkstation } from "../lib/validation";
 import { useStore } from "../state/store";
+import { PathField } from "./PathField";
 import { Badge, Field } from "./ui";
 
 /** 检查更新的结果文案；失败一律引导去通知中心看详情，不静默 */
@@ -29,7 +30,7 @@ const UPDATE_RESULT_TEXT: Record<UpdateCheckResult, string> = {
 };
 
 export function SettingsDialog() {
-  const { state, dispatch } = useStore();
+  const { state, dispatch, reload } = useStore();
   const { settingsOpen, workstation } = state;
 
   const [operator, setOperator] = useState("");
@@ -201,8 +202,14 @@ export function SettingsDialog() {
     setBusy(true);
     setSaveError(null);
     try {
+      const previousRoot = state.workstation?.nasRoot?.trim() ?? "";
       const next = await api.setWorkstationInfo(operator.trim(), nasRoot.trim());
       dispatch({ type: "workstationUpdated", workstation: next });
+      // 换了 NAS 根：项目/设备/任务列表都还指着旧根,必须整体重拉,
+      // 否则界面显示旧 NAS 的项目却往新根建夹(静默错位)
+      if (previousRoot && next.nasRoot.trim() !== previousRoot) {
+        reload();
+      }
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : "保存失败，请重试");
     } finally {
@@ -254,17 +261,17 @@ export function SettingsDialog() {
           <Field
             label="NAS 根路径"
             htmlFor="settings-nas-root"
-            hint="项目文件夹的父目录，如 /Volumes/DIT-NAS/Projects 或 Z:\\Projects"
+            hint="项目文件夹的父目录，点「浏览」直接选，或粘贴绝对路径"
             error={submitted ? errors.nasRoot : undefined}
           >
-            <input
+            <PathField
               id="settings-nas-root"
-              data-testid="settings-nas-root"
-              className={`input input--mono${submitted && errors.nasRoot ? " input--invalid" : ""}`}
-              type="text"
+              testId="settings-nas-root"
               value={nasRoot}
+              onChange={setNasRoot}
               placeholder="/Volumes/DIT-NAS/Projects"
-              onChange={(e) => setNasRoot(e.currentTarget.value)}
+              pickerTitle="选择 NAS 根目录"
+              invalid={Boolean(submitted && errors.nasRoot)}
             />
           </Field>
 

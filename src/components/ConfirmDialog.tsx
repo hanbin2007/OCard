@@ -14,6 +14,11 @@ export interface ConfirmRequest {
   confirmLabel: string;
   /** 可返回 Promise：调用方需要等后端结果再更新本地状态 */
   onConfirm: () => void | Promise<void>;
+  /**
+   * 确认按钮的语气。默认 "danger"（红色,破坏性动作）；
+   * 非破坏性的二次确认（如换人确认）用 "primary"，别拿红色吓唬人。
+   */
+  tone?: "danger" | "primary";
 }
 
 export function ConfirmDialog({
@@ -67,7 +72,9 @@ export function ConfirmDialog({
           </button>
           <button
             type="button"
-            className="btn btn--danger-solid"
+            className={
+              request.tone === "primary" ? "btn btn--primary" : "btn btn--danger-solid"
+            }
             onClick={() => {
               void request.onConfirm();
               close();

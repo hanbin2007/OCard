@@ -11,9 +11,40 @@ pub struct VolumeInfo {
     pub name: String,
     pub mount_point: PathBuf,
     pub removable: bool,
+    /// 系统内置盘(启动盘/系统分区):拷卡源默认隐藏,防止误把本机磁盘当卡拷。
+    pub system: bool,
     pub total_bytes: u64,
     pub available_bytes: u64,
     pub file_system: String,
+}
+
+/// 判定挂载点是否属于系统内置盘。按平台的挂载习惯做保守判定:
+/// - macOS:`/` 与 `/System/Volumes/*`(启动卷组);外接盘都在 `/Volumes/*`。
+/// - Windows:系统盘符(`SystemDrive`,通常 `C:`)。
+/// - Linux:可移动介质挂在 `/media`、`/run/media`、`/mnt` 下,其余(`/`、
+///   `/home`、`/boot` 等)视为系统盘。
+///
+/// 判定只影响默认过滤,UI 提供「显示系统盘」开关兜底——宁可多隐藏、不可漏隐藏。
+pub fn is_system_mount(mount: &std::path::Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let m = mount.to_string_lossy();
+        return m == "/" || m.starts_with("/System/Volumes");
+    }
+    #[cfg(windows)]
+    {
+        let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        let m = mount.to_string_lossy().to_ascii_uppercase();
+        let sys = sys_drive.to_ascii_uppercase();
+        return m == sys || m == format!("{sys}\\");
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let m = mount.to_string_lossy();
+        return !(m.starts_with("/media/") || m.starts_with("/run/media/") || m.starts_with("/mnt/"));
+    }
+    #[allow(unreachable_code)]
+    false
 }
 
 /// 列出全部挂载卷。
@@ -25,6 +56,7 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
             name: d.name().to_string_lossy().to_string(),
             mount_point: d.mount_point().to_path_buf(),
             removable: d.is_removable(),
+            system: is_system_mount(d.mount_point()),
             total_bytes: d.total_space(),
             available_bytes: d.available_space(),
             file_system: d.file_system().to_string_lossy().to_string(),
@@ -55,6 +87,38 @@ mod tests {
         let all = list_volumes().len();
         let removable = removable_volumes().len();
         assert!(removable <= all);
+    }
+
+    #[test]
+    fn system_mount_detection_per_platform() {
+        use std::path::Path;
+        #[cfg(target_os = "macos")]
+        {
+            assert!(is_system_mount(Path::new("/")));
+            assert!(is_system_mount(Path::new("/System/Volumes/Data")));
+            assert!(!is_system_mount(Path::new("/Volumes/SDCARD")));
+            assert!(!is_system_mount(Path::new("/Volumes/DIT-NAS")));
+        }
+        #[cfg(windows)]
+        {
+            assert!(is_system_mount(Path::new("C:\\")));
+            assert!(is_system_mount(Path::new("c:")));
+            assert!(!is_system_mount(Path::new("E:\\")));
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert!(is_system_mount(Path::new("/")));
+            assert!(is_system_mount(Path::new("/home")));
+            assert!(!is_system_mount(Path::new("/media/user/SDCARD")));
+            assert!(!is_system_mount(Path::new("/run/media/user/SDCARD")));
+            assert!(!is_system_mount(Path::new("/mnt/card")));
+        }
+    }
+
+    #[test]
+    fn current_machine_reports_at_least_one_system_volume() {
+        // 真机上系统盘一定在列且被标记(macOS `/`、Windows C:、Linux `/`)
+        assert!(list_volumes().iter().any(|v| v.system));
     }
 }
 

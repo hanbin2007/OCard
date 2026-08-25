@@ -1,9 +1,75 @@
-/** 主区顶部极简标题栏：标题 + 次要信息 + 右侧动作 + 设置入口。 */
+/** 主区顶部极简标题栏：标题 + 次要信息 + 居中的当前项目 + 右侧动作 + 设置入口。 */
 
-import type { ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { IconSettings } from "./Icon";
 import { NoticeBell } from "./NotificationCenter";
 import { useStore } from "../state/store";
+
+/**
+ * 当前操作项目的常驻指示（UX 波）：拷卡/分类/转码全都作用在「当前项目」上，
+ * 这个内部状态过去只藏在项目列表的选中行里,极易在错误的项目上开工。
+ * 现在钉在顶栏正中——黄底加粗,超长跑马灯,点击回项目列表。
+ */
+function CurrentProjectChip() {
+  const { state, dispatch } = useStore();
+  const project =
+    state.projects.find((p) => p.id === state.selectedProjectId) ?? null;
+  // 首跑引导阶段没有「当前项目」概念,不显示(设置没配完,项目都还进不去)
+  const configured = Boolean(
+    state.workstation?.operator?.trim() && state.workstation?.nasRoot?.trim(),
+  );
+
+  const clipRef = useRef<HTMLSpanElement>(null);
+  const textRef = useRef<HTMLSpanElement>(null);
+  const [shift, setShift] = useState(0);
+
+  // 量出超出宽度：超出才起播跑马灯,不超出的名字一动不动
+  useLayoutEffect(() => {
+    const clip = clipRef.current;
+    const text = textRef.current;
+    if (!clip || !text) return;
+    const measure = () => {
+      setShift(Math.max(0, text.scrollWidth - clip.clientWidth));
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(clip);
+    observer.observe(text);
+    return () => observer.disconnect();
+  }, [project?.name]);
+
+  if (!configured) return null;
+
+  if (!project) {
+    return (
+      <span className="topbar__project topbar__project--empty" data-testid="current-project-chip">
+        未选择项目
+      </span>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      className="topbar__project"
+      data-testid="current-project-chip"
+      title={`当前操作项目：${project.name}（点击回项目列表）`}
+      onClick={() => dispatch({ type: "navigate", route: "projects" })}
+    >
+      <span className="topbar__project-label">当前</span>
+      <span className="topbar__project-clip" ref={clipRef}>
+        <span
+          className={`topbar__project-name${shift > 0 ? " topbar__project-name--marquee" : ""}`}
+          ref={textRef}
+          style={shift > 0 ? ({ "--marquee-shift": `-${shift}px` } as React.CSSProperties) : undefined}
+        >
+          {project.name}
+        </span>
+      </span>
+    </button>
+  );
+}
 
 export function TopBar({
   title,
@@ -25,6 +91,7 @@ export function TopBar({
       {subtitle ? (
         <span className={`topbar__sub${subtitleMono ? " mono" : ""}`}>{subtitle}</span>
       ) : null}
+      <CurrentProjectChip />
       <div className="topbar__actions">
         {actions}
         {/* 通知铃铛常驻所有屏幕：降级/失败必须随时看得见 */}

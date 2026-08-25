@@ -834,6 +834,10 @@
   color: var(--text-tertiary);
 }
 
+.text-2xs {
+  font-size: var(--text-2xs);
+}
+
 .text-xs {
   font-size: var(--text-xs);
 }
@@ -1342,9 +1346,13 @@
 }
 
 /* 即时呈现层：贴在内容区顶部，不遮挡操作 */
+/* 浮在内容之上、紧贴顶栏之下(.main 为锚)。此前用 sticky 挂在非滚动容器里,
+   等于普通流式布局——toast 一来把顶栏往下顶(UX 波修正) */
 .toasts {
-  position: sticky;
-  top: 0;
+  position: absolute;
+  top: var(--topbar-height);
+  left: 0;
+  right: 0;
   z-index: 30;
   display: grid;
   gap: 1px;
@@ -1477,4 +1485,151 @@
 .caps__head,
 .caps__row {
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+/* ---------- 路径输入组(UX 波):输入框 + 原生浏览按钮 ---------- */
+
+.path-field {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.path-field__row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  min-width: 0;
+}
+
+.path-field__row .input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.path-field__row .btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* ---------- 新人引导(UX 波) ---------- */
+
+.onboarding {
+  display: grid;
+  place-items: start center;
+  padding-top: var(--space-8);
+}
+
+.onboarding__card {
+  width: min(560px, 100%);
+}
+
+.onboarding__intro {
+  display: grid;
+  gap: var(--space-2);
+  justify-items: start;
+}
+
+.onboarding__badge {
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.08em;
+}
+
+.onboarding__title {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.01em;
+}
+
+.onboarding__steps {
+  display: flex;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.onboarding__step {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 4px var(--space-3);
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.onboarding__step[aria-current="step"] {
+  border-color: var(--accent);
+  color: var(--text-primary);
+  background: var(--accent-soft);
+}
+
+.onboarding__step[data-done] {
+  color: var(--text-secondary);
+}
+
+.onboarding__step-index {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--bg-subtle);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+}
+
+.onboarding__step[aria-current="step"] .onboarding__step-index {
+  background: var(--accent);
+  color: #fff;
+}
+
+.onboarding__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+/* ---------- 会话守卫(UX 波) ---------- */
+
+/* 会话门必须压过一切浮层(普通 overlay z=50):没确认操作员之前什么都不能点 */
+.overlay--gate {
+  z-index: 80;
+}
+
+.dialog--gate {
+  max-width: 400px;
+  width: min(400px, calc(100vw - var(--space-8)));
+}
+
+.session-gate__last {
+  width: 100%;
+  justify-content: flex-start;
+  margin-bottom: var(--space-3);
+}
+
+.session-gate__last strong {
+  font-weight: var(--weight-semibold);
+}
+
+/* ---------- 当前项目黄标(项目列表行内) ---------- */
+
+.current-flag {
+  display: inline-block;
+  padding: 3px var(--space-2);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
 }

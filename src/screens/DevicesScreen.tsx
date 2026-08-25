@@ -30,6 +30,7 @@ export function DevicesScreen() {
   const [cardSerial, setCardSerial] = useState("");
   const [cardSubmitted, setCardSubmitted] = useState(false);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
   /** 删除失败必须说出来——不能乐观移除后让界面谎报成功 */
   const [deleteError, setDeleteError] = useState<string | null>(null);
   /** 登记成功后的回执，避免「表单清空」被读成「没提交上」 */
@@ -62,35 +63,50 @@ export function DevicesScreen() {
   async function addCamera() {
     setCameraSubmitted(true);
     if (!cameraValidation.valid) return;
-    const camera = await api.createCamera({
-      model,
-      position,
-      operatorAlias: alias,
-      note,
-    });
-    dispatch({ type: "cameraCreated", camera });
-    setLastCamera(camera.code);
-    setModel("");
-    setPosition("");
-    setAlias("");
-    setNote("");
-    setCameraSubmitted(false);
+    try {
+      const camera = await api.createCamera({
+        model,
+        position,
+        operatorAlias: alias,
+        note,
+      });
+      dispatch({ type: "cameraCreated", camera });
+      setLastCamera(camera.code);
+      setModel("");
+      setPosition("");
+      setAlias("");
+      setNote("");
+      setCameraSubmitted(false);
+      setSubmitError(null);
+    } catch (err) {
+      // 登记表写失败(NAS 掉了/重码)不能只让按钮弹一下(零静默铁律)
+      setSubmitError(
+        `登记相机失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   async function addCard() {
     setCardSubmitted(true);
     if (!cardLabel.trim() || !cardCameraId) return;
-    const card = await api.createStorageCard({
-      label: cardLabel,
-      cameraId: cardCameraId,
-      capacityBytes: cardCapacity * GB,
-      serial: cardSerial,
-    });
-    dispatch({ type: "cardCreated", card });
-    setLastCard(card.label);
-    setCardLabel("");
-    setCardSerial("");
-    setCardSubmitted(false);
+    try {
+      const card = await api.createStorageCard({
+        label: cardLabel,
+        cameraId: cardCameraId,
+        capacityBytes: cardCapacity * GB,
+        serial: cardSerial,
+      });
+      dispatch({ type: "cardCreated", card });
+      setLastCard(card.label);
+      setCardLabel("");
+      setCardSerial("");
+      setCardSubmitted(false);
+      setSubmitError(null);
+    } catch (err) {
+      setSubmitError(
+        `登记存储卡失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   return (
@@ -107,6 +123,16 @@ export function DevicesScreen() {
 
       <div className="content">
         <div className="content__inner">
+          {submitError ? (
+            <div
+              className="notice notice--danger"
+              role="alert"
+              data-testid="devices-submit-error"
+            >
+              <strong>登记没有成功</strong>
+              <span>{submitError}</span>
+            </div>
+          ) : null}
           <div className="devices">
             <div className="devices__form">
               <div className="card">

@@ -77,6 +77,7 @@ export function ProjectsScreen() {
                   <span>备份</span>
                   <span>最近事件</span>
                   <span>状态</span>
+                  <span aria-hidden="true" />
                 </div>
 
                 {projects.length === 0 ? (
@@ -145,6 +146,28 @@ export function ProjectsScreen() {
                         <Badge tone={PROJECT_STATUS_TONE[project.status]} dot>
                           {PROJECT_STATUS_LABEL[project.status]}
                         </Badge>
+                      </span>
+
+                      {/* 「当前操作项目」是全局状态,选中行的高亮太隐晦——
+                          每行给出显式动作,当前行给出显式黄标(UX 波) */}
+                      <span className="projects__switch">
+                        {project.id === selectedProjectId ? (
+                          <span className="current-flag" data-testid="project-current-flag">
+                            当前项目
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn btn--sm projects__switch-btn"
+                            data-testid="project-switch"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              dispatch({ type: "selectProject", projectId: project.id });
+                            }}
+                          >
+                            切换到此项目
+                          </button>
+                        )}
                       </span>
                     </div>
                   ))}

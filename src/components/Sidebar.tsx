@@ -167,16 +167,18 @@ export function Sidebar() {
                   data-testid={`nav-${route}`}
                   className="nav-item"
                   aria-current={state.route === route ? "page" : undefined}
-                  /* 打包期间锁住导航：离开会让结果面板（含未交付明细）静默蒸发 */
-                  disabled={
-                    deliveryWorking ||
-                    (route === "transcode" && !transcodeAvailable)
+                  /* 打包期间锁住导航：离开会让结果面板（含未交付明细）静默蒸发。
+                     「代理转码」不再禁用（macOS 禁用按钮连 tooltip 都不出,
+                     等于无提示的死门）：不适用时进屏由屏内空态解释并给出去路 */
+                  disabled={deliveryWorking}
+                  data-inapplicable={
+                    route === "transcode" && !transcodeAvailable ? true : undefined
                   }
                   title={
                     deliveryWorking
                       ? "交付打包进行中，完成后才能切换页面"
                       : route === "transcode" && !transcodeAvailable
-                        ? "代理转码只适用于工况 A 项目"
+                        ? "代理转码只适用于工况 A 项目，点击查看说明"
                         : undefined
                   }
                   onClick={() => dispatch({ type: "navigate", route })}

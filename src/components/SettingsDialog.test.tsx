@@ -451,19 +451,32 @@ describe("首跑引导", () => {
     expect(screen.queryAllByTestId("project-row")).toHaveLength(0);
   });
 
-  it("引导里的按钮直接打开设置，配置完成后进入项目列表", async () => {
+  it("引导向导两步配完操作人与 NAS 根，完成后进入项目列表", async () => {
     const user = userEvent.setup();
     render(<App preloaded={firstRun} />);
 
-    await user.click(screen.getByTestId("first-run-open-settings"));
-    expect(screen.getByRole("dialog", { name: "工作站设置" })).toBeDefined();
+    // 第 1 步:操作人
+    await user.type(screen.getByTestId("onboarding-operator"), "张三");
+    await user.click(screen.getByTestId("onboarding-next"));
 
-    await user.type(screen.getByTestId("settings-operator"), "张三");
-    await user.type(screen.getByTestId("settings-nas-root"), "/Volumes/DIT-NAS/Projects");
-    await user.click(screen.getByTestId("settings-save"));
+    // 第 2 步:NAS 根目录(手填路径,浏览按钮在测试环境隐藏)
+    await user.type(
+      screen.getByTestId("onboarding-nas-root"),
+      "/Volumes/DIT-NAS/Projects",
+    );
+    await user.click(screen.getByTestId("onboarding-finish"));
 
     await waitFor(() => expect(screen.queryByTestId("first-run-guide")).toBeNull());
     expect(screen.getAllByTestId("project-row").length).toBeGreaterThan(0);
+  });
+
+  it("引导第 1 步操作人为空时报错并停在原步骤", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={firstRun} />);
+
+    await user.click(screen.getByTestId("onboarding-next"));
+    expect(screen.getByText(/请填写操作人/)).toBeDefined();
+    expect(screen.getByTestId("onboarding-operator")).toBeDefined();
   });
 
   it("首跑状态下齿轮入口依然可用（顶栏常驻）", () => {

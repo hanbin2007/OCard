@@ -72,6 +72,8 @@ pub struct VolumeDto {
     pub capacity_bytes: u64,
     pub used_bytes: u64,
     pub removable: bool,
+    /// 系统内置盘:拷卡源默认过滤(UX 波),前端提供开关显示。
+    pub is_system: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_card_id: Option<String>,
 }

@@ -42,7 +42,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function preloaded(projectId: string) {
+function preloaded(projectId: string | null) {
   return {
     route: "transcode" as const,
     workstation: mockWorkstation,
@@ -69,23 +69,34 @@ function transcodeJob(over: Partial<TranscodeJob> = {}): TranscodeJob {
 }
 
 describe("入口约束", () => {
-  it("工况 B 项目不给转码入口，侧栏项禁用并说明原因", async () => {
+  it("工况 B 项目下侧栏项仍可点(禁用会变成无提示的死门),标注不适用", async () => {
     render(<App preloaded={preloaded(projectB.id)} />);
     const nav = (await screen.findByTestId("nav-transcode")) as HTMLButtonElement;
-    expect(nav.disabled).toBe(true);
+    expect(nav.disabled).toBe(false);
+    expect(nav.dataset.inapplicable).toBe("true");
     expect(nav.title).toContain("工况 A");
   });
 
-  it("工况 A 项目下入口可用", async () => {
+  it("工况 A 项目下入口可用且无不适用标注", async () => {
     render(<App preloaded={preloaded(projectA.id)} />);
     const nav = (await screen.findByTestId("nav-transcode")) as HTMLButtonElement;
     expect(nav.disabled).toBe(false);
+    expect(nav.dataset.inapplicable).toBeUndefined();
   });
 
-  it("直接进到工况 B 的转码屏会说清不适用", async () => {
+  it("进到工况 B 的转码屏会说清不适用,并给出回项目列表的动作", async () => {
+    const user = userEvent.setup();
     render(<App preloaded={preloaded(projectB.id)} />);
     expect(await screen.findByTestId("transcode-scenario-b")).toBeDefined();
     expect(screen.queryByTestId("transcode-start")).toBeNull();
+    await user.click(screen.getByTestId("transcode-goto-projects"));
+    expect(await screen.findAllByTestId("project-row")).not.toHaveLength(0);
+  });
+
+  it("未选项目时进转码屏给出空态与去路,而不是一句死话", async () => {
+    render(<App preloaded={preloaded(null)} />);
+    expect(await screen.findByTestId("transcode-no-project")).toBeDefined();
+    expect(screen.getByTestId("transcode-goto-projects")).toBeDefined();
   });
 });
 

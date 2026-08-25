@@ -229,6 +229,7 @@ export const mockVolumes: Volume[] = [
     capacityBytes: 512 * GB,
     usedBytes: 386 * GB,
     removable: true,
+    isSystem: false,
     matchedCardId: "card-sd-03",
   },
   {
@@ -238,6 +239,7 @@ export const mockVolumes: Volume[] = [
     capacityBytes: 512 * GB,
     usedBytes: 214 * GB,
     removable: true,
+    isSystem: false,
     matchedCardId: "card-sd-06",
   },
   {
@@ -247,6 +249,16 @@ export const mockVolumes: Volume[] = [
     capacityBytes: 256 * GB,
     usedBytes: 91 * GB,
     removable: true,
+    isSystem: false,
+  },
+  {
+    id: "vol-system",
+    name: "Macintosh HD",
+    mountPath: "/",
+    capacityBytes: 1024 * GB,
+    usedBytes: 620 * GB,
+    removable: false,
+    isSystem: true,
   },
 ];
 

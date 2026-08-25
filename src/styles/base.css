@@ -10,6 +10,9 @@ html,
 body,
 #root {
   height: 100%;
+  /* 应用壳永不滚动(UX 波):唯一的页面滚动区是 .content,
+     任何溢出(含路由过渡的 12px 位移)都不允许顶出文档滚动条 */
+  overflow: hidden;
 }
 
 body {

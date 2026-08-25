@@ -97,6 +97,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // 原生文件夹选择器(UX 波):所有手填路径处都必须能 UI 选目录
+        .plugin(tauri_plugin_dialog::init())
         // 应用运行日志(v0.3.1):平台日志目录轮转文件(单文件 ≤5MB,KeepAll +
         // 启动期修剪),级别 Info;业务可见性仍以通知中心为准,日志是事后排障用
         .plugin(

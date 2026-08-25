@@ -140,7 +140,8 @@ export type AppAction =
   | { type: "noticesPanelToggled" }
   | { type: "noticesPanelClosed" }
   | { type: "jobsLoaded"; jobs: JobSnapshot[] }
-  | { type: "jobProgress"; job: JobSnapshot };
+  | { type: "jobProgress"; job: JobSnapshot }
+  | { type: "volumesUpdated"; volumes: Volume[] };
 
 /** 孤儿对账的退避档位：失败一次等 2s，再失败 5s，之后稳定在 10s */
 const ORPHAN_BACKOFF_MS = [2000, 5000, 10000];
@@ -367,6 +368,9 @@ export function reducer(state: AppState, action: AppAction): AppState {
     case "selectTask":
       return { ...state, selectedTaskId: action.taskId };
 
+    case "volumesUpdated":
+      return { ...state, volumes: action.volumes };
+
     case "projectCreated":
       return {
         ...state,
@@ -577,6 +581,30 @@ export function StoreProvider({
   const skipBootstrap = preloaded !== undefined;
   const [reloadToken, setReloadToken] = useState(0);
   const reload = useCallback(() => setReloadToken((n) => n + 1), []);
+
+  /**
+   * 全局兜底网（零静默铁律）：任何漏掉 catch 的 Promise rejection 都不允许
+   * 无声消失——统一转成可见 error 通知。这是最后一道网，不豁免调用点自己
+   * 该做的错误处理（调用点应给出更具体的上下文）。
+   */
+  useEffect(() => {
+    const onUnhandled = (e: PromiseRejectionEvent) => {
+      e.preventDefault();
+      const reason = e.reason;
+      const message = reason instanceof Error ? reason.message : String(reason);
+      dispatch({
+        type: "noticeReceived",
+        notice: {
+          level: "error",
+          code: "unhandled-error",
+          message: `操作失败（未被界面正确接住）：${message}`,
+          occurredAt: new Date().toISOString(),
+        },
+      });
+    };
+    window.addEventListener("unhandledrejection", onUnhandled);
+    return () => window.removeEventListener("unhandledrejection", onUnhandled);
+  }, []);
 
   /**
    * 后端通知（降级/失败）常驻订阅 + 启动回放。

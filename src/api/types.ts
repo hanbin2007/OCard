@@ -117,6 +117,8 @@ export interface Volume {
   capacityBytes: number;
   usedBytes: number;
   removable: boolean;
+  /** 系统内置盘（启动盘/系统分区）：拷卡源默认隐藏，可在 UI 开关显示 */
+  isSystem: boolean;
   /** 若能与已登记存储卡匹配上，带出卡 id */
   matchedCardId?: string;
 }

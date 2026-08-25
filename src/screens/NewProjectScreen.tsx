@@ -49,6 +49,7 @@ export function NewProjectScreen() {
   );
   const [submitted, setSubmitted] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   const date = toCompactDate(isoDate);
   const categoryValues = useMemo(() => categories.map((c) => c.value), [categories]);
@@ -86,6 +87,7 @@ export function NewProjectScreen() {
     }
     if (busy) return;
     setBusy(true);
+    setSubmitError(null);
     try {
       const project = await api.createProject({
         name: name.trim(),
@@ -94,6 +96,15 @@ export function NewProjectScreen() {
         categories: scenario === "B" ? categoryValues.map((c) => c.trim()) : [],
       });
       dispatch({ type: "projectCreated", project });
+    } catch (err) {
+      // 同名项目等后端拒绝在这之前会被整个吞掉(按钮闪一下什么都不发生)——
+      // 失败必须落在表单里说清原因(零静默铁律)
+      const message = err instanceof Error ? err.message : String(err);
+      setSubmitError(
+        message.includes("目标已存在")
+          ? `已有同名项目夹（${folderName}）。换个项目名，或直接打开已有项目。`
+          : `创建项目失败：${message}`,
+      );
     } finally {
       setBusy(false);
     }
@@ -139,6 +150,16 @@ export function NewProjectScreen() {
                 void submit();
               }}
             >
+              {submitError ? (
+                <div
+                  className="notice notice--danger"
+                  role="alert"
+                  data-testid="np-submit-error"
+                >
+                  <strong>没有创建成功</strong>
+                  <span>{submitError}</span>
+                </div>
+              ) : null}
               <div className="card">
                 <div className="card__head">
                   <span className="card__title">基本信息</span>

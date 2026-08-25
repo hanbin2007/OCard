@@ -409,6 +409,7 @@ pub fn list_volumes<R: tauri::Runtime>(
                 capacity_bytes: v.total_bytes,
                 used_bytes: v.total_bytes.saturating_sub(v.available_bytes),
                 removable: v.removable,
+                is_system: v.system,
                 matched_card_id: matched,
             }
         })

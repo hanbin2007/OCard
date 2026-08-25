@@ -522,3 +522,68 @@ describe("分页与进度事件互不打架", () => {
     listSpy.mockRestore();
   });
 });
+
+describe("源卷过滤与刷新(UX 波)", () => {
+  it("系统内置盘默认被隐藏,并显示忽略开关", async () => {
+    render(<App preloaded={preloaded} />);
+
+    const options = screen.getAllByTestId("copy-volume-option");
+    expect(options).toHaveLength(mockVolumes.filter((v) => !v.isSystem).length);
+    expect(screen.queryByText("Macintosh HD")).toBeNull();
+
+    const toggle = screen.getByTestId("volumes-hide-system") as HTMLInputElement;
+    expect(toggle.checked).toBe(true);
+  });
+
+  it("关掉忽略开关后系统盘出现并带「系统盘」标注", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    await user.click(screen.getByTestId("volumes-hide-system"));
+    expect(screen.getAllByTestId("copy-volume-option")).toHaveLength(
+      mockVolumes.length,
+    );
+    expect(screen.getByText("Macintosh HD")).toBeDefined();
+    expect(screen.getByText("系统盘")).toBeDefined();
+  });
+
+  it("「刷新」重拉卷列表,开机后插的卡能出现", async () => {
+    const newCard = {
+      id: "vol-new",
+      name: "FX3_CARD",
+      mountPath: "/Volumes/FX3_CARD",
+      capacityBytes: 512 * 2 ** 30,
+      usedBytes: 100 * 2 ** 30,
+      removable: true,
+      isSystem: false,
+    };
+    const spy = vi
+      .spyOn(api, "listVolumes")
+      .mockResolvedValue([...mockVolumes, newCard]);
+
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    await user.click(screen.getByTestId("volumes-refresh"));
+    expect(await screen.findByText("FX3_CARD")).toBeDefined();
+    expect(spy).toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("刷新失败会有可见报错,不静默", async () => {
+    const spy = vi
+      .spyOn(api, "listVolumes")
+      .mockRejectedValue(new Error("volume backend down"));
+
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    await user.click(screen.getByTestId("volumes-refresh"));
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(/刷新卷列表失败/).length,
+      ).toBeGreaterThan(0),
+    );
+    spy.mockRestore();
+  });
+});

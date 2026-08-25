@@ -3,7 +3,11 @@
 .shell {
   display: grid;
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  /* 唯一一行必须钉死在 minmax(0,1fr):默认 auto 行会随内容长高,
+     把整个壳顶出视口(UX 波:全局滚动收口) */
+  grid-template-rows: minmax(0, 1fr);
   height: 100%;
+  overflow: hidden;
   background: var(--surface-shell);
 }
 
@@ -226,6 +230,9 @@
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+  /* toasts 绝对定位的锚点;路由过渡的位移也在这里被裁掉,不再顶出滚动条 */
+  position: relative;
+  overflow: hidden;
   /* 内容区比侧栏亮一档 */
   background: var(--bg);
 }
@@ -239,6 +246,8 @@
   padding: 0 var(--space-5);
   border-bottom: 1px solid var(--border);
   background: var(--bg);
+  /* 居中的当前项目指示以它为锚 */
+  position: relative;
 }
 
 /* 标题栏是"框"，不跟着内容一起位移：只做交叉淡入，
@@ -270,6 +279,84 @@
   align-items: center;
   gap: var(--space-2);
   margin-left: auto;
+}
+
+/* ---------- 当前操作项目指示(UX 波) ----------
+ * 拷卡/分类/转码都作用在「当前项目」上,这个状态必须常驻可见:
+ * 顶栏正中、黄底、加粗;超长跑马灯;点击回项目列表。
+ * 绝对定位居中,不挤压标题与右侧动作;窄窗下限宽,必要时被跑马灯接管。 */
+.topbar__project {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: min(34%, 320px);
+  padding: 3px var(--space-3);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-pill);
+  background: var(--warn-soft);
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  cursor: pointer;
+  animation: chrome-fade-in var(--dur-quick) var(--ease-out);
+}
+
+.topbar__project:hover {
+  filter: brightness(1.04);
+}
+
+.topbar__project--empty {
+  border-color: var(--border);
+  background: var(--bg-subtle);
+  color: var(--text-tertiary);
+  font-weight: var(--weight-medium);
+  cursor: default;
+}
+
+.topbar__project-label {
+  flex: 0 0 auto;
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  color: var(--warn);
+  letter-spacing: 0.08em;
+}
+
+.topbar__project-clip {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.topbar__project-name {
+  display: inline-block;
+  white-space: nowrap;
+}
+
+/* 只有量出真实溢出才起播;位移量由 JS 写进 --marquee-shift。
+   不写 100% 帧:88% 后回落到静态样式(translateX(0)),既是"滚过去再滚回来"
+   的完整节拍,也满足减少动效时终态=静态的约束(tokens.test 关键帧规则) */
+.topbar__project-name--marquee {
+  animation: project-marquee 8s ease-in-out infinite;
+}
+
+@keyframes project-marquee {
+  0%,
+  10% {
+    transform: translateX(0);
+  }
+  55%,
+  80% {
+    transform: translateX(var(--marquee-shift, 0));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .topbar__project-name--marquee {
+    animation: none;
+  }
 }
 
 /*

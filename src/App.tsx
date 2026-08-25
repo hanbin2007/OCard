@@ -1,4 +1,6 @@
 import { NoticeToasts } from "./components/NotificationCenter";
+import { OnboardingWizard } from "./components/OnboardingWizard";
+import { SessionGuard } from "./components/SessionGuard";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { Sidebar } from "./components/Sidebar";
 import { TopBar } from "./components/TopBar";
@@ -49,7 +51,7 @@ const IS_MAC_DESKTOP =
   "__TAURI_INTERNALS__" in window;
 
 function Routes() {
-  const { state, reload, dispatch } = useStore();
+  const { state, reload } = useStore();
 
   if (state.error) {
     return (
@@ -96,40 +98,15 @@ function Routes() {
     );
   }
 
-  // 首跑没配 NAS 根路径时，先温和引导，别让用户撞上「路径为空」的死胡同
-  if (!state.workstation?.nasRoot?.trim()) {
+  // 首跑：操作人或 NAS 根任一没配就先走引导——操作人漏配不能静默记成
+  // 「未登记DIT」，那是审计污点，不是可跳过的小事
+  if (!state.workstation?.nasRoot?.trim() || !state.workstation?.operator?.trim()) {
     return (
       <>
         <TopBar title="欢迎使用 OCard" />
         <div className="content">
           <div className="content__inner">
-            <div className="card" data-testid="first-run-guide">
-              <div className="card__head">
-                <span className="card__title">先完成本机设置</span>
-              </div>
-              <div className="card__body">
-                <div className="stack">
-                  <p className="text-sm muted">
-                    OCard 需要知道两件事才能开工：谁在操作（审计日志按操作人留痕），
-                    以及本机的 NAS 根路径（项目文件夹建在哪里）。
-                  </p>
-                  <p className="text-sm muted">
-                    这两项只影响本机。项目状态内只存相对路径，因此各工作站的路径形式
-                    不同也能打开同一个项目。
-                  </p>
-                  <div>
-                    <button
-                      type="button"
-                      data-testid="first-run-open-settings"
-                      className="btn btn--primary"
-                      onClick={() => dispatch({ type: "settingsOpened" })}
-                    >
-                      打开设置
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
+            <OnboardingWizard />
           </div>
         </div>
       </>
@@ -171,6 +148,7 @@ export function Shell() {
         <Routes />
       </main>
       <SettingsDialog />
+      <SessionGuard />
     </div>
   );
 }

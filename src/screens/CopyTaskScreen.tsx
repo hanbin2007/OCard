@@ -11,6 +11,7 @@ import type {
 import { SpeedSparkline, useSpeedSamples } from "../components/charts";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { IconPlus, IconRetry, IconTrash } from "../components/Icon";
+import { PathField } from "../components/PathField";
 import { RemoteActivityBanner } from "../components/RemoteActivityBanner";
 import { TopBar } from "../components/TopBar";
 import { Badge, EmptyState, Field, ProgressBar } from "../components/ui";
@@ -67,6 +68,9 @@ export function CopyTaskScreen() {
     projectTasks.find((t) => t.id === selectedTaskId) ?? projectTasks[0] ?? null;
 
   const [volumeId, setVolumeId] = useState("");
+  /** 忽略系统内置盘（默认开）：本机启动盘不是拷卡源,误选后果严重 */
+  const [showSystemVolumes, setShowSystemVolumes] = useState(false);
+  const [volumesRefreshing, setVolumesRefreshing] = useState(false);
   const [cameraId, setCameraId] = useState("");
   const [note, setNote] = useState("");
   const [targetPrefix, setTargetPrefix] = useState("");
@@ -106,6 +110,48 @@ export function CopyTaskScreen() {
     task?.state === "running" || task?.state === "verifying",
   );
 
+  /** 本屏内失败上抛通知中心的统一出口（零静默铁律） */
+  const pushNotice = useCallback(
+    (level: "warning" | "error", code: string, message: string) =>
+      dispatch({
+        type: "noticeReceived",
+        notice: { level, code, message, occurredAt: new Date().toISOString() },
+      }),
+    [dispatch],
+  );
+
+  /**
+   * 卷列表以前只在启动时拉一次：开机后才插卡永远看不见,也没有任何提示。
+   * 进屏自动刷一次 + 手动刷新按钮兜底（原生挂载事件通知是后续增强,PRD §6.5）。
+   */
+  const refreshVolumes = useCallback(async () => {
+    setVolumesRefreshing(true);
+    try {
+      const next = await api.listVolumes();
+      dispatch({ type: "volumesUpdated", volumes: next });
+    } catch (err) {
+      pushNotice(
+        "error",
+        "volumes-refresh-failed",
+        `刷新卷列表失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setVolumesRefreshing(false);
+    }
+  }, [dispatch, pushNotice]);
+
+  useEffect(() => {
+    void refreshVolumes();
+  }, [refreshVolumes]);
+
+  /** 默认隐藏系统内置盘；已选中的卷永远不隐藏（开关不该把当前选择变没） */
+  const visibleVolumes = useMemo(
+    () =>
+      volumes.filter((v) => showSystemVolumes || !v.isSystem || v.id === volumeId),
+    [volumes, showSystemVolumes, volumeId],
+  );
+  const hiddenSystemCount = volumes.length - visibleVolumes.length;
+
   const camera = cameras.find((c) => c.id === cameraId) ?? null;
   const validation = useMemo(
     () =>
@@ -129,18 +175,28 @@ export function CopyTaskScreen() {
     if (!volumeId || !project || prefixEditedRef.current) return;
     let cancelled = false;
     void (async () => {
-      const inspection = await api.inspectVolume(volumeId);
-      if (cancelled || prefixEditedRef.current) return;
-      // 工况 A 用项目拍摄日期，工况 B 用卡内素材推断出的时段
-      setTargetPrefix(
-        project.scenario === "A" ? project.date : inspection.suggestedPrefix,
-      );
-      setPrefixInferred(true);
+      try {
+        const inspection = await api.inspectVolume(volumeId);
+        if (cancelled || prefixEditedRef.current) return;
+        // 工况 A 用项目拍摄日期，工况 B 用卡内素材推断出的时段
+        setTargetPrefix(
+          project.scenario === "A" ? project.date : inspection.suggestedPrefix,
+        );
+        setPrefixInferred(true);
+      } catch (err) {
+        if (cancelled) return;
+        // 探查失败以前是静默的：前缀悄悄没推出来,用户不知道为什么是空的
+        pushNotice(
+          "warning",
+          "volume-inspect-failed",
+          `读取卡内素材时间失败，时段前缀请手动填写：${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     })();
     return () => {
       cancelled = true;
     };
-  }, [volumeId, project]);
+  }, [volumeId, project, pushNotice]);
 
 
   /** 进度事件驱动的重拉节流：拷贝中每 ~200ms 一条事件，不能每条都打一次 IPC */
@@ -149,28 +205,49 @@ export function CopyTaskScreen() {
   const lastRefreshRef = useRef(0);
 
   /** 追加下一页 */
-  const loadMoreFiles = useCallback(async (taskId: string, offset: number) => {
-    setFilesLoading(true);
-    try {
-      const page = await api.listCopyFiles(taskId, offset, PAGE_SIZE);
-      setFileTotal(page.total);
-      setFiles((prev) => [...prev, ...page.items]);
-    } finally {
-      setFilesLoading(false);
-    }
-  }, []);
+  const loadMoreFiles = useCallback(
+    async (taskId: string, offset: number) => {
+      setFilesLoading(true);
+      try {
+        const page = await api.listCopyFiles(taskId, offset, PAGE_SIZE);
+        setFileTotal(page.total);
+        setFiles((prev) => [...prev, ...page.items]);
+      } catch (err) {
+        pushNotice(
+          "error",
+          "copy-files-load-failed",
+          `加载文件明细失败：${err instanceof Error ? err.message : String(err)}`,
+        );
+      } finally {
+        setFilesLoading(false);
+      }
+    },
+    [pushNotice],
+  );
 
   /**
    * 重拉「已经加载出来的那些」——从 0 拉到已加载条数，而不是固定回到第一页。
    * 否则用户点了几次「加载更多」，一条进度事件就把它们全丢了。
    */
-  const refreshLoadedFiles = useCallback(async (taskId: string) => {
-    const limit = Math.max(loadedCountRef.current, PAGE_SIZE);
-    lastRefreshRef.current = Date.now();
-    const page = await api.listCopyFiles(taskId, 0, limit);
-    setFiles(page.items);
-    setFileTotal(page.total);
-  }, []);
+  const refreshLoadedFiles = useCallback(
+    async (taskId: string) => {
+      const limit = Math.max(loadedCountRef.current, PAGE_SIZE);
+      lastRefreshRef.current = Date.now();
+      try {
+        const page = await api.listCopyFiles(taskId, 0, limit);
+        setFiles(page.items);
+        setFileTotal(page.total);
+      } catch (err) {
+        // 节流刷新失败：状态列可能滞后,必须让用户知道显示的不是最新
+        pushNotice(
+          "warning",
+          "copy-files-refresh-failed",
+          `文件状态刷新失败，列表可能滞后：${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    },
+    [pushNotice],
+  );
 
   // 切换任务：重置并拉第一页（只认 taskId，不受进度事件影响）
   const taskId = task?.id ?? null;
@@ -185,16 +262,25 @@ export function CopyTaskScreen() {
     setFiles([]);
     loadedCountRef.current = 0;
     void (async () => {
-      const page = await api.listCopyFiles(taskId, 0, PAGE_SIZE);
-      if (cancelled) return;
-      setFiles(page.items);
-      setFileTotal(page.total);
-      lastRefreshRef.current = Date.now();
+      try {
+        const page = await api.listCopyFiles(taskId, 0, PAGE_SIZE);
+        if (cancelled) return;
+        setFiles(page.items);
+        setFileTotal(page.total);
+        lastRefreshRef.current = Date.now();
+      } catch (err) {
+        if (cancelled) return;
+        pushNotice(
+          "error",
+          "copy-files-load-failed",
+          `加载文件明细失败：${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     })();
     return () => {
       cancelled = true;
     };
-  }, [taskId]);
+  }, [taskId, pushNotice]);
 
   // 进度推进时刷新状态列，但按 REFRESH_MIN_MS 节流并保住已加载的页数
   const taskRevision = task?.progressRevision ?? 0;
@@ -457,15 +543,26 @@ export function CopyTaskScreen() {
                       }}
                     >
                       <div className="field">
-                        <span className="field__label" id="volume-group-label">
-                          源卷
-                        </span>
+                        <div className="row-inline">
+                          <span className="field__label" id="volume-group-label">
+                            源卷
+                          </span>
+                          <button
+                            type="button"
+                            className="btn btn--sm push-right"
+                            data-testid="volumes-refresh"
+                            disabled={volumesRefreshing}
+                            onClick={() => void refreshVolumes()}
+                          >
+                            {volumesRefreshing ? "刷新中…" : "刷新"}
+                          </button>
+                        </div>
                         <div
                           role="radiogroup"
                           data-testid="copy-volume-select"
                           aria-labelledby="volume-group-label"
                         >
-                          {volumes.map((v) => {
+                          {visibleVolumes.map((v) => {
                             const matched = state.cards.find(
                               (c) => c.id === v.matchedCardId,
                             );
@@ -490,7 +587,9 @@ export function CopyTaskScreen() {
                                     {formatBytes(v.capacityBytes, 0)}
                                   </span>
                                 </span>
-                                {matched ? (
+                                {v.isSystem ? (
+                                  <Badge tone="warn">系统盘</Badge>
+                                ) : matched ? (
                                   <Badge mono>{matched.label}</Badge>
                                 ) : (
                                   <Badge tone="warn">未登记</Badge>
@@ -498,10 +597,28 @@ export function CopyTaskScreen() {
                               </button>
                             );
                           })}
-                          {volumes.length === 0 ? (
-                            <p className="text-sm dim">未检测到可移动卷。</p>
+                          {visibleVolumes.length === 0 ? (
+                            <p className="text-sm dim" data-testid="volumes-empty">
+                              {hiddenSystemCount > 0
+                                ? `未检测到存储卡（已隐藏 ${hiddenSystemCount} 个系统内置盘）。插入卡后点「刷新」。`
+                                : "未检测到卷。插入卡后点「刷新」。"}
+                            </p>
                           ) : null}
                         </div>
+                        <label className="row-inline text-xs dim">
+                          <input
+                            type="checkbox"
+                            data-testid="volumes-hide-system"
+                            checked={!showSystemVolumes}
+                            onChange={(e) =>
+                              setShowSystemVolumes(!e.currentTarget.checked)
+                            }
+                          />
+                          忽略系统内置盘
+                          {!showSystemVolumes && hiddenSystemCount > 0
+                            ? `（已隐藏 ${hiddenSystemCount} 个）`
+                            : ""}
+                        </label>
                         {submitted && validation.errors.volumeId ? (
                           <span className="field__error" role="alert">
                             {validation.errors.volumeId}
@@ -624,25 +741,22 @@ export function CopyTaskScreen() {
                                   </option>
                                 ))}
                               </select>
-                              <input
-                                className={`input input--mono${
-                                  submitted && validation.errors.destinationAt?.[index]
-                                    ? " input--invalid"
-                                    : ""
-                                }`}
-                                type="text"
+                              <PathField
                                 value={dest.kind === "nas" ? "" : dest.path}
-                                aria-label={`第 ${index + 1} 个目的地路径`}
+                                ariaLabel={`第 ${index + 1} 个目的地路径`}
                                 /* NAS 目的地由项目结构推导，用户填了也会被后端忽略 */
                                 readOnly={dest.kind === "nas"}
                                 disabled={dest.kind === "nas"}
+                                invalid={Boolean(
+                                  submitted && validation.errors.destinationAt?.[index],
+                                )}
                                 placeholder={
                                   dest.kind === "nas"
                                     ? "由项目结构自动推导"
                                     : "选择或粘贴目标文件夹路径"
                                 }
-                                onChange={(e) => {
-                                  const path = e.currentTarget.value;
+                                pickerTitle={`选择第 ${index + 1} 个目的地文件夹`}
+                                onChange={(path) => {
                                   setDests((prev) =>
                                     prev.map((d) =>
                                       d.id === dest.id ? { ...d, path } : d,

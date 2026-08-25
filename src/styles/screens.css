@@ -9,7 +9,7 @@
  */
 .projects__head,
 .projects__row {
-  grid-template-columns: minmax(0, 1fr) 64px 108px minmax(0, 1.2fr) 84px;
+  grid-template-columns: minmax(0, 1fr) 64px 108px minmax(0, 1.2fr) 84px 104px;
 }
 
 .projects__head > :nth-child(5),
@@ -23,7 +23,7 @@
   .projects__head,
   .projects__row {
     grid-template-columns:
-      minmax(140px, 1.3fr) 64px 108px minmax(120px, 1fr) 48px 96px 84px;
+      minmax(140px, 1.3fr) 64px 108px minmax(120px, 1fr) 48px 96px 84px 104px;
   }
 
   .projects__head > :nth-child(5),
@@ -37,7 +37,7 @@
 @media (max-width: 1180px) {
   .projects__head,
   .projects__row {
-    grid-template-columns: minmax(0, 1fr) 64px 84px;
+    grid-template-columns: minmax(0, 1fr) 64px 84px 104px;
   }
 
   .projects__head > :nth-child(3),
@@ -46,6 +46,23 @@
   .projects__row > :nth-child(4) {
     display: none;
   }
+}
+
+/* 「切换到此项目 / 当前项目」列(UX 波):当前操作项目必须显式可见、可达 */
+.projects__switch {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+.projects__switch-btn {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.projects__switch-btn:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
 }
 
 .projects__name {
