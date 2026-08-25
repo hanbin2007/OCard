@@ -81,6 +81,16 @@ fn create_b_project(window: &WebviewWindow<tauri::test::MockRuntime>) -> String 
     created["id"].as_str().unwrap().to_string()
 }
 
+fn create_a_project(window: &WebviewWindow<tauri::test::MockRuntime>) -> String {
+    let created = invoke(
+        window,
+        "create_project",
+        json!({"input": {"name": "集成A", "date": "20260824", "scenario": "A"}}),
+    )
+    .expect("建项目应成功");
+    created["id"].as_str().unwrap().to_string()
+}
+
 #[test]
 fn sorting_full_chain_through_real_handler() {
     let (window, _tmp, nas) = mock_app();
@@ -307,4 +317,202 @@ fn m3_commands_wired_and_gated() {
     let acts = invoke(&window, "list_remote_activity", json!({"projectId": pid})).unwrap();
     assert!(acts.is_array(), "{acts}");
     assert_eq!(acts.as_array().unwrap().len(), 0, "分析不产生远端活动条目");
+}
+
+// ---------- R3-F2 闸接线回归(评审缺口 3:修复点必须有命令层网) ----------
+
+/// R2 P0-1 接线回归:持久化清单被篡改(`../` 项)后,resume 必须整单拒绝,
+/// 且闸在卷重解析之前——报文点名篡改,而不是让用户「插回原卡」。
+/// (拷卡发起要求源恰为真实挂载卷,mock 环境不可伪造;任务句柄按生产
+/// 同构直接落 TaskManager,resume 命令本身仍走真实 handler 全链路。)
+/// 在 resume_copy_task 里删掉 planned 校验块本测试红。
+#[test]
+fn resume_rejects_tampered_manifest_through_real_handler() {
+    use std::sync::atomic::AtomicBool;
+    let (window, tmp, nas) = mock_app();
+    let pid = create_b_project(&window);
+    let project_root = nas.join(&pid);
+
+    // 生产同构的持久化清单……
+    let mut m = crate::core::manifest::CopyManifest::new(
+        "1. 待分类/0824上午_A7M4_A_ZS",
+        "SDXC_01",
+        "A7M4_A_ZS",
+        "ZS",
+        "",
+    );
+    m.planned.push(crate::core::manifest::PlannedFile {
+        rel_path: "DCIM/IMG_0001.JPG".into(),
+        size: 64,
+    });
+    crate::core::manifest::save(&project_root, &m).unwrap();
+    // ……随后在 NAS 上被篡改:planned 注入逃逸项
+    let mfile = project_root.join(format!(".ocard/manifests/{}.json", m.id));
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&mfile).unwrap()).unwrap();
+    v["planned"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"rel_path": "../逃逸.bin", "size": 4}));
+    std::fs::write(&mfile, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+
+    // 任务句柄(暂停态,与 start_copy_task 落进 TaskManager 的结构一致)
+    let dest = project_root.join("1. 待分类/0824上午_A7M4_A_ZS");
+    let state = window.state::<AppState>();
+    state.tasks.insert(
+        "t-tampered".into(),
+        std::sync::Arc::new(crate::commands::tasks::TaskHandle {
+            pause_requested: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+            snapshot: std::sync::Mutex::new(crate::commands::dto::CopyTaskDto {
+                id: "t-tampered".into(),
+                project_id: pid.clone(),
+                volume_id: tmp.path().join("card").display().to_string(),
+                volume_name: "SDXC_01".into(),
+                camera_id: "cam-1".into(),
+                camera_code: "A7M4_A_ZS".into(),
+                note: String::new(),
+                target_folder: "0824上午_A7M4_A_ZS".into(),
+                destinations: Vec::new(),
+                files: Vec::new(),
+                file_count: None,
+                total_bytes: 0,
+                copied_bytes: 0,
+                speed_bytes_per_sec: 0,
+                state: "paused",
+                progress_revision: None,
+                operator: "ZS".into(),
+                started_at: String::new(),
+                finished_at: None,
+            }),
+            project_root: project_root.clone(),
+            manifest_id: m.id.clone(),
+            source_root: std::sync::Mutex::new(tmp.path().join("card")),
+            dest_targets: vec![dest],
+            machine_id: "TEST-MACHINE".into(),
+            config_dir: tmp.path().join("config"),
+        }),
+    );
+
+    let e = invoke(&window, "resume_copy_task", json!({"taskId": "t-tampered"}))
+        .expect_err("篡改清单必须拒绝续传");
+    assert!(
+        e.as_str()
+            .unwrap_or_default()
+            .contains("任务清单损坏或被篡改"),
+        "报文必须点名篡改而非挂载环境: {e}"
+    );
+    // 逃逸落点(目的地根上一级)不得出现任何写入
+    assert!(!project_root.join("1. 待分类/逃逸.bin").exists());
+}
+
+/// R2 成对承诺兑现:auto_proxy 意图链挂网——意图必须真正走到作业管理器
+/// (重试计数先持久化、真实产生转码作业),连续三次未整批完成必须放弃:
+/// proxy_completed 置位防重放 + 可见告警。删 dispatch_auto_proxy 里的
+/// attempts 持久化/放弃分支/spawn_proxy_job 调用,本测试对应断言红。
+#[test]
+fn auto_proxy_intent_chain_wired() {
+    let (window, tmp, nas) = mock_app();
+    let pid = create_a_project(&window);
+    let project_root = nas.join(&pid);
+    let config_dir = tmp.path().join("config");
+
+    // 拷卡完成、带 auto_proxy 意图的清单(与 start_copy_task 落盘结构一致)
+    let mut m = crate::core::manifest::CopyManifest::new(
+        "2. 原始素材/20260824_A7M4_A_ZS",
+        "SDXC_01",
+        "A7M4_A_ZS",
+        "ZS",
+        "",
+    );
+    m.auto_proxy = true;
+    m.completed = true;
+    crate::core::manifest::save(&project_root, &m).unwrap();
+
+    let app = window.app_handle();
+    crate::commands::transcode_cmds::dispatch_auto_proxy(
+        app,
+        &project_root,
+        "TEST-MACHINE",
+        &config_dir,
+        "ZS",
+        &m,
+    );
+    // 计数先于作业持久化(放弃上限的根据),意图真实落到作业管理器
+    let m1 = crate::core::manifest::load(&project_root, &m.id).unwrap();
+    assert_eq!(m1.proxy_attempts, 1, "意图派发必须先持久化重试计数");
+    assert!(!m1.proxy_completed);
+    let jobs = window.state::<std::sync::Arc<crate::core::jobs::JobManager>>();
+    assert!(
+        jobs.snapshots()
+            .iter()
+            .any(|s| s.kind == crate::core::jobs::JobKind::Transcode),
+        "意图必须产生真实转码作业"
+    );
+
+    // 放弃路径:attempts 已达上限 → 不再重投,置位防重放,可见告警
+    let mut m3 = crate::core::manifest::CopyManifest::new(
+        "2. 原始素材/20260824_DJIRonin4D_B_ZS",
+        "SDXC_02",
+        "DJIRonin4D_B_ZS",
+        "ZS",
+        "",
+    );
+    m3.auto_proxy = true;
+    m3.completed = true;
+    m3.proxy_attempts = 3;
+    crate::core::manifest::save(&project_root, &m3).unwrap();
+    crate::commands::transcode_cmds::dispatch_auto_proxy(
+        app,
+        &project_root,
+        "TEST-MACHINE",
+        &config_dir,
+        "ZS",
+        &m3,
+    );
+    let m3r = crate::core::manifest::load(&project_root, &m3.id).unwrap();
+    assert!(m3r.proxy_completed, "三次未整批完成必须放弃并防重放");
+    let notices = invoke(&window, "list_notices", json!({})).unwrap();
+    assert!(
+        notices
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["code"] == "auto-proxy-abandoned"),
+        "放弃必须可见告警: {notices}"
+    );
+}
+
+/// R2 P0-4 接线回归:归档输出根的**祖先**是指向项目区的符号链接时,
+/// 字符串级检查全部放行,必须由 canonicalize 复核闸拒绝——在
+/// start_archive_transcode 里删掉 canonicalize 复核块本测试红。
+#[cfg(unix)]
+#[test]
+fn archive_output_ancestor_symlink_refused_through_real_handler() {
+    let (window, tmp, nas) = mock_app();
+    let pid = create_a_project(&window);
+
+    // tmp/escape_link -> 项目根;输出目录字符串上完全在项目外
+    let link = tmp.path().join("escape_link");
+    std::os::unix::fs::symlink(nas.join(&pid), &link).unwrap();
+    let out_dir = link.join("归档区");
+
+    let e = invoke(
+        &window,
+        "start_archive_transcode",
+        json!({"input": {"projectId": pid, "tier": "balanced",
+               "outputDir": out_dir.display().to_string()}}),
+    )
+    .expect_err("经链接祖先指进项目区的输出根必须被拒");
+    assert!(
+        e.as_str().unwrap_or_default().contains("经符号链接"),
+        "报文必须点名链接绕过: {e}"
+    );
+    // 不得创建归档作业
+    let jobs = window.state::<std::sync::Arc<crate::core::jobs::JobManager>>();
+    assert!(
+        jobs.snapshots()
+            .iter()
+            .all(|s| s.kind != crate::core::jobs::JobKind::Transcode),
+        "拒绝路径不得留下转码作业"
+    );
 }
