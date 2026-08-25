@@ -226,10 +226,8 @@ pub fn note_times_preserve_failures(n: u64) {
 pub fn preserve_times(src_meta: &fs::Metadata, dst: &Path) -> io::Result<bool> {
     let mut full = true;
     let mut times = fs::FileTimes::new();
-    match src_meta.modified() {
-        Ok(m) => times = times.set_modified(m),
-        Err(e) => return Err(e), // mtime 是硬承诺,取不到按失败计
-    }
+    // mtime 是硬承诺,取不到按失败计
+    times = times.set_modified(src_meta.modified()?);
     match src_meta.accessed() {
         Ok(a) => times = times.set_accessed(a),
         Err(_) => full = false,
