@@ -54,7 +54,7 @@ pub fn check_final_cuts<R: tauri::Runtime>(
         return Err("成片命名校验仅适用于工况 A(视频)项目".into());
     }
     let dir = stats.root.join(project::SCENARIO_A_DIRS[5]); // 6. 成片
-    // R2 P1:中间段可能被换成符号链接把读取导出项目外——canonical 只读闸
+                                                            // R2 P1:中间段可能被换成符号链接把读取导出项目外——canonical 只读闸
     paths::assert_within(&stats.root, &dir)?;
     let mut report = FinalCutReportDto {
         items: Vec::new(),

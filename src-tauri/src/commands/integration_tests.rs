@@ -170,9 +170,7 @@ fn delivery_job_end_to_end_through_real_handler() {
         let active = jobs
             .snapshots()
             .iter()
-            .filter(|s| {
-                s.kind == crate::core::jobs::JobKind::Delivery && !s.state.is_terminal()
-            })
+            .filter(|s| s.kind == crate::core::jobs::JobKind::Delivery && !s.state.is_terminal())
             .count();
         assert!(
             active <= 1,

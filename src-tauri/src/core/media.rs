@@ -211,12 +211,7 @@ pub fn decode_oriented(abs: &Path) -> Option<image::DynamicImage> {
     Some(apply_orientation(img, exif_orientation(abs)))
 }
 
-fn make_photo_thumb(
-    project_root: &Path,
-    abs: &Path,
-    dir: &Path,
-    cache: &Path,
-) -> Option<PathBuf> {
+fn make_photo_thumb(project_root: &Path, abs: &Path, dir: &Path, cache: &Path) -> Option<PathBuf> {
     let img = decode_oriented(abs)?;
     let thumb = img.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE);
     write_jpeg(project_root, &thumb, dir, cache)

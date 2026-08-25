@@ -362,8 +362,7 @@ fn copy_one(
                     )));
                 }
                 fs::create_dir_all(root)?;
-                super::paths::ensure_dir_within(root, parent)
-                    .map_err(super::CoreError::Invalid)?;
+                super::paths::ensure_dir_within(root, parent).map_err(super::CoreError::Invalid)?;
             }
             // 同任务崩溃残留的 part 是自己的,清掉;create_new 拦截跨任务冲突
             let _ = fs::remove_file(part);
@@ -927,11 +926,8 @@ mod review_regression_tests {
         let tmp = tempdir().unwrap();
         make_card(tmp.path());
         std::os::unix::fs::symlink(tmp.path().join("DCIM"), tmp.path().join("LINKDIR")).unwrap();
-        std::os::unix::fs::symlink(
-            tmp.path().join("CLIP0001.MP4"),
-            tmp.path().join("LINK.MP4"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("CLIP0001.MP4"), tmp.path().join("LINK.MP4"))
+            .unwrap();
         let files = scan_source(tmp.path()).unwrap();
         assert!(
             files.iter().all(|(r, _)| !r.contains("LINK")),
