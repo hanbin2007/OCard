@@ -212,8 +212,9 @@
   background: var(--panel);
   text-align: left;
   transition:
-    border-color var(--transition),
-    background var(--transition);
+    border-color var(--dur-micro) var(--ease-out),
+    background var(--dur-micro) var(--ease-out),
+    transform var(--dur-spring-fast) var(--spring);
 }
 
 .volume-row + .volume-row {
@@ -374,8 +375,9 @@
   color: var(--text-primary);
   font-size: var(--text-xs);
   transition:
-    background var(--transition),
-    border-color var(--transition);
+    background var(--dur-micro) var(--ease-out),
+    border-color var(--dur-micro) var(--ease-out),
+    transform var(--dur-spring-fast) var(--spring);
 }
 
 .chip:hover:not(:disabled) {
@@ -431,8 +433,9 @@
   background: var(--panel);
   cursor: pointer;
   transition:
-    border-color var(--transition),
-    background var(--transition);
+    border-color var(--dur-micro) var(--ease-out),
+    background var(--dur-micro) var(--ease-out),
+    transform var(--dur-spring-fast) var(--spring);
 }
 
 .asset:hover {
@@ -444,13 +447,52 @@
   border-color: var(--border-focus);
 }
 
+/*
+ * 键盘光标环也"收拢"落位：连按方向键时，收拢这个动作就是
+ * "焦点刚从那边跳到这边"的可见提示。类在格子之间移动，
+ * 新格子获得类的瞬间动画即开始，天然跟得上连按。
+ */
 .asset--focused {
   outline: 2px solid var(--accent);
   outline-offset: -1px;
+  animation: cursor-ring-settle var(--dur-spring-fast) var(--spring);
+}
+
+@keyframes cursor-ring-settle {
+  from {
+    outline-offset: 5px;
+    outline-color: transparent;
+  }
 }
 
 .asset--marked {
   border-color: var(--danger);
+}
+
+/*
+ * 「提交完成」的因果反馈（§13 causality）：精选是复制语义，格子不会离开网格，
+ * 如果不给反馈，用户按完 P 只能靠顶部计数猜到底生没生效。
+ * 一次轻微下压再回弹，只作用在**视口内**这几十个格子上，且只动 transform。
+ * a / b 两个同形关键帧交替，是为了让连续两次操作都能重新起播。
+ */
+.asset[data-commit="a"] {
+  animation: cell-commit-a var(--dur-spring-pop) var(--ease-out);
+}
+
+.asset[data-commit="b"] {
+  animation: cell-commit-b var(--dur-spring-pop) var(--ease-out);
+}
+
+@keyframes cell-commit-a {
+  38% {
+    transform: scale(0.955);
+  }
+}
+
+@keyframes cell-commit-b {
+  38% {
+    transform: scale(0.955);
+  }
 }
 
 .asset__thumb {
@@ -499,6 +541,22 @@
   font-weight: var(--weight-semibold);
 }
 
+/*
+ * 标删角标弹入：这是本应用唯一用带过冲弹簧（ζ=0.75，峰值 1.028）的地方。
+ * 标删是一次离散的"提交"，一点点分量让它读起来是被放上去的实体，
+ * 而不是凭空出现的一个色块。过冲仅 2.8%，是分量不是弹跳。
+ */
+.asset__flag {
+  animation: flag-in var(--dur-spring-pop) var(--spring-pop);
+}
+
+@keyframes flag-in {
+  from {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+}
+
 .asset__flag--delete {
   background: var(--danger);
   color: var(--on-danger);
@@ -517,6 +575,7 @@
   flex: 1 1 auto;
 }
 
+/* 待删清单贴在屏底，所以从屏底方向进来——来向与它待的位置一致 */
 .sorting__pending {
   display: flex;
   align-items: center;
@@ -524,13 +583,28 @@
   padding: var(--space-3) var(--space-6);
   border-top: 1px solid var(--danger);
   background: var(--danger-soft);
+  animation: pending-in var(--dur-spring-fast) var(--spring);
+}
+
+@keyframes pending-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0);
+  }
 }
 
 .sorting__pending .dot {
   color: var(--danger);
 }
 
-/* 全屏预览 */
+/*
+ * 全屏预览。
+ *
+ * 内核支持视图过渡时，缩略图与这里的大图是**同一个实体**在形变
+ * （见 lib/motion.ts 与 base.css 的 ocard-preview 组），进出同路径；
+ * 不支持时退到下面这套关键帧：遮罩淡入、工具条从上方压下、图像微放大落位。
+ * 两条路径的视觉终点完全一致。
+ */
 .lightbox {
   position: fixed;
   inset: 0;
@@ -538,6 +612,7 @@
   display: flex;
   flex-direction: column;
   background: var(--overlay);
+  animation: scrim-in var(--dur-quick) var(--ease-out);
 }
 
 .lightbox__bar {
@@ -547,6 +622,14 @@
   padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--border);
   background: var(--panel);
+  animation: lightbox-bar-in var(--dur-spring-fast) var(--spring);
+}
+
+@keyframes lightbox-bar-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, -10px, 0);
+  }
 }
 
 .lightbox__stage {
@@ -565,6 +648,14 @@
   object-fit: contain;
   border-radius: var(--radius-md);
   background: var(--bg-sunken);
+  animation: lightbox-media-in var(--dur-spring-fast) var(--spring);
+}
+
+@keyframes lightbox-media-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
 }
 
 .lightbox__image--empty {

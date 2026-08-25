@@ -45,6 +45,21 @@ export type RouteName =
   | "transcode";
 
 /**
+ * 导航的**空间顺序**：侧栏就是按这个顺序排的，屏间过渡的方向也由它算。
+ * 往下走 → 新屏从下方进来；往回走 → 从上方进来。
+ * 两处共用同一个常量，改了顺序不会出现"侧栏在下、动画说在上"的错位。
+ */
+export const ROUTE_ORDER: RouteName[] = [
+  "projects",
+  "new-project",
+  "devices",
+  "copy",
+  "sorting",
+  "transcode",
+  "trash",
+];
+
+/**
  * 通知中心条目：同 code 连续重复会折叠成一条并计数，避免刷屏。
  * `live` 表示还在即时呈现区（error 需手动确认，warning 数秒后自动收进铃铛）。
  */

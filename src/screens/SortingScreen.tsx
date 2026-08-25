@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import * as api from "../api";
 import type {
+  AnalysisResult,
   BulkResult,
   CuratedFlowHint,
   SortingAsset,
@@ -12,9 +13,10 @@ import { AssetLightbox } from "../components/AssetLightbox";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { DeliveryButton } from "../components/DeliveryPanel";
 import { TopBar } from "../components/TopBar";
-import { Badge, EmptyState, Kbd, ProgressBar } from "../components/ui";
+import { Badge, EmptyState, Kbd, ProgressBar, PulseValue } from "../components/ui";
 import { VirtualGrid } from "../components/VirtualGrid";
 import { formatBytes, formatTimestamp } from "../lib/format";
+import { withViewTransition } from "../lib/motion";
 import {
   actionTargets,
   buildGridEntries,
@@ -56,6 +58,8 @@ const KIND_LABEL: Record<SortingAsset["kind"], string> = {
 const CELL_MIN_WIDTH = 148;
 const ROW_HEIGHT = 148;
 const GRID_GAP = 8;
+/** 「操作已提交」的格子回弹提示挂多久（略长于 --dur-spring-pop，让动画放完） */
+const COMMIT_PULSE_MS = 420;
 
 export function SortingScreen() {
   const { state, dispatch } = useStore();
@@ -102,6 +106,17 @@ export function SortingScreen() {
   const [columns, setColumns] = useState(6);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [busy, setBusy] = useState(false);
+  /**
+   * 「这一下确实生效了」的格子级回弹。
+   *
+   * 精选是复制语义，素材不离开网格——不给反馈的话，用户按完 P 只能靠顶部
+   * 计数去猜。phase 在 a / b 之间来回切，是为了让连续两次操作都能重新起播
+   * （同名 CSS 动画在同一个节点上不会自动重放）。
+   */
+  const [commit, setCommit] = useState<{ ids: Set<string>; phase: "a" | "b" } | null>(
+    null,
+  );
+  const commitPhaseRef = useRef<"a" | "b">("b");
 
   const gridWrapRef = useRef<HTMLDivElement>(null);
   const loadedCountRef = useRef(0);
@@ -159,6 +174,58 @@ export function SortingScreen() {
   const cursorIndex = selection.cursor ? assetIds.indexOf(selection.cursor) : -1;
 
   const projectId = project?.id ?? null;
+
+  /* ---------------- 动效与导航连续性 ---------------- */
+
+  const pulseCommit = useCallback((entryIds: string[]) => {
+    if (entryIds.length === 0) return;
+    commitPhaseRef.current = commitPhaseRef.current === "a" ? "b" : "a";
+    setCommit({ ids: new Set(entryIds), phase: commitPhaseRef.current });
+  }, []);
+
+  // 播完就摘掉标记：否则格子滚出窗口再滚回来会莫名其妙再弹一次
+  useEffect(() => {
+    if (!commit) return;
+    const timer = setTimeout(() => setCommit(null), COMMIT_PULSE_MS);
+    return () => clearTimeout(timer);
+  }, [commit]);
+
+  /**
+   * 打开全屏预览。
+   *
+   * 支持视图过渡的内核上，网格里那一格的缩略图与全屏大图共用过渡名
+   * `ocard-preview`，于是"打开"读起来是**同一张图长大了**，
+   * 而不是网格消失、另一个界面出现（§7 空间一致性）。
+   */
+  const openPreview = useCallback((assetId: string) => {
+    withViewTransition(() => setPreviewId(assetId));
+  }, []);
+
+  /**
+   * 关闭全屏预览：大图缩回它所在的那一格，并把键盘光标**留在你最后看的那张**上。
+   *
+   * 后半句才是导航上的正事：翻了十几张再退出来，光标还停在进去之前那一格
+   * 等于把人扔回原点。光标跟过来之后 VirtualGrid 会把它滚进可视区，
+   * 缩回去的目标格也因此一定在视野里。
+   */
+  const closePreview = useCallback(() => {
+    withViewTransition(() => {
+      if (previewId && assetIds.includes(previewId)) {
+        setSelection((prev) => ({ ...prev, cursor: previewId, anchor: previewId }));
+      }
+      setPreviewId(null);
+    });
+  }, [previewId, assetIds]);
+
+  /* 展开层没有共用实体，进场交给 CSS 关键帧（缩放 + 淡入）更好看；
+     退场没有挂载动画可用，才需要视图过渡兜住。 */
+  const openGroupOverlay = useCallback((groupId: string) => {
+    setOpenGroup(groupId);
+  }, []);
+
+  const closeGroupOverlay = useCallback(() => {
+    withViewTransition(() => setOpenGroup(null));
+  }, []);
 
   /* ---------------- 数据加载 ---------------- */
 
@@ -236,10 +303,30 @@ export function SortingScreen() {
   // 两轮事件数相同时用它当全局令牌会让第二轮永不刷新
   const analyzeDoneId = analyzeJob?.state === "done" ? analyzeJob.id : null;
   const refreshedAnalyzeIdRef = useRef<string | null>(null);
+  /** 结果与 analyzeDoneId 同批到达；走 ref 传进 effect，免得把整个 job 塞进依赖 */
+  const analyzeResultRef = useRef<AnalysisResult | undefined>(undefined);
+  analyzeResultRef.current =
+    analyzeJob?.state === "done" ? analyzeJob.result : undefined;
+
   useEffect(() => {
     if (!analyzeDoneId) return;
     if (refreshedAnalyzeIdRef.current === analyzeDoneId) return;
     refreshedAnalyzeIdRef.current = analyzeDoneId;
+
+    /*
+     * 视频首帧图被跳过 = 转码引擎不可用的降级，格子会一直停在「索引中」占位。
+     * 不说的话，用户只会以为分析没跑完或者软件坏了。跳过必须可见。
+     */
+    const skipped = analyzeResultRef.current?.videoThumbsSkipped ?? 0;
+    if (skipped > 0) {
+      notifyRef.current(
+        "warning",
+        "analysis-video-thumbs-skipped",
+        `${skipped} 个视频没能抽出首帧图（转码引擎不可用），这些格子会继续显示占位。` +
+          `分析结论本身不受影响；装好转码引擎后重跑分析即可补上。`,
+      );
+    }
+
     void refreshLoadedAssets();
   }, [analyzeDoneId, refreshLoadedAssets]);
 
@@ -420,29 +507,37 @@ export function SortingScreen() {
    */
   const applyBulk = useCallback(
     (result: BulkResult, verb: string) => {
-      if (result.succeeded.length > 0) {
-        const done = new Set(result.succeeded);
-        setAssets((prev) => prev.filter((a) => !done.has(a.id)));
-        setTotal((t) => Math.max(0, t - result.succeeded.length));
-      }
-      if (result.failed.length > 0) {
-        // 失败项重新选中，方便直接重试
-        setSelection({
-          cursor: result.failed[0].assetId,
-          anchor: result.failed[0].assetId,
-          selected: result.failed.map((f) => f.assetId),
-        });
-        notify(
-          "error",
-          "sorting-bulk-failed",
-          `${result.failed.length} 个文件${verb}失败：${result.failed
-            .slice(0, 3)
-            .map((f) => f.message)
-            .join("；")}${result.failed.length > 3 ? " 等" : ""}`,
-        );
-      } else {
-        setSelection((prev) => pruneSelection(prev, result.succeeded));
-      }
+      /*
+       * 整批移出走视图过渡：被移走的格子溶出、剩下的格子补位，
+       * 而不是"啪"地换一批。网格本身没有过渡名，因此走的是根快照的
+       * 交叉淡入淡出——背景像素完全一致，看到的只有变动的那部分。
+       * 不支持视图过渡时，这就是原来的同步更新，一步不差。
+       */
+      withViewTransition(() => {
+        if (result.succeeded.length > 0) {
+          const done = new Set(result.succeeded);
+          setAssets((prev) => prev.filter((a) => !done.has(a.id)));
+          setTotal((t) => Math.max(0, t - result.succeeded.length));
+        }
+        if (result.failed.length > 0) {
+          // 失败项重新选中，方便直接重试
+          setSelection({
+            cursor: result.failed[0].assetId,
+            anchor: result.failed[0].assetId,
+            selected: result.failed.map((f) => f.assetId),
+          });
+          notify(
+            "error",
+            "sorting-bulk-failed",
+            `${result.failed.length} 个文件${verb}失败：${result.failed
+              .slice(0, 3)
+              .map((f) => f.message)
+              .join("；")}${result.failed.length > 3 ? " 等" : ""}`,
+          );
+        } else {
+          setSelection((prev) => pruneSelection(prev, result.succeeded));
+        }
+      });
     },
     [notify],
   );
@@ -506,12 +601,15 @@ export function SortingScreen() {
   );
 
   const runCurate = useCallback(async () => {
-    const targets = resolveEntryIds(entries, actionTargets(selection));
+    const actedEntries = actionTargets(selection);
+    const targets = resolveEntryIds(entries, actedEntries);
     if (!projectId || targets.length === 0 || busy || deliveryWorking) return;
     setBusy(true);
     try {
       const result = await api.curateAssets(projectId, targets);
-      // 精选是「复制一份进待修」，原件留在待分类，所以不从列表移除
+      // 精选是「复制一份进待修」，原件留在待分类，所以格子不会离开网格；
+      // 正因为不会离开，才必须在格子上给一次"收到了"的回弹（§13 causality）
+      if (result.succeeded.length > 0) pulseCommit(actedEntries);
       if (result.failed.length > 0) {
         notify(
           "error",
@@ -529,7 +627,16 @@ export function SortingScreen() {
     } finally {
       setBusy(false);
     }
-  }, [projectId, selection, busy, deliveryWorking, entries, refreshCategories, notify]);
+  }, [
+    projectId,
+    selection,
+    busy,
+    deliveryWorking,
+    entries,
+    refreshCategories,
+    notify,
+    pulseCommit,
+  ]);
 
   runCurateRef.current = runCurate;
 
@@ -632,11 +739,11 @@ export function SortingScreen() {
         case "preview": {
           // 光标可能停在折叠组上：预览打开组内第一张
           const targets = resolveEntryIds(entries, actionTargets(selection));
-          if (targets.length > 0) setPreviewId(targets[0]);
+          if (targets.length > 0) openPreview(targets[0]);
           return;
         }
         case "closePreview":
-          setPreviewId(null);
+          closePreview();
           return;
         case "assign":
           void runAssign(action.categoryId);
@@ -679,6 +786,8 @@ export function SortingScreen() {
       entries,
       runAssign,
       runCurate,
+      openPreview,
+      closePreview,
     ],
   );
 
@@ -712,7 +821,7 @@ export function SortingScreen() {
         actions={
           <>
             <span className="text-xs dim" data-testid="sorting-remaining">
-              待分类 {total}
+              待分类 <PulseValue value={total} />
             </span>
             <button
               type="button"
@@ -769,7 +878,8 @@ export function SortingScreen() {
                 {category.kind === "curated" ? <Kbd>P</Kbd> : null}
                 {category.kind === "other" ? <Kbd>O</Kbd> : null}
                 <span>{category.name}</span>
-                <span className="chip__count">{category.count}</span>
+                {/* 计数变化就是"这一下生效了"的因果反馈：分类完不用满屏找差别 */}
+                <PulseValue className="chip__count" value={category.count} />
               </button>
             ))}
 
@@ -921,6 +1031,14 @@ export function SortingScreen() {
                       entry={entry}
                       selected={selectedSet.has(entry.id)}
                       focused={selection.cursor === entry.id}
+                      /* 预览中就锚在被预览那张所在的格上，否则锚在光标格：
+                         打开/关闭时大图与它之间才有"同一个实体"的连续关系 */
+                      previewAnchor={
+                        previewId
+                          ? entry.items.some((i) => i.id === previewId)
+                          : selection.cursor === entry.id
+                      }
+                      committed={commit?.ids.has(entry.id) ? commit.phase : undefined}
                       markedCount={
                         entry.items.filter((i) => markedSet.has(i.id)).length
                       }
@@ -929,7 +1047,7 @@ export function SortingScreen() {
                           clickSelection(assetIds, prev, entry.id, modifiers),
                         )
                       }
-                      onExpand={() => setOpenGroup(entry.groupId)}
+                      onExpand={() => openGroupOverlay(entry.groupId)}
                       onThumbError={onThumbError}
                       onThumbLoad={onThumbLoad}
                     />
@@ -940,13 +1058,19 @@ export function SortingScreen() {
                       index={index}
                       selected={selectedSet.has(entry.id)}
                       focused={selection.cursor === entry.id}
+                      previewAnchor={
+                        previewId
+                          ? entry.asset.id === previewId
+                          : selection.cursor === entry.id
+                      }
+                      committed={commit?.ids.has(entry.id) ? commit.phase : undefined}
                       marked={markedSet.has(entry.id)}
                       onSelect={(modifiers) =>
                         setSelection((prev) =>
                           clickSelection(assetIds, prev, entry.id, modifiers),
                         )
                       }
-                      onOpen={() => setPreviewId(entry.asset.id)}
+                      onOpen={() => openPreview(entry.asset.id)}
                       onThumbError={onThumbError}
                       onThumbLoad={onThumbLoad}
                     />
@@ -1055,7 +1179,7 @@ export function SortingScreen() {
           onKeyDown={handleKeyDown}
           onThumbError={onThumbError}
           onThumbLoad={onThumbLoad}
-          onClose={() => setOpenGroup(null)}
+          onClose={closeGroupOverlay}
         />
       ) : null}
 
@@ -1064,7 +1188,7 @@ export function SortingScreen() {
           asset={previewAssets[previewIndex]}
           index={previewIndex}
           total={previewAssets.length}
-          onClose={() => setPreviewId(null)}
+          onClose={closePreview}
           onPrev={() =>
             setPreviewId(previewAssets[Math.max(0, previewIndex - 1)].id)
           }
@@ -1099,6 +1223,8 @@ function AssetCell({
   selected,
   focused,
   marked,
+  previewAnchor,
+  committed,
   onSelect,
   onOpen,
   onThumbError,
@@ -1109,6 +1235,10 @@ function AssetCell({
   selected: boolean;
   focused: boolean;
   marked: boolean;
+  /** 该格是不是全屏预览的来源/去向：是就把过渡名挂上，做同一实体的形变 */
+  previewAnchor: boolean;
+  /** 刚被"精选"命中过：a / b 交替以便连续两次都能重新起播 */
+  committed?: "a" | "b";
   onSelect: (modifiers: { shift?: boolean; meta?: boolean }) => void;
   onOpen: () => void;
   onThumbError: () => void;
@@ -1120,6 +1250,11 @@ function AssetCell({
     setThumbFailed(false);
   }, [asset.thumbnail]);
 
+  /* 过渡名全局唯一：只有锚点格挂，其余格一律 undefined —— 挂重了整次过渡会被放弃 */
+  const anchorStyle = previewAnchor
+    ? { viewTransitionName: "ocard-preview" }
+    : undefined;
+
   return (
     <div
       role="gridcell"
@@ -1127,6 +1262,7 @@ function AssetCell({
       data-testid="asset-cell"
       data-asset={asset.id}
       data-marked={marked || undefined}
+      data-commit={committed}
       className={`asset${selected ? " asset--selected" : ""}${
         focused ? " asset--focused" : ""
       }${marked ? " asset--marked" : ""}`}
@@ -1136,6 +1272,7 @@ function AssetCell({
       {asset.thumbReady && asset.thumbnail && !thumbFailed ? (
         <img
           className="asset__thumb"
+          style={anchorStyle}
           src={asset.thumbnail}
           alt=""
           loading="lazy"
@@ -1147,7 +1284,11 @@ function AssetCell({
           onLoad={onThumbLoad}
         />
       ) : (
-        <div className="asset__thumb asset__thumb--empty" data-testid="asset-no-thumb">
+        <div
+          className="asset__thumb asset__thumb--empty"
+          style={anchorStyle}
+          data-testid="asset-no-thumb"
+        >
           <span className="text-2xs dim">{thumbFailed ? "预览不可用" : "索引中"}</span>
         </div>
       )}
@@ -1187,10 +1328,22 @@ function AssetCell({
 /** 判定角标：AI 只标注，不触发任何文件操作 */
 function JudgementBadges({ judgement }: { judgement?: SortingAsset["judgement"] }) {
   if (!judgement) return null;
+  const faces = judgement.faces;
   return (
     <span className="asset__judge" data-testid="asset-judgement">
       {judgement.suggestedKeep ? (
         <Badge tone="ok">建议保留</Badge>
+      ) : null}
+      {/*
+        只有"确实检出了脸"才出角标。
+        faces == null 是**检测不可用**、0 是**确实没有脸**，两者都不出角标：
+        网格里一个中性角标承载不了这个区别，硬塞会把"不知道"说成"没有"。
+        需要区分时去全屏预览看逐项说明。
+      */}
+      {typeof faces === "number" && faces > 0 ? (
+        <Badge tone="neutral">
+          <span data-testid="judge-faces">{faces} 人</span>
+        </Badge>
       ) : null}
       {judgement.blurry ? <Badge tone="warn">糊</Badge> : null}
       {judgement.overExposed ? <Badge tone="warn">过曝</Badge> : null}
@@ -1209,6 +1362,8 @@ function GroupCell({
   selected,
   focused,
   markedCount,
+  previewAnchor,
+  committed,
   onSelect,
   onExpand,
   onThumbError,
@@ -1218,6 +1373,8 @@ function GroupCell({
   selected: boolean;
   focused: boolean;
   markedCount: number;
+  previewAnchor: boolean;
+  committed?: "a" | "b";
   onSelect: (modifiers: { shift?: boolean; meta?: boolean }) => void;
   onExpand: () => void;
   onThumbError: () => void;
@@ -1227,6 +1384,9 @@ function GroupCell({
   const cover =
     entry.items.find((i) => i.judgement?.suggestedKeep) ?? entry.items[0];
   const [failed, setFailed] = useState(false);
+  const anchorStyle = previewAnchor
+    ? { viewTransitionName: "ocard-preview" }
+    : undefined;
 
   return (
     <div
@@ -1234,6 +1394,7 @@ function GroupCell({
       aria-selected={selected}
       data-testid="asset-group"
       data-group={entry.groupId}
+      data-commit={committed}
       className={`asset asset--group${selected ? " asset--selected" : ""}${
         focused ? " asset--focused" : ""
       }`}
@@ -1243,6 +1404,7 @@ function GroupCell({
       {cover.thumbReady && cover.thumbnail && !failed ? (
         <img
           className="asset__thumb"
+          style={anchorStyle}
           src={cover.thumbnail}
           alt=""
           loading="lazy"
@@ -1253,7 +1415,7 @@ function GroupCell({
           onLoad={onThumbLoad}
         />
       ) : (
-        <div className="asset__thumb asset__thumb--empty">
+        <div className="asset__thumb asset__thumb--empty" style={anchorStyle}>
           <span className="text-2xs dim">索引中</span>
         </div>
       )}

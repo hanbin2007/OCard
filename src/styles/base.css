@@ -87,6 +87,16 @@ button {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
   border-radius: var(--radius-sm);
+  /* 焦点环"收拢"落位而不是硬闪：Tab / 方向键连按时，收拢这个动作本身
+     就在回答"焦点刚跳到哪儿了"。终态与静态样式一致，减少动效时直接静止。 */
+  animation: focus-ring-settle var(--dur-spring-fast) var(--spring);
+}
+
+@keyframes focus-ring-settle {
+  from {
+    outline-offset: 7px;
+    outline-color: transparent;
+  }
 }
 
 code,
@@ -121,12 +131,61 @@ kbd,
   background: var(--accent-soft);
 }
 
+/* ------------------------------------------------------------------ *
+ * 视图过渡（View Transitions）
+ *
+ * 只有内核支持、且用户没要求减少动效时，lib/motion.ts 才会走这条路；
+ * 不支持时 DOM 变更同步落地，行为完全一致，只是没有过渡。
+ *
+ * 未命名的元素统统落在 root 快照里：打开对话框这类"背景像素完全没变"的
+ * 变更，root 交叉淡入淡出等于只让浮层淡出/淡入，其余部分肉眼无差别。
+ * ------------------------------------------------------------------ */
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: var(--dur-quick);
+  animation-timing-function: var(--ease-out);
+}
+
+/* 网格缩略图 ⇄ 全屏预览是同一个实体：位置与尺寸走弹簧形变，
+   内容（cover 裁切 vs contain 完整图）交叉淡入。§7 同路径进出。 */
+::view-transition-group(ocard-preview) {
+  animation-duration: var(--dur-spring);
+  animation-timing-function: var(--spring);
+}
+
+::view-transition-old(ocard-preview),
+::view-transition-new(ocard-preview) {
+  animation-duration: var(--dur-quick);
+  animation-timing-function: var(--ease-out);
+}
+
+/* 视图过渡进行中，屏蔽 CSS 挂载动画，避免同一次进场被演两遍 */
+:root[data-vt] .lightbox,
+:root[data-vt] .lightbox__bar,
+:root[data-vt] .lightbox__image,
+:root[data-vt] .overlay,
+:root[data-vt] .dialog {
+  animation: none !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
     transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
     animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
     animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* JS 侧已经绕开 startViewTransition，这里再兜一层：
+     即便某条路径漏了，过渡也不会真的动起来。 */
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none !important;
   }
 }

@@ -11,6 +11,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { scrollElementTo } from "../lib/motion";
 
 /** 视口外多渲染几行，滚动时不至于露白 */
 const OVERSCAN_ROWS = 2;
@@ -88,7 +89,14 @@ export function VirtualGrid<T>({
   const endIndex = Math.min(items.length, lastRow * columns);
   const visible = items.slice(startIndex, endIndex);
 
-  // 键盘移动焦点后把它滚进可视区
+  /*
+   * 键盘移动焦点后把它滚进可视区。
+   *
+   * 用平滑滚动而不是瞬移：滚动这个动作本身就在回答"我刚从哪儿挪到哪儿"，
+   * 一格一格跳着走的时候尤其重要。连按方向键时后一次会接管前一次，
+   * 不会排队——滚动天然是可中断的。
+   * 减少动效时退回瞬时定位（见 scrollElementTo）。
+   */
   useEffect(() => {
     if (scrollToIndex == null || scrollToIndex < 0) return;
     const el = viewportRef.current;
@@ -97,9 +105,9 @@ export function VirtualGrid<T>({
     const top = row * rowStride;
     const bottom = top + rowHeight;
     const height = el.clientHeight || viewport.height;
-    if (top < el.scrollTop) el.scrollTop = top;
+    if (top < el.scrollTop) scrollElementTo(el, top);
     else if (height > 0 && bottom > el.scrollTop + height) {
-      el.scrollTop = bottom - height;
+      scrollElementTo(el, bottom - height);
     }
   }, [scrollToIndex, columns, rowStride, rowHeight, viewport.height]);
 
@@ -113,7 +121,19 @@ export function VirtualGrid<T>({
       data-testid="virtual-grid"
       data-columns={columns}
       data-rendered={visible.length}
-      onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+      /*
+       * 只有**跨行**才更新状态。
+       *
+       * 窗口只取决于 floor(scrollTop / rowStride)，同一行内的像素级滚动
+       * 不会改变要渲染的那批节点，却会每帧触发一次几十个格子的重新协调。
+       * 千张级素材下这就是掉帧的来源；量化到行之后，滚一屏只重渲染几次。
+       */
+      onScroll={(e) => {
+        const top = e.currentTarget.scrollTop;
+        setScrollTop((prev) =>
+          Math.floor(prev / rowStride) === Math.floor(top / rowStride) ? prev : top,
+        );
+      }}
     >
       {/* 用上下占位撑出总高度，滚动条长度才是真的 */}
       <div style={{ height: firstRow * rowStride }} />

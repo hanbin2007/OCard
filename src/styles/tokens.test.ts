@@ -32,6 +32,53 @@ const light = declarationsOf(":root {");
 const systemDark = declarationsOf(':root:not([data-theme="light"])');
 const manualDark = declarationsOf(':root[data-theme="dark"]');
 
+const STYLESHEETS = ["base", "shell", "components", "screens", "tokens"] as const;
+const sheets = Object.fromEntries(
+  STYLESHEETS.map((name) => [
+    name,
+    readFileSync(resolve(process.cwd(), `src/styles/${name}.css`), "utf8"),
+  ]),
+) as Record<(typeof STYLESHEETS)[number], string>;
+
+/** 抠出所有 @keyframes 块（花括号配对，不怕嵌套的百分比段） */
+function keyframeBlocks(source: string): Array<{ name: string; body: string }> {
+  const blocks: Array<{ name: string; body: string }> = [];
+  const head = /@keyframes\s+([A-Za-z0-9_-]+)\s*\{/g;
+  let match: RegExpExecArray | null;
+  while ((match = head.exec(source))) {
+    const open = head.lastIndex - 1;
+    let depth = 0;
+    let i = open;
+    for (; i < source.length; i += 1) {
+      if (source[i] === "{") depth += 1;
+      else if (source[i] === "}") {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+    blocks.push({ name: match[1], body: source.slice(open + 1, i) });
+    head.lastIndex = i;
+  }
+  return blocks;
+}
+
+/** 块里声明了哪些属性（`from {` / `38% {` 这类段选择器没有冒号，不会被误收） */
+function declaredProperties(body: string): string[] {
+  return [...body.matchAll(/^\s*([a-z-]+)\s*:/gm)].map((m) => m[1]);
+}
+
+/** 所有 transition / transition-property 里点名的属性 */
+function transitionedProperties(source: string): string[] {
+  const out: string[] = [];
+  for (const match of source.matchAll(/^\s*transition(?:-property)?\s*:\s*([^;]+);/gm)) {
+    for (const part of match[1].split(",")) {
+      const name = part.trim().split(/\s+/)[0];
+      if (name) out.push(name);
+    }
+  }
+  return out;
+}
+
 describe("主题令牌", () => {
   it("两份深色定义的变量名集合完全一致", () => {
     expect(Object.keys(systemDark).sort()).toEqual(Object.keys(manualDark).sort());
@@ -137,5 +184,129 @@ describe("主题令牌", () => {
     expect(mono).toContain("ui-monospace");
     expect(mono).toContain("SF Mono");
     expect(mono).toContain("Consolas");
+  });
+});
+
+/**
+ * 动效守卫。
+ *
+ * 这一组不评价"好不好看"，只锁住三条会真出事的约束：
+ * ① 一切动画/过渡只碰合成属性——分类工作台的网格可达上千张缩略图，
+ *    动一次 width/height/top 就是一次整网格重排；
+ * ② 弹簧参数是解出来的常量，不是随手改的魔数；
+ * ③ prefers-reduced-motion 必须把时长、延迟、滚动行为一并按下去。
+ */
+describe("动效令牌与合成安全", () => {
+  it("时长与曲线都在令牌里，组件不许写死魔数", () => {
+    for (const token of [
+      "--dur-instant",
+      "--dur-micro",
+      "--dur-quick",
+      "--dur-spring-fast",
+      "--dur-spring",
+      "--dur-spring-pop",
+      "--ease-out",
+      "--spring",
+      "--spring-pop",
+    ]) {
+      expect(light, `缺少动效令牌 ${token}`).toHaveProperty(token);
+    }
+    // 按压反馈必须"快到读作即时"：超过 120ms 就不再是 pointer-down 的直接感
+    expect(Number.parseInt(light["--dur-instant"], 10)).toBeLessThanOrEqual(120);
+  });
+
+  it("弹簧曲线：基础层是 cubic-bezier 兜底，支持 linear() 的内核换成真实弹簧采样", () => {
+    expect(light["--spring"]).toContain("cubic-bezier");
+    expect(light["--spring-pop"]).toContain("cubic-bezier");
+
+    // 注释里写着峰值数字，先剥掉，否则会被当成曲线采样点
+    const upgrade = css
+      .slice(css.indexOf("@supports (transition-timing-function"))
+      .replace(/\/\*[\s\S]*?\*\//g, "");
+    /** 取出 linear() 括号里的采样点 */
+    const samples = (token: string): number[] => {
+      const found = new RegExp(`${token}:\\s*linear\\(([^)]*)\\)`).exec(upgrade);
+      expect(found, `${token} 没有升级成 linear() 弹簧`).not.toBeNull();
+      return (found as RegExpExecArray)[1]
+        .split(",")
+        .map((v) => Number(v.trim()))
+        .filter((v) => Number.isFinite(v));
+    };
+
+    // 临界阻尼那条不许有过冲；带过冲的只有 --spring-pop 一条，且过冲很小
+    const critical = samples("--spring");
+    expect(critical.length).toBeGreaterThan(15);
+    expect(critical[0]).toBe(0);
+    expect(critical[critical.length - 1]).toBe(1);
+    expect(Math.max(...critical)).toBeLessThanOrEqual(1);
+
+    const pop = samples("--spring-pop");
+    const popPeak = Math.max(...pop);
+    expect(popPeak).toBeGreaterThan(1);
+    // 是"分量"不是"弹跳"：过冲控制在 5% 以内
+    expect(popPeak).toBeLessThan(1.05);
+  });
+
+  it("所有关键帧只动合成属性——网格再大也不会因为动画重排", () => {
+    // outline 的两项不进合成层，但只作用在"当前那一个"焦点元素上，代价可忽略
+    const allowed = new Set(["transform", "opacity", "outline-offset", "outline-color"]);
+    for (const [sheet, source] of Object.entries(sheets)) {
+      for (const { name, body } of keyframeBlocks(source)) {
+        for (const property of declaredProperties(body)) {
+          expect(
+            allowed.has(property),
+            `${sheet}.css @keyframes ${name} 动了 ${property}——会引发重排/重绘`,
+          ).toBe(true);
+        }
+      }
+    }
+  });
+
+  it("所有过渡只挂在合成或纯上色属性上，尤其不许再出现 width", () => {
+    const allowed = new Set([
+      "transform",
+      "opacity",
+      "background",
+      "border-color",
+      "color",
+      "outline-offset",
+    ]);
+    for (const [sheet, source] of Object.entries(sheets)) {
+      for (const property of transitionedProperties(source)) {
+        expect(
+          allowed.has(property),
+          `${sheet}.css 过渡了 ${property}——只允许合成/上色属性`,
+        ).toBe(true);
+      }
+    }
+    // 进度条改走 scaleX：过渡 width 会让拷卡屏每帧重排
+    expect(sheets.components).toContain("transform-origin: left center");
+  });
+
+  it("prefers-reduced-motion 把时长、延迟与滚动行为一并按下去", () => {
+    const start = sheets.base.indexOf("@media (prefers-reduced-motion: reduce)");
+    expect(start).toBeGreaterThan(-1);
+    const block = sheets.base.slice(start);
+    expect(block).toContain("transition-duration: 0.01ms !important");
+    expect(block).toContain("transition-delay: 0ms !important");
+    expect(block).toContain("animation-duration: 0.01ms !important");
+    expect(block).toContain("animation-delay: 0ms !important");
+    expect(block).toContain("scroll-behavior: auto !important");
+    // 视图过渡也要一并停掉（JS 侧已绕过，这里是第二道保险）
+    expect(block).toContain("::view-transition-group(*)");
+  });
+
+  it("每个关键帧的终态就是静态样式：减少动效时直接静止在最终样子，不缺功能", () => {
+    for (const [sheet, source] of Object.entries(sheets)) {
+      for (const { name, body } of keyframeBlocks(source)) {
+        // 只写 from（或起始段）而不写 to，终态自然回落到元素本身的静态值
+        const hasExplicitTo = /(^|\s)(to|100%)\s*\{/.test(body);
+        expect(
+          hasExplicitTo,
+          `${sheet}.css @keyframes ${name} 写了 to/100%——终态应交回静态样式，` +
+            `否则减少动效时会停在动画自己的终点上`,
+        ).toBe(false);
+      }
+    }
   });
 });

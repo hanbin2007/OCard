@@ -186,6 +186,65 @@ describe("进度视图", () => {
     ).toContain("312/769");
     cancelSpy.mockRestore();
   });
+
+  /**
+   * 取消请求在路上时作业自己跑完了。
+   * 后端此时会回一句「已请求取消，作业将在当前文件完成后停止」——
+   * 对一个已经结束的作业，这是假话。前端必须把真相补上，
+   * 否则用户会以为是自己取消掉的，回头找不到打包结果。
+   */
+  it("取消晚了一步（作业已跑完）时如实说没生效，不假装取消成功", async () => {
+    const { user } = await startWith(
+      deliveryJob({
+        state: "running",
+        done: 760,
+        result: undefined,
+        finishedAt: undefined,
+      }),
+    );
+    await screen.findByTestId("delivery-progress");
+
+    // 取消打到后端时作业已经 done：返回的是完成快照，不是 cancelled
+    const cancelSpy = vi
+      .spyOn(api, "cancelJob")
+      .mockResolvedValue(deliveryJob({ state: "done", revision: 12 }));
+
+    await user.click(screen.getByTestId("delivery-cancel"));
+
+    await waitFor(() => expect(cancelSpy).toHaveBeenCalledTimes(1));
+    const toast = await screen.findByTestId("notice-toast-info");
+    expect(toast.getAttribute("data-code")).toBe("job-cancel-too-late");
+    expect(toast.textContent).toContain("本次取消未生效");
+
+    // 结果块给的是「完成」，不是「已取消」——不能把完成说成取消
+    const result = await screen.findByTestId("delivery-result");
+    expect(within(result).queryByTestId("delivery-cancelled")).toBeNull();
+    cancelSpy.mockRestore();
+  });
+
+  it("作业已经是终态时根本不发取消请求", async () => {
+    await startWith(
+      deliveryJob({
+        state: "running",
+        done: 760,
+        result: undefined,
+        finishedAt: undefined,
+      }),
+    );
+    await screen.findByTestId("delivery-progress");
+
+    const cancelSpy = vi.spyOn(api, "cancelJob");
+    // 按钮还在屏幕上的那一帧，作业已经在后台跑完了
+    await act(async () => {
+      jobEmitters.forEach((emit) =>
+        emit(deliveryJob({ state: "done", revision: 20 })),
+      );
+    });
+    // 进度视图已经让位给结果块，取消按钮随之消失——这本身就是第一道防线
+    expect(screen.queryByTestId("delivery-cancel")).toBeNull();
+    expect(cancelSpy).not.toHaveBeenCalled();
+    cancelSpy.mockRestore();
+  });
 });
 
 describe("终态 done 的结果块（E2E 依赖，语义保持不变）", () => {

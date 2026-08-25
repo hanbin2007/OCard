@@ -1,9 +1,11 @@
 /** 左侧窄边栏：导航 + 最近项目 + 操作人/主题。 */
 
-import { selectDeliveryWorking, useStore } from "../state/store";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ROUTE_ORDER, selectDeliveryWorking, useStore } from "../state/store";
 import type { RouteName } from "../state/store";
 import { THEME_LABELS, useTheme } from "../state/theme";
 import { formatCompactDate } from "../lib/format";
+import { PulseValue } from "./ui";
 import {
   IconCamera,
   IconCard,
@@ -17,19 +19,63 @@ import {
   IconSun,
 } from "./Icon";
 
-const NAV: Array<{
-  route: RouteName;
-  label: string;
-  icon: typeof IconProjects;
-}> = [
-  { route: "projects", label: "项目", icon: IconProjects },
-  { route: "new-project", label: "新建项目", icon: IconPlus },
-  { route: "devices", label: "设备登记", icon: IconCamera },
-  { route: "copy", label: "拷卡任务", icon: IconCard },
-  { route: "sorting", label: "分类工作台", icon: IconGrid },
-  { route: "transcode", label: "代理转码", icon: IconFilm },
-  { route: "trash", label: "回收站", icon: IconTrash },
-];
+/** 只描述"长什么样"；顺序由 ROUTE_ORDER 单点决定，与屏间过渡方向永远一致 */
+const NAV_ITEMS: Record<RouteName, { label: string; icon: typeof IconProjects }> = {
+  projects: { label: "项目", icon: IconProjects },
+  "new-project": { label: "新建项目", icon: IconPlus },
+  devices: { label: "设备登记", icon: IconCamera },
+  copy: { label: "拷卡任务", icon: IconCard },
+  sorting: { label: "分类工作台", icon: IconGrid },
+  transcode: { label: "代理转码", icon: IconFilm },
+  trash: { label: "回收站", icon: IconTrash },
+};
+
+const NAV = ROUTE_ORDER.map((route) => ({ route, ...NAV_ITEMS[route] }));
+
+/**
+ * 量出当前项在列表里的位置，交给一块**会移动的**选中底。
+ *
+ * 切屏时它从上一项滑到下一项，导航的空间关系因此是连续可读的：
+ * 你看得见"从哪来、到哪去"，而不是两次互不相干的闪烁。
+ * 量不到布局信息（无 JS 布局的环境）时返回 null，CSS 会退回原来的逐项底色。
+ */
+function useNavRail(route: RouteName, itemCount: number) {
+  const listRef = useRef<HTMLUListElement>(null);
+  const [rail, setRail] = useState<{ top: number; height: number } | null>(null);
+  const [ready, setReady] = useState(false);
+
+  useLayoutEffect(() => {
+    const list = listRef.current;
+    const measure = () => {
+      const current = list?.querySelector<HTMLElement>('[aria-current="page"]');
+      const row = current?.parentElement;
+      // offsetHeight 为 0 说明拿不到真实布局，此时底块会变成一条看不见的线
+      if (!row || row.offsetHeight <= 0) {
+        setRail(null);
+        return;
+      }
+      const next = { top: row.offsetTop, height: row.offsetHeight };
+      setRail((prev) =>
+        prev && prev.top === next.top && prev.height === next.height ? prev : next,
+      );
+    };
+
+    measure();
+    // 系统字号调大导致标签折行时，行高会变——不重新量，底块就会对不齐
+    if (!list || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(list);
+    return () => observer.disconnect();
+  }, [route, itemCount]);
+
+  // 首次落位必须无过渡，否则底块会从列表顶端"飞"到当前项：
+  // 等第一帧画完（useEffect）再挂上过渡
+  useEffect(() => {
+    if (rail && !ready) setReady(true);
+  }, [rail, ready]);
+
+  return { listRef, rail, ready };
+}
 
 const THEME_ICONS = {
   system: IconMonitor,
@@ -76,6 +122,7 @@ export function Sidebar() {
     devices: state.cameras.length,
     copy: state.tasks.filter((t) => t.state === "running").length,
   };
+  const { listRef, rail, ready } = useNavRail(state.route, NAV.length);
 
   return (
     <aside className="sidebar">
@@ -85,8 +132,23 @@ export function Sidebar() {
       </div>
 
       <div className="sidebar__scroll">
-        <nav className="sidebar__section" aria-label="主导航">
-          <ul>
+        <nav className="sidebar__section sidebar__nav" aria-label="主导航">
+          {rail ? (
+            <span
+              aria-hidden="true"
+              data-testid="nav-rail"
+              className={`nav-rail${ready ? " nav-rail--ready" : ""}`}
+              style={{
+                height: rail.height,
+                transform: `translate3d(0, ${rail.top}px, 0)`,
+              }}
+            />
+          ) : null}
+          <ul
+            className="sidebar__nav-list"
+            ref={listRef}
+            data-rail={rail ? "on" : undefined}
+          >
             {NAV.map(({ route, label, icon: Icon }) => (
               <li key={route}>
                 <button
@@ -111,7 +173,10 @@ export function Sidebar() {
                   <Icon className="nav-item__icon" />
                   <span>{label}</span>
                   {counts[route] ? (
-                    <span className="nav-item__count">{counts[route]}</span>
+                    <PulseValue
+                      className="nav-item__count"
+                      value={counts[route] as number}
+                    />
                   ) : null}
                 </button>
               </li>

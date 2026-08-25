@@ -16,9 +16,14 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import * as api from "../api";
-import { mockProjects, mockWorkstation } from "../api/mock";
+import { mockPendingAssets, mockProjects, mockWorkstation } from "../api/mock";
 import { mockAnalysisResult, resetMockJobs } from "../api/mockJobs";
-import type { AnalyzeJob, JobSnapshot } from "../api/types";
+import type {
+  AnalyzeJob,
+  DeliveryStatus,
+  FinalCutReport,
+  JobSnapshot,
+} from "../api/types";
 
 const projectB = mockProjects.find((p) => p.scenario === "B")!;
 const projectA = mockProjects.find((p) => p.scenario === "A")!;
@@ -298,6 +303,131 @@ describe("#11 第二轮分析仍会刷新角标", () => {
   }, 15000);
 });
 
+/**
+ * 人脸数：后端一直在算，前端此前完全没接出来。
+ * 接出来之后最要命的一条是别把「检测不可用」说成「没有人脸」——
+ * 那是把不知道包装成结论，正是本项目明令禁止的静默降级。
+ */
+describe("人脸数呈现", () => {
+  it("检出人脸的格子标出人数", async () => {
+    await renderSorting();
+    const faceBadges = screen.getAllByTestId("judge-faces");
+    expect(faceBadges.length).toBeGreaterThan(0);
+    for (const badge of faceBadges) {
+      expect(badge.textContent).toMatch(/^[1-9]\d* 人$/);
+    }
+  });
+
+  it("检出 0 张与检测不可用都不出角标——网格里一个中性角标承载不了这个区别", async () => {
+    await renderSorting();
+    const texts = screen.getAllByTestId("judge-faces").map((b) => b.textContent);
+    expect(texts).not.toContain("0 人");
+    // null 同理：不会渲染成 "null 人" 之类的东西
+    for (const text of texts) expect(text).not.toContain("null");
+  });
+
+  it("全屏预览把两者分开说清楚：0 就是 0，不可用就说不可用", async () => {
+    const user = userEvent.setup();
+    await renderSorting();
+
+    const zeroFaces = mockPendingAssets.find((a) => a.judgement?.faces === 0)!;
+    const unknownFaces = mockPendingAssets.find(
+      (a) => a.judgement !== undefined && a.judgement.faces === null,
+    )!;
+
+    const openCell = async (assetId: string) => {
+      const cell = document.querySelector(
+        `[data-testid="asset-cell"][data-asset="${CSS.escape(assetId)}"]`,
+      ) as HTMLElement;
+      expect(cell, `网格里应渲染出 ${assetId}`).toBeTruthy();
+      await user.dblClick(cell);
+      return screen.findByTestId("lightbox-faces");
+    };
+
+    const zero = await openCell(zeroFaces.id);
+    expect(zero.textContent).toBe("检出人脸 0");
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("asset-lightbox")).toBeNull());
+
+    const unknown = await openCell(unknownFaces.id);
+    expect(unknown.textContent).toBe("人脸检测不可用");
+    // 绝不能出现任何把「不可用」说成「没有」的措辞
+    expect(unknown.textContent).not.toContain("0");
+    expect(unknown.textContent).not.toContain("无人脸");
+  }, 15000);
+});
+
+/**
+ * 视频首帧图被跳过 = 转码引擎不可用的降级，格子会一直停在占位。
+ * 后端一直在统计，TS 类型此前缺这两个字段，于是这个数字对用户完全不存在。
+ */
+describe("分析完成后的视频首帧图跳过数", () => {
+  it("跳过数 >0 时经通知中心说出来，并说清后果与补救", async () => {
+    const user = userEvent.setup();
+    const start = vi
+      .spyOn(api, "startAnalysis")
+      .mockResolvedValue(
+        analyzeJob({ id: "job-vt", state: "running", revision: 1, result: undefined }),
+      );
+
+    await renderSorting();
+    await user.click(screen.getByTestId("sorting-analyze"));
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      jobEmitters.forEach((emit) =>
+        emit(
+          analyzeJob({
+            id: "job-vt",
+            state: "done",
+            // revision 必须大于 running 那条，否则会被乱序保护当成过期事件丢掉
+            revision: 4,
+            result: { ...mockAnalysisResult, videoThumbsSkipped: 4 },
+          }),
+        ),
+      );
+    });
+
+    const toast = await screen.findByTestId("notice-toast-warning");
+    expect(toast.getAttribute("data-code")).toBe("analysis-video-thumbs-skipped");
+    expect(toast.textContent).toContain("4 个视频");
+    // 后果 + 补救都要说，不能只丢一个数字
+    expect(toast.textContent).toContain("占位");
+    expect(toast.textContent).toContain("重跑分析");
+  }, 15000);
+
+  it("跳过数为 0 时不打扰用户", async () => {
+    const user = userEvent.setup();
+    const start = vi
+      .spyOn(api, "startAnalysis")
+      .mockResolvedValue(
+        analyzeJob({ id: "job-vt0", state: "running", revision: 1, result: undefined }),
+      );
+
+    await renderSorting();
+    await user.click(screen.getByTestId("sorting-analyze"));
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      jobEmitters.forEach((emit) =>
+        emit(
+          analyzeJob({
+            id: "job-vt0",
+            state: "done",
+            revision: 4,
+            result: { ...mockAnalysisResult, videoThumbsSkipped: 0 },
+          }),
+        ),
+      );
+    });
+
+    await waitFor(() => expect(api.listPendingAssets).toBeDefined());
+    expect(
+      screen.queryByTestId("notice-toast-warning")?.getAttribute("data-code"),
+    ).not.toBe("analysis-video-thumbs-skipped");
+  }, 15000);
+});
+
 describe("#24 score 量纲是 0–100", () => {
   it("低分点按百分制阈值出现（0.31 那种小数不会误判为低分）", async () => {
     await renderSorting();
@@ -365,6 +495,61 @@ describe("成片校验（工况 A）", () => {
       "非视频文件已跳过",
     );
   });
+
+  it("分辨率不符要把后端给的原因说出来，不能只亮一个红角标", async () => {
+    render(<App preloaded={projects} />);
+    const panel = await screen.findByTestId("final-cut-panel");
+    await within(panel).findAllByTestId("final-cut-item");
+
+    const reason = within(panel).getByTestId("final-cut-mismatch");
+    // 后端下发的是「哪儿不符」的原文；当布尔用会把这句话整个丢掉
+    expect(reason.textContent).toContain("4K");
+    expect(reason.textContent).toContain("1280x720");
+  });
+
+  /**
+   * 后端要对「6. 成片」下每个文件逐个 ffprobe，最长可到 30s，而轮询是 7s 一拍。
+   * 无守卫地按点发车会同时压着好几个全量扫描在 NAS 上跑，
+   * 而且旧响应后到还会把新结果覆盖掉。
+   */
+  it("扫描比轮询间隔慢时不叠加请求，回来后立刻补跑被挡下的那一拍", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const pending: Array<(report: FinalCutReport) => void> = [];
+    const spy = vi
+      .spyOn(api, "checkFinalCuts")
+      .mockImplementation(
+        () => new Promise<FinalCutReport>((resolve) => pending.push(resolve)),
+      );
+
+    render(<App preloaded={projects} />);
+    await screen.findByTestId("final-cut-panel");
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+
+    // 跨过 4 个轮询周期：上一轮还没回来，一个新请求都不该发出去
+    await act(async () => {
+      vi.advanceTimersByTime(30000);
+    });
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    // 第一轮终于回来 → 被挡下的那些拍合并成一次补跑，不白等一整个周期
+    await act(async () => {
+      pending[0]({ items: [], warnings: ["扫描很慢"] });
+    });
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(2));
+    expect(
+      within(screen.getByTestId("final-cut-panel")).getByTestId(
+        "final-cut-warnings",
+      ).textContent,
+    ).toContain("扫描很慢");
+
+    // 补跑这一次仍在途时，同样不会再叠加
+    await act(async () => {
+      vi.advanceTimersByTime(30000);
+    });
+    expect(spy).toHaveBeenCalledTimes(2);
+
+    vi.useRealTimers();
+  }, 15000);
 
   it("工况 B 项目不显示成片校验", async () => {
     render(
@@ -471,6 +656,60 @@ describe("交付状态勾选", () => {
     });
     spy.mockRestore();
     vi.useRealTimers();
+  }, 15000);
+
+  /**
+   * 轮询与勾选写的是同一份 status：
+   * 轮询在 T0 发出 get，用户在 T1 勾上，set 先回来把界面点亮，
+   * 随后 T0 那个「还是未勾选」的旧响应回来——勾就自己跳回去了。
+   * 用户会以为自己没勾上，再勾一次，来回打架。
+   */
+  it("勾选期间回来的旧轮询响应不许把勾又抹回去", async () => {
+    const user = userEvent.setup();
+    const unchecked: DeliveryStatus = { uploaded: false };
+    let resolveStalePoll!: (value: DeliveryStatus) => void;
+
+    const getSpy = vi
+      .spyOn(api, "getDeliveryStatus")
+      .mockResolvedValueOnce(unchecked)
+      .mockImplementationOnce(
+        () =>
+          new Promise<DeliveryStatus>((resolve) => {
+            resolveStalePoll = resolve;
+          }),
+      );
+    const setSpy = vi.spyOn(api, "setDeliveryStatus").mockResolvedValue({
+      uploaded: true,
+      updatedBy: "阿斌",
+      updatedAt: "2026-08-24T12:00:00+08:00",
+    });
+
+    render(<App preloaded={projects} />);
+    const checkbox = (await screen.findByTestId(
+      "delivery-uploaded",
+    )) as HTMLInputElement;
+    await waitFor(() => expect(checkbox.disabled).toBe(false));
+    expect(checkbox.checked).toBe(false);
+
+    // 让第二次轮询发车并挂在半路（visibilitychange 会触发一次 load，无需假时钟）
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await waitFor(() => expect(getSpy).toHaveBeenCalledTimes(2));
+
+    // 这期间用户勾上了，写回成功
+    await user.click(checkbox);
+    await waitFor(() => expect(setSpy).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(checkbox.checked).toBe(true));
+
+    // 现在那个「还是未勾选」的旧响应才姗姗来迟
+    await act(async () => {
+      resolveStalePoll(unchecked);
+    });
+
+    // 勾必须还在：旧响应的号比勾选小，不该被采纳
+    expect(checkbox.checked).toBe(true);
+    expect(screen.getByTestId("delivery-status-meta").textContent).toContain("阿斌");
   }, 15000);
 
   it("写回失败要说出来", async () => {

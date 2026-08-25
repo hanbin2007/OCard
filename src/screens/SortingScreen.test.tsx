@@ -304,6 +304,47 @@ describe("分类工作台", () => {
     await waitFor(() => expect(screen.queryByTestId("asset-lightbox")).toBeNull());
   });
 
+  it("退出全屏后光标停在最后看的那一张，而不是把人扔回进去之前的位置", async () => {
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "ArrowRight" });
+    const enteredFrom = focusedAsset();
+    expect(enteredFrom).not.toBeNull();
+
+    fireEvent.keyDown(grid(), { key: "Enter" });
+    await screen.findByTestId("asset-lightbox");
+
+    // 往后翻两张再退出
+    fireEvent.keyDown(document, { key: "ArrowRight" });
+    fireEvent.keyDown(document, { key: "ArrowRight" });
+    await waitFor(() =>
+      expect(screen.getByTestId("lightbox-position").textContent).toBe("3 / 200"),
+    );
+    const viewed = screen
+      .getByTestId("asset-lightbox")
+      .getAttribute("aria-label");
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("asset-lightbox")).toBeNull());
+
+    const landed = focusedAsset();
+    expect(landed).not.toBe(enteredFrom);
+    expect(viewed).toContain(landed!.split("/").pop()!);
+  });
+
+  it("光标格挂着全屏预览的过渡名，其余格一个都不挂——挂重了整次过渡会被放弃", async () => {
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "ArrowRight" });
+
+    const named = cells().filter(
+      (cell) =>
+        cell.querySelector('[style*="view-transition-name"]') !== null,
+    );
+    expect(named).toHaveLength(1);
+    expect(named[0].getAttribute("data-asset")).toBe(focusedAsset());
+  });
+
   it("索引事件到达时进度条实时更新（index://progress 接线）", async () => {
     let emit: ((e: IndexProgressEvent) => void) | null = null;
     const spy = vi

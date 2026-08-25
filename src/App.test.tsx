@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import * as api from "./api";
 import { mockCopyTasks, mockProjects, mockWorkstation } from "./api/mock";
+import { ROUTE_ORDER } from "./state/store";
 import type { CopyProgressEvent, CopyTask } from "./api/types";
 
 afterEach(cleanup);
@@ -295,5 +296,50 @@ describe("应用外壳", () => {
 
     await user.click(screen.getByRole("button", { name: /新建项目/ }));
     expect(screen.getByText("将创建")).toBeDefined();
+  });
+});
+
+/**
+ * 屏间过渡的方向必须与侧栏排布一致：往下走从下方进来、往回走从上方进来。
+ * 方向错了不会报错、也不会崩，只会让人隐隐觉得"这软件怪怪的"——
+ * 所以只能靠测试锁住。
+ */
+describe("导航方向", () => {
+  const shell = () => document.querySelector(".shell") as HTMLElement;
+
+  it("侧栏的排列顺序就是 ROUTE_ORDER，两处不会各说各话", () => {
+    render(<App preloaded={{ route: "projects", workstation: mockWorkstation }} />);
+    const rendered = screen
+      .getAllByRole("button")
+      .map((el) => el.getAttribute("data-testid"))
+      .filter((id): id is string => !!id && id.startsWith("nav-"))
+      .map((id) => id.slice("nav-".length));
+    expect(rendered).toEqual(ROUTE_ORDER);
+  });
+
+  it("首屏不带方向：不是导航引起的整屏替换不该做方向性位移", () => {
+    render(<App preloaded={{ route: "projects", workstation: mockWorkstation }} />);
+    expect(shell().getAttribute("data-nav")).toBe("none");
+  });
+
+  it("往列表下方走标 forward，往回走标 back", async () => {
+    const user = userEvent.setup();
+    render(
+      <App
+        preloaded={{
+          route: "projects",
+          workstation: mockWorkstation,
+          projects: mockProjects,
+        }}
+      />,
+    );
+
+    // projects(0) → devices(2)
+    await user.click(screen.getByTestId("nav-devices"));
+    await waitFor(() => expect(shell().getAttribute("data-nav")).toBe("forward"));
+
+    // devices(2) → new-project(1)
+    await user.click(screen.getByTestId("nav-new-project"));
+    await waitFor(() => expect(shell().getAttribute("data-nav")).toBe("back"));
   });
 });

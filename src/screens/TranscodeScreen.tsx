@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import * as api from "../api";
 import type { ArchiveTier, FfmpegStatus, TranscodeJob } from "../api/types";
-import { isArchiveResult } from "../api/types";
+import { isArchiveResult, isJobTerminal } from "../api/types";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { TopBar } from "../components/TopBar";
 import { Badge, EmptyState, Field, ProgressBar } from "../components/ui";
@@ -138,9 +138,23 @@ export function TranscodeScreen() {
 
   async function cancel() {
     if (!job || cancelling) return;
+    // 已经跑完的作业不发取消：后端会回「将在当前文件完成后停止」，那是假话
+    if (isJobTerminal(job.state)) {
+      dispatch({ type: "jobProgress", job });
+      return;
+    }
     setCancelling(true);
     try {
-      dispatch({ type: "jobProgress", job: await api.cancelJob(job.id) });
+      const snapshot = await api.cancelJob(job.id);
+      dispatch({ type: "jobProgress", job: snapshot });
+      // 取消在路上时作业自己跑完了：如实说没生效
+      if (isJobTerminal(snapshot.state) && snapshot.state !== "cancelled") {
+        notify(
+          "warning",
+          "job-cancel-too-late",
+          "转码作业在取消生效前已经结束，本次取消未生效。",
+        );
+      }
     } catch (err) {
       notify(
         "warning",
