@@ -315,6 +315,28 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// R3:缩略图写路径的 `.ocard` 落地闸接线回归——中间段被换成指向项目外的
+    /// 符号链接时必须拒写(在 write_jpeg 里删掉 ensure_dir_within 调用本测试红)。
+    #[cfg(unix)]
+    #[test]
+    fn thumb_write_refuses_symlinked_state_dir() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, project.join(STATE_DIR)).unwrap();
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
+        assert!(
+            !store_thumb_from_image(&project, "a.jpg", 1, 1, &img),
+            "符号链接 .ocard 必须拒写"
+        );
+        assert!(
+            fs::read_dir(&outside).unwrap().next().is_none(),
+            "缩略图不得经链接写到项目外"
+        );
+    }
+
     fn write_test_jpeg(path: &Path, w: u32, h: u32) {
         let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
             image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
