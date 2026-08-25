@@ -95,14 +95,15 @@ jobs:
     strategy:
       fail-fast: false
       # bundles:CI 每平台只打 verify-bundle.sh 实际核查的格式,砍掉零验证的
-      # 纯耗时项(实测:linux AppImage 打包 14.5 分钟、windows NSIS 3 分钟,
-      # 而 verify 在 linux 只拆 .deb、windows 只查暂存目录)。
+      # 纯耗时项。实测更正:linux 腿的 14.5 分钟大头是 **rpm**(tauri-bundler
+      # 纯 Rust rpm 实现对 ~200MB payload 单线程高压缩;deb 7s、AppImage 80s),
+      # windows NSIS 3 分钟;而 verify 在 linux 只拆 .deb、windows 只查暂存目录。
       # Release 工作流不受影响,发布产物仍是全格式。
       matrix:
         include:
           - platform: linux
             os: ubuntu-latest
-            bundles: deb,rpm
+            bundles: deb
           - platform: macos
             # macos-latest 当前为 arm64,verify-bundle.sh 里对应硬编码
             # ffmpeg/ffprobe-aarch64-apple-darwin 条目。若 runner 架构漂移,
@@ -178,7 +179,6 @@ jobs:
             src-tauri/target/release/bundle/dmg/*.dmg
             src-tauri/target/release/bundle/macos/*.app/**
             src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/rpm/*.rpm
 
   e2e:
     name: E2E (linux, tauri-driver)
