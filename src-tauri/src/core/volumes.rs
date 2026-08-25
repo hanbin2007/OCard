@@ -41,7 +41,9 @@ pub fn is_system_mount(mount: &std::path::Path) -> bool {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let m = mount.to_string_lossy();
-        return !(m.starts_with("/media/") || m.starts_with("/run/media/") || m.starts_with("/mnt/"));
+        return !(m.starts_with("/media/")
+            || m.starts_with("/run/media/")
+            || m.starts_with("/mnt/"));
     }
     #[allow(unreachable_code)]
     false
