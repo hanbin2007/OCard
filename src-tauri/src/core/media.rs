@@ -75,6 +75,35 @@ pub fn mtime_nanos(meta: &fs::Metadata) -> u128 {
         .unwrap_or(0)
 }
 
+/// EXIF Orientation(1-8;取不到按 1)。
+pub fn exif_orientation(abs_path: &Path) -> u32 {
+    let Ok(file) = fs::File::open(abs_path) else {
+        return 1;
+    };
+    let mut reader = BufReader::new(file);
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut reader) else {
+        return 1;
+    };
+    exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+        .and_then(|f| f.value.get_uint(0))
+        .filter(|v| (1..=8).contains(v))
+        .unwrap_or(1)
+}
+
+/// 按 EXIF Orientation 摆正图像(镜像方向 2/4/5/7 与旋转合并处理)。
+pub fn apply_orientation(img: image::DynamicImage, orientation: u32) -> image::DynamicImage {
+    match orientation {
+        2 => img.fliph(),
+        3 => img.rotate180(),
+        4 => img.flipv(),
+        5 => img.rotate90().fliph(),
+        6 => img.rotate90(),
+        7 => img.rotate270().fliph(),
+        8 => img.rotate270(),
+        _ => img,
+    }
+}
+
 /// 提取 EXIF 拍摄时间的**墙钟**(DateTimeOriginal 优先,其次 DateTime)。
 /// EXIF 不带时区:这就是相机表盘上的时间。半天分包等「以拍摄现场为准」的
 /// 判定必须直接用它,绝不能先套一个时区再转回来(codex 评审 9:那样

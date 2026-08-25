@@ -53,6 +53,7 @@ macro_rules! ocard_invoke_handler {
             $crate::commands::transcode_cmds::transcode_capabilities,
             $crate::commands::transcode_cmds::transcode_diagnostics,
             $crate::commands::transcode_cmds::start_proxy_transcode,
+            $crate::commands::transcode_cmds::start_archive_transcode,
             $crate::commands::analysis_cmds::start_analysis,
             $crate::commands::finalcut_cmds::check_final_cuts,
             $crate::commands::finalcut_cmds::curated_flow_hints,
@@ -83,6 +84,8 @@ pub fn run() {
             });
             // sidecar 缺失立即可见(零静默 ffmpeg-missing)
             commands::transcode_cmds::notify_ffmpeg_missing_on_startup(app.handle());
+            // AI 模型启动校验(D1:哈希不符=禁用 AI,硬失败可见)
+            commands::analysis_cmds::verify_models_on_startup(app.handle());
             // auto_proxy 意图补投递(at-least-once:整批成功才置位,skip 语义容忍重复)
             {
                 let app_handle = app.handle().clone();
@@ -163,6 +166,52 @@ pub fn run() {
                     }
                 }
             });
+        })
+        .on_window_event(|window, event| {
+            // D2/评审 #18:有活跃后台作业时关窗先拦 + 可见提示;
+            // 15 秒内再次关闭 = 确认强退:取消全部作业、杀 ffmpeg 子进程后放行
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                use tauri::Manager as _;
+                static LAST_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+                let app = window.app_handle();
+                let jobs_active = app
+                    .try_state::<std::sync::Arc<core::jobs::JobManager>>()
+                    .map(|j| j.any_active())
+                    .unwrap_or(false);
+                let tasks_running = app
+                    .try_state::<commands::AppState>()
+                    .map(|s| s.tasks.any_running())
+                    .unwrap_or(false);
+                if !jobs_active && !tasks_running {
+                    return;
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let last = LAST_ATTEMPT.swap(now, Ordering::SeqCst);
+                if now.saturating_sub(last) <= 15 {
+                    // 确认强退:请求取消全部活跃作业 + 杀子进程,放行关闭
+                    if let Some(jobs) =
+                        app.try_state::<std::sync::Arc<core::jobs::JobManager>>()
+                    {
+                        for s in jobs.snapshots() {
+                            if !s.state.is_terminal() {
+                                let _ = jobs.request_cancel(&s.id);
+                            }
+                        }
+                    }
+                    core::transcode::kill_all_children();
+                    return;
+                }
+                api.prevent_close();
+                commands::notify::warn(
+                    app,
+                    "close-blocked-active-jobs",
+                    "有后台作业(拷卡/交付/转码/分析)进行中,已阻止关闭;15 秒内再次关闭将取消作业并退出".into(),
+                );
+            }
         })
         .invoke_handler(crate::ocard_invoke_handler!())
         .run(tauri::generate_context!())

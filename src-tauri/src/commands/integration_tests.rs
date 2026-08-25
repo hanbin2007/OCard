@@ -194,3 +194,96 @@ fn delivery_job_end_to_end_through_real_handler() {
         .iter()
         .any(|j| j["id"] == job_id.as_str()));
 }
+
+// ---------- M3 命令挂网(评审 #13:每波新命令必须有网) ----------
+
+#[test]
+fn m3_commands_wired_and_gated() {
+    let (window, _tmp, nas) = mock_app();
+    let pid = create_b_project(&window);
+
+    // ffmpeg_status:mock 环境无 sidecar → missing 且原因可见(零静默形状)
+    let st = invoke(&window, "ffmpeg_status", json!({})).unwrap();
+    assert_eq!(st["status"], "missing");
+    assert!(st["error"].as_str().unwrap_or_default().len() > 3);
+
+    // 转码/归档只认工况 A:B 项目必须被拒且报文点名
+    let e = invoke(
+        &window,
+        "start_proxy_transcode",
+        json!({"input": {"projectId": pid}}),
+    )
+    .expect_err("B 项目转码必须拒");
+    assert!(e.as_str().unwrap().contains("工况 A"));
+    let e = invoke(
+        &window,
+        "start_archive_transcode",
+        json!({"input": {"projectId": pid, "tier": "balanced", "outputDir": "/tmp/x"}}),
+    )
+    .expect_err("B 项目归档必须拒");
+    assert!(e.as_str().unwrap().contains("工况 A"));
+
+    // 成片校验只认工况 A
+    let e = invoke(&window, "check_final_cuts", json!({"projectId": pid}))
+        .expect_err("B 项目成片校验必须拒");
+    assert!(e.as_str().unwrap().contains("工况 A"));
+
+    // 流转提示(B 项目,空):正常返回空表
+    let hints = invoke(&window, "curated_flow_hints", json!({"projectId": pid})).unwrap();
+    assert_eq!(hints.as_array().unwrap().len(), 0);
+
+    // 交付状态回读闭环
+    let s0 = invoke(&window, "get_delivery_status", json!({"projectId": pid})).unwrap();
+    assert_eq!(s0["uploaded"], false);
+    let s1 = invoke(
+        &window,
+        "set_delivery_status",
+        json!({"projectId": pid, "uploaded": true}),
+    )
+    .unwrap();
+    assert_eq!(s1["uploaded"], true);
+    let s2 = invoke(&window, "get_delivery_status", json!({"projectId": pid})).unwrap();
+    assert_eq!(s2["uploaded"], true);
+    assert!(s2["updatedBy"].as_str().is_some());
+
+    // 分析作业:注入一张真 JPEG → 发起 → 轮询终态 done,特征落盘
+    let inbox = nas.join(&pid).join("1. 待分类/x");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(320, 240, |x, y| {
+        image::Rgb([(x % 256) as u8, (y % 256) as u8, 99])
+    }));
+    img.save(inbox.join("a.jpg")).unwrap();
+    let snap = invoke(&window, "start_analysis", json!({"projectId": pid})).unwrap();
+    let job_id = snap["id"].as_str().unwrap().to_string();
+    let mut last = json!(null);
+    for _ in 0..300 {
+        last = invoke(&window, "get_job", json!({"jobId": job_id})).unwrap();
+        if ["done", "failed", "cancelled"].contains(&last["state"].as_str().unwrap_or_default()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(last["state"], "done", "{last}");
+    assert_eq!(last["result"]["analyzed"], 1);
+    assert!(nas
+        .join(&pid)
+        .join(".ocard/analysis/features-TEST-MACHINE.jsonl")
+        .is_file());
+
+    // 分析后的列表带 judgement(挂网到 list_pending_assets 契约)
+    let page = invoke(
+        &window,
+        "list_pending_assets",
+        json!({"projectId": pid, "offset": 0, "limit": 50}),
+    )
+    .unwrap();
+    assert!(page["items"][0]["judgement"]["score"].is_number());
+
+    // 转码能力探测:mock 无 sidecar → 状态机可达(idle→probing/failed),不 panic
+    let cap = invoke(&window, "transcode_capabilities", json!({})).unwrap();
+    assert!(["idle", "probing", "ready", "failed"]
+        .contains(&cap["status"].as_str().unwrap_or_default()));
+    // 诊断导出无素材路径字段
+    let diag = invoke(&window, "transcode_diagnostics", json!({})).unwrap();
+    assert!(diag.get("ffmpeg").is_some());
+}

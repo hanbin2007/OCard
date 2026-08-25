@@ -453,8 +453,9 @@ pub fn list_pending_assets<R: tauri::Runtime>(
     ensure_indexing(&app, &project_id, &stats.root, &files);
 
     // 客观分析判定:特征缓存 + 查询时确定性聚类(计划 C5)。
-    // 有分析结果时列表改按拍摄时间排序——同组连续且不跨分页的结构保证。
-    let (features, _) = crate::core::analysis::load_features(&stats.root);
+    // 有分析结果时列表改按拍摄时间排序;分页窗口尾部按组延展(评审 #25:
+    // 「不跨页」由这里真正保证,不再只是注释宣称)。
+    let (features, _) = cached_features(&stats.root);
     let judgements = if features.is_empty() {
         Default::default()
     } else {
@@ -484,10 +485,19 @@ pub fn list_pending_assets<R: tauri::Runtime>(
     };
 
     let total = files.len();
-    let items = files
+    // 页窗口:尾部若切断连拍组,延展到组尾(组大小有限,延展有界)
+    let start = offset.min(total);
+    let mut end = (start + limit.min(200)).min(total);
+    if end > start && end < total {
+        let gid_of = |i: usize| judgements.get(&files[i].0).and_then(|j| j.group_id.clone());
+        if let Some(gid) = gid_of(end - 1) {
+            while end < total && gid_of(end) == Some(gid.clone()) {
+                end += 1;
+            }
+        }
+    }
+    let items = files[start..end]
         .iter()
-        .skip(offset)
-        .take(limit.min(200)) // 上限与前端页大小一致
         .map(|(rel, size, mtime)| {
             let mut dto = asset_dto(
                 &stats.root,
@@ -502,6 +512,60 @@ pub fn list_pending_assets<R: tauri::Runtime>(
         })
         .collect();
     Ok(AssetPageDto { items, total })
+}
+
+/// 特征内存缓存(评审 #25 性能项):键=项目根,失效=features-*.jsonl 的
+/// (数量, 最大 mtime) 变化——分页翻页不再每页全量重读 NAS。
+type FeaturesCacheMap = HashMap<
+    PathBuf,
+    (
+        (usize, std::time::SystemTime),
+        std::collections::HashMap<u64, crate::core::analysis::FeatureRecord>,
+        usize,
+    ),
+>;
+static FEATURES_CACHE: Mutex<Option<FeaturesCacheMap>> = Mutex::new(None);
+
+fn cached_features(
+    project_root: &Path,
+) -> (
+    std::collections::HashMap<u64, crate::core::analysis::FeatureRecord>,
+    usize,
+) {
+    let dir = crate::core::analysis::analysis_dir(project_root);
+    let mut count = 0usize;
+    let mut max_mtime = std::time::SystemTime::UNIX_EPOCH;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("features-") && name.ends_with(".jsonl") {
+                count += 1;
+                if let Ok(m) = e.metadata() {
+                    if let Ok(t) = m.modified() {
+                        max_mtime = max_mtime.max(t);
+                    }
+                }
+            }
+        }
+    }
+    let key = (count, max_mtime);
+    {
+        let cache = FEATURES_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(map) = cache.as_ref() {
+            if let Some((k, feats, skipped)) = map.get(project_root) {
+                if *k == key {
+                    return (feats.clone(), *skipped);
+                }
+            }
+        }
+    }
+    let (feats, skipped) = crate::core::analysis::load_features(project_root);
+    FEATURES_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(project_root.to_path_buf(), (key, feats.clone(), skipped));
+    (feats, skipped)
 }
 
 #[tauri::command]
@@ -1033,6 +1097,16 @@ pub fn cancel_job<R: tauri::Runtime>(
     // running 的作业由 worker 在安全点收尾;这里返回请求后的快照
     match jobs.request_cancel(&job_id) {
         Some(s) => {
+            // 零静默:取消请求本身可见(排队取消立即终态,运行中在安全点生效)
+            notify::info(
+                &app,
+                "job-cancelled",
+                if s.state == crate::core::jobs::JobState::Cancelled {
+                    "作业已取消".to_string()
+                } else {
+                    "已请求取消,作业将在当前文件完成后停止".to_string()
+                },
+            );
             let _ = app.emit(JOB_EVENT, &s);
             Ok(s)
         }
@@ -1048,6 +1122,8 @@ pub fn cancel_job<R: tauri::Runtime>(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteActivityDto {
+    /// "copy" | "transcode"(前端按类型措辞)。
+    pub activity: &'static str,
     pub machine: String,
     pub operator: String,
     pub volume: String,
@@ -1083,6 +1159,7 @@ pub fn list_remote_activity<R: tauri::Runtime>(
         let task_id = ev
             .data
             .get("taskId")
+            .or_else(|| ev.data.get("jobId"))
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
@@ -1104,6 +1181,7 @@ pub fn list_remote_activity<R: tauri::Runtime>(
                     open.insert(
                         task_id,
                         RemoteActivityDto {
+                            activity: "copy",
                             machine: ev.machine.clone(),
                             operator: ev.operator.clone(),
                             volume: s("volume"),
@@ -1115,6 +1193,32 @@ pub fn list_remote_activity<R: tauri::Runtime>(
                 }
             }
             k if k == crate::core::journal::kind::COPY_COMPLETED => {
+                open.remove(&task_id);
+            }
+            // 他机转码可见(评审 #17;W6 明定)
+            "transcode_started" => {
+                if ev.machine != state.machine_id && ev.ts >= cutoff {
+                    let folders = ev
+                        .data
+                        .get("folders")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("全部相机夹")
+                        .to_string();
+                    open.insert(
+                        task_id,
+                        RemoteActivityDto {
+                            activity: "transcode",
+                            machine: ev.machine.clone(),
+                            operator: ev.operator.clone(),
+                            volume: String::new(),
+                            camera: folders.clone(),
+                            target_folder: folders,
+                            started_at: ev.ts.to_rfc3339(),
+                        },
+                    );
+                }
+            }
+            "transcode_completed" | "transcode_cancelled" => {
                 open.remove(&task_id);
             }
             _ => {}

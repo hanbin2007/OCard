@@ -172,8 +172,10 @@ pub struct ProxyInput {
     pub project_id: String,
     /// 限定的相机夹(「2. 原始素材」下的一级子夹名);None=全部。
     pub camera_folders: Option<Vec<String>>,
-    /// 整夹强制全转(跳过高负载判定;仍不覆盖已有输出)。
+    /// 整夹强制全转(只跳过高负载判定;**不**触碰已有输出)。
     pub force_all: Option<bool>,
+    /// 强制重转(唯一覆盖入口,D2):先删既有代理再转;前端必须二次确认。
+    pub retranscode: Option<bool>,
 }
 
 const VIDEO_EXTS: &[&str] = &["mp4", "mov", "avi", "mts", "m4v", "mxf", "mkv"];
@@ -246,7 +248,9 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
     intent_manifest: Option<String>,
 ) -> std::result::Result<JobSnapshot, String> {
     let jobs = app.state::<Arc<JobManager>>().inner().clone();
-    if jobs.has_active(JobKind::Transcode, &input.project_id) {
+    // auto_proxy 补投递允许排队(lane 串行天然消化多卡,评审 P1-7);
+    // UI 手动路径保留防重复点击
+    if intent_manifest.is_none() && jobs.has_active(JobKind::Transcode, &input.project_id) {
         return Err("该项目已有转码作业在进行中".into());
     }
     if meta.scenario != project::Scenario::A {
@@ -271,10 +275,25 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                     machine_id.clone(),
                     op.clone(),
                     "transcode_started",
-                    serde_json::json!({ "jobId": h.snapshot().id }),
+                    serde_json::json!({
+                        "jobId": h.snapshot().id,
+                        "folders": input
+                            .camera_folders
+                            .as_ref()
+                            .map(|f| f.join("、"))
+                            .unwrap_or_else(|| "全部相机夹".into()),
+                    }),
                 ),
             );
             let caps = capabilities_blocking()?;
+            // 阻塞探测路径也要兑现 hwenc-fallback 告警(评审:不能只挂设置页路径)
+            if !caps.winners.keys().any(|k| k.ends_with("_hw")) {
+                notify::warn(
+                    &body_app,
+                    "hwenc-fallback",
+                    "未探测到可用的硬件编码器,本次转码使用软件编码(速度较慢)".into(),
+                );
+            }
             let encoder = caps
                 .winners
                 .get("h264_hw")
@@ -298,12 +317,21 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
             };
 
             // 收集视频文件(逐夹过工况 A 命名空间闸)
+            let mut dir_errors: Vec<FailureDto> = Vec::new();
             let mut work: Vec<(String, PathBuf, String)> = Vec::new(); // (folder, abs, rel)
             for folder in &folders {
                 let rel_dir = format!("{raw_dir}/{folder}");
                 let dir = sorting::resolve_asset_a_in_project(&root, &meta, &rel_dir)?;
-                let Ok(entries) = std::fs::read_dir(&dir) else {
-                    continue;
+                let entries = match std::fs::read_dir(&dir) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        // 目录读错不许静默吞:入失败清单,且阻止 intent 标完成(评审 P0-4)
+                        dir_errors.push(FailureDto {
+                            rel: rel_dir.clone(),
+                            message: format!("目录读取失败: {e}"),
+                        });
+                        continue;
+                    }
                 };
                 for e in entries.flatten() {
                     let p = e.path();
@@ -321,6 +349,7 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
             let mut result = ProxyResultDto {
                 used_encoder: encoder.clone(),
                 output_dir: root.join(&out_root_rel).display().to_string(),
+                failures: dir_errors,
                 ..Default::default()
             };
 
@@ -329,15 +358,57 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                 .iter()
                 .filter_map(|(_, p, _)| std::fs::metadata(p).ok().map(|m| m.len()))
                 .sum();
-            if let Some(free) = free_space_for(&root) {
-                let est = total_src / 8 + 2 * 1024 * 1024 * 1024;
-                if free < est {
-                    return Err(format!(
-                        "磁盘空间不足:可用 {} GB,预估需要 {} GB(代理输出+余量);请清理后重试",
-                        free / 1_073_741_824,
-                        est / 1_073_741_824
-                    ));
+            match free_space_for(&root) {
+                Some(free) => {
+                    let est = total_src / 8 + 2 * 1024 * 1024 * 1024;
+                    if free < est {
+                        notify::warn(
+                            &body_app,
+                            "disk-space-insufficient",
+                            format!(
+                                "转码空间预检失败:可用 {} GB,预估需要 {} GB",
+                                free / 1_073_741_824,
+                                est / 1_073_741_824
+                            ),
+                        );
+                        return Err(format!(
+                            "磁盘空间不足:可用 {} GB,预估需要 {} GB(代理输出+余量);请清理后重试",
+                            free / 1_073_741_824,
+                            est / 1_073_741_824
+                        ));
+                    }
                 }
+                None => notify::warn(
+                    &body_app,
+                    "disk-space-insufficient",
+                    "无法探测目标磁盘可用空间,已跳过空间预检;若中途空间耗尽会逐文件失败".into(),
+                ),
+            }
+
+            // 本机残留 staging 全输出根清理(D2:作业起点执行+可见提示)
+            let mut cleaned = 0usize;
+            let out_root = root.join(&out_root_rel);
+            let mut stack = vec![out_root.clone()];
+            while let Some(d) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&d) else { continue };
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        stack.push(e.path());
+                    } else if name.starts_with(&format!(".{machine_id}."))
+                        && name.contains(".transpart")
+                        && std::fs::remove_file(e.path()).is_ok()
+                    {
+                        cleaned += 1;
+                    }
+                }
+            }
+            if cleaned > 0 {
+                notify::info(
+                    &body_app,
+                    "transcode-staging-cleaned",
+                    format!("清理了 {cleaned} 个上次未完成的转码半成品(本机残留)"),
+                );
             }
 
             let total = work.len();
@@ -380,12 +451,18 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                     });
                     continue;
                 }
+                // 名带源扩展名:C0001.MP4 与 C0001.MXF 不再撞名误报(评审 P1-3)
                 let stem = abs
                     .file_stem()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                let final_out = out_dir.join(format!("{stem}_proxy.mp4"));
+                let ext = abs
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_ascii_uppercase();
+                let final_out = out_dir.join(format!("{stem}_{ext}_proxy.mp4"));
                 if paths::is_symlink(&final_out) {
                     result.failures.push(FailureDto {
                         rel: rel.clone(),
@@ -394,9 +471,20 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                     continue;
                 }
                 if final_out.exists() {
-                    // 幂等 skip(计划 D2):不覆盖、不比对——已有输出即已完成
-                    result.already_transcoded += 1;
-                    continue;
+                    if input.retranscode.unwrap_or(false) {
+                        // 唯一覆盖入口(D2):显式强制重转,先删后转(前端已二次确认)
+                        if let Err(e) = std::fs::remove_file(&final_out) {
+                            result.failures.push(FailureDto {
+                                rel: rel.clone(),
+                                message: format!("删除既有代理失败: {e}"),
+                            });
+                            continue;
+                        }
+                    } else {
+                        // 幂等 skip(计划 D2):不覆盖、不比对——已有输出即已完成
+                        result.already_transcoded += 1;
+                        continue;
+                    }
                 }
                 // 本机残留 staging 清理(只清本机,启动/重跑安全)
                 if let Ok(entries) = std::fs::read_dir(&out_dir) {
@@ -509,6 +597,7 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                     op.clone(),
                     audit_kind,
                     serde_json::json!({
+                        "jobId": h.snapshot().id,
                         "converted": result.converted,
                         "alreadyTranscoded": result.already_transcoded,
                         "skipped": result.skipped.len(),
@@ -536,7 +625,8 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
             }
             // auto_proxy intent:整批成功才置位(计划 D2 at-least-once)
             if let Some(mid) = &intent_manifest {
-                if !cancelled && result.failures.is_empty() {
+                // 评审 P0-4:空清单/读错/取消都不许标完成——attempts 上限负责最终放弃
+                if !cancelled && result.failures.is_empty() && total > 0 {
                     if let Ok(mut m) = crate::core::manifest::load(&root, mid) {
                         m.proxy_completed = true;
                         if let Err(e) = crate::core::manifest::save(&root, &m) {
@@ -571,6 +661,26 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
     if !m.auto_proxy || m.proxy_completed || !m.completed {
         return;
     }
+    // 永久失败不许无限重投(评审 P1-8):三次仍未整批成功即放弃,可见告知
+    if m.proxy_attempts >= 3 {
+        let mut done = m.clone();
+        done.proxy_completed = true;
+        let _ = crate::core::manifest::save(project_root, &done);
+        notify::warn(
+            app,
+            "auto-proxy-abandoned",
+            format!(
+                "「{}」的自动转代理已连续 {} 次未能整批完成,停止自动重试;可在转码页手动执行(已转文件会安全跳过)",
+                m.target_rel, m.proxy_attempts
+            ),
+        );
+        return;
+    }
+    {
+        let mut bump = m.clone();
+        bump.proxy_attempts += 1;
+        let _ = crate::core::manifest::save(project_root, &bump);
+    }
     let Ok(meta) = project::load_meta(project_root) else {
         return;
     };
@@ -587,6 +697,7 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
         project_id,
         camera_folders: Some(vec![folder.to_string()]),
         force_all: Some(false),
+        retranscode: Some(false),
     };
     if let Err(e) = spawn_proxy_job(
         app,
@@ -604,4 +715,333 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
             format!("自动转代理暂未启动({e});下次启动应用会自动补投"),
         );
     }
+}
+
+// ---------- 归档转码(PRD §5.6 三档,评审 #15 接线) ----------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveInput {
+    pub project_id: String,
+    pub camera_folders: Option<Vec<String>>,
+    pub tier: transcode::ArchiveTier,
+    /// 输出目录(用户选择,绝对路径;必须在项目外——归档不改写项目区)。
+    pub output_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveResultDto {
+    pub converted: usize,
+    pub already_archived: usize,
+    pub failures: Vec<FailureDto>,
+    pub used_encoder: String,
+    pub output_dir: String,
+}
+
+/// 发起归档转码作业(HEVC 三档;默认不动原件;零覆盖 + skip 幂等)。
+#[tauri::command]
+pub fn start_archive_transcode<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<super::AppState>,
+    input: ArchiveInput,
+) -> std::result::Result<JobSnapshot, String> {
+    let jobs = app.state::<Arc<JobManager>>().inner().clone();
+    if jobs.has_active(JobKind::Transcode, &input.project_id) {
+        return Err("该项目已有转码作业在进行中".into());
+    }
+    let nas = super::nas_root(&app, &state)?;
+    let stats = super::find_project(&nas, &input.project_id)?;
+    if stats.meta.scenario != project::Scenario::A {
+        return Err("归档转码仅适用于工况 A(视频)项目".into());
+    }
+    let out_root = PathBuf::from(input.output_dir.trim());
+    if !out_root.is_absolute() {
+        return Err("输出目录必须是绝对路径".into());
+    }
+    // 布局闸(计划 B2):输出与素材源互不嵌套(现成原语,不手搓)
+    let raw_root = stats.root.join(project::SCENARIO_A_DIRS[1]);
+    paths::validate_dest_layout(&raw_root, std::slice::from_ref(&out_root))?;
+    if out_root.starts_with(&stats.root) {
+        return Err("归档输出目录不能位于项目内部(项目区不做归档写入)".into());
+    }
+    std::fs::create_dir_all(&out_root).map_err(|e| format!("创建输出目录失败: {e}"))?;
+    if paths::is_symlink(&out_root) {
+        return Err("输出目录是符号链接,拒绝".into());
+    }
+
+    let handle = jobs.create(JobKind::Transcode, &input.project_id);
+    let root = stats.root.clone();
+    let meta = stats.meta.clone();
+    let machine_id = state.machine_id.clone();
+    let config_dir = state.config_dir.clone();
+    let op = super::operator(&app, &state);
+    let body_app = app.clone();
+    let event_app = app.clone();
+    let ret = handle.clone();
+    let raw_dir = project::SCENARIO_A_DIRS[1].to_string();
+    let tier = input.tier;
+
+    jobs.run(
+        handle.clone(),
+        || Ok(()),
+        move |h| {
+            super::tasks::append_audit(
+                &body_app,
+                &root,
+                &config_dir,
+                &crate::core::journal::Event::new(
+                    machine_id.clone(),
+                    op.clone(),
+                    "transcode_started",
+                    serde_json::json!({
+                        "jobId": h.snapshot().id,
+                        "folders": "归档",
+                    }),
+                ),
+            );
+            let caps = capabilities_blocking()?;
+            let ffmpeg_bin = PathBuf::from(&caps.ffmpeg.ffmpeg_path);
+            let ffprobe_bin = PathBuf::from(&caps.ffmpeg.ffprobe_path);
+            let pick = |ten_bit: bool| -> Option<String> {
+                if ten_bit {
+                    caps.winners
+                        .get("hevc10_hw")
+                        .or_else(|| caps.winners.get("hevc10_sw"))
+                        .cloned()
+                } else {
+                    caps.winners
+                        .get("hevc_hw")
+                        .or_else(|| caps.winners.get("hevc_sw"))
+                        .cloned()
+                }
+            };
+
+            // 收集(与代理同一套闸)
+            let raw_root = root.join(&raw_dir);
+            let folders: Vec<String> = match &input.camera_folders {
+                Some(list) => list.clone(),
+                None => std::fs::read_dir(&raw_root)
+                    .map_err(|e| format!("无法读取「{raw_dir}」: {e}"))?
+                    .flatten()
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| !n.starts_with('.'))
+                    .collect(),
+            };
+            let mut result = ArchiveResultDto {
+                output_dir: out_root.display().to_string(),
+                ..Default::default()
+            };
+            let mut work: Vec<(String, PathBuf, String)> = Vec::new();
+            for folder in &folders {
+                let rel_dir = format!("{raw_dir}/{folder}");
+                let dir = sorting::resolve_asset_a_in_project(&root, &meta, &rel_dir)?;
+                match std::fs::read_dir(&dir) {
+                    Ok(entries) => {
+                        for e in entries.flatten() {
+                            let p = e.path();
+                            if e.file_type().map(|t| t.is_file()).unwrap_or(false) && is_video(&p) {
+                                let rel = format!(
+                                    "{rel_dir}/{}",
+                                    p.file_name().unwrap_or_default().to_string_lossy()
+                                );
+                                work.push((folder.clone(), p, rel));
+                            }
+                        }
+                    }
+                    Err(e) => result.failures.push(FailureDto {
+                        rel: rel_dir.clone(),
+                        message: format!("目录读取失败: {e}"),
+                    }),
+                }
+            }
+            work.sort_by(|a, b| a.2.cmp(&b.2));
+
+            // 空间预检:归档可接近源体积
+            let total_src: u64 = work
+                .iter()
+                .filter_map(|(_, p, _)| std::fs::metadata(p).ok().map(|m| m.len()))
+                .sum();
+            match free_space_for(&out_root) {
+                Some(free) if free < total_src + 2 * 1024 * 1024 * 1024 => {
+                    notify::warn(
+                        &body_app,
+                        "disk-space-insufficient",
+                        format!(
+                            "归档空间预检失败:可用 {} GB,预估需要 {} GB",
+                            free / 1_073_741_824,
+                            (total_src + 2 * 1024 * 1024 * 1024) / 1_073_741_824
+                        ),
+                    );
+                    return Err("输出磁盘空间不足(归档输出可接近源体积)".into());
+                }
+                None => notify::warn(
+                    &body_app,
+                    "disk-space-insufficient",
+                    "无法探测输出磁盘可用空间,已跳过预检".into(),
+                ),
+                _ => {}
+            }
+
+            let total = work.len();
+            for (i, (folder, abs, rel)) in work.iter().enumerate() {
+                if h.cancel_requested() {
+                    break;
+                }
+                h.progress(i, total, 0, Some(rel.clone()));
+                let _ = body_app.emit(JOB_EVENT, &h.snapshot());
+                let info = match transcode::probe_file(&ffprobe_bin, abs) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        result.failures.push(FailureDto {
+                            rel: rel.clone(),
+                            message: format!("探测失败: {e}"),
+                        });
+                        continue;
+                    }
+                };
+                let ten_bit = info.pix_fmt.contains("10le") || info.pix_fmt.contains("10be");
+                let Some(encoder) = pick(ten_bit) else {
+                    result.failures.push(FailureDto {
+                        rel: rel.clone(),
+                        message: format!("无可用 HEVC 编码器(10bit={ten_bit})"),
+                    });
+                    continue;
+                };
+                let out_dir = out_root.join(folder);
+                if let Err(e) = std::fs::create_dir_all(&out_dir) {
+                    result.failures.push(FailureDto {
+                        rel: rel.clone(),
+                        message: format!("创建输出夹失败: {e}"),
+                    });
+                    continue;
+                }
+                let stem = abs
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let ext = abs
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_ascii_uppercase();
+                let tier_tag = match tier {
+                    transcode::ArchiveTier::Quality => "hq",
+                    transcode::ArchiveTier::Balanced => "std",
+                    transcode::ArchiveTier::Compact => "min",
+                };
+                let final_out = out_dir.join(format!("{stem}_{ext}_hevc_{tier_tag}.mp4"));
+                if paths::is_symlink(&final_out) {
+                    result.failures.push(FailureDto {
+                        rel: rel.clone(),
+                        message: "输出位置是符号链接,拒绝".into(),
+                    });
+                    continue;
+                }
+                if final_out.exists() {
+                    result.already_archived += 1;
+                    continue;
+                }
+                let job_short = h.snapshot().id[..8].to_string();
+                let tmp = out_dir.join(format!(".{machine_id}.{job_short}.transpart.mp4"));
+                let args = transcode::archive_args(abs, &encoder, tier, ten_bit, &tmp);
+                let frac_rel = rel.clone();
+                let hh = h;
+                let run = transcode::run_transcode(
+                    &ffmpeg_bin,
+                    &args,
+                    &tmp,
+                    info.duration_secs,
+                    move |frac| {
+                        let msg = match frac {
+                            Some(f) => format!("{frac_rel} ({:.0}%)", f * 100.0),
+                            None => format!("{frac_rel} (时长未知)"),
+                        };
+                        hh.progress(i, total, 0, Some(msg));
+                    },
+                    &|| hh.cancel_requested(),
+                );
+                match run {
+                    Ok(()) => {
+                        let expect_pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
+                        let verdict = transcode::probe_file(&ffprobe_bin, &tmp)
+                            .and_then(|out_info| {
+                                // 硬编 10bit 常输出 p010le,两者等价接受
+                                let pix_ok = out_info.pix_fmt == expect_pix
+                                    || (ten_bit && out_info.pix_fmt == "p010le");
+                                if !pix_ok {
+                                    return Err(format!("输出像素格式不符: {}", out_info.pix_fmt));
+                                }
+                                transcode::verify_output(
+                                    &out_info,
+                                    "hevc",
+                                    None,
+                                    &out_info.pix_fmt.clone(),
+                                    &info,
+                                )
+                            })
+                            .and_then(|_| {
+                                crate::core::fsx::rename_no_replace(&tmp, &final_out)
+                                    .map_err(|e| format!("落位失败: {e}"))
+                            });
+                        match verdict {
+                            Ok(()) => {
+                                result.converted += 1;
+                                result.used_encoder = encoder.clone();
+                            }
+                            Err(e) => {
+                                let _ = std::fs::remove_file(&tmp);
+                                result.failures.push(FailureDto {
+                                    rel: rel.clone(),
+                                    message: format!("输出验证失败: {e}"),
+                                });
+                            }
+                        }
+                    }
+                    Err(e) if e == "已取消" => break,
+                    Err(e) => result.failures.push(FailureDto {
+                        rel: rel.clone(),
+                        message: e,
+                    }),
+                }
+            }
+            let cancelled = h.cancel_requested();
+            super::tasks::append_audit(
+                &body_app,
+                &root,
+                &config_dir,
+                &crate::core::journal::Event::new(
+                    machine_id.clone(),
+                    op.clone(),
+                    if cancelled {
+                        "transcode_cancelled"
+                    } else {
+                        "transcode_completed"
+                    },
+                    serde_json::json!({
+                        "jobId": h.snapshot().id,
+                        "archived": result.converted,
+                        "failures": result.failures.len(),
+                    }),
+                ),
+            );
+            if !result.failures.is_empty() {
+                notify::warn(
+                    &body_app,
+                    "transcode-partial",
+                    format!(
+                        "归档完成,但 {} 个文件失败(明细见结果)",
+                        result.failures.len()
+                    ),
+                );
+            }
+            serde_json::to_value(&result).map_err(|e| e.to_string())
+        },
+        move |s: JobSnapshot| {
+            let _ = event_app.emit(JOB_EVENT, &s);
+        },
+    );
+    Ok(ret.snapshot())
 }

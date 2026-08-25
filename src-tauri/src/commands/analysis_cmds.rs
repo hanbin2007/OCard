@@ -1,4 +1,5 @@
-//! AI 客观分析作业(M3 W7a):单次解码流水线(rayon 并行、逐项 catch_unwind)、
+//! AI 客观分析作业(M3 W7a):单次解码流水线(rayon 并行——逻辑核-1,
+//! 计划「物理核」按标准库能力收窄为逻辑核并记录;逐项 catch_unwind)、
 //! 特征入每机纯追加缓存、缩略图顺带回填共享缓存。
 //! 分析不进互斥(计划 D3):只读素材,文件被并发分类移走按 missing 处理。
 
@@ -21,6 +22,9 @@ pub struct AnalysisResultDto {
     /// 分析期间被移走/删除(不是失败)。
     pub missing: usize,
     pub failed: Vec<AnalysisFailureDto>,
+    /// 视频首帧图已就绪数 / 引擎缺失未抽帧数(零静默)。
+    pub video_thumbs: usize,
+    pub video_thumbs_skipped: usize,
     /// 特征缓存坏行(零静默)。
     pub cache_skipped_lines: usize,
 }
@@ -32,6 +36,25 @@ pub struct AnalysisFailureDto {
     pub message: String,
 }
 
+/// AI 硬禁用标志(D1:模型哈希不符=篡改/损坏,禁用整个 AI 功能;
+/// 模型「缺失」是打包问题,降级为无人脸分析并可见 error——两种语义分开)。
+static AI_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 启动校验:模型存在但哈希不符 → 禁用 AI + 可见 error(计划 D1)。
+pub fn verify_models_on_startup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Ok(p) = resolve_model_path(app) {
+        if let Err(e) = crate::core::yunet::verify_model(&p) {
+            AI_DISABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+            notify::error(
+                app,
+                "ai-models-corrupt",
+                format!("AI 模型校验失败({e}):AI 选片功能已禁用;请重新安装应用"),
+            );
+        }
+    }
+    // 模型缺失不在此禁用:分析仍可跑纯算法指标,人脸缺席在作业内可见上报
+}
+
 /// 发起分析作业(工况 B「待分类」全量;幂等:指纹命中即缓存)。
 #[tauri::command]
 pub fn start_analysis<R: tauri::Runtime>(
@@ -39,6 +62,9 @@ pub fn start_analysis<R: tauri::Runtime>(
     state: tauri::State<super::AppState>,
     project_id: String,
 ) -> std::result::Result<JobSnapshot, String> {
+    if AI_DISABLED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("AI 选片功能已禁用(模型校验失败,详见通知);请重新安装应用".into());
+    }
     let jobs = app.state::<Arc<JobManager>>().inner().clone();
     if jobs.has_active(JobKind::Analyze, &project_id) {
         return Err("该项目已有分析作业在进行中".into());
@@ -51,6 +77,10 @@ pub fn start_analysis<R: tauri::Runtime>(
     // 人脸模型:资源目录解析(测试/E2E 用 OCARD_MODELS_DIR 覆盖);
     // 校验/加载失败=可见 error + 本轮 faces=None(客观分析继续,零静默)
     let model_path = resolve_model_path(&app);
+    // 视频首帧抽取用捆绑 ffmpeg(缺失=保持占位,启动期已有可见提示)
+    let ffmpeg_bin = crate::core::ffmpeg::detect()
+        .ok()
+        .map(|i| PathBuf::from(i.ffmpeg_path));
     let handle = jobs.create(JobKind::Analyze, &project_id);
     let body_app = app.clone();
     let event_app = app.clone();
@@ -94,6 +124,8 @@ pub fn start_analysis<R: tauri::Runtime>(
             let done = AtomicUsize::new(0);
             let cached = AtomicUsize::new(0);
             let missing = AtomicUsize::new(0);
+            let vthumbs = AtomicUsize::new(0);
+            let vthumbs_skipped = AtomicUsize::new(0);
             let failures = std::sync::Mutex::new(Vec::<AnalysisFailureDto>::new());
             let new_features = std::sync::Mutex::new(Vec::<analysis::FeatureRecord>::new());
             let last_emit = std::sync::Mutex::new(std::time::Instant::now());
@@ -113,7 +145,16 @@ pub fn start_analysis<R: tauri::Runtime>(
                         return;
                     }
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        analyze_one(&root, &machine_id, rel, *size, *mtime, &features, detector)
+                        analyze_one(
+                            &root,
+                            &machine_id,
+                            rel,
+                            *size,
+                            *mtime,
+                            &features,
+                            detector,
+                            ffmpeg_bin.as_ref(),
+                        )
                     }));
                     match outcome {
                         Ok(AnalyzeOne::Cached) => {
@@ -121,6 +162,13 @@ pub fn start_analysis<R: tauri::Runtime>(
                         }
                         Ok(AnalyzeOne::Missing) => {
                             missing.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(AnalyzeOne::VideoThumb(ok)) => {
+                            if ok {
+                                vthumbs.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                vthumbs_skipped.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         Ok(AnalyzeOne::Fresh(rec)) => {
                             new_features
@@ -167,7 +215,7 @@ pub fn start_analysis<R: tauri::Runtime>(
                     &body_app,
                     "analysis-cache-degraded",
                     format!(
-                        "{cache_write_failed} 条分析结果写入缓存失败(结果本轮可用,重启后这些素材会重新分析)"
+                        "{cache_write_failed} 条分析结果写入缓存失败:这些素材的角标本轮不会出现,下次分析会重算"
                     ),
                 );
             }
@@ -175,6 +223,8 @@ pub fn start_analysis<R: tauri::Runtime>(
                 analyzed,
                 cached: cached.load(Ordering::Relaxed),
                 missing: missing.load(Ordering::Relaxed),
+                video_thumbs: vthumbs.load(Ordering::Relaxed),
+                video_thumbs_skipped: vthumbs_skipped.load(Ordering::Relaxed),
                 failed: failures.into_inner().unwrap_or_default(),
                 cache_skipped_lines: skipped,
             };
@@ -198,7 +248,70 @@ enum AnalyzeOne {
     Cached,
     Missing,
     Fresh(analysis::FeatureRecord),
+    /// 视频:只补首帧图进缩略图缓存(M2 media.rs 记账;不参与聚类评分)。
+    VideoThumb(bool),
     Failed(String),
+}
+
+/// 视频首帧抽取进共享缩略图缓存(引擎缺失=false,保持占位——
+/// 启动期已有 ffmpeg-missing 可见提示,这里不重复轰炸)。
+fn extract_video_thumb(
+    root: &std::path::Path,
+    rel: &str,
+    size: u64,
+    mtime: u128,
+    abs: &std::path::Path,
+    ffmpeg_bin: Option<&PathBuf>,
+) -> bool {
+    let Some(bin) = ffmpeg_bin else { return false };
+    let cache = media::cached_thumb_path(root, rel, size, mtime);
+    if cache.is_file() {
+        return true;
+    }
+    let Some(dir) = cache.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let tmp = dir.join(format!(".{}.vthumb.jpg", uuid::Uuid::new_v4()));
+    let args = [
+        "-nostdin",
+        "-hide_banner",
+        "-v",
+        "error",
+        "-ss",
+        "0.5",
+        "-i",
+        &abs.to_string_lossy(),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=-2:320",
+        "-q:v",
+        "5",
+        "-n",
+        &tmp.to_string_lossy(),
+    ];
+    let ok = matches!(
+        crate::core::ffmpeg::run_with_timeout(bin, &args, std::time::Duration::from_secs(30)),
+        Ok(out) if out.status.success()
+    ) && tmp.is_file();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    match crate::core::fsx::rename_no_replace(&tmp, &cache) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&tmp);
+            true
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            false
+        }
+    }
 }
 
 fn resolve_model_path<R: tauri::Runtime>(
@@ -226,6 +339,7 @@ fn resolve_model_path<R: tauri::Runtime>(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_one(
     root: &std::path::Path,
     machine_id: &str,
@@ -234,6 +348,7 @@ fn analyze_one(
     mtime: u128,
     features: &std::collections::HashMap<u64, analysis::FeatureRecord>,
     detector: Option<&yunet::FaceDetector>,
+    ffmpeg_bin: Option<&PathBuf>,
 ) -> AnalyzeOne {
     let fp = analysis::src_fingerprint(rel, size, mtime);
     if features.contains_key(&fp) {
@@ -243,15 +358,23 @@ fn analyze_one(
     if !abs.exists() {
         return AnalyzeOne::Missing;
     }
-    // 只分析可解码的照片(RAW 用内嵌预览归 W7b;视频不参与聚类评分)
-    if !matches!(media::classify(rel), media::AssetKind::Photo) {
-        return AnalyzeOne::Failed("非照片类型,客观分析暂不支持".into());
+    match media::classify(rel) {
+        media::AssetKind::Photo => {}
+        media::AssetKind::Video => {
+            // 视频:补首帧图(M2 记账),不参与聚类评分
+            return AnalyzeOne::VideoThumb(extract_video_thumb(
+                root, rel, size, mtime, &abs, ffmpeg_bin,
+            ));
+        }
+        _ => return AnalyzeOne::Failed("非照片类型,客观分析暂不支持".into()),
     }
     let img = match image::open(&abs) {
         Ok(i) => i,
         Err(_) if !abs.exists() => return AnalyzeOne::Missing,
         Err(e) => return AnalyzeOne::Failed(format!("解码失败: {e}")),
     };
+    // EXIF 方向摆正(评审:竖拍不摆正会毁掉 dHash 聚类与人脸检测)
+    let img = media::apply_orientation(img, media::exif_orientation(&abs));
     // 单次解码产出全部特征 + 回填共享缩略图缓存
     let (dhash, mut sharpness, over, under) = analysis::extract_features(&img);
     // 人脸在场:清晰度改按最大脸区域(对焦在脸=可用;检测失败按不可用处理)

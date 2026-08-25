@@ -14,6 +14,12 @@ use std::path::{Path, PathBuf};
 /// 解析并校验一次缩略图请求,返回可读的缓存文件绝对路径。
 /// 纯函数:一切闸都在这里,协议处理器只做 IO。
 pub fn resolve_thumb_request(nas_root: &Path, url_path: &str) -> Result<PathBuf, String> {
+    // webview 对非 ASCII 必然百分号编码(规范项目名是中文!);
+    // 与 tauri 内置协议同规矩:先 decode 再进闸(评审 P0-1)
+    let decoded = percent_encoding::percent_decode_str(url_path)
+        .decode_utf8()
+        .map_err(|_| "路径不是合法 UTF-8".to_string())?;
+    let url_path: &str = &decoded;
     let mut segs = url_path.trim_start_matches('/').split('/');
     let (Some(project_id), Some(cache_name), None) = (segs.next(), segs.next(), segs.next()) else {
         return Err("路径段数不合法".into());
@@ -88,6 +94,25 @@ mod tests {
         ] {
             assert!(resolve_thumb_request(nas, bad).is_err(), "{bad} 必须被拒");
         }
+    }
+
+    #[test]
+    fn percent_encoded_paths_decode_before_gates() {
+        // 评审 P0-1:中文项目名经 webview 编码后必须还原;编码的逃逸照样被拒
+        let tmp = tempdir().unwrap();
+        let nas = tmp.path();
+        let ok = resolve_thumb_request(
+            nas,
+            "/20260824_%E6%A0%A1%E8%BF%90%E4%BC%9A/0123456789abcdef.jpg",
+        )
+        .unwrap();
+        assert!(ok.ends_with("20260824_校运会/.ocard/thumbs/0123456789abcdef.jpg"));
+        // 编码的 ../ 不许绕闸
+        assert!(resolve_thumb_request(nas, "/%2E%2E/0123456789abcdef.jpg").is_err());
+        assert!(
+            resolve_thumb_request(nas, "/p%2F..%2Fq/0123456789abcdef.jpg").is_err(),
+            "解码引入的分隔符要落进段校验"
+        );
     }
 
     #[cfg(unix)]

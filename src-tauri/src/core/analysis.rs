@@ -192,10 +192,17 @@ pub fn sharpness_region(img: &image::DynamicImage, x: f32, y: f32, w: f32, h: f3
     // 外扩 20% 再裁,防框贴边切掉高频细节
     let ex = (w * 0.2).max(0.02);
     let ey = (h * 0.2).max(0.02);
-    let x0 = ((x - ex) * iw).max(0.0) as u32;
-    let y0 = ((y - ey) * ih).max(0.0) as u32;
-    let cw = (((w + 2.0 * ex) * iw) as u32).clamp(8, img.width() - x0.min(img.width() - 1));
-    let ch = (((h + 2.0 * ey) * ih) as u32).clamp(8, img.height() - y0.min(img.height() - 1));
+    // 边界数学(评审 #23):先夹 x0 保证右侧至少 8px,再夹宽度,杜绝 clamp(min>max) panic
+    let x0 = (((x - ex) * iw).max(0.0) as u32).min(img.width().saturating_sub(8));
+    let y0 = (((y - ey) * ih).max(0.0) as u32).min(img.height().saturating_sub(8));
+    let max_w = img.width() - x0;
+    let max_h = img.height() - y0;
+    let cw = (((w + 2.0 * ex) * iw) as u32)
+        .clamp(1, max_w)
+        .max(max_w.min(8));
+    let ch = (((h + 2.0 * ey) * ih) as u32)
+        .clamp(1, max_h)
+        .max(max_h.min(8));
     laplacian_score(&image::imageops::grayscale(&img.crop_imm(x0, y0, cw, ch)))
 }
 

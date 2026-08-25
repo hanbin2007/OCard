@@ -55,6 +55,9 @@ pub struct CopyManifest {
     /// 只有整批成功后置位,不宣称 exactly-once——skip 语义容忍重复)。
     #[serde(default)]
     pub proxy_completed: bool,
+    /// 自动转代理已尝试次数(≥3 放弃并可见告知,防永久失败无限重投)。
+    #[serde(default)]
+    pub proxy_attempts: u32,
     pub entries: Vec<ManifestEntry>,
 }
 
@@ -80,6 +83,7 @@ impl CopyManifest {
             completed: false,
             auto_proxy: false,
             proxy_completed: false,
+            proxy_attempts: 0,
             entries: Vec::new(),
         }
     }

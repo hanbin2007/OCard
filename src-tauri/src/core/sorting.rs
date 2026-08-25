@@ -790,6 +790,36 @@ mod tests {
     // ---------- 分类 ----------
 
     #[test]
+    fn scenario_a_namespace_gate() {
+        // 评审 #13:resolve_asset_a_in_project 零测试 → 补齐
+        let tmp = tempdir().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        let root = project::create_project(tmp.path(), date, "晚会", Scenario::A, &[]).unwrap();
+        let meta = project::load_meta(&root).unwrap();
+        fs::create_dir_all(root.join("2. 原始素材/cam")).unwrap();
+        fs::write(root.join("2. 原始素材/cam/v.mp4"), b"v").unwrap();
+
+        assert!(resolve_asset_a_in_project(&root, &meta, "2. 原始素材/cam/v.mp4").is_ok());
+        assert!(resolve_asset_a_in_project(&root, &meta, "3. 特别素材/x.mp4").is_ok());
+        // 素材夹之外的一律拒(成片/工程文件/内部区/逃逸)
+        for bad in [
+            "6. 成片/a.mp4",
+            "1. 工程文件/p.prproj",
+            ".ocard/manifests/m.json",
+            "../外面.mp4",
+            "2. 原始素材/../6. 成片/a.mp4",
+        ] {
+            assert!(
+                resolve_asset_a_in_project(&root, &meta, bad).is_err(),
+                "{bad} 必须被拒"
+            );
+        }
+        // 工况 B 项目走 A 闸必须拒
+        let (_t2, broot, bmeta) = setup_project();
+        assert!(resolve_asset_a_in_project(&broot, &bmeta, "2. 原始素材/x.mp4").is_err());
+    }
+
+    #[test]
     fn categories_layout_and_hotkeys() {
         let (_t, root, meta) = setup_project();
         let cats = list_categories(&root, &meta).unwrap();
