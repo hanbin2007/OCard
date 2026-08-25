@@ -679,7 +679,8 @@ fn stage_sidecar_dir(tmp: &std::path::Path) -> Option<std::path::PathBuf> {
 
 /// R2 P1 行为级(真 ffmpeg):代理转码端到端——转出真产物;重跑幂等且
 /// 「既有产物」经 ffprobe 验真才计完成;坏产物如实报失败绝不采信;
-/// 无硬件编码器时 hwenc-fallback 告警可见。
+/// hwenc-fallback 告警与真实硬编探测结果一致(无硬编必须告警——Linux
+/// 容器/runner;有硬编不得误报——macOS runner 的 VideoToolbox 真探针会过)。
 /// sidecar 由 scripts/fetch-ffmpeg.sh 拉取(CI 在 cargo test 前已就位)。
 #[cfg(unix)]
 #[test]
@@ -759,15 +760,24 @@ fn proxy_transcode_end_to_end_with_real_ffmpeg() {
         .join(&pid)
         .join("4. 转码素材/20260824_A7M4_A_ZS/C0001_MP4_proxy.mp4");
     assert!(final_out.is_file(), "代理产物必须落盘");
-    // 容器/CI runner 无硬件编码器:软编回退必须可见告警(R2 P1 hwenc-fallback)
+    // hwenc-fallback 告警必须与真实探测结果一致(R2 P1):无硬编(Linux
+    // 容器/runner)必须可见;有硬编(macOS VideoToolbox)不得误报。
+    // 作业已跑过 capabilities_blocking,PROBE_STATE 为 Ready,命令直接回缓存
+    let caps = invoke(&window, "transcode_capabilities", json!({})).unwrap();
+    assert_eq!(caps["status"], "ready", "{caps}");
+    let has_hw = caps["report"]["winners"]
+        .as_object()
+        .map(|w| w.keys().any(|k| k.ends_with("_hw")))
+        .unwrap_or(false);
     let notices = invoke(&window, "list_notices", json!({})).unwrap();
-    assert!(
-        notices
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|n| n["code"] == "hwenc-fallback"),
-        "软编回退必须可见: {notices}"
+    let fallback_seen = notices
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["code"] == "hwenc-fallback");
+    assert_eq!(
+        fallback_seen, !has_hw,
+        "软编回退告警必须与硬编探测一致(has_hw={has_hw}): {notices}"
     );
 
     // 第二轮:幂等——既有产物 ffprobe 验真通过才计 alreadyTranscoded
