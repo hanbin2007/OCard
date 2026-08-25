@@ -128,6 +128,15 @@ pub fn run() {
                 prune_rotated_logs(&log_dir, 10);
             }
             log::info!("OCard 启动,版本 {}", env!("CARGO_PKG_VERSION"));
+            // Linux WebKit 崩溃规避状态落日志(main.rs 里设置,这里只报告——
+            // 打包后 stderr 不可见,远程排障只能靠这份日志)
+            #[cfg(target_os = "linux")]
+            log::info!(
+                "Linux WebKit 规避: DMABUF_RENDERER 禁用={} 加速合成禁用={} AppImage={}",
+                std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").as_deref() == Ok("1"),
+                std::env::var("WEBKIT_DISABLE_COMPOSITING_MODE").as_deref() == Ok("1"),
+                std::env::var_os("APPIMAGE").is_some(),
+            );
             let machine_id = core::machine::machine_id(&config_dir)
                 .map_err(|e| format!("初始化机器 ID 失败: {e}"))?;
             app.manage(commands::updater::PendingUpdate::default());
