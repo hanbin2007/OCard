@@ -99,12 +99,26 @@ fn project_dto(stats: &catalog::ProjectStats, running: bool) -> ProjectDto {
 }
 
 fn find_project(nas: &Path, project_id: &str) -> CmdResult<catalog::ProjectStats> {
-    catalog::scan_cached(nas)
+    let mut stats = catalog::scan_cached(nas)
         .map_err(err)?
         .projects
         .into_iter()
         .find(|p| p.folder_name == project_id)
-        .ok_or_else(|| format!("项目不存在: {project_id}"))
+        .ok_or_else(|| format!("项目不存在: {project_id}"))?;
+    // R4(终审 P0-3):项目根统一 canonical 锚——命令层一切 `.ocard` 读写、
+    // 落地闸与协议闸都以这里返回的 root 为锚;链接项目与 NAS 外实体一律拒。
+    if crate::core::paths::is_symlink(&stats.root) {
+        return Err(format!("项目目录是符号链接,拒绝: {project_id}"));
+    }
+    let canon_nas = std::fs::canonicalize(nas).map_err(err)?;
+    let canon = std::fs::canonicalize(&stats.root).map_err(err)?;
+    if !crate::core::paths::comparison_key(&canon)
+        .starts_with(crate::core::paths::comparison_key(&canon_nas))
+    {
+        return Err(format!("项目实际位置在 NAS 根之外,拒绝: {project_id}"));
+    }
+    stats.root = canon;
+    Ok(stats)
 }
 
 // ---------- 工作站 ----------

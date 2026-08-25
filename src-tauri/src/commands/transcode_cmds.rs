@@ -241,6 +241,85 @@ fn collect_videos_recursive(
     }
 }
 
+/// 转码作业出口保证(R4 终审 P1):body 从任何一条 `?` 提前失败退出时,
+/// terminal 审计(transcode_failed)与 auto_proxy intent 登记都必须归位——
+/// 否则他机「正在转码」横幅假活跃 24h,intent 卡到进程重启。
+/// 正常收尾路径写完 completed/cancelled 审计后调用 `disarm`;
+/// intent 登记的移除由本 guard 统一负责(幂等)。
+struct TranscodeExitGuard<R: tauri::Runtime> {
+    app: tauri::AppHandle<R>,
+    root: PathBuf,
+    config_dir: PathBuf,
+    machine_id: String,
+    op: String,
+    job_id: String,
+    intent: Option<String>,
+    armed: bool,
+}
+
+impl<R: tauri::Runtime> TranscodeExitGuard<R> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<R: tauri::Runtime> Drop for TranscodeExitGuard<R> {
+    fn drop(&mut self) {
+        if let Some(mid) = &self.intent {
+            intent_end(mid);
+        }
+        if !self.armed {
+            return;
+        }
+        super::tasks::append_audit(
+            &self.app,
+            &self.root,
+            &self.config_dir,
+            &crate::core::journal::Event::new(
+                self.machine_id.clone(),
+                self.op.clone(),
+                "transcode_failed",
+                serde_json::json!({ "jobId": self.job_id }),
+            ),
+        );
+    }
+}
+
+/// 顶层相机夹枚举(R4 终审 P0-8:`.flatten()`+`unwrap_or(false)` 会把
+/// 读不出的条目静默当不存在,整夹漏转)。错误逐条收进 errors,由调用方
+/// 转失败清单(并阻止 auto_proxy intent 标完成)。
+fn list_camera_folders(
+    raw_root: &Path,
+    raw_dir: &str,
+) -> std::result::Result<(Vec<String>, Vec<String>), String> {
+    let entries = std::fs::read_dir(raw_root).map_err(|e| format!("无法读取「{raw_dir}」: {e}"))?;
+    let mut folders = Vec::new();
+    let mut errors = Vec::new();
+    for e in entries {
+        let e = match e {
+            Ok(e) => e,
+            Err(ee) => {
+                errors.push(format!("{raw_dir}: 目录项读取失败: {ee}"));
+                continue;
+            }
+        };
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        match e.file_type() {
+            Ok(t) if t.is_symlink() => {
+                errors.push(format!("{raw_dir}/{name}: 符号链接,不作为相机夹"));
+            }
+            Ok(t) if t.is_dir() => folders.push(name),
+            Ok(_) => {}
+            Err(ee) => errors.push(format!("{raw_dir}/{name}: 类型读取失败: {ee}")),
+        }
+    }
+    folders.sort();
+    Ok((folders, errors))
+}
+
 /// 批内输出名碰撞预检(R2 P1-6:大小写敏感文件系统上 `clip.mov` 与 `clip.MOV`
 /// 会映射到同一个输出名——后到者会把先到者的产物误判为「已完成」)。
 /// 返回被剔除的冲突项(rel 列表),调用方逐条入失败清单。
@@ -366,6 +445,16 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                     }),
                 ),
             );
+            let mut exit_guard = TranscodeExitGuard {
+                app: body_app.clone(),
+                root: root.clone(),
+                config_dir: config_dir.clone(),
+                machine_id: machine_id.clone(),
+                op: op.clone(),
+                job_id: h.snapshot().id.clone(),
+                intent: intent_manifest.clone(),
+                armed: true,
+            };
             let caps = capabilities_blocking()?;
             // 阻塞探测路径也要兑现 hwenc-fallback 告警(评审:不能只挂设置页路径)
             if !caps.winners.keys().any(|k| k.ends_with("_hw")) {
@@ -386,20 +475,25 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
 
             // 收集相机夹
             let raw_root = root.join(&raw_dir);
+            let mut folder_enum_errors: Vec<String> = Vec::new();
             let folders: Vec<String> = match &input.camera_folders {
                 Some(list) => list.clone(),
-                None => std::fs::read_dir(&raw_root)
-                    .map_err(|e| format!("无法读取「{raw_dir}」: {e}"))?
-                    .flatten()
-                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .filter(|n| !n.starts_with('.'))
-                    .collect(),
+                None => {
+                    let (folders, errs) = list_camera_folders(&raw_root, &raw_dir)?;
+                    folder_enum_errors = errs;
+                    folders
+                }
             };
 
             // 收集视频文件(逐夹过工况 A 命名空间闸;R2 P0:递归收集,
             // 目录/目录项错误入失败清单并阻止 intent 标完成,符号链接入 skipped)
             let mut dir_errors: Vec<FailureDto> = Vec::new();
+            for msg in folder_enum_errors.drain(..) {
+                dir_errors.push(FailureDto {
+                    rel: raw_dir.clone(),
+                    message: msg,
+                });
+            }
             let mut symlink_skips: Vec<String> = Vec::new();
             let mut work: Vec<(String, PathBuf, String)> = Vec::new(); // (folder, abs, rel)
             for folder in &folders {
@@ -573,21 +667,24 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                     } else {
                         // 幂等 skip(计划 D2)。R2 P1:「存在即成功」会永久采信坏产物——
                         // 计入完成前 ffprobe 验一次,坏产物如实报失败(覆盖仍只走重转入口)
-                        match transcode::probe_file(&ffprobe_bin, &final_out) {
-                            Ok(out_info) if out_info.codec == "h264" => {
-                                result.already_transcoded += 1;
-                            }
-                            Ok(out_info) => result.failures.push(FailureDto {
-                                rel: rel.clone(),
-                                message: format!(
-                                    "既有代理编码不符({}),未计入完成;可用「重新转码」覆盖",
-                                    out_info.codec
-                                ),
-                            }),
+                        // R4(终审 P0-6):只验 codec 不够——时长/分辨率/像素/
+                        // 音频/HDR 标签任何一项不符的「合法视频」都不许计入完成
+                        let verdict = transcode::probe_file(&ffprobe_bin, &final_out)
+                            .and_then(|out_info| {
+                                let pix_ok = out_info.pix_fmt == "yuv420p"
+                                    || out_info.pix_fmt == "nv12";
+                                if !pix_ok {
+                                    return Err(format!("像素格式不符: {}", out_info.pix_fmt));
+                                }
+                                let pix = out_info.pix_fmt.clone();
+                                transcode::verify_output(&out_info, "h264", Some(1080), &pix, &info)
+                            });
+                        match verdict {
+                            Ok(()) => result.already_transcoded += 1,
                             Err(e) => result.failures.push(FailureDto {
                                 rel: rel.clone(),
                                 message: format!(
-                                    "既有代理无法通过校验({e}),未计入完成;可用「重新转码」覆盖"
+                                    "既有代理未通过完整校验({e}),未计入完成;可用「重新转码」覆盖"
                                 ),
                             }),
                         }
@@ -709,6 +806,7 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
             } else {
                 "transcode_completed"
             };
+            exit_guard.disarm(); // 正常收尾:terminal 审计由下方写入
             super::tasks::append_audit(
                 &body_app,
                 &root,
@@ -744,9 +842,9 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                     format!("转码完成,但 {} 个文件失败(明细见转码结果)", result.failures.len()),
                 );
             }
-            // auto_proxy intent:整批成功才置位(计划 D2 at-least-once)
+            // auto_proxy intent:整批成功才置位(计划 D2 at-least-once);
+            // in-flight 登记的移除统一由 exit_guard 负责(含所有早退路径)
             if let Some(mid) = &intent_manifest {
-                intent_end(mid);
                 // 评审 P0-4:空清单/读错/取消都不许标完成——attempts 上限负责最终放弃
                 if !cancelled && result.failures.is_empty() && total > 0 {
                     if let Ok(mut m) = crate::core::manifest::load(&root, mid) {
@@ -939,25 +1037,26 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
     if out_root.starts_with(&stats.root) {
         return Err("归档输出目录不能位于项目内部(项目区不做归档写入)".into());
     }
+    // R2 P0 → R4(终审 P0-5):canonical 复核必须在**任何副作用之前**——
+    // `/tmp/link/sub` 指回项目时,老顺序会先在项目内建出 `sub` 再报错。
+    // 用「最深已存在祖先」的 canonical 投影先裁决,过闸才允许创建。
+    // (stats.root 出自 find_project,已是 canonical 锚。)
+    let archive_bans = |candidate: &Path| -> std::result::Result<(), String> {
+        if paths::comparison_key(candidate).starts_with(paths::comparison_key(&stats.root)) {
+            return Err("归档输出目录实际位于项目内部(经符号链接),拒绝".into());
+        }
+        paths::validate_dest_layout(&raw_root, std::slice::from_ref(&candidate.to_path_buf()))
+    };
+    archive_bans(&paths::canonical_projection(&out_root)?)?;
     std::fs::create_dir_all(&out_root).map_err(|e| format!("创建输出目录失败: {e}"))?;
     if paths::is_symlink(&out_root) {
         return Err("输出目录是符号链接,拒绝".into());
     }
-    // R2 P0:上面的检查全是字符串/末节点级——祖先段是符号链接时
-    // `/tmp/link/sub` 可指进项目区。canonicalize 后用真实位置复核全部禁令。
+    // 创建后整体复核一次(防创建期间被替换;canonicalize→使用之间的极窄窗口
+    // 属无锁共享盘固有边界,已声明)
     let out_root =
         std::fs::canonicalize(&out_root).map_err(|e| format!("输出目录解析失败: {e}"))?;
-    {
-        let canon_project =
-            std::fs::canonicalize(&stats.root).map_err(|e| format!("项目目录解析失败: {e}"))?;
-        if out_root.starts_with(&canon_project) {
-            return Err("归档输出目录实际位于项目内部(经符号链接),拒绝".into());
-        }
-        paths::validate_dest_layout(
-            &canon_project.join(project::SCENARIO_A_DIRS[1]),
-            std::slice::from_ref(&out_root),
-        )?;
-    }
+    archive_bans(&out_root)?;
 
     let handle = jobs.create(JobKind::Transcode, &input.project_id);
     let root = stats.root.clone();
@@ -989,6 +1088,16 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                     }),
                 ),
             );
+            let mut exit_guard = TranscodeExitGuard {
+                app: body_app.clone(),
+                root: root.clone(),
+                config_dir: config_dir.clone(),
+                machine_id: machine_id.clone(),
+                op: op.clone(),
+                job_id: h.snapshot().id.clone(),
+                intent: None,
+                armed: true,
+            };
             let caps = capabilities_blocking()?;
             let ffmpeg_bin = PathBuf::from(&caps.ffmpeg.ffmpeg_path);
             let ffprobe_bin = PathBuf::from(&caps.ffmpeg.ffprobe_path);
@@ -1008,21 +1117,26 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
 
             // 收集(与代理同一套闸)
             let raw_root = root.join(&raw_dir);
+            let mut folder_enum_errors: Vec<String> = Vec::new();
             let folders: Vec<String> = match &input.camera_folders {
                 Some(list) => list.clone(),
-                None => std::fs::read_dir(&raw_root)
-                    .map_err(|e| format!("无法读取「{raw_dir}」: {e}"))?
-                    .flatten()
-                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .filter(|n| !n.starts_with('.'))
-                    .collect(),
+                None => {
+                    let (folders, errs) = list_camera_folders(&raw_root, &raw_dir)?;
+                    folder_enum_errors = errs;
+                    folders
+                }
             };
             let mut result = ArchiveResultDto {
                 mode: "archive",
                 output_dir: out_root.display().to_string(),
                 ..Default::default()
             };
+            for msg in folder_enum_errors.drain(..) {
+                result.failures.push(FailureDto {
+                    rel: raw_dir.clone(),
+                    message: msg,
+                });
+            }
             let mut work: Vec<(String, PathBuf, String)> = Vec::new();
             for folder in &folders {
                 let rel_dir = format!("{raw_dir}/{folder}");
@@ -1155,21 +1269,25 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                 if final_out.exists() {
                     // R2 P1:「存在即成功」会永久采信坏产物(预置空文件也算完成)——
                     // 计入完成前用 ffprobe 验一次有效性,坏产物如实报失败
-                    match transcode::probe_file(&ffprobe_bin, &final_out) {
-                        Ok(out_info) if out_info.codec == "hevc" => {
-                            result.already_archived += 1;
-                        }
-                        Ok(out_info) => result.failures.push(FailureDto {
-                            rel: rel.clone(),
-                            message: format!(
-                                "既有归档产物编码不符({}),未计入完成;请人工确认后删除再归档",
-                                out_info.codec
-                            ),
-                        }),
+                    // R4(终审 P0-6):完整校验,合法但错误的产物不许计入完成
+                    let verdict = transcode::probe_file(&ffprobe_bin, &final_out)
+                        .and_then(|out_info| {
+                            let pix_ok = matches!(
+                                out_info.pix_fmt.as_str(),
+                                "yuv420p" | "yuv420p10le" | "p010le" | "nv12"
+                            );
+                            if !pix_ok {
+                                return Err(format!("像素格式不符: {}", out_info.pix_fmt));
+                            }
+                            let pix = out_info.pix_fmt.clone();
+                            transcode::verify_output(&out_info, "hevc", None, &pix, &info)
+                        });
+                    match verdict {
+                        Ok(()) => result.already_archived += 1,
                         Err(e) => result.failures.push(FailureDto {
                             rel: rel.clone(),
                             message: format!(
-                                "既有归档产物无法通过校验({e}),未计入完成;请人工确认后删除再归档"
+                                "既有归档产物未通过完整校验({e}),未计入完成;请人工确认后删除再归档"
                             ),
                         }),
                     }
@@ -1287,6 +1405,7 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
                 Some(if cancelled { "已取消" } else { "收尾" }.into()),
             );
             super::sorting_cmds::notify_if_unsafe_fallback(&body_app);
+            exit_guard.disarm(); // 正常收尾:terminal 审计由下方写入
             super::tasks::append_audit(
                 &body_app,
                 &root,
@@ -1395,6 +1514,27 @@ mod scan_tests {
             errs.iter().any(|e| e.contains("SEALED")),
             "不可读目录必须入 errors: {errs:?}"
         );
+    }
+
+    /// R4 终审 P0-8:顶层相机夹枚举里的链接/坏条目必须可见,不许静默当不存在。
+    #[cfg(unix)]
+    #[test]
+    fn camera_folder_enumeration_surfaces_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = tmp.path().join("2. 原始素材");
+        std::fs::create_dir_all(raw.join("真夹")).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, raw.join("链接夹")).unwrap();
+        let (folders, errs) = list_camera_folders(&raw, "2. 原始素材").unwrap();
+        assert_eq!(folders, vec!["真夹".to_string()]);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("链接夹") && e.contains("符号链接")),
+            "链接夹必须进错误清单: {errs:?}"
+        );
+        // 根不可读=顶层 Err(作业级失败,不静默)
+        assert!(list_camera_folders(&tmp.path().join("不存在"), "x").is_err());
     }
 
     /// R2 P1-6:仅大小写不同的源文件映射同一输出名——后到者必须被剔除并可见。

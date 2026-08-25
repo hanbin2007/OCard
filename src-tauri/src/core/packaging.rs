@@ -127,6 +127,12 @@ fn deliver_one(
     dst_dir: &Path,
     dst: &Path,
 ) -> std::result::Result<bool, (&'static str, String)> {
+    // R4(终审 P0-7):时间戳快照必须在**首次读取源之前**采集——复制/哈希都会
+    // 刷新 atime,读后采集保留下来的是「打包时刻」;取不到也要计数可见
+    let src_meta = fs::metadata(src).ok();
+    if src_meta.is_none() {
+        fsx::note_times_preserve_failures(1);
+    }
     let verdict_existing = |src: &Path, dst: &Path| {
         let sh = hash::xxh3_file(src).map_err(|e| ("error", format!("源文件校验失败: {e}")))?;
         let dh =
@@ -177,9 +183,9 @@ fn deliver_one(
     }
     match fsx::rename_no_replace(&tmp, dst) {
         Ok(()) => {
-            // 保留源时间戳(mtime/atime 三平台;创建时间 mac/win,Linux 声明边界)
-            if let Ok(m) = fs::metadata(src) {
-                fsx::preserve_times_counted(&m, dst);
+            // 保留源时间戳(快照在读源之前采集,见函数开头)
+            if let Some(m) = &src_meta {
+                fsx::preserve_times_counted(m, dst);
             }
             Ok(true)
         }

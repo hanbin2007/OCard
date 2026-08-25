@@ -99,6 +99,14 @@ pub(crate) fn notify_if_unsafe_fallback<R: tauri::Runtime>(app: &AppHandle<R>) {
             format!("{n} 个文件的源时间戳未能保留(目标文件系统限制或权限);文件内容不受影响"),
         );
     }
+    let u = crate::core::fsx::take_uncached_fallbacks();
+    if u > 0 {
+        notify::info(
+            app,
+            "verify-cache-fallback",
+            format!("{u} 次校验回读未能绕过系统缓存(内核拒绝直读请求);校验仍执行,但覆盖介质错误的能力退化为普通读"),
+        );
+    }
 }
 
 // ---------- DTO ----------
@@ -562,28 +570,41 @@ fn cached_features(
     let mut count = 0usize;
     let mut max_mtime = std::time::SystemTime::UNIX_EPOCH;
     let mut fp_sum = 0u64;
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with("features-") && name.ends_with(".jsonl") {
-                count += 1;
-                if let Ok(m) = e.metadata() {
-                    if let Ok(t) = m.modified() {
-                        max_mtime = max_mtime.max(t);
-                        let nanos = t
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_nanos() as u64)
-                            .unwrap_or(0);
-                        fp_sum = fp_sum.wrapping_add(xxhash_rust::xxh3::xxh3_64(
-                            format!("{name}\u{0}{}\u{0}{nanos}", m.len()).as_bytes(),
-                        ));
+    // R4(终审 P0-8):键枚举中的任何错误(read_dir/条目/metadata)都不许
+    // 静默吞——出错即旁路缓存直读 load_features(那里会把读错如实上浮),
+    // 也绝不把错误态写进缓存(避免「零键命中旧空缓存抹掉 read_err」)。
+    let mut enum_err = false;
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            for e in entries {
+                let Ok(e) = e else {
+                    enum_err = true;
+                    continue;
+                };
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("features-") && name.ends_with(".jsonl") {
+                    count += 1;
+                    match e.metadata().and_then(|m| m.modified().map(|t| (m, t))) {
+                        Ok((m, t)) => {
+                            max_mtime = max_mtime.max(t);
+                            let nanos = t
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos() as u64)
+                                .unwrap_or(0);
+                            fp_sum = fp_sum.wrapping_add(xxhash_rust::xxh3::xxh3_64(
+                                format!("{name}\u{0}{}\u{0}{nanos}", m.len()).as_bytes(),
+                            ));
+                        }
+                        Err(_) => enum_err = true,
                     }
                 }
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => enum_err = true,
     }
     let key = (count, max_mtime, fp_sum);
-    {
+    if !enum_err {
         let cache = FEATURES_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(map) = cache.as_ref() {
             if let Some((k, feats, skipped)) = map.get(project_root) {
@@ -594,7 +615,7 @@ fn cached_features(
         }
     }
     let (feats, skipped, read_err) = crate::core::analysis::load_features(project_root);
-    if read_err.is_none() {
+    if read_err.is_none() && !enum_err {
         FEATURES_CACHE
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1257,7 +1278,7 @@ pub fn list_remote_activity<R: tauri::Runtime>(
                     );
                 }
             }
-            "transcode_completed" | "transcode_cancelled" => {
+            "transcode_completed" | "transcode_cancelled" | "transcode_failed" => {
                 open.remove(&task_id);
             }
             _ => {}

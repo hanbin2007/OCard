@@ -123,9 +123,11 @@ pub fn append(project_root: &Path, event: &Event) -> Result<()> {
     append_in(&dir, event)
 }
 
-/// 项目级日志:合并读取。
+/// 项目级日志:合并读取(R4:读路径同样过 canonical 只读闸)。
 pub fn read_all(project_root: &Path) -> Result<JournalRead> {
-    read_all_in(&project_journal_dir(project_root))
+    let dir = project_journal_dir(project_root);
+    super::paths::assert_within(project_root, &dir).map_err(super::CoreError::Invalid)?;
+    read_all_in(&dir)
 }
 
 #[cfg(test)]

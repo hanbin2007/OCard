@@ -128,15 +128,33 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> Result<()> {
     Ok(())
 }
 
-/// 判定文件是否「真正完成」:manifest 已验证 **且** 每个目的地上最终文件都在、尺寸一致。
+/// 判定文件是否「真正完成」:manifest 已验证 **且** 每个目的地上最终文件都在、
+/// 尺寸一致、**xxh3 与清单一致**(R4 终审 P0-1:只查存在+尺寸时,目标被替换成
+/// 同大小内容会被静默当成功;重验哈希是续传跳过的资格,不是可选项)。
 /// 只信 manifest 会在备份盘被拔/目标被删后产生假绿灯(评审 H2/P0-1)。
 pub fn file_done(m: &CopyManifest, rel: &str, size: u64, destinations: &[PathBuf]) -> bool {
-    if !m.is_done(rel, size) {
+    let Some(entry) = m
+        .entries
+        .iter()
+        .find(|e| e.rel_path == rel && e.verified && e.size == size)
+    else {
         return false;
-    }
+    };
     destinations.iter().all(|d| {
-        fs::metadata(d.join(rel_to_native(rel)))
+        let p = d.join(rel_to_native(rel));
+        if super::paths::is_symlink(&p) {
+            return false; // 链接目标不作数(经链接读外部文件会误判完成)
+        }
+        let size_ok = fs::metadata(&p)
             .map(|meta| meta.is_file() && meta.len() == size)
+            .unwrap_or(false);
+        if !size_ok {
+            return false;
+        }
+        // 绕页缓存重验:尽量读介质;哈希不符=目标被替换/损坏 → 不算完成,
+        // 引擎会走既有目标裁决路径(可见冲突,绝不覆盖)
+        hash::xxh3_file_uncached(&p)
+            .map(|h| h == entry.xxh3)
             .unwrap_or(false)
     })
 }
@@ -284,13 +302,29 @@ fn copy_one(
             "源文件是符号链接,拒绝拷贝: {rel}"
         )));
     }
+    // R4(终审 P0-2):末节点检查挡不住**祖先**链接(DCIM → 外部目录时,
+    // planned 项经 resume 并回后仍会读到卡外)——canonical 断言真实位置在源根内
+    super::paths::assert_within(source_root, &src_path).map_err(super::CoreError::Invalid)?;
 
     let finals: Vec<PathBuf> = destinations
         .iter()
         .map(|d| d.join(rel_to_native(rel)))
         .collect();
 
-    // 目的地已有同名最终文件 → 先算源哈希,再逐一比对
+    // 目的地已有同名最终文件 → 先算源哈希,再逐一比对。
+    // R4(终审 P0-2):裁决前先过闸——既有目标是链接或实际位置在目的地根外时,
+    // 经链接 exists/hash 会把外部文件误当包内既有文件采信
+    for (i, f) in finals.iter().enumerate() {
+        if f.exists() {
+            if super::paths::is_symlink(f) {
+                return Err(super::CoreError::Invalid(format!(
+                    "目标位置是符号链接,拒绝采信/写入: {}",
+                    f.display()
+                )));
+            }
+            super::paths::assert_within(&destinations[i], f).map_err(super::CoreError::Invalid)?;
+        }
+    }
     let pre_existing: Vec<usize> = finals
         .iter()
         .enumerate()
@@ -1008,5 +1042,87 @@ mod review_regression_tests {
             .iter()
             .any(|f| f.rel_path == "ALIAS.MP4" && matches!(f.status, FileStatus::Failed(_))));
         assert!(!req.destinations[0].join("ALIAS.MP4").exists());
+    }
+
+    /// R4 终审 P0-1:目标被替换成**同大小不同内容**后,file_done 不许再判完成
+    /// (只查存在+尺寸的旧实现对这条必绿——哈希重验是变异判别点)。
+    #[test]
+    fn resume_skip_reverifies_hash_not_just_size() {
+        let (_t, req, mut m, project) = setup();
+        run_copy(
+            &req,
+            &scan_source(&req.source_root).unwrap(),
+            &mut m,
+            &project,
+            |_| CopyControl::Continue,
+        )
+        .unwrap();
+        assert!(file_done(&m, "CLIP0001.MP4", 9000, &req.destinations));
+        // 同大小篡改:内容换、长度不变
+        let victim = req.destinations[1].join("CLIP0001.MP4");
+        let mut bytes = fs::read(&victim).unwrap();
+        bytes[0] ^= 0xFF;
+        fs::write(&victim, &bytes).unwrap();
+        assert!(
+            !file_done(&m, "CLIP0001.MP4", 9000, &req.destinations),
+            "同大小篡改必须让完成判定失效(哈希重验)"
+        );
+    }
+
+    /// R4 终审 P0-2:源**祖先**目录被换成指向卡外的链接时,清单项必须被拒
+    /// (末节点 is_symlink 挡不住这条)。
+    #[cfg(unix)]
+    #[test]
+    fn source_ancestor_symlink_is_refused() {
+        let (tmp, req, mut m, project) = setup();
+        let outside = tmp.path().join("outside-src");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("EVIL.MP4"), vec![7u8; 64]).unwrap();
+        // 卡上放一个指向卡外的目录链接,清单项穿过它
+        std::os::unix::fs::symlink(&outside, req.source_root.join("LINKED")).unwrap();
+        let mut files = scan_source(&req.source_root).unwrap();
+        files.push(("LINKED/EVIL.MP4".into(), 64));
+        let out = run_copy(&req, &files, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(out
+            .files
+            .iter()
+            .any(|f| f.rel_path == "LINKED/EVIL.MP4" && matches!(f.status, FileStatus::Failed(_))));
+        assert!(
+            !req.destinations[0].join("LINKED/EVIL.MP4").exists(),
+            "卡外文件不得经祖先链接被拷贝"
+        );
+    }
+
+    /// R4 终审 P0-2:既有目标是符号链接时必须拒绝「采信为已完成」——
+    /// 经链接做 exists/hash 会把外部文件误当包内既有文件。
+    #[cfg(unix)]
+    #[test]
+    fn existing_target_via_symlink_is_not_adjudicated() {
+        let (tmp, req, mut m, project) = setup();
+        let outside = tmp.path().join("outside-dst");
+        fs::create_dir_all(&outside).unwrap();
+        // 外部同内容文件 + 目的地同名链接指过去(同内容→旧逻辑会静默当已完成)
+        fs::write(outside.join("CLIP0001.MP4"), vec![3u8; 9000]).unwrap();
+        fs::create_dir_all(&req.destinations[0]).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("CLIP0001.MP4"),
+            req.destinations[0].join("CLIP0001.MP4"),
+        )
+        .unwrap();
+        let out = run_copy(
+            &req,
+            &scan_source(&req.source_root).unwrap(),
+            &mut m,
+            &project,
+            |_| CopyControl::Continue,
+        )
+        .unwrap();
+        assert!(
+            out.files
+                .iter()
+                .any(|f| f.rel_path == "CLIP0001.MP4" && matches!(f.status, FileStatus::Failed(_))),
+            "链接目标必须显式失败,不许当作已交付: {:?}",
+            out.files
+        );
     }
 }

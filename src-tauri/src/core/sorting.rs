@@ -340,9 +340,14 @@ pub fn curate_assets(
                     ));
                 }
                 let tmp = dir.join(format!(".{}.curatepart", uuid::Uuid::new_v4()));
+                // R4(终审 P0-7):时间戳快照在读源之前采集;取不到计数可见
+                let src_meta = fs::metadata(&src).ok();
+                if src_meta.is_none() {
+                    fsx::note_times_preserve_failures(1);
+                }
                 fs::copy(&src, &tmp).map_err(|e| format!("复制失败: {e}"))?;
-                if let Ok(m) = fs::metadata(&src) {
-                    fsx::preserve_times_counted(&m, &tmp);
+                if let Some(m) = &src_meta {
+                    fsx::preserve_times_counted(m, &tmp);
                 }
                 fsx::rename_no_replace(&tmp, &dst).map_err(|e| {
                     let _ = fs::remove_file(&tmp);

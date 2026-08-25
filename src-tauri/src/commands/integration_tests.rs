@@ -617,6 +617,35 @@ fn auto_proxy_intent_chain_wired() {
     );
 }
 
+/// R4 终审 P0-3 接线回归:符号链接项目经真实 handler 必须整体不可见/不可用
+/// (catalog 跳过 → find_project 报「项目不存在」),不许把 NAS 外实体当项目锚。
+#[cfg(unix)]
+#[test]
+fn symlinked_project_is_invisible_through_real_handler() {
+    let (window, tmp, nas) = mock_app();
+    // NAS 外造一个合法项目,再在 NAS 内放同名链接
+    let outside = tmp.path().join("outside-nas");
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+    let real = crate::core::project::create_project(
+        &outside,
+        date,
+        "外部",
+        crate::core::project::Scenario::B,
+        &["开幕式".into()],
+    )
+    .unwrap();
+    let name = real.file_name().unwrap().to_string_lossy().to_string();
+    std::os::unix::fs::symlink(&real, nas.join(&name)).unwrap();
+
+    let e = invoke(&window, "get_delivery_status", json!({"projectId": name}))
+        .expect_err("链接项目必须不可用");
+    assert!(
+        e.as_str().unwrap_or_default().contains("项目不存在")
+            || e.as_str().unwrap_or_default().contains("符号链接"),
+        "报文要如实: {e}"
+    );
+}
+
 /// R2 P0-4 接线回归:归档输出根的**祖先**是指向项目区的符号链接时,
 /// 字符串级检查全部放行,必须由 canonicalize 复核闸拒绝——在
 /// start_archive_transcode 里删掉 canonicalize 复核块本测试红。
@@ -649,6 +678,12 @@ fn archive_output_ancestor_symlink_refused_through_real_handler() {
             .iter()
             .all(|s| s.kind != crate::core::jobs::JobKind::Transcode),
         "拒绝路径不得留下转码作业"
+    );
+    // R4(终审 P0-5):拒绝必须**零文件系统副作用**——老实现先 create_dir_all
+    // 再 canonicalize,会先在项目内建出「归档区」再报错
+    assert!(
+        !nas.join(&pid).join("归档区").exists(),
+        "闸必须先于副作用:项目内不得出现被创建的输出目录"
     );
 }
 
@@ -696,11 +731,19 @@ fn proxy_transcode_end_to_end_with_real_ffmpeg() {
         eprintln!("跳过:src-tauri/binaries 无 sidecar(先跑 scripts/fetch-ffmpeg.sh)");
         return;
     };
-    // env 是进程全局:与 ffmpeg.rs 的 env 测试共用进程级互斥,持锁贯穿全程
+    // env 是进程全局:与 ffmpeg.rs 的 env 测试共用进程级互斥,持锁贯穿全程。
+    // R4:panic 也要清 env(否则失败会连锁污染并行的 missing 断言)——Drop 兜底
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("OCARD_FFMPEG_DIR");
+        }
+    }
     let _g = crate::core::ffmpeg::FFMPEG_ENV_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     std::env::set_var("OCARD_FFMPEG_DIR", &ffdir);
+    let _env_guard = EnvGuard;
 
     let pid = create_a_project(&window);
     let cam_dir = nas.join(&pid).join("2. 原始素材/20260824_A7M4_A_ZS");
@@ -798,9 +841,53 @@ fn proxy_transcode_end_to_end_with_real_ffmpeg() {
     let msg = r3["result"]["failures"][0]["message"]
         .as_str()
         .unwrap_or_default();
-    assert!(msg.contains("无法通过校验"), "坏产物必须如实报失败: {r3}");
+    assert!(msg.contains("未通过完整校验"), "坏产物必须如实报失败: {r3}");
 
-    std::env::remove_var("OCARD_FFMPEG_DIR");
+    // 第四轮(R4 终审 P0-6):**合法但错误**的既有产物——把 1s 源的有效代理
+    // 冒充 3s 新源的产物,只验 codec 会放行,完整校验必须按时长偏差拒绝
+    let src2 = cam_dir.join("C0002.MP4");
+    let out2 = std::process::Command::new(ffdir.join("ffmpeg"))
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=25:duration=3",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            &src2.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out2.status.success(), "生成 3s 测试源失败");
+    // 清掉 C0001 的垃圾产物,让两支都重转出**有效**代理
+    std::fs::remove_file(&final_out).unwrap();
+    let r4a = run_job();
+    assert_eq!(r4a["result"]["converted"], 2, "两支源都应重转成功: {r4a}");
+    // 再用 C0001(1s 源)的有效代理顶换 C0002(3s 源)的产物——合法视频、错误来源
+    let fake_done = final_out.with_file_name("C0002_MP4_proxy.mp4");
+    std::fs::remove_file(&fake_done).unwrap();
+    std::fs::copy(&final_out, &fake_done).unwrap();
+    let r4 = run_job();
+    let fails = r4["result"]["failures"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        fails.iter().any(|f| {
+            f["rel"].as_str().unwrap_or_default().ends_with("C0002.MP4")
+                && f["message"].as_str().unwrap_or_default().contains("时长")
+        }),
+        "合法但时长不符的冒充产物必须被完整校验拒绝: {r4}"
+    );
+    assert_eq!(
+        r4["result"]["alreadyTranscoded"], 1,
+        "C0001 的真产物照常计入完成: {r4}"
+    );
 }
 
 /// R2 P1 行为级(真模型 + 真 ort 推理):YuNet 检测器加载仓内模型

@@ -6,7 +6,8 @@
 //! - `-progress pipe:1` 解析(out_time_us 优先、progress=end 判终);
 //! - 执行器:stderr/stdout 双读线程 + 看门狗(取消不依赖 progress 行,
 //!   4h 总时长上限强杀)、staging 带机器标识、落位前 ffprobe 验证
-//!   (codec/高度/pix_fmt/音频存在性/时长;色彩标签未纳入,属声明边界);
+//!   (codec/高度/pix_fmt/音频存在性/时长必核;HDR 源的色彩传递标签必须保留,
+//!   R2 起纳入验证——不再是边界);
 //! - 幂等:输出已存在 = `already-transcoded` skip;覆盖唯一入口=显式
 //!   `retranscode`(前端二次确认,先删后转)——均已接线(计划 D2)。
 
@@ -422,10 +423,15 @@ pub fn verify_output(
             ));
         }
     }
-    if let (Some(a), Some(b)) = (src_info.duration_secs, out_info.duration_secs) {
-        if (a - b).abs() > 1.0 {
-            return Err(format!("输出时长偏差过大:源 {a:.2}s,输出 {b:.2}s"));
+    match (src_info.duration_secs, out_info.duration_secs) {
+        (Some(a), Some(b)) => {
+            if (a - b).abs() > 1.0 {
+                return Err(format!("输出时长偏差过大:源 {a:.2}s,输出 {b:.2}s"));
+            }
         }
+        // R4(终审 P0-6):时长读不出=无法证明产物完整——fail-closed,
+        // 不许在关键字段缺失时放行
+        _ => return Err("时长不可核对(探测缺少时长字段),按失败处理".into()),
     }
     Ok(())
 }

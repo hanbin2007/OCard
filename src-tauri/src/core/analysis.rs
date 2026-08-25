@@ -44,8 +44,18 @@ pub struct FeatureRecord {
     /// 检出人脸数(None=本次分析时人脸检测不可用;闭眼检测已砍,见 yunet.rs 边界)。
     #[serde(default)]
     pub faces: Option<u32>,
+    /// 产出 faces 的模型身份(SHA-256 前 8 位;None=无人脸信息)。
+    /// R4 终审 P0-9:缓存必须携带模型身份,模型修复/更换后可判定重算。
+    #[serde(default)]
+    pub faces_model: Option<String>,
     pub analyzed_at: chrono::DateTime<chrono::Utc>,
     pub machine_id: String,
+}
+
+/// 缓存命中判定(R4 终审 P0-9):faces=None 的记录只有在检测器缺席时才算命中,
+/// 检测器在场必须重算——一次失败/缺模不许永久冻结成「无人脸信息」。
+pub fn cache_hit(rec: &FeatureRecord, detector_present: bool) -> bool {
+    rec.faces.is_some() || !detector_present
 }
 
 pub fn src_fingerprint(rel: &str, size: u64, mtime_nanos: u128) -> u64 {
@@ -100,6 +110,14 @@ pub fn load_features(
     let mut out: std::collections::HashMap<u64, FeatureRecord> = Default::default();
     let mut skipped = 0usize;
     let dir = analysis_dir(project_root);
+    // R4(终审 P0-3):读路径 canonical 只读闸——`.ocard/analysis` 被换成链接时
+    // 拒读并上浮(与写侧 ensure_dir_within 同源),绝不静默把外部特征注入
+    if let Err(e) = super::paths::assert_within(project_root, &dir) {
+        if dir.exists() {
+            return (out, 0, Some(e));
+        }
+        return (out, 0, None); // 目录不存在=未分析过,正常态
+    }
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (out, 0, None),
@@ -123,7 +141,14 @@ pub fn load_features(
                     if rec.schema_version == SCHEMA_VERSION && rec.algo_version == ALGO_VERSION =>
                 {
                     match out.get(&rec.src_fingerprint) {
-                        // 冲突:analyzedAt 最新胜;持平 machineId 字典序大者胜(确定性)
+                        // R4 终审 P0-9 修正:**有人脸信息优先于新鲜度**(双向对称,
+                        // 与读入顺序无关)——无模型机器的 faces=None 记录不许抹掉
+                        // 有效人脸,不论谁新谁旧;两侧信息等级相同时才比新鲜度
+                        // (analyzedAt 最新胜;持平 machineId 字典序大者胜,确定性)。
+                        Some(cur) if cur.faces.is_none() && rec.faces.is_some() => {
+                            out.insert(rec.src_fingerprint, rec);
+                        }
+                        Some(cur) if rec.faces.is_none() && cur.faces.is_some() => {}
                         Some(cur)
                             if (cur.analyzed_at, &cur.machine_id)
                                 >= (rec.analyzed_at, &rec.machine_id) => {}
@@ -385,6 +410,7 @@ mod tests {
             under_exposed: 0.0,
             shot_at_epoch: None,
             faces: None,
+            faces_model: None,
             analyzed_at: Utc::now(),
             machine_id: "M".into(),
         }
@@ -563,6 +589,36 @@ mod tests {
                 "行序 reversed={reversed} 下也必须取 analyzedAt 最新"
             );
         }
+    }
+
+    /// R4 终审 P0-9:新记录无人脸信息不许覆盖旧记录的有效人脸(跨机上
+    /// 「坏机器最新」不能抹掉好结果);cache_hit 在检测器在场时拒绝 None 命中。
+    #[test]
+    fn faces_none_never_overwrites_some_and_recomputes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut with_faces = feat(1, 10.0);
+        with_faces.rel = "1. 待分类/a.jpg".into();
+        with_faces.src_fingerprint = 555;
+        with_faces.faces = Some(2);
+        with_faces.faces_model = Some("8f2383e4".into());
+        append_feature(&root, "M1", &with_faces).unwrap();
+        let mut newer_none = with_faces.clone();
+        newer_none.faces = None;
+        newer_none.faces_model = None;
+        newer_none.analyzed_at = with_faces.analyzed_at + chrono::Duration::seconds(60);
+        newer_none.machine_id = "MZ".into();
+        append_feature(&root, "MZ", &newer_none).unwrap();
+        let (map, _, _) = load_features(&root);
+        assert_eq!(map[&555].faces, Some(2), "有人脸信息优先于新鲜度");
+
+        assert!(cache_hit(&with_faces, true));
+        assert!(!cache_hit(&newer_none, true), "检测器在场时 None 必须重算");
+        assert!(
+            cache_hit(&newer_none, false),
+            "检测器缺席时 None 记录照常命中"
+        );
     }
 
     /// R2 变异复核(收敛 #23):sharpness_region 在极小图与贴边框上不得 panic,

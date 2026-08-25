@@ -135,6 +135,33 @@ impl JobHandle {
         Some(s.clone())
     }
 
+    /// 终态原子裁决(R4 终审 P1):在**同一把快照锁内**读取消标志、写结果、
+    /// 选择并发布终态——消除「检查取消 → 发布 Done」间隙里取消静默输掉的窗口。
+    fn finish(&self, outcome: Result<serde_json::Value, String>) -> Option<JobSnapshot> {
+        let mut s = self.lock();
+        let to = if self.cancel.load(Ordering::SeqCst) {
+            JobState::Cancelled
+        } else {
+            match &outcome {
+                Ok(_) => JobState::Done,
+                Err(_) => JobState::Failed,
+            }
+        };
+        if !s.state.can_transition(to) {
+            return None;
+        }
+        match outcome {
+            Ok(result) if to == JobState::Done => s.result = Some(result),
+            Ok(result) => s.result = Some(result), // 取消:保留已产出的部分结果
+            Err(e) => s.error = Some(e),
+        }
+        s.state = to;
+        s.revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        s.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        s.message = None;
+        Some(s.clone())
+    }
+
     /// 状态转移(合法表 + 终态不可逆,锁内 CAS)。成功返回新快照。
     fn transition(&self, to: JobState) -> Option<JobSnapshot> {
         let mut s = self.lock();
@@ -326,27 +353,9 @@ impl JobManager {
                 Ok(r) => r,
                 Err(_) => Err("作业线程异常终止(panic),已中断".into()),
             };
-            // 终态发布(锁内 CAS:取消竞争先到先得)
-            let final_snap = if handle.cancel_requested() {
-                handle.transition(JobState::Cancelled)
-            } else {
-                match outcome {
-                    Ok(result) => {
-                        {
-                            let mut s = handle.lock();
-                            s.result = Some(result);
-                        }
-                        handle.transition(JobState::Done)
-                    }
-                    Err(e) => {
-                        {
-                            let mut s = handle.lock();
-                            s.error = Some(e);
-                        }
-                        handle.transition(JobState::Failed)
-                    }
-                }
-            };
+            // 终态发布:R4 终审 P1——取消标志读取、结果写入与状态转移在同一把
+            // 快照锁内一次完成(finish),「检查后到达的取消」不再静默输给 Done
+            let final_snap = handle.finish(outcome);
             drop(_guard); // 互斥 guard 在终态发布前释放(D2)——顺序:transition 已完成,发布=on_change
             if let Some(s) = final_snap {
                 on_change(s);
@@ -596,5 +605,29 @@ mod tests {
         let fin = wait_terminal(&h);
         assert_eq!(fin.state, JobState::Cancelled);
         assert!(!mgr.any_active());
+    }
+
+    /// R4 终审 P1:body 返回 Ok 但取消标志已置——终态裁决必须在同一把锁内
+    /// 判成 Cancelled(不许「检查后到达的取消」静默输给 Done),部分结果保留。
+    #[test]
+    fn cancel_flag_set_during_body_wins_over_done() {
+        let mgr = Arc::new(JobManager::default());
+        let h = mgr.create(JobKind::Analyze, "P");
+        let mgr2 = mgr.clone();
+        let id = h.snapshot().id.clone();
+        mgr.run(
+            h.clone(),
+            || Ok(()),
+            move |hh| {
+                // body 收尾前一刻取消到达(running:只置标志)
+                let _ = mgr2.request_cancel(&id);
+                assert!(!hh.snapshot().state.is_terminal(), "running 取消只置标志");
+                Ok(serde_json::json!({"partial": 3}))
+            },
+            |_| {},
+        );
+        let fin = wait_terminal(&h);
+        assert_eq!(fin.state, JobState::Cancelled, "取消必须赢过 Done");
+        assert_eq!(fin.result.as_ref().unwrap()["partial"], 3, "部分结果保留");
     }
 }

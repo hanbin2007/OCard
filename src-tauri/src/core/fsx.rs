@@ -125,21 +125,37 @@ fn platform_rename_no_replace(_src: &Path, _dst: &Path) -> io::Result<()> {
 
 /// 打开文件并尽量绕过页缓存(校验用:让回读尽量来自介质而非内存)。
 /// Windows 回退普通打开(如实标注的边界,见模块文档)。
+/// 绕缓存请求被内核拒绝的次数(R4 终审 P1:此前返回值被忽略,「介质回读」
+/// 保证会无提示退化成普通缓存读;计数由命令层聚合为可见提示)。
+static UNCACHED_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 取走绕缓存退化计数(swap 清零)。
+pub fn take_uncached_fallbacks() -> u64 {
+    UNCACHED_FALLBACKS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn open_uncached(path: &Path) -> io::Result<fs::File> {
     let file = fs::File::open(path)?;
     #[cfg(target_os = "macos")]
     {
         use std::os::fd::AsRawFd;
-        unsafe {
-            libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
+        let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+        if rc != 0 {
+            UNCACHED_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
-        unsafe {
-            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        if rc != 0 {
+            UNCACHED_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+    #[cfg(windows)]
+    {
+        // Windows 无扇区对齐读实现,固定按退化计数(声明边界的可见化)
+        UNCACHED_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(file)
 }
@@ -204,35 +220,45 @@ pub fn note_times_preserve_failures(n: u64) {
 ///   (声明边界:Linux 上创建时间为拷贝时刻,mtime 仍与源一致)。
 ///
 /// 失败不阻塞复制(数据本体安全),计数由上层聚合为可见 warning。
-pub fn preserve_times(src_meta: &fs::Metadata, dst: &Path) -> io::Result<()> {
+/// 返回 Ok(true)=全字段保留;Ok(false)=部分字段(atime/创建时间)取不到,
+/// 已按可得字段保留(R4 终审:部分退化也要计数可见,不再静默跳过);
+/// mtime 取不到=Err(mtime 是硬承诺)。
+pub fn preserve_times(src_meta: &fs::Metadata, dst: &Path) -> io::Result<bool> {
+    let mut full = true;
     let mut times = fs::FileTimes::new();
-    if let Ok(m) = src_meta.modified() {
-        times = times.set_modified(m);
+    match src_meta.modified() {
+        Ok(m) => times = times.set_modified(m),
+        Err(e) => return Err(e), // mtime 是硬承诺,取不到按失败计
     }
-    if let Ok(a) = src_meta.accessed() {
-        times = times.set_accessed(a);
+    match src_meta.accessed() {
+        Ok(a) => times = times.set_accessed(a),
+        Err(_) => full = false,
     }
     #[cfg(target_os = "macos")]
     {
         use std::os::macos::fs::FileTimesExt;
-        if let Ok(c) = src_meta.created() {
-            times = times.set_created(c);
+        match src_meta.created() {
+            Ok(c) => times = times.set_created(c),
+            Err(_) => full = false,
         }
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::FileTimesExt;
-        if let Ok(c) = src_meta.created() {
-            times = times.set_created(c);
+        match src_meta.created() {
+            Ok(c) => times = times.set_created(c),
+            Err(_) => full = false,
         }
     }
     let f = fs::OpenOptions::new().write(true).open(dst)?;
-    f.set_times(times)
+    f.set_times(times)?;
+    Ok(full)
 }
 
 /// 带失败计数的便捷封装(复制落位后调用)。
 pub fn preserve_times_counted(src_meta: &fs::Metadata, dst: &Path) {
-    if preserve_times(src_meta, dst).is_err() {
+    // Err(含 mtime 缺失)与部分退化(Ok(false))都计入聚合告警,零静默
+    if !matches!(preserve_times(src_meta, dst), Ok(true)) {
         TIMES_PRESERVE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }

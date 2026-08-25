@@ -56,10 +56,14 @@ pub fn resolve_thumb_request(nas_root: &Path, url_path: &str) -> Result<PathBuf,
     if crate::core::paths::is_symlink(&path) {
         return Err("缓存文件是符号链接,拒绝".into());
     }
-    // R2 P0:首尾两段检查挡不住中间组件(`.ocard`/`thumbs` 本身被换成链接)——
-    // canonicalize 断言实际落点仍在 NAS 根之内(以 nas_root 为基准:项目目录
-    // 可能尚不存在,此时最深已存在祖先就是 NAS 根,天然通过)
-    crate::core::paths::assert_within(nas_root, &path)?;
+    // R2 P0 → R4 收紧(终审 P0-3):canonical 锚从 NAS 根升级为**项目根**——
+    // 仅锚 NAS 根时,`.ocard/thumbs` 链到同一 NAS 的其他项目仍可跨项目读取。
+    // 项目目录存在则以它为锚;不存在则回落 NAS 根(随后读取自然 404)。
+    if project_root.is_dir() {
+        crate::core::paths::assert_within(&project_root, &path)?;
+    } else {
+        crate::core::paths::assert_within(nas_root, &path)?;
+    }
     Ok(path)
 }
 
@@ -164,5 +168,23 @@ mod tests {
         std::fs::create_dir_all(nas2.join("项目/.ocard/thumbs")).unwrap();
         std::fs::write(nas2.join("项目/.ocard/thumbs/0123456789abcdef.jpg"), b"x").unwrap();
         assert!(resolve_thumb_request(&nas2, "/项目/0123456789abcdef.jpg").is_ok());
+    }
+
+    /// R4 终审 P0-3:锚定 NAS 根不够——`.ocard/thumbs` 链到**同一 NAS 的
+    /// 其他项目**仍在 NAS 内;锚必须是项目根。
+    #[cfg(unix)]
+    #[test]
+    fn cross_project_thumbs_link_within_nas_rejected() {
+        let tmp = tempdir().unwrap();
+        let nas = tmp.path().join("nas");
+        std::fs::create_dir_all(nas.join("甲/.ocard")).unwrap();
+        std::fs::create_dir_all(nas.join("乙/.ocard/thumbs")).unwrap();
+        std::fs::write(nas.join("乙/.ocard/thumbs/0123456789abcdef.jpg"), b"x").unwrap();
+        std::os::unix::fs::symlink(nas.join("乙/.ocard/thumbs"), nas.join("甲/.ocard/thumbs"))
+            .unwrap();
+        assert!(
+            resolve_thumb_request(&nas, "/甲/0123456789abcdef.jpg").is_err(),
+            "跨项目链接必须拒(项目根锚)"
+        );
     }
 }

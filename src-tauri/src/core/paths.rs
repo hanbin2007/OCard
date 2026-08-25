@@ -244,6 +244,28 @@ pub(crate) fn assert_within(root: &Path, target: &Path) -> Result<(), String> {
     }
 }
 
+/// 词法目标的 canonical 投影(R4 终审 P0-5):把「最深已存在祖先」canonicalize
+/// 后拼回剩余段——目标尚未创建时也能得到真实落点,供**闸先于副作用**的检查用
+/// (`/tmp/link/sub` 在 `sub` 创建前就能判出 link 指向何处)。
+pub(crate) fn canonical_projection(path: &Path) -> Result<PathBuf, String> {
+    let mut probe = path.to_path_buf();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    while !probe.exists() {
+        match (probe.parent(), probe.file_name()) {
+            (Some(p), Some(n)) => {
+                rest.push(n.to_os_string());
+                probe = p.to_path_buf();
+            }
+            _ => return Err(format!("路径不在任何已存在位置下: {}", path.display())),
+        }
+    }
+    let mut canon = std::fs::canonicalize(&probe).map_err(|e| format!("路径解析失败: {e}"))?;
+    for seg in rest.iter().rev() {
+        canon.push(seg);
+    }
+    Ok(canon)
+}
+
 /// 清单/外部输入相对路径闸(R2 P0:resume 清单可被篡改为 `../../…` 逃逸):
 /// 仅允许普通非空组件——拒绝绝对路径、`..`、`.`、空段,以及含反斜杠的段
 /// (清单统一 `/` 分隔;反斜杠段在 Windows 上会被路径层二次拆分,产生歧义)。

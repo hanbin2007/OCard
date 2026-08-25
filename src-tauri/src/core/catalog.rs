@@ -91,9 +91,25 @@ pub fn scan(nas_root: &Path) -> Result<CatalogScan> {
         return Ok(out);
     }
     for entry in fs::read_dir(nas_root)? {
-        let path = entry?.path();
-        if !path.is_dir() {
-            continue;
+        let entry = entry?;
+        let path = entry.path();
+        // R4(终审 P0-3):项目目录不许是符号链接——NAS 外的「OCard 形状」目录
+        // 经链接混入项目列表,是后续一切状态读写的锚点污染;跳过并可见
+        match entry.file_type() {
+            Ok(t) if t.is_symlink() => {
+                out.warnings
+                    .push(format!("跳过符号链接目录(不作为项目): {}", path.display()));
+                continue;
+            }
+            Ok(t) if !t.is_dir() => continue,
+            Ok(_) => {}
+            Err(e) => {
+                out.warnings.push(format!(
+                    "目录项类型读取失败,已跳过: {}({e})",
+                    path.display()
+                ));
+                continue;
+            }
         }
         let Ok(meta) = project::load_meta(&path) else {
             if path.join(project::STATE_DIR).exists() {
@@ -287,6 +303,43 @@ mod cache_tests {
             scan_cached(nas).unwrap().projects.len(),
             2,
             "切回原根仍正确"
+        );
+    }
+
+    /// R4 终审 P0-3:符号链接目录不作为项目(NAS 外的 OCard 形状目录经链接
+    /// 混入=状态锚点污染),必须跳过并给可见警告。
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_project_dir_is_skipped_with_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nas = tmp.path().join("nas");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&nas).unwrap();
+        // NAS 外造一个「合法项目形状」目录
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        let real = super::super::project::create_project(
+            &outside,
+            date,
+            "外部",
+            super::super::project::Scenario::B,
+            &["开幕式".into()],
+        )
+        .unwrap();
+        let name = real.file_name().unwrap();
+        std::os::unix::fs::symlink(&real, nas.join(name)).unwrap();
+        let scan = scan(&nas).unwrap();
+        assert!(
+            scan.projects.is_empty(),
+            "链接项目不得入列: {:?}",
+            scan.projects
+                .iter()
+                .map(|p| &p.folder_name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            scan.warnings.iter().any(|w| w.contains("符号链接")),
+            "跳过必须可见: {:?}",
+            scan.warnings
         );
     }
 }

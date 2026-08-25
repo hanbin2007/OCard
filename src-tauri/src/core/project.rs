@@ -146,6 +146,9 @@ pub fn save_meta(project_root: &Path, meta: &ProjectMeta) -> Result<()> {
 
 pub fn load_meta(project_root: &Path) -> Result<ProjectMeta> {
     let path = project_root.join(STATE_DIR).join(META_FILE);
+    // R4(终审 P0-3):读路径同样过 canonical 只读闸——`.ocard` 链上任何一段
+    // 被换成链接都不许把外部 project.json 注入为项目状态
+    super::paths::assert_within(project_root, &path).map_err(super::CoreError::Invalid)?;
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
@@ -228,5 +231,36 @@ mod tests {
         let p = Path::new("/nas/20260824_x");
         assert!(raw_material_dir(p, Scenario::A).ends_with("2. 原始素材"));
         assert!(raw_material_dir(p, Scenario::B).ends_with("1. 待分类"));
+    }
+
+    /// R4 终审 P0-3:`.ocard` 为链接时 load_meta 拒读(外部 project.json 不许注入)。
+    #[cfg(unix)]
+    #[test]
+    fn load_meta_refuses_symlinked_state_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // 外部放一份合法 meta
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        let real = create_project(
+            tmp.path().join("real-nas").as_path(),
+            date,
+            "样例",
+            Scenario::A,
+            &[],
+        )
+        .unwrap();
+        std::fs::copy(
+            real.join(STATE_DIR).join("project.json"),
+            outside.join("project.json"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, project.join(STATE_DIR)).unwrap();
+        assert!(
+            load_meta(&project).is_err(),
+            "链接 .ocard 下的 project.json 不许被读作项目状态"
+        );
     }
 }

@@ -124,6 +124,8 @@ pub fn save(project_root: &Path, m: &CopyManifest) -> Result<()> {
 
 pub fn load(project_root: &Path, id: &str) -> Result<CopyManifest> {
     let path = manifest_dir(project_root).join(format!("{id}.json"));
+    // R4(终审 P0-3):清单读取过 canonical 只读闸(清单驱动 resume,是高危输入)
+    super::paths::assert_within(project_root, &path).map_err(super::CoreError::Invalid)?;
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
@@ -225,5 +227,31 @@ mod tests {
         });
         assert!(!m.is_done("DCIM/100/IMG_0001.JPG", 100));
         assert_eq!(m.entries.len(), 1, "upsert 应覆盖同路径条目");
+    }
+
+    /// R4 终审 P0-3:`.ocard` 被换成指向项目外的链接时,清单**读取**也必须拒
+    /// (清单驱动 resume,经链接注入外部清单=任意路径读写的前菜)。
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_symlinked_state_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        // 外部造一份「合法清单」
+        std::fs::create_dir_all(outside.join("manifests")).unwrap();
+        let m = CopyManifest::new("1. 待分类/x", "SD", "A7M4_A_ZS", "ZS", "");
+        let mid = m.id.clone();
+        std::fs::write(
+            outside.join("manifests").join(format!("{mid}.json")),
+            serde_json::to_vec(&m).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, project.join(super::super::project::STATE_DIR))
+            .unwrap();
+        assert!(
+            load(&project, &mid).is_err(),
+            "链接 .ocard 下的清单读取必须被拒"
+        );
     }
 }

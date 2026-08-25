@@ -286,12 +286,15 @@ fn extract_video_thumb(
     let Some(bin) = ffmpeg_bin else { return false };
     let cache = media::cached_thumb_path(root, rel, size, mtime);
     if cache.is_file() {
-        return true;
+        // R4(终审 P0-4):已有缓存也要验完整性——半截/损坏 JPEG 不许计成功
+        return media::looks_like_valid_jpeg(&cache);
     }
     let Some(dir) = cache.parent() else {
         return false;
     };
-    if std::fs::create_dir_all(dir).is_err() {
+    // R4(终审 P0-4):此前裸 create_dir_all 绕过 `.ocard` 中间组件闸——
+    // 链接可把 ffmpeg 临时文件与最终 JPEG 写出项目;与照片写路径同源过闸
+    if crate::core::paths::ensure_dir_within(root, dir).is_err() {
         return false;
     }
     let tmp = dir.join(format!(".{}.vthumb.jpg", uuid::Uuid::new_v4()));
@@ -300,6 +303,8 @@ fn extract_video_thumb(
         "-hide_banner",
         "-v",
         "error",
+        "-protocol_whitelist",
+        "file",
         "-ss",
         "0.5",
         "-i",
@@ -324,8 +329,10 @@ fn extract_video_thumb(
     match crate::core::fsx::rename_no_replace(&tmp, &cache) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // 别机先落位:验一下成品再采信(R4:既有文件可能是坏缓存,
+            // 与照片路径 write_jpeg 同一规矩)
             let _ = std::fs::remove_file(&tmp);
-            true
+            media::looks_like_valid_jpeg(&cache)
         }
         Err(_) => {
             let _ = std::fs::remove_file(&tmp);
@@ -371,8 +378,12 @@ fn analyze_one(
     ffmpeg_bin: Option<&PathBuf>,
 ) -> AnalyzeOne {
     let fp = analysis::src_fingerprint(rel, size, mtime);
-    if features.contains_key(&fp) {
-        return AnalyzeOne::Cached;
+    if let Some(rec) = features.get(&fp) {
+        // R4(终审 P0-9):判定单源在 analysis::cache_hit(faces=None + 检测器在场
+        // 必须重算,模型修复后自愈)
+        if analysis::cache_hit(rec, detector.is_some()) {
+            return AnalyzeOne::Cached;
+        }
     }
     let abs: PathBuf = root.join(rel.split('/').collect::<PathBuf>());
     if !abs.exists() {
@@ -437,6 +448,9 @@ fn analyze_one(
         over_exposed: over,
         under_exposed: under,
         shot_at_epoch,
+        faces_model: faces
+            .is_some()
+            .then(|| yunet::YUNET_SHA256[..8].to_string()),
         faces,
         analyzed_at: chrono::Utc::now(),
         machine_id: machine_id.to_string(),
@@ -545,5 +559,74 @@ mod exif_orientation_tests {
             assert!(analysis::ALGO_VERSION >= 2, "EXIF 统一摆正要求 algo v2+");
         }
         assert_eq!(rec.algo_version, analysis::ALGO_VERSION);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod video_thumb_tests {
+    use super::*;
+
+    /// R4 终审 P0-4:`.ocard` 被换成指向项目外的链接时,视频缩略图路径必须
+    /// 在闸上拒绝——用「会真写文件」的假 ffmpeg 证明:删闸(裸 create_dir_all)
+    /// 时假 ffmpeg 会把帧写进外部目录,本测试红。
+    #[test]
+    fn video_thumb_refuses_symlinked_state_dir() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, project.join(".ocard")).unwrap();
+        // 假 ffmpeg:向最后一个参数写出「JPEG 形状」文件
+        let fake = tmp.path().join("ffmpeg");
+        {
+            let mut f = std::fs::File::create(&fake).unwrap();
+            f.write_all(
+                b"#!/bin/sh\nfor last; do :; done\nprintf '\\xff\\xd8x\\xff\\xd9' > \"$last\"\n",
+            )
+            .unwrap();
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let src = project.join("v.mp4");
+        std::fs::write(&src, b"not-a-real-video").unwrap();
+
+        let ok = extract_video_thumb(&project, "1. 待分类/v.mp4", 16, 1, &src, Some(&fake));
+        assert!(!ok, "链接 .ocard 下必须拒绝生成");
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "帧文件不得经链接写到项目外"
+        );
+    }
+
+    /// 已有缓存必须验 JPEG 完整性:垃圾缓存不计成功,且重生成后的
+    /// AlreadyExists 分支也不许采信坏缓存(R4)。
+    #[test]
+    fn video_thumb_rejects_corrupt_cached_jpeg() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let src = project.join("v.mp4");
+        std::fs::write(&src, b"x").unwrap();
+        let cache = media::cached_thumb_path(&project, "1. 待分类/v.mp4", 1, 1);
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, b"garbage").unwrap();
+        // 假 ffmpeg 能产出合法 JPEG,但落位撞上既有坏缓存 → 不许采信坏缓存
+        let fake = tmp.path().join("ffmpeg");
+        {
+            let mut f = std::fs::File::create(&fake).unwrap();
+            f.write_all(
+                b"#!/bin/sh\nfor last; do :; done\nprintf '\\xff\\xd8x\\xff\\xd9' > \"$last\"\n",
+            )
+            .unwrap();
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !extract_video_thumb(&project, "1. 待分类/v.mp4", 1, 1, &src, Some(&fake)),
+            "坏缓存不得被计成功(入口验证 + AlreadyExists 分支验证)"
+        );
     }
 }
