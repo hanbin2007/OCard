@@ -20,7 +20,7 @@ export function TopBar({
   const { dispatch } = useStore();
 
   return (
-    <div className="topbar">
+    <div className="topbar" data-tauri-drag-region>
       <h1 className="topbar__title">{title}</h1>
       {subtitle ? (
         <span className={`topbar__sub${subtitleMono ? " mono" : ""}`}>{subtitle}</span>

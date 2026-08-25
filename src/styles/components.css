@@ -7,7 +7,7 @@
   align-items: center;
   justify-content: center;
   gap: var(--space-2);
-  height: 32px;
+  height: 28px;
   padding: 0 var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
@@ -78,18 +78,18 @@
 }
 
 .btn--sm {
-  height: 26px;
+  height: 24px;
   padding: 0 var(--space-2);
   font-size: var(--text-xs);
 }
 
 .btn--icon {
-  width: 32px;
+  width: 28px;
   padding: 0;
 }
 
 .btn--icon.btn--sm {
-  width: 26px;
+  width: 24px;
 }
 
 .btn--danger {
@@ -136,6 +136,8 @@
 
 .card {
   border: 1px solid var(--border);
+  /* 深色下的"接光上棱"：顶边略亮一线补足层次（浅色两值相同，无变化） */
+  border-top-color: var(--border-panel-top);
   border-radius: var(--radius-lg);
   background: var(--panel);
   overflow: hidden;
@@ -145,7 +147,7 @@
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  padding: var(--space-4) var(--space-5);
+  padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--border);
 }
 
@@ -160,7 +162,7 @@
 }
 
 .card__body {
-  padding: var(--space-5);
+  padding: var(--space-4);
 }
 
 .card__body--tight {
@@ -201,7 +203,7 @@
 .select,
 .textarea {
   width: 100%;
-  height: 32px;
+  height: 28px;
   padding: 0 var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
@@ -254,8 +256,8 @@
   background-image: linear-gradient(45deg, transparent 50%, var(--text-tertiary) 50%),
     linear-gradient(135deg, var(--text-tertiary) 50%, transparent 50%);
   background-position:
-    calc(100% - 15px) 14px,
-    calc(100% - 10px) 14px;
+    calc(100% - 15px) 12px,
+    calc(100% - 10px) 12px;
   background-size:
     5px 5px,
     5px 5px;
@@ -470,6 +472,7 @@
 
 .list {
   border: 1px solid var(--border);
+  border-top-color: var(--border-panel-top);
   border-radius: var(--radius-lg);
   background: var(--panel);
   overflow: hidden;
@@ -480,7 +483,7 @@
   align-items: center;
   gap: var(--space-4);
   width: 100%;
-  padding: var(--space-3) var(--space-4);
+  padding: var(--space-2) var(--space-4);
   border: 0;
   border-top: 1px solid var(--border);
   background: transparent;
@@ -509,30 +512,44 @@
   background: var(--selected);
 }
 
+/* 表头不再压灰底带（后台感的主要来源）：细字 + 微字距 + 1px 底线即可。
+   底色与列表面同色而非透明——files__scroll 里表头吸顶，滚动时不能透出行。 */
 .list__head {
   display: grid;
   gap: var(--space-4);
-  padding: var(--space-2) var(--space-4);
+  padding: 6px var(--space-4);
   border-bottom: 1px solid var(--border);
-  background: var(--panel-raised);
+  background: var(--panel);
   font-size: var(--text-2xs);
   font-weight: var(--weight-medium);
   color: var(--text-tertiary);
-  letter-spacing: 0.03em;
+  letter-spacing: 0.06em;
 }
 
+/* 空态沿用目录树的 box-drawing 母题：一枝空树杈，而不是一行孤零零的灰字 */
 .list__empty {
+  display: grid;
+  justify-items: center;
+  gap: var(--space-2);
   padding: var(--space-10) var(--space-4);
   text-align: center;
   font-size: var(--text-sm);
   color: var(--text-tertiary);
 }
 
+.list__empty-mark {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+  letter-spacing: 0.08em;
+  user-select: none;
+}
+
 /* ---------- 定义列表（详情面板） ---------- */
 
 .dl {
   display: grid;
-  gap: var(--space-3);
+  gap: var(--space-2);
 }
 
 .dl__row {
@@ -615,7 +632,7 @@
 }
 
 .section {
-  margin-top: var(--space-8);
+  margin-top: var(--space-6);
 }
 
 .section__head {
@@ -653,7 +670,7 @@
 }
 
 .stack--lg {
-  gap: var(--space-5);
+  gap: var(--space-4);
 }
 
 .row-inline {

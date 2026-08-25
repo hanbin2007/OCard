@@ -29,14 +29,21 @@
   --text-md: 16px;
   --text-lg: 20px;
   --text-xl: 24px;
+  /* 仪表级数字（拷卡百分比等）专用，正文不用 */
+  --text-2xl: 32px;
 
   --leading-tight: 1.25;
   --leading-normal: 1.5;
   --leading-relaxed: 1.7;
 
+  /* 字重台阶按 CJK 现实校准：中文系统字体（微软雅黑 / Noto CJK）大多只有
+     Regular(400) 和 Bold(700) 两档，CSS 对 500 的匹配是"就近向下"落回 400——
+     所以 500 在中文上与正文毫无区别，层级等于不存在。
+     medium 取 600（就近向上命中 Bold / PingFang Semibold），semibold 取 700，
+     保证三档在所有平台的中文里至少呈现两档、拉丁文三档。 */
   --weight-normal: 400;
-  --weight-medium: 500;
-  --weight-semibold: 600;
+  --weight-medium: 600;
+  --weight-semibold: 700;
 
   /* ---- 间距（4 的倍数） ---- */
   --space-1: 4px;
@@ -88,10 +95,12 @@
   --spring: cubic-bezier(0.22, 1, 0.36, 1);
   --spring-pop: cubic-bezier(0.34, 1.4, 0.64, 1);
 
-  /* ---- 布局尺寸 ---- */
-  --sidebar-width: 232px;
-  --topbar-height: 52px;
-  --content-max: 1180px;
+  /* ---- 布局尺寸 ----
+   * 密度基准向专业工具（Resolve / Silverstack）看齐：chrome 尽量薄，
+   * 内容区上限放宽让表格吃满宽度，屏幕留给数据而不是留白。 */
+  --sidebar-width: 220px;
+  --topbar-height: 46px;
+  --content-max: 1440px;
 
   /* ----------------------------------------------------------------
    * 浅色主题：层次靠**灰阶台阶**，不靠阴影。由后到前依次变亮：
@@ -110,6 +119,9 @@
   --border: #e0e1e2;
   --border-strong: #cdcfd1;
   --border-focus: #adb0b3;
+  /* 卡片顶边：浅色与普通边框同色；深色略亮一线，充当"接光的上棱"——
+     深色下四个灰阶台阶拉不开时，用 1px 顶棱补层次，而不是引入装饰阴影 */
+  --border-panel-top: #e0e1e2;
 
   --text-primary: #0d0d0d;
   --text-secondary: #5d5d5d;
@@ -121,13 +133,15 @@
   --active: rgba(13, 13, 13, 0.07);
   --selected: rgba(13, 13, 13, 0.06);
 
-  /* 唯一强调色，用量极少：仅主按钮、焦点环、进度条 */
-  --accent: #2f6fd0;
-  --accent-hover: #2a63bb;
-  --accent-soft: rgba(47, 111, 208, 0.1);
-  --accent-ring: rgba(47, 111, 208, 0.35);
+  /* 唯一强调色，用量极少：仅主按钮、焦点环、进度条。
+     取偏紫的靛蓝（iris）而非默认感的蓝：低饱和、有记忆点，
+     与状态色（绿/琥珀/红）拉开色相距离。白字对比 5.6:1（AA）。 */
+  --accent: #5559d1;
+  --accent-hover: #484cc0;
+  --accent-soft: rgba(85, 89, 209, 0.1);
+  --accent-ring: rgba(85, 89, 209, 0.35);
   /* 压在 --accent-soft 上的文字，需比 --accent 更深才够 4.5:1 */
-  --accent-strong: #255ba8;
+  --accent-strong: #4347b5;
   /* 强调色上的文字，两主题一致 */
   --on-accent: #ffffff;
 
@@ -186,6 +200,7 @@
     --border: #2f2f2f;
     --border-strong: #3d3d3d;
     --border-focus: #565656;
+    --border-panel-top: #404040;
 
     --text-primary: #ececec;
     --text-secondary: #b4b4b4;
@@ -196,12 +211,12 @@
     --active: rgba(255, 255, 255, 0.08);
     --selected: rgba(255, 255, 255, 0.07);
 
-    --accent: #5b8def;
-    --accent-hover: #6d9bf3;
-    --accent-soft: rgba(91, 141, 239, 0.14);
-    --accent-ring: rgba(91, 141, 239, 0.4);
-    --accent-strong: #8fb4f7;
-    /* #5b8def 上用白字只有 3.18:1，改近黑字得 5.9:1 */
+    --accent: #7d82ec;
+    --accent-hover: #8f94f0;
+    --accent-soft: rgba(125, 130, 236, 0.16);
+    --accent-ring: rgba(125, 130, 236, 0.4);
+    --accent-strong: #a6aaf5;
+    /* #7d82ec 上用白字不足 4.5:1，改近黑字得 5.6:1 */
     --on-accent: #0d0d0d;
 
     --ok: #5fb083;
@@ -234,6 +249,7 @@
   --border: #2f2f2f;
   --border-strong: #3d3d3d;
   --border-focus: #565656;
+  --border-panel-top: #404040;
 
   --text-primary: #ececec;
   --text-secondary: #b4b4b4;
@@ -244,12 +260,12 @@
   --active: rgba(255, 255, 255, 0.08);
   --selected: rgba(255, 255, 255, 0.07);
 
-  --accent: #5b8def;
-  --accent-hover: #6d9bf3;
-  --accent-soft: rgba(91, 141, 239, 0.14);
-  --accent-ring: rgba(91, 141, 239, 0.4);
-  --accent-strong: #8fb4f7;
-  /* #5b8def 上用白字只有 3.18:1，改近黑字得 5.9:1 */
+  --accent: #7d82ec;
+  --accent-hover: #8f94f0;
+  --accent-soft: rgba(125, 130, 236, 0.16);
+  --accent-ring: rgba(125, 130, 236, 0.4);
+  --accent-strong: #a6aaf5;
+  /* #7d82ec 上用白字不足 4.5:1，改近黑字得 5.6:1 */
   --on-accent: #0d0d0d;
 
   --ok: #5fb083;

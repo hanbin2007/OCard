@@ -179,7 +179,15 @@ export function PulseValue({
 }
 
 export function EmptyState({ children }: { children: ReactNode }) {
-  return <div className="list__empty">{children}</div>;
+  return (
+    <div className="list__empty">
+      {/* 与目录树预览同一套 box-drawing 视觉母题：空的是内容，不是界面 */}
+      <span className="list__empty-mark" aria-hidden="true">
+        └── ∅
+      </span>
+      <div>{children}</div>
+    </div>
+  );
 }
 
 export function Kbd({ children }: { children: ReactNode }) {

@@ -37,6 +37,17 @@ function useNavDirection(route: RouteName): "forward" | "back" | "none" {
   return direction.current;
 }
 
+/**
+ * macOS 桌面端（Tauri）标题栏走 Overlay：红绿灯悬浮在侧栏品牌区上，
+ * 窗口 chrome 与应用 chrome 融为一体，而不是"网页装在系统窗框里"。
+ * 仅在 macOS + Tauri 下打标记；浏览器/其他平台不受影响。
+ */
+const IS_MAC_DESKTOP =
+  typeof navigator !== "undefined" &&
+  navigator.userAgent.includes("Mac") &&
+  typeof window !== "undefined" &&
+  "__TAURI_INTERNALS__" in window;
+
 function Routes() {
   const { state, reload, dispatch } = useStore();
 
@@ -149,7 +160,11 @@ export function Shell() {
   const navDirection = useNavDirection(state.route);
 
   return (
-    <div className="shell" data-nav={navDirection}>
+    <div
+      className="shell"
+      data-nav={navDirection}
+      data-platform={IS_MAC_DESKTOP ? "mac" : undefined}
+    >
       <Sidebar />
       <main className="main">
         <NoticeToasts />

@@ -758,41 +758,49 @@ export function CopyTaskScreen() {
                     </div>
                     <div className="card__body">
                       <div className="stack stack--lg">
-                        <div className="stack stack--sm">
-                          <ProgressBar
-                            value={task.copiedBytes}
-                            total={task.totalBytes}
-                            tone={task.state === "done" ? "ok" : "accent"}
-                            label="总进度"
-                            valueText={`${formatBytes(task.copiedBytes)} / ${formatBytes(task.totalBytes)}`}
-                          />
+                        {/* 仪表区：拷卡是全应用的高光时刻，百分比与速度是主角 */}
+                        <div className="copy-hero">
+                          <div className="copy-hero__row">
+                            <div className="copy-hero__percent">
+                              {Math.round(ratio(task.copiedBytes, task.totalBytes) * 100)}
+                              <span className="copy-hero__unit">%</span>
+                            </div>
+                            <div className="copy-hero__vitals">
+                              <div className="copy-hero__vital">
+                                <span className="stat__label">速度</span>
+                                <span className="copy-hero__vital-value">
+                                  {formatSpeed(task.speedBytesPerSec)}
+                                </span>
+                              </div>
+                              <div className="copy-hero__vital">
+                                <span className="stat__label">预计剩余</span>
+                                <span className="copy-hero__vital-value">
+                                  {formatEta(
+                                    task.totalBytes - task.copiedBytes,
+                                    task.speedBytesPerSec,
+                                  )}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                          <div className="copy-hero__bar">
+                            <ProgressBar
+                              value={task.copiedBytes}
+                              total={task.totalBytes}
+                              tone={task.state === "done" ? "ok" : "accent"}
+                              label="总进度"
+                              valueText={`${formatBytes(task.copiedBytes)} / ${formatBytes(task.totalBytes)}`}
+                            />
+                          </div>
                           <div className="row-inline text-xs dim">
                             <span className="mono">
                               {formatBytes(task.copiedBytes)} /{" "}
                               {formatBytes(task.totalBytes)}
                             </span>
-                            <span className="mono push-right">
-                              {Math.round(ratio(task.copiedBytes, task.totalBytes) * 100)}%
-                            </span>
                           </div>
                         </div>
 
                         <div className="task-stats">
-                          <div>
-                            <div className="stat__label">速度</div>
-                            <div className="stat__value">
-                              {formatSpeed(task.speedBytesPerSec)}
-                            </div>
-                          </div>
-                          <div>
-                            <div className="stat__label">预计剩余</div>
-                            <div className="stat__value">
-                              {formatEta(
-                                task.totalBytes - task.copiedBytes,
-                                task.speedBytesPerSec,
-                              )}
-                            </div>
-                          </div>
                           <div>
                             <div className="stat__label">
                               {fullyLoaded ? "已校验" : "文件明细"}
@@ -833,27 +841,29 @@ export function CopyTaskScreen() {
                               {task.destinations.length} 个 · 单读多写
                             </span>
                           </div>
+                          {/* 每个目的地一条通栏泳道：多写并行时各自的写入节奏一眼可见 */}
                           {task.destinations.map((dest) => (
-                            <div className="dest-line" key={dest.id}>
-                              <span className="truncate">
-                                <Badge>{DESTINATION_KIND_LABEL[dest.kind]}</Badge>{" "}
-                                <span className="dest-line__path" title={dest.path}>
+                            <div className="dest-lane" key={dest.id}>
+                              <div className="dest-lane__head">
+                                <Badge>{DESTINATION_KIND_LABEL[dest.kind]}</Badge>
+                                <span
+                                  className="dest-line__path truncate"
+                                  title={dest.path}
+                                >
                                   {dest.path}
                                 </span>
-                              </span>
-                              <span className="stack stack--sm">
-                                <ProgressBar
-                                  value={dest.writtenBytes}
-                                  total={task.totalBytes}
-                                  tone={dest.state === "done" ? "ok" : "accent"}
-                                  thin
-                                  decorative
-                                />
-                                <span className="text-xs dim">
+                                <span className="dest-lane__stats">
                                   {DESTINATION_STATE_LABEL[dest.state]} ·{" "}
                                   {formatBytes(dest.writtenBytes, 0)}
                                 </span>
-                              </span>
+                              </div>
+                              <ProgressBar
+                                value={dest.writtenBytes}
+                                total={task.totalBytes}
+                                tone={dest.state === "done" ? "ok" : "accent"}
+                                thin
+                                decorative
+                              />
                             </div>
                           ))}
                         </div>

@@ -2,15 +2,42 @@
 
 /* ---------- 项目列表 ---------- */
 
+/*
+ * 基准五列;「备份 / 最近事件」两列只在宽屏出现——1280 窗口下主区约
+ * 1060px,再减详情栏后表格仅 ~660px,硬塞七列会把项目名列挤到几像素
+ * (E2E 在 1280 窗口点不到项目行,就是这个几何)。
+ */
 .projects__head,
 .projects__row {
-  grid-template-columns: minmax(0, 1fr) 72px 116px 132px 88px;
+  grid-template-columns: minmax(0, 1fr) 64px 108px minmax(0, 1.2fr) 84px;
+}
+
+.projects__head > :nth-child(5),
+.projects__head > :nth-child(6),
+.projects__row > :nth-child(5),
+.projects__row > :nth-child(6) {
+  display: none;
+}
+
+@media (min-width: 1420px) {
+  .projects__head,
+  .projects__row {
+    grid-template-columns:
+      minmax(140px, 1.3fr) 64px 108px minmax(120px, 1fr) 48px 96px 84px;
+  }
+
+  .projects__head > :nth-child(5),
+  .projects__head > :nth-child(6),
+  .projects__row > :nth-child(5),
+  .projects__row > :nth-child(6) {
+    display: block;
+  }
 }
 
 @media (max-width: 1180px) {
   .projects__head,
   .projects__row {
-    grid-template-columns: minmax(0, 1fr) 72px 88px;
+    grid-template-columns: minmax(0, 1fr) 64px 84px;
   }
 
   .projects__head > :nth-child(3),
@@ -55,7 +82,7 @@
 /* 详情侧栏（吸顶） */
 .detail {
   position: sticky;
-  top: var(--space-8);
+  top: var(--space-5);
   display: grid;
   gap: var(--space-4);
 }
@@ -65,7 +92,7 @@
 .wizard {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 400px;
-  gap: var(--space-8);
+  gap: var(--space-6);
   align-items: start;
 }
 
@@ -78,7 +105,7 @@
 
 .wizard__preview {
   position: sticky;
-  top: var(--space-8);
+  top: var(--space-5);
 }
 
 .wizard__choices {
@@ -122,7 +149,7 @@
 .devices {
   display: grid;
   grid-template-columns: 360px minmax(0, 1fr);
-  gap: var(--space-8);
+  gap: var(--space-6);
   align-items: start;
 }
 
@@ -135,7 +162,7 @@
 
 .devices__form {
   position: sticky;
-  top: var(--space-8);
+  top: var(--space-5);
   display: grid;
   gap: var(--space-4);
 }
@@ -182,7 +209,7 @@
 .copy {
   display: grid;
   grid-template-columns: 380px minmax(0, 1fr);
-  gap: var(--space-8);
+  gap: var(--space-6);
   align-items: start;
 }
 
@@ -195,7 +222,7 @@
 
 .copy__form {
   position: sticky;
-  top: var(--space-8);
+  top: var(--space-5);
   display: grid;
   gap: var(--space-4);
 }
@@ -206,7 +233,7 @@
   gap: var(--space-3);
   align-items: center;
   width: 100%;
-  padding: var(--space-3);
+  padding: var(--space-2) var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--panel);
@@ -257,6 +284,59 @@
   align-items: center;
 }
 
+/* ---- 拷卡仪表区：百分比与速度是这块屏的主角 ---- */
+
+.copy-hero {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.copy-hero__row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-6);
+}
+
+.copy-hero__percent {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xl);
+  line-height: 1;
+  font-weight: var(--weight-medium);
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+}
+
+.copy-hero__unit {
+  margin-left: 2px;
+  font-size: var(--text-md);
+  font-weight: var(--weight-normal);
+  color: var(--text-tertiary);
+}
+
+.copy-hero__vitals {
+  display: flex;
+  gap: var(--space-8);
+  margin-left: auto;
+}
+
+.copy-hero__vital {
+  display: grid;
+  gap: 2px;
+  justify-items: end;
+}
+
+.copy-hero__vital-value {
+  font-family: var(--font-mono);
+  font-size: var(--text-lg);
+  line-height: 1.1;
+  color: var(--text-primary);
+}
+
+/* 主进度条比常规粗一档：它是仪表，不是装饰 */
+.copy-hero__bar .progress {
+  height: 6px;
+}
+
 .task-stats {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -292,6 +372,32 @@
 
 .dest-line + .dest-line {
   border-top: 1px solid var(--border);
+}
+
+/* 目的地泳道：进度通栏，多目的地并行写入的节奏差一眼可比 */
+.dest-lane {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+}
+
+.dest-lane + .dest-lane {
+  border-top: 1px solid var(--border);
+}
+
+.dest-lane__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.dest-lane__stats {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-tertiary);
+  white-space: nowrap;
 }
 
 .dest-line__path {
@@ -358,7 +464,7 @@
   align-items: center;
   gap: var(--space-2);
   flex-wrap: wrap;
-  padding: var(--space-3) var(--space-6);
+  padding: var(--space-2) var(--space-5);
   border-bottom: 1px solid var(--border);
   background: var(--bg);
 }
@@ -367,7 +473,7 @@
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
-  height: 28px;
+  height: 26px;
   padding: 0 var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-pill);
@@ -418,7 +524,7 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  padding: var(--space-4) var(--space-6);
+  padding: var(--space-3) var(--space-5);
 }
 
 /* 单元格 */
