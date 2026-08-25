@@ -4,19 +4,24 @@
 
 .projects__head,
 .projects__row {
-  grid-template-columns: minmax(0, 1fr) 72px 116px 132px 88px;
+  grid-template-columns:
+    minmax(0, 1.3fr) 64px 108px minmax(120px, 1fr) 48px 96px 84px;
 }
 
 @media (max-width: 1180px) {
   .projects__head,
   .projects__row {
-    grid-template-columns: minmax(0, 1fr) 72px 88px;
+    grid-template-columns: minmax(0, 1fr) 64px 84px;
   }
 
   .projects__head > :nth-child(3),
   .projects__head > :nth-child(4),
+  .projects__head > :nth-child(5),
+  .projects__head > :nth-child(6),
   .projects__row > :nth-child(3),
-  .projects__row > :nth-child(4) {
+  .projects__row > :nth-child(4),
+  .projects__row > :nth-child(5),
+  .projects__row > :nth-child(6) {
     display: none;
   }
 }
@@ -55,7 +60,7 @@
 /* 详情侧栏（吸顶） */
 .detail {
   position: sticky;
-  top: var(--space-8);
+  top: var(--space-5);
   display: grid;
   gap: var(--space-4);
 }
@@ -65,7 +70,7 @@
 .wizard {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 400px;
-  gap: var(--space-8);
+  gap: var(--space-6);
   align-items: start;
 }
 
@@ -78,7 +83,7 @@
 
 .wizard__preview {
   position: sticky;
-  top: var(--space-8);
+  top: var(--space-5);
 }
 
 .wizard__choices {
@@ -122,7 +127,7 @@
 .devices {
   display: grid;
   grid-template-columns: 360px minmax(0, 1fr);
-  gap: var(--space-8);
+  gap: var(--space-6);
   align-items: start;
 }
 
@@ -135,7 +140,7 @@
 
 .devices__form {
   position: sticky;
-  top: var(--space-8);
+  top: var(--space-5);
   display: grid;
   gap: var(--space-4);
 }
@@ -182,7 +187,7 @@
 .copy {
   display: grid;
   grid-template-columns: 380px minmax(0, 1fr);
-  gap: var(--space-8);
+  gap: var(--space-6);
   align-items: start;
 }
 
@@ -195,7 +200,7 @@
 
 .copy__form {
   position: sticky;
-  top: var(--space-8);
+  top: var(--space-5);
   display: grid;
   gap: var(--space-4);
 }
@@ -206,7 +211,7 @@
   gap: var(--space-3);
   align-items: center;
   width: 100%;
-  padding: var(--space-3);
+  padding: var(--space-2) var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--panel);
@@ -351,7 +356,7 @@
 .dest-lane {
   display: grid;
   gap: var(--space-2);
-  padding: var(--space-3) 0;
+  padding: var(--space-2) 0;
 }
 
 .dest-lane + .dest-lane {
@@ -437,7 +442,7 @@
   align-items: center;
   gap: var(--space-2);
   flex-wrap: wrap;
-  padding: var(--space-3) var(--space-6);
+  padding: var(--space-2) var(--space-5);
   border-bottom: 1px solid var(--border);
   background: var(--bg);
 }
@@ -446,7 +451,7 @@
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
-  height: 28px;
+  height: 26px;
   padding: 0 var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-pill);
@@ -497,7 +502,7 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  padding: var(--space-4) var(--space-6);
+  padding: var(--space-3) var(--space-5);
 }
 
 /* 单元格 */

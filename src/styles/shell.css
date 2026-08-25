@@ -59,7 +59,7 @@
 }
 
 .sidebar__section {
-  margin-top: var(--space-5);
+  margin-top: var(--space-4);
 }
 
 .sidebar__section:first-child {
@@ -110,7 +110,7 @@
   align-items: center;
   gap: var(--space-2);
   width: 100%;
-  padding: var(--space-2) var(--space-2);
+  padding: 6px var(--space-2);
   border: 0;
   border-radius: var(--radius-md);
   background: transparent;
@@ -166,7 +166,7 @@
 .sidebar__project {
   display: block;
   width: 100%;
-  padding: var(--space-2);
+  padding: 6px var(--space-2);
   border: 0;
   border-radius: var(--radius-md);
   background: transparent;
@@ -242,7 +242,7 @@
   align-items: center;
   gap: var(--space-3);
   height: var(--topbar-height);
-  padding: 0 var(--space-6);
+  padding: 0 var(--space-5);
   border-bottom: 1px solid var(--border);
   background: var(--bg);
 }
@@ -325,7 +325,7 @@
 
 .content__inner {
   max-width: var(--content-max);
-  padding: var(--space-8) var(--space-6) var(--space-12);
+  padding: var(--space-5) var(--space-6) var(--space-10);
   margin: 0 auto;
 }
 
@@ -337,8 +337,8 @@
 /* 列表 + 详情 双栏 */
 .split {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
-  gap: var(--space-6);
+  grid-template-columns: minmax(0, 1fr) 336px;
+  gap: var(--space-5);
   align-items: start;
 }
 

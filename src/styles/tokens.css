@@ -95,10 +95,12 @@
   --spring: cubic-bezier(0.22, 1, 0.36, 1);
   --spring-pop: cubic-bezier(0.34, 1.4, 0.64, 1);
 
-  /* ---- 布局尺寸 ---- */
-  --sidebar-width: 232px;
-  --topbar-height: 52px;
-  --content-max: 1180px;
+  /* ---- 布局尺寸 ----
+   * 密度基准向专业工具（Resolve / Silverstack）看齐：chrome 尽量薄，
+   * 内容区上限放宽让表格吃满宽度，屏幕留给数据而不是留白。 */
+  --sidebar-width: 220px;
+  --topbar-height: 46px;
+  --content-max: 1440px;
 
   /* ----------------------------------------------------------------
    * 浅色主题：层次靠**灰阶台阶**，不靠阴影。由后到前依次变亮：

@@ -65,6 +65,8 @@ export function ProjectsScreen() {
                   <span>工况</span>
                   <span>已拷卡</span>
                   <span>分类进度</span>
+                  <span>备份</span>
+                  <span>最近事件</span>
                   <span>状态</span>
                 </div>
 
@@ -120,6 +122,14 @@ export function ProjectsScreen() {
                             project.assetCount,
                           )}
                         </span>
+                      </span>
+
+                      <span className="projects__cell projects__cell--mono">
+                        {project.destinationCount} 处
+                      </span>
+
+                      <span className="projects__cell projects__cell--mono">
+                        {formatTimestamp(project.updatedAt)}
                       </span>
 
                       <span>
