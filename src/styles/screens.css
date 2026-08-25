@@ -2,10 +2,36 @@
 
 /* ---------- 项目列表 ---------- */
 
+/*
+ * 基准五列;「备份 / 最近事件」两列只在宽屏出现——1280 窗口下主区约
+ * 1060px,再减详情栏后表格仅 ~660px,硬塞七列会把项目名列挤到几像素
+ * (E2E 在 1280 窗口点不到项目行,就是这个几何)。
+ */
 .projects__head,
 .projects__row {
-  grid-template-columns:
-    minmax(0, 1.3fr) 64px 108px minmax(120px, 1fr) 48px 96px 84px;
+  grid-template-columns: minmax(0, 1fr) 64px 108px minmax(0, 1.2fr) 84px;
+}
+
+.projects__head > :nth-child(5),
+.projects__head > :nth-child(6),
+.projects__row > :nth-child(5),
+.projects__row > :nth-child(6) {
+  display: none;
+}
+
+@media (min-width: 1420px) {
+  .projects__head,
+  .projects__row {
+    grid-template-columns:
+      minmax(140px, 1.3fr) 64px 108px minmax(120px, 1fr) 48px 96px 84px;
+  }
+
+  .projects__head > :nth-child(5),
+  .projects__head > :nth-child(6),
+  .projects__row > :nth-child(5),
+  .projects__row > :nth-child(6) {
+    display: block;
+  }
 }
 
 @media (max-width: 1180px) {
@@ -16,12 +42,8 @@
 
   .projects__head > :nth-child(3),
   .projects__head > :nth-child(4),
-  .projects__head > :nth-child(5),
-  .projects__head > :nth-child(6),
   .projects__row > :nth-child(3),
-  .projects__row > :nth-child(4),
-  .projects__row > :nth-child(5),
-  .projects__row > :nth-child(6) {
+  .projects__row > :nth-child(4) {
     display: none;
   }
 }
