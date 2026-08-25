@@ -914,7 +914,10 @@ mod tests {
     #[test]
     fn curate_copies_and_original_stays() {
         let (_t, root, meta) = setup_project();
-        // R2 变异复核:精选复制也要保留源时间戳(删 preserve_times_counted 必红)
+        // R2 变异复核:精选复制也要保留源时间戳。
+        // R3 声明:生产路径用 fs::copy 落临时文件,macOS 的 fs::copy 本身克隆
+        // 时间戳——本断言在 macOS 恒真,判别力由 CI 三平台矩阵的 Linux/Windows
+        // 腿提供(删 preserve_times_counted 在那两腿必红)。
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 30);
         let f = fs::OpenOptions::new()
             .write(true)

@@ -555,9 +555,11 @@ mod tests {
         assert!(manifest.contains("文件数: 3") || manifest.contains("文件数: 2"),);
     }
 
-    /// R2 变异复核:交付复制必须保留源 mtime(删 deliver_one 的
-    /// preserve_times_counted 本测试红)。源 mtime 被改会影响半天分包,
+    /// R2 变异复核:交付复制必须保留源 mtime。源 mtime 被改会影响半天分包,
     /// 所以在**全部包**里找落点,不假设它进第一个包。
+    /// R3 声明:生产路径用 fs::copy 落临时文件,macOS 的 fs::copy 本身克隆
+    /// 时间戳——本断言在 macOS 恒真,判别力由 CI 三平台矩阵的 Linux/Windows
+    /// 腿提供(删 preserve_times_counted 在那两腿必红)。
     #[test]
     fn delivery_preserves_source_mtime() {
         let (_t, root, meta) = setup();

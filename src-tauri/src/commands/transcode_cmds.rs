@@ -948,12 +948,15 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
     let out_root =
         std::fs::canonicalize(&out_root).map_err(|e| format!("输出目录解析失败: {e}"))?;
     {
-        let canon_project = std::fs::canonicalize(&stats.root)
-            .map_err(|e| format!("项目目录解析失败: {e}"))?;
+        let canon_project =
+            std::fs::canonicalize(&stats.root).map_err(|e| format!("项目目录解析失败: {e}"))?;
         if out_root.starts_with(&canon_project) {
             return Err("归档输出目录实际位于项目内部(经符号链接),拒绝".into());
         }
-        paths::validate_dest_layout(&canon_project.join(project::SCENARIO_A_DIRS[1]), std::slice::from_ref(&out_root))?;
+        paths::validate_dest_layout(
+            &canon_project.join(project::SCENARIO_A_DIRS[1]),
+            std::slice::from_ref(&out_root),
+        )?;
     }
 
     let handle = jobs.create(JobKind::Transcode, &input.project_id);

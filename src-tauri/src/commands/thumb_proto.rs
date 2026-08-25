@@ -162,11 +162,7 @@ mod tests {
         // 对照:真实目录下同名文件可通过
         let nas2 = tmp.path().join("nas2");
         std::fs::create_dir_all(nas2.join("项目/.ocard/thumbs")).unwrap();
-        std::fs::write(
-            nas2.join("项目/.ocard/thumbs/0123456789abcdef.jpg"),
-            b"x",
-        )
-        .unwrap();
+        std::fs::write(nas2.join("项目/.ocard/thumbs/0123456789abcdef.jpg"), b"x").unwrap();
         assert!(resolve_thumb_request(&nas2, "/项目/0123456789abcdef.jpg").is_ok());
     }
 }

@@ -6,9 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# PR 分支:新 push 顶掉旧 head 的在途 run(旧 head 不再需要验证)。
+# main:绝不取消,排队跑完——每个落地 commit 都必须拿到完整绿章
+# (教训:R2 波连推时多个 main run 被顶成 cancelled,代码落地却从未被 CI 完整验证)。
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # 默认最小权限:只有 e2e job 因需推 e2e-shots 分支单独提权到 contents: write
 permissions:
