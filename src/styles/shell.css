@@ -46,6 +46,11 @@
   letter-spacing: -0.01em;
 }
 
+/* macOS Overlay 标题栏：红绿灯悬浮在品牌区左侧，内容给它让位 */
+.shell[data-platform="mac"] .sidebar__brand {
+  padding-left: 76px;
+}
+
 .sidebar__scroll {
   flex: 1 1 auto;
   min-height: 0;
@@ -249,10 +254,11 @@
   animation: chrome-fade-in var(--dur-quick) var(--ease-out);
 }
 
+/* 标题是每屏的视觉锚点：比正文大一档、加重——此前与正文几乎同字号，页面没有起点 */
 .topbar__title {
-  font-size: var(--text-base);
-  font-weight: var(--weight-medium);
-  letter-spacing: -0.005em;
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.01em;
   white-space: nowrap;
 }
 

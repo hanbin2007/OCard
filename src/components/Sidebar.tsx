@@ -126,7 +126,8 @@ export function Sidebar() {
 
   return (
     <aside className="sidebar">
-      <div className="sidebar__brand">
+      {/* data-tauri-drag-region：无边框窗口下品牌区空白处可拖动窗口（仅命中元素本身，不影响子元素点击） */}
+      <div className="sidebar__brand" data-tauri-drag-region>
         <span className="sidebar__mark">OC</span>
         <span className="sidebar__name">OCard</span>
       </div>

@@ -21,6 +21,8 @@ body {
   font-size: var(--text-base);
   line-height: var(--leading-normal);
   font-weight: var(--weight-normal);
+  /* 等宽数字：进度、容量、倒计时刷新时数值不横向抖动，列内数字天然对齐 */
+  font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;

@@ -257,6 +257,59 @@
   align-items: center;
 }
 
+/* ---- 拷卡仪表区：百分比与速度是这块屏的主角 ---- */
+
+.copy-hero {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.copy-hero__row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-6);
+}
+
+.copy-hero__percent {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xl);
+  line-height: 1;
+  font-weight: var(--weight-medium);
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+}
+
+.copy-hero__unit {
+  margin-left: 2px;
+  font-size: var(--text-md);
+  font-weight: var(--weight-normal);
+  color: var(--text-tertiary);
+}
+
+.copy-hero__vitals {
+  display: flex;
+  gap: var(--space-8);
+  margin-left: auto;
+}
+
+.copy-hero__vital {
+  display: grid;
+  gap: 2px;
+  justify-items: end;
+}
+
+.copy-hero__vital-value {
+  font-family: var(--font-mono);
+  font-size: var(--text-lg);
+  line-height: 1.1;
+  color: var(--text-primary);
+}
+
+/* 主进度条比常规粗一档：它是仪表，不是装饰 */
+.copy-hero__bar .progress {
+  height: 6px;
+}
+
 .task-stats {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -292,6 +345,32 @@
 
 .dest-line + .dest-line {
   border-top: 1px solid var(--border);
+}
+
+/* 目的地泳道：进度通栏，多目的地并行写入的节奏差一眼可比 */
+.dest-lane {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3) 0;
+}
+
+.dest-lane + .dest-lane {
+  border-top: 1px solid var(--border);
+}
+
+.dest-lane__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.dest-lane__stats {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-tertiary);
+  white-space: nowrap;
 }
 
 .dest-line__path {
