@@ -162,6 +162,25 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// R3:save 的 `.ocard` 落地闸接线回归——中间段被换成指向项目外的
+    /// 符号链接时必须拒写(在 save 里删掉 ensure_dir_within 调用本测试红)。
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_symlinked_state_dir() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, project.join(STATE_DIR)).unwrap();
+        let m = CopyManifest::new("2. 原始素材/x", "card", "A7M4_A_ZS", "ZS", "");
+        assert!(save(&project, &m).is_err(), "符号链接 .ocard 必须拒写");
+        assert!(
+            !outside.join(MANIFEST_DIR).exists(),
+            "manifest 不得经链接写到项目外"
+        );
+    }
+
     fn sample() -> CopyManifest {
         let mut m = CopyManifest::new(
             "2. 原始素材/20260824_A7M4_A_ZS",

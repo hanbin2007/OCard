@@ -442,3 +442,108 @@ fn analyze_one(
         machine_id: machine_id.to_string(),
     })
 }
+
+#[cfg(test)]
+mod exif_orientation_tests {
+    use super::*;
+    use crate::core::{analysis, media};
+
+    /// 生成带 EXIF Orientation 的不对称 JPEG 样张(SOI 后拼接 APP1 段)。
+    fn write_oriented_jpeg(path: &std::path::Path, orientation: u16) {
+        let img = image::RgbImage::from_fn(80, 40, |x, y| {
+            if x < 20 && y < 10 {
+                image::Rgb([250, 250, 250])
+            } else {
+                image::Rgb([10, 10, 10])
+            }
+        });
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let field = exif::Field {
+            tag: exif::Tag::Orientation,
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Short(vec![orientation]),
+        };
+        let mut w = exif::experimental::Writer::new();
+        w.push_field(&field);
+        let mut tiff = std::io::Cursor::new(Vec::new());
+        w.write(&mut tiff, false).unwrap();
+        let tiff = tiff.into_inner();
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&tiff);
+        let mut out = Vec::with_capacity(jpeg.len() + payload.len() + 4);
+        out.extend_from_slice(&jpeg[..2]); // SOI
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&jpeg[2..]);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// R2 P0-7 / R3-F2:EXIF 方向样张——索引路径(decode_oriented)与
+    /// 分析路径(analyze_one 的内联摆正,为区分 Missing/Failed 而复制)
+    /// 必须同向。任一路丢掉摆正,两路 dhash 对不上,本测试红。
+    #[test]
+    fn index_and_analysis_orient_identically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join("素材")).unwrap();
+        let rel = "素材/竖拍.jpg";
+        let abs = root.join("素材").join("竖拍.jpg");
+        write_oriented_jpeg(&abs, 6);
+
+        // 样张自证:EXIF 必须真的读得出 Orientation=6(拼接失败即恒真,先挡住)
+        assert_eq!(
+            media::exif_orientation(&abs),
+            6,
+            "样张 EXIF 不可读,fixture 失效"
+        );
+
+        // 索引路径:Orientation=6 是 90° 旋转,宽高必须互换
+        let oriented = media::decode_oriented(&abs).unwrap();
+        assert_eq!(
+            (oriented.width(), oriented.height()),
+            (40, 80),
+            "Orientation=6 必须旋转"
+        );
+        // 样张自证判别力:摆正前后 dhash 必须不同
+        let raw = image::open(&abs).unwrap();
+        assert_ne!(
+            analysis::extract_features(&raw).0,
+            analysis::extract_features(&oriented).0,
+            "样张摆正前后 dhash 相同,本测试无判别力"
+        );
+
+        // 分析路径:经真实 analyze_one 提取的 dhash 与索引路径一致(两路同向)
+        let meta = std::fs::metadata(&abs).unwrap();
+        let out = analyze_one(
+            &root,
+            "TEST-MACHINE",
+            rel,
+            meta.len(),
+            media::mtime_nanos(&meta),
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        );
+        let AnalyzeOne::Fresh(rec) = out else {
+            panic!("分析应产出 Fresh 特征");
+        };
+        assert_eq!(
+            rec.dhash,
+            analysis::extract_features(&oriented).0,
+            "分析路径与索引路径必须同向(dhash 一致)"
+        );
+        // ALGO_VERSION 断言:EXIF 统一摆正自 v2 起进入算法口径;改变方向
+        // 语义或特征口径时必须递增 ALGO_VERSION,并让缓存整体失效。
+        const {
+            assert!(analysis::ALGO_VERSION >= 2, "EXIF 统一摆正要求 algo v2+");
+        }
+        assert_eq!(rec.algo_version, analysis::ALGO_VERSION);
+    }
+}

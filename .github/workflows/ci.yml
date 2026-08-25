@@ -6,9 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# PR 分支:新 push 顶掉旧 head 的在途 run(旧 head 不再需要验证)。
+# main:绝不取消,排队跑完——每个落地 commit 都必须拿到完整绿章
+# (教训:R2 波连推时多个 main run 被顶成 cancelled,代码落地却从未被 CI 完整验证)。
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # 默认最小权限:只有 e2e job 因需推 e2e-shots 分支单独提权到 contents: write
 permissions:
@@ -66,6 +69,13 @@ jobs:
 
       - name: cargo test
         run: cargo test
+        working-directory: src-tauri
+
+      # M3 计划兑现:小集性能非回退回归。阈值宽松(外推千张 <300s,按核数
+      # 归一),防数量级回退而非 SLA(SLA 须用户真实素材)。本地 4 核实测
+      # 126s;release 产物由 rust-cache 复用,增量成本一次编译。
+      - name: perf non-regression (24MP 单张小集,宽松阈值)
+        run: cargo test --release --lib bench_single_24mp -- --ignored --nocapture
         working-directory: src-tauri
 
   build:

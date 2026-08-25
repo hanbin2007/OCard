@@ -362,8 +362,7 @@ fn copy_one(
                     )));
                 }
                 fs::create_dir_all(root)?;
-                super::paths::ensure_dir_within(root, parent)
-                    .map_err(super::CoreError::Invalid)?;
+                super::paths::ensure_dir_within(root, parent).map_err(super::CoreError::Invalid)?;
             }
             // 同任务崩溃残留的 part 是自己的,清掉;create_new 拦截跨任务冲突
             let _ = fs::remove_file(part);
@@ -927,11 +926,8 @@ mod review_regression_tests {
         let tmp = tempdir().unwrap();
         make_card(tmp.path());
         std::os::unix::fs::symlink(tmp.path().join("DCIM"), tmp.path().join("LINKDIR")).unwrap();
-        std::os::unix::fs::symlink(
-            tmp.path().join("CLIP0001.MP4"),
-            tmp.path().join("LINK.MP4"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("CLIP0001.MP4"), tmp.path().join("LINK.MP4"))
+            .unwrap();
         let files = scan_source(tmp.path()).unwrap();
         assert!(
             files.iter().all(|(r, _)| !r.contains("LINK")),
@@ -942,9 +938,14 @@ mod review_regression_tests {
 
     /// R2 P0:清单(可被篡改的持久化输入)里的 `../` 项必须被引擎拒绝,
     /// 且不得在目的地根外产生任何写入。
+    /// R3 修订:逃逸源文件必须真实存在,且断言闸缺席时写入实际会落到的
+    /// 解析位置——否则源不存在时 File::open 一样失败,断言恒真,
+    /// 闸被回退也测不红(R2 点名的恒真机理同型)。
     #[test]
     fn manifest_rel_escape_is_refused_by_engine() {
         let (tmp, req, mut m, project) = setup();
+        // card/../escape.bin = tmp/escape.bin,真实存在(与清单里的 size 一致)
+        fs::write(tmp.path().join("escape.bin"), b"boom").unwrap();
         let mut files = scan_source(&req.source_root).unwrap();
         files.push(("../escape.bin".into(), 4));
         let out = run_copy(&req, &files, &mut m, &project, |_| CopyControl::Continue).unwrap();
@@ -955,8 +956,10 @@ mod review_regression_tests {
             "逃逸项必须记为失败: {:?}",
             out.files
         );
+        // dest.join("../escape.bin") 的解析位置:两个目的地根的上一级
         assert!(
-            !tmp.path().join("escape.bin").exists() && !tmp.path().join("nas/escape.bin").exists(),
+            !tmp.path().join("nas/2. 原始素材/escape.bin").exists()
+                && !tmp.path().join("backup/escape.bin").exists(),
             "目的地根外不得出现任何写入"
         );
     }
