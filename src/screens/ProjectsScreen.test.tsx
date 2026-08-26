@@ -158,7 +158,11 @@ describe("已拷卡语义(UX 波三:分母=项目用卡清单)", () => {
 
   it("详情面板的用卡清单可增删、可套用登记表模板", async () => {
     const user = userEvent.setup();
-    const spy = vi.spyOn(api, "setProjectCards");
+    const spy = vi
+      .spyOn(api, "setProjectCards")
+      .mockImplementation((_, ids) =>
+        Promise.resolve({ cardIds: ids, copiedCardIds: [] }),
+      );
     render(
       <App
         preloaded={{ ...preloaded, cards: mockStorageCards }}

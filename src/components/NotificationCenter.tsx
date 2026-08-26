@@ -38,6 +38,26 @@ const NOTICE_TITLES: Record<string, string> = {
   "volume-inspect-failed": "卡内素材探查失败",
   "copy-files-load-failed": "文件明细加载失败",
   "copy-files-refresh-failed": "文件状态刷新失败",
+  // toast 统一波(UX 波三)迁入的提交后失败 code:抬头是 toast 最显眼的一行
+  "project-create-failed": "项目没有创建成功",
+  "settings-save-failed": "设置没有保存成功",
+  "device-register-failed": "登记没有成功",
+  "device-delete-failed": "删除登记失败",
+  "copy-start-failed": "拷卡没有发起成功",
+  "copy-preview-failed": "落盘路径解析失败",
+  "transcode-start-failed": "转码没有启动成功",
+  "archive-start-failed": "归档转码没有启动成功",
+  "trash-empty-partial": "部分文件未能删除",
+  "trash-empty-failed": "清空回收站失败",
+  "trash-restore-failed": "恢复文件失败",
+  "folder-picker-failed": "文件夹选择器不可用",
+  "project-cards-load-failed": "用卡清单读取失败",
+  "project-cards-save-failed": "用卡清单保存失败",
+  "project-cards-pruned": "用卡清单已自动清理",
+  "analysis-start-failed": "分析没有启动成功",
+  "delivery-status-save-failed": "交付状态没有保存成功",
+  "reveal-failed": "无法打开文件管理器",
+  "card-match-conflict": "卡片匹配存在冲突",
 };
 
 /** 未知 code 也要有体面的抬头，不能露出空白 */

@@ -144,11 +144,16 @@ export function ProjectsScreen() {
                           />
                         ) : null}
                         <span className="projects__cell text-xs">
-                          {progressLabel(
-                            project.scenario,
-                            project.sortedCount,
-                            project.assetCount,
-                          )}
+                          {/* 条与文字必须同一个分母:A 配了用卡清单时条画的是
+                              用卡进度,文字不能再说素材数(评审 P2) */}
+                          {project.scenario === "A" &&
+                          project.cardRosterTotal != null
+                            ? `${project.cardRosterDone ?? 0}/${project.cardRosterTotal} 张已拷`
+                            : progressLabel(
+                                project.scenario,
+                                project.sortedCount,
+                                project.assetCount,
+                              )}
                         </span>
                       </span>
 
@@ -289,6 +294,17 @@ export function ProjectsScreen() {
                             }
                             label="拷卡进度"
                           />
+                        ) : null}
+                        {selected.cardRosterTotal != null ? (
+                          /* 次数与 x/y 并列:清单外/未登记卡的拷卡不进 x,
+                             但不许在 UI 里消失(评审 P1) */
+                          <span className="text-2xs dim">
+                            共完成 {selected.cardsCopied} 次拷卡任务
+                            {selected.cardsCopied >
+                            (selected.cardRosterDone ?? 0)
+                              ? ",部分来自清单外或未登记的卡"
+                              : ""}
+                          </span>
                         ) : null}
                         {selected.copyIncomplete ? (
                           <span

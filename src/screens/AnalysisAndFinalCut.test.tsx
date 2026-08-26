@@ -725,8 +725,9 @@ describe("交付状态勾选", () => {
     await waitFor(() => expect(checkbox.disabled).toBe(false));
     await user.click(checkbox);
 
-    const err = await screen.findByTestId("delivery-status-error");
-    expect(err.textContent).toContain("NAS 只读");
+    // 提交后失败统一走 toast(UX 波三),级别 error
+    const toast = await screen.findByTestId("notice-toast-error");
+    expect(toast.textContent).toContain("NAS 只读");
     spy.mockRestore();
   });
 });

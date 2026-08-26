@@ -53,7 +53,7 @@ export function PathField({
       notify(
         "warning",
         "folder-picker-failed",
-        `文件夹选择器打开失败：${err instanceof Error ? err.message : String(err)}。请直接粘贴路径。`,
+        `「${pickerTitle}」的文件夹选择器打开失败：${err instanceof Error ? err.message : String(err)}。请直接粘贴路径。`,
       );
     } finally {
       setPicking(false);

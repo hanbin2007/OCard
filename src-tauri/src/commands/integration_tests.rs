@@ -1190,3 +1190,58 @@ fn project_cards_roundtrip_and_validation() {
     assert_eq!(p["cardRosterTotal"], json!(1));
     assert_eq!(p["cardRosterDone"], json!(0));
 }
+
+#[test]
+fn project_cards_empty_and_pruned_semantics() {
+    // 空清单等价未配置(不出现 0/0);登记卡删除后旧清单不锁死(评审 P1)
+    let (window, _tmp, _nas) = mock_app();
+    let project_id = create_b_project(&window);
+    let cam = invoke(
+        &window,
+        "create_camera",
+        json!({"input": {"model": "R5C", "position": "C", "operatorAlias": "WH"}}),
+    )
+    .unwrap();
+    let card = invoke(
+        &window,
+        "create_storage_card",
+        json!({"input": {"label": "CF-04", "cameraId": cam["id"], "capacityBytes": 1}}),
+    )
+    .unwrap();
+    let card_id = card["id"].as_str().unwrap().to_string();
+
+    invoke(
+        &window,
+        "set_project_cards",
+        json!({"projectId": project_id, "cardIds": [card_id.clone()]}),
+    )
+    .unwrap();
+
+    // 删除登记卡后:x/y 字段消失(清单只剩死 id,过滤后为空 = 未配置)
+    invoke(
+        &window,
+        "delete_storage_card",
+        json!({"cardId": card_id.clone()}),
+    )
+    .unwrap();
+    let projects = invoke(&window, "list_projects", json!({})).unwrap();
+    let p = projects
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == json!(project_id.clone()))
+        .unwrap();
+    assert!(
+        p.get("cardRosterTotal").is_none(),
+        "死 id 不得撑分母,空清单等价未配置: {p}"
+    );
+
+    // 关键:清单里带着已注销 id 时仍可编辑——旧 id 被剔除而不是整单拒绝
+    let dto = invoke(
+        &window,
+        "set_project_cards",
+        json!({"projectId": project_id, "cardIds": [card_id]}),
+    )
+    .expect("含已注销 id 的清单编辑不得被锁死");
+    assert_eq!(dto["cardIds"], json!([]));
+}

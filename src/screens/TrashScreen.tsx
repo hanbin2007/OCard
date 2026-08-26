@@ -7,7 +7,7 @@ import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog"
 import { TopBar } from "../components/TopBar";
 import { EmptyState } from "../components/ui";
 import { formatBytes, formatTimestamp } from "../lib/format";
-import { useStore } from "../state/store";
+import { useNotify, useStore } from "../state/store";
 
 export function TrashScreen() {
   const { state, dispatch } = useStore();
@@ -47,19 +47,7 @@ export function TrashScreen() {
     void reload();
   }, [reload]);
 
-  const notify = useCallback(
-    (message: string, code: string) =>
-      dispatch({
-        type: "noticeReceived",
-        notice: {
-          level: "error",
-          code,
-          message,
-          occurredAt: new Date().toISOString(),
-        },
-      }),
-    [dispatch],
-  );
+  const pushNotice = useNotify();
 
   async function restore(entry: TrashEntry) {
     if (!projectId || busy) return;
@@ -67,13 +55,18 @@ export function TrashScreen() {
     try {
       const result = await api.restoreFromTrash(projectId, [entry.id]);
       if (result.failed.length > 0) {
-        notify(`恢复 ${entry.fileName} 失败：${result.failed[0].message}`, "trash-restore-failed");
+        pushNotice(
+          "error",
+          "trash-restore-failed",
+          `恢复 ${entry.fileName} 失败：${result.failed[0].message}`,
+        );
       }
       await reload();
     } catch (err) {
-      notify(
-        `恢复 ${entry.fileName} 失败：${err instanceof Error ? err.message : String(err)}`,
+      pushNotice(
+        "error",
         "trash-restore-failed",
+        `恢复 ${entry.fileName} 失败：${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
       setBusy(false);
@@ -95,16 +88,19 @@ export function TrashScreen() {
           const result = await api.emptyTrash(projectId);
           if (result.failed > 0) {
             // 部分失败统一走 toast(UX 波三);失败条目仍留在下方列表里
-            notify(
-              `${result.failed} 个文件删除失败,已保留在回收站,可重试清空`,
+            // 文件还在、可重试 = warning,不是 error(评审 P2:级别别拉爆)
+            pushNotice(
+              "warning",
               "trash-empty-partial",
+              `${result.failed} 个文件删除失败,已保留在回收站,可重试清空;常见原因是文件被占用或权限不足`,
             );
           }
           await reload();
         } catch (err) {
-          notify(
-            `清空回收站失败：${err instanceof Error ? err.message : String(err)}`,
+          pushNotice(
+            "error",
             "trash-empty-failed",
+            `清空回收站失败：${err instanceof Error ? err.message : String(err)}`,
           );
         } finally {
           setBusy(false);

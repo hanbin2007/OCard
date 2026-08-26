@@ -238,15 +238,24 @@ pub fn prepare_resume(
 
 /// journal 追加带重试;彻底失败时写本机 outbox 兜底,绝不静默丢审计(评审 P1-7)。
 /// 任何降级都向 UI 发用户可见通知(UX 原则:fail-open 不允许无提示)。
+/// 审计事件的落盘结局:调用方若把事件当**配置**用(如用卡清单),
+/// 非 Written 必须按失败处理——outbox 只保审计不丢,不保配置生效。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditWrite {
+    Written,
+    Outboxed,
+    Lost,
+}
+
 pub fn append_audit<R: tauri::Runtime>(
     app: &AppHandle<R>,
     project_root: &std::path::Path,
     outbox_dir: &std::path::Path,
     ev: &journal::Event,
-) {
+) -> AuditWrite {
     for _ in 0..3 {
         if journal::append(project_root, ev).is_ok() {
-            return;
+            return AuditWrite::Written;
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
@@ -272,6 +281,7 @@ pub fn append_audit<R: tauri::Runtime>(
                 ev.kind
             ),
         );
+        AuditWrite::Outboxed
     } else {
         super::notify::error(
             app,
@@ -281,6 +291,7 @@ pub fn append_audit<R: tauri::Runtime>(
                 ev.kind
             ),
         );
+        AuditWrite::Lost
     }
 }
 

@@ -12,7 +12,7 @@ import { isJobTerminal } from "../api/types";
 import type { DeliveryJob, DeliverySummary } from "../api/types";
 import { formatBytes } from "../lib/format";
 import { classifyFailures, deliveryHeadline } from "../lib/delivery";
-import { selectLatestDeliveryJob, useStore } from "../state/store";
+import { selectLatestDeliveryJob, useNotify, useStore } from "../state/store";
 import { ConfirmDialog, type ConfirmRequest } from "./ConfirmDialog";
 import { DeliveryStatusToggle } from "./FinalCutPanel";
 import { Badge, ProgressBar } from "./ui";
@@ -235,7 +235,7 @@ function DeliveryResult({
   error: string | null;
   onClose: () => void;
 }) {
-  const [revealError, setRevealError] = useState<string | null>(null);
+  const notify = useNotify();
   const summary: DeliverySummary | null = job?.result ?? null;
   const cancelled = job?.state === "cancelled";
 
@@ -438,8 +438,10 @@ function DeliveryResult({
                 data-testid="delivery-reveal"
                 onClick={() => {
                   void api.revealPath(summary.deliveryPath).catch((err) => {
-                    setRevealError(
-                      err instanceof Error ? err.message : String(err),
+                    notify(
+                      "warning",
+                      "reveal-failed",
+                      `无法打开文件管理器：${err instanceof Error ? err.message : String(err)}`,
                     );
                   });
                 }}
@@ -449,11 +451,6 @@ function DeliveryResult({
               <Badge tone="warn">上传网盘与发送链接需人工完成</Badge>
             </div>
             {job ? <DeliveryStatusToggle projectId={job.projectId} /> : null}
-            {revealError ? (
-              <span className="field__error" role="alert" data-testid="delivery-reveal-error">
-                无法打开文件管理器：{revealError}
-              </span>
-            ) : null}
           </div>
         </div>
 

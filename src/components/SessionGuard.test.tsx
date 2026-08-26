@@ -177,6 +177,12 @@ describe("操作员确认门", () => {
     expect(screen.queryByTestId("session-gate")).toBeNull();
   });
 
+  it("toast 层不在 .main 里:门 inert 主区时 error toast 仍可确认(结构钉死)", () => {
+    render(<App preloaded={preloaded} />);
+    // jsdom 测不了命中,但结构能钉:toasts 一旦回到 .main 下,这条立刻红
+    expect(document.querySelector(".shell > .main .toasts")).toBeNull();
+  });
+
   it("门弹出时背后的侧栏与主区被 inert 屏蔽,恢复后解除", () => {
     endSession();
     const sidebar = document.querySelector(".shell > .sidebar");

@@ -7,7 +7,7 @@
 import { useEffect, useState } from "react";
 import * as api from "../api";
 import type { ProjectCards, StorageCard } from "../api/types";
-import { useNotify } from "../state/store";
+import { useNotify, useStore } from "../state/store";
 import { Select } from "./controls";
 import { Badge } from "./ui";
 import { IconTrash } from "./Icon";
@@ -20,13 +20,16 @@ export function ProjectCardsPanel({
   cards: StorageCard[];
 }) {
   const notify = useNotify();
+  const { reload } = useStore();
   const [roster, setRoster] = useState<ProjectCards | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [addId, setAddId] = useState("");
 
+  const [reloadToken, setReloadToken] = useState(0);
   useEffect(() => {
     let cancelled = false;
+    setLoadFailed(false);
     void (async () => {
       try {
         const data = await api.listProjectCards(projectId);
@@ -44,14 +47,18 @@ export function ProjectCardsPanel({
     return () => {
       cancelled = true;
     };
-  }, [projectId, notify]);
+  }, [projectId, reloadToken, notify]);
 
   async function save(nextIds: string[]) {
-    if (busy) return;
+    // 清单还没读回来就写 = 拿空快照整单覆盖未知内容(评审 P1),一律拒绝
+    if (busy || roster === null) return;
     setBusy(true);
     try {
       setRoster(await api.setProjectCards(projectId, nextIds));
       setAddId("");
+      // 上方 x/y 与列表行的数字来自 store.projects,不整体重拉就会和
+      // 面板打架——同屏两个数字必须同源(评审 P1)
+      reload();
     } catch (err) {
       notify(
         "error",
@@ -81,8 +88,12 @@ export function ProjectCardsPanel({
             type="button"
             className="btn btn--sm"
             data-testid="cards-apply-template"
-            disabled={busy || cards.length === 0}
-            title="以设备登记表的全部卡为模板(替换当前清单)"
+            disabled={busy || cards.length === 0 || roster === null}
+            title={
+              cards.length === 0
+                ? "设备登记表里还没有卡,先去「设备登记」登记"
+                : "以设备登记表的全部卡为模板(替换当前清单)"
+            }
             onClick={() => void save(cards.map((c) => c.id))}
           >
             套用登记表模板
@@ -92,17 +103,28 @@ export function ProjectCardsPanel({
       <div className="card__body">
         <div className="stack stack--sm">
           {loadFailed ? (
-            <p className="text-sm dim" role="status">
-              清单读取失败,请稍后重试(详见右下角提示)。
-            </p>
+            <div className="row-inline">
+              <p className="text-sm dim" role="status">
+                清单读取失败(详见右下角提示)。
+              </p>
+              <button
+                type="button"
+                className="btn btn--sm"
+                data-testid="cards-retry"
+                onClick={() => setReloadToken((n) => n + 1)}
+              >
+                重试
+              </button>
+            </div>
           ) : roster === null ? (
             <p className="text-sm dim" role="status">
               读取中…
             </p>
           ) : rosterIds.length === 0 ? (
             <p className="text-sm dim">
-              还没有配置本项目要用的卡。套用登记表模板一键填入,或在下方逐张添加;
-              拷卡时实际用到的登记卡也会自动加进来。
+              {cards.length === 0
+                ? "设备登记表里还没有卡——先去「设备登记」把卡登记上,再回来配置本项目用卡。"
+                : "还没有配置本项目要用的卡。套用登记表模板一键填入,或在下方逐张添加;拷卡时实际用到的登记卡也会自动加进来。"}
             </p>
           ) : (
             rosterIds.map((id) => {
@@ -129,7 +151,7 @@ export function ProjectCardsPanel({
             })
           )}
 
-          {addable.length > 0 ? (
+          {roster !== null && addable.length > 0 ? (
             <div className="row-inline">
               <Select
                 ariaLabel="添加用卡"

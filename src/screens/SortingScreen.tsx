@@ -84,7 +84,6 @@ export function SortingScreen() {
   const [thumbFailStreak, setThumbFailStreak] = useState(0);
   const [suggestionOnly, setSuggestionOnly] = useState(false);
   const [openGroup, setOpenGroup] = useState<string | null>(null);
-  const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [flowHints, setFlowHints] = useState<CuratedFlowHint[]>([]);
   const [flowHintsOpen, setFlowHintsOpen] = useState(false);
   const [categories, setCategories] = useState<SortingCategory[]>([]);
@@ -685,13 +684,12 @@ export function SortingScreen() {
 
   async function startAnalysis() {
     if (!projectId || analyzing) return;
-    setAnalysisError(null);
     try {
       const job = await api.startAnalysis(projectId);
       dispatch({ type: "jobProgress", job });
     } catch (err) {
+      // 提交后失败只走 toast,不再内联双报(评审 P2)
       const message = err instanceof Error ? err.message : String(err);
-      setAnalysisError(message);
       notify("error", "analysis-start-failed", `分析作业未能启动：${message}`);
     }
   }
@@ -906,14 +904,6 @@ export function SortingScreen() {
               只看建议保留
             </Checkbox>
           </div>
-
-          {analysisError ? (
-            <div className="sorting__indexing">
-              <span className="field__error" role="alert" data-testid="sorting-analysis-error">
-                分析未能启动：{analysisError}
-              </span>
-            </div>
-          ) : null}
 
           {flowHints.length > 0 ? (
             <div className="sorting__indexing" data-testid="sorting-flow-hints">

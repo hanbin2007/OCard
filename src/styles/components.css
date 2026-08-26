@@ -1352,7 +1352,9 @@
    右下是全 App 主动作密度最低的角落,且容器 pointer-events:none,
    只有卡片本身可点,空白区域绝不挡内容 */
 .toasts {
-  position: absolute;
+  /* fixed + 挂在 .shell 层:不受 .main 的 inert/overflow 影响,
+     会话门开着时 error toast 依然可确认(评审 P1) */
+  position: fixed;
   bottom: var(--space-3);
   right: var(--space-3);
   width: min(380px, calc(100% - var(--space-6)));

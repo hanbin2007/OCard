@@ -185,21 +185,31 @@ pub fn scan(nas_root: &Path) -> Result<CatalogScan> {
         // 读失败进 warnings(零静默),清单按「未配置」处理。
         let card_roster: Option<Vec<String>> = match crate::core::journal::read_all(&path) {
             Ok(read) => {
+                // 半损也要出声:最新的清单设定可能恰好在坏行里(零静默铁律)
+                if read.skipped_lines > 0 || read.unreadable_files > 0 {
+                    out.warnings.push(format!(
+                        "项目「{folder}」日志有损坏数据(跳过 {} 行、{} 个文件),用卡清单可能不完整",
+                        read.skipped_lines, read.unreadable_files
+                    ));
+                }
                 let mut roster: Option<Vec<String>> = None;
                 for ev in &read.events {
                     match ev.kind.as_str() {
                         crate::core::journal::kind::PROJECT_CARDS_SET => {
-                            let ids: Vec<String> = ev
-                                .data
-                                .get("cardIds")
-                                .and_then(|v| v.as_array())
-                                .map(|a| {
-                                    a.iter()
-                                        .filter_map(|x| x.as_str().map(str::to_string))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            roster = Some(ids);
+                            // 载荷坏了 = 未知,不是空清单:跳过该事件并出声,
+                            // 保留上一次有效设定(未知折成零同样是假话)
+                            match ev.data.get("cardIds").and_then(|v| v.as_array()) {
+                                Some(a) => {
+                                    roster = Some(
+                                        a.iter()
+                                            .filter_map(|x| x.as_str().map(str::to_string))
+                                            .collect(),
+                                    );
+                                }
+                                None => out.warnings.push(format!(
+                                    "项目「{folder}」的用卡清单事件载荷损坏,已跳过该条设定"
+                                )),
+                            }
                         }
                         crate::core::journal::kind::PROJECT_CARD_USED => {
                             if let Some(id) = ev.data.get("cardId").and_then(|v| v.as_str()) {

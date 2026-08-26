@@ -154,7 +154,8 @@ describe("回收站", () => {
     await user.click(screen.getByTestId("trash-empty"));
     await user.click(screen.getByRole("button", { name: "永久删除" }));
 
-    const toast = await screen.findByTestId("notice-toasts");
+    // 文件还在、可重试 = warning 级(级别回归就是被不钉级别的断言漏掉的)
+    const toast = await screen.findByTestId("notice-toast-warning");
     expect(toast.textContent).toContain("2 个文件删除失败");
     expect(toast.textContent).toContain("已保留在回收站");
     empty.mockRestore();

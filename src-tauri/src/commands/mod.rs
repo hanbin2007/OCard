@@ -82,7 +82,8 @@ fn resolve_done_card_ids(
 
 fn project_dto(
     stats: &catalog::ProjectStats,
-    cards: &[registry::StorageCard],
+    // None = 登记表读取失败:x/y 报「未知」(字段缺席),不许把未知折成 0
+    cards: Option<&[registry::StorageCard]>,
     running: bool,
 ) -> ProjectDto {
     ProjectDto {
@@ -103,10 +104,18 @@ fn project_dto(
         },
         cards_copied: stats.cards_copied,
         copy_incomplete: stats.has_incomplete_copy,
-        card_roster_total: stats.card_roster.as_ref().map(|r| r.len()),
-        card_roster_done: stats.card_roster.as_ref().map(|roster| {
-            let done = resolve_done_card_ids(&stats.completed_sources, cards);
-            roster.iter().filter(|id| done.contains(*id)).count()
+        card_roster_total: cards.and_then(|cards| {
+            live_roster(stats, cards)
+                .filter(|r| !r.is_empty())
+                .map(|r| r.len())
+        }),
+        card_roster_done: cards.and_then(|cards| {
+            live_roster(stats, cards)
+                .filter(|r| !r.is_empty())
+                .map(|roster| {
+                    let done = resolve_done_card_ids(&stats.completed_sources, cards);
+                    roster.iter().filter(|id| done.contains(*id)).count()
+                })
         }),
         bytes_copied: stats.bytes_copied,
         asset_count: stats.asset_count,
@@ -220,21 +229,21 @@ pub fn list_projects<R: tauri::Runtime>(
     let cards = match registry::load(&nas) {
         Ok(load) => {
             notice_registry_health(&app, &load);
-            load.registry.cards
+            Some(load.registry.cards)
         }
         Err(e) => {
             notify::warn(
                 &app,
                 "volumes-registry-unavailable",
-                format!("登记表读取失败,用卡进度暂无法映射到登记卡: {e}"),
+                format!("登记表读取失败,用卡进度暂时显示为未知: {e}"),
             );
-            Vec::new()
+            None
         }
     };
     Ok(scan
         .projects
         .iter()
-        .map(|s| project_dto(s, &cards, running.contains(&s.folder_name)))
+        .map(|s| project_dto(s, cards.as_deref(), running.contains(&s.folder_name)))
         .collect())
 }
 
@@ -273,7 +282,7 @@ pub fn create_project<R: tauri::Runtime>(
     catalog::invalidate_cache(&nas);
     let stats = find_project(&nas, &root.file_name().unwrap().to_string_lossy())?;
     // 新建项目还没有用卡记录,登记卡表在映射里用不上,给空表即可
-    Ok(project_dto(&stats, &[], false))
+    Ok(project_dto(&stats, Some(&[]), false))
 }
 
 #[tauri::command]
@@ -414,9 +423,24 @@ pub(crate) fn match_card(
             });
         return (Some(hit.id.clone()), conflict);
     }
-    let label_hit = cards
+    let label_hits: Vec<&registry::StorageCard> = cards
         .iter()
-        .find(|c| c.label.eq_ignore_ascii_case(volume_name));
+        .filter(|c| c.label.eq_ignore_ascii_case(volume_name))
+        .collect();
+    if label_hits.len() > 1 {
+        let labels = label_hits
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect::<Vec<_>>()
+            .join("、");
+        return (
+            None,
+            Some(format!(
+                "卷「{volume_name}」按卷标能对上多张登记卡({labels}),无法确定是哪张,请为旧卡补绑指纹"
+            )),
+        );
+    }
+    let label_hit = label_hits.first().copied();
     // 卷带着未登记的指纹时,卷标兜底只许落在「从未绑定过指纹」的旧卡上:
     // 卷标对上的卡绑着**别的**指纹 = 克隆/换卡,静默配对会稳定认错(codex P1)
     if uid.is_some() {
@@ -452,6 +476,17 @@ pub fn create_storage_card<R: tauri::Runtime>(
     let reg = registry::load(&nas).map_err(err)?.registry;
     if !reg.cameras.iter().any(|c| c.id == input.camera_id) {
         return Err(format!("相机未登记: {}", input.camera_id));
+    }
+    // 标签唯一:卷名兜底匹配按标签认卡,重名会静默认错(评审 P2)
+    if reg
+        .cards
+        .iter()
+        .any(|c| c.label.eq_ignore_ascii_case(input.label.trim()))
+    {
+        return Err(format!(
+            "卡面标签「{}」已被另一张卡使用,请换一个可辨识的标签",
+            input.label.trim()
+        ));
     }
     let (volume_uid, capacity_bytes) = match &input.bind_mount_path {
         None => (None, input.capacity_bytes),
@@ -523,11 +558,26 @@ pub fn delete_storage_card<R: tauri::Runtime>(
 
 // ---------- 项目用卡(UX 波三:x/y 的真分母) ----------
 
+/// 清单里只认仍在登记表的卡:登记卡被注销后,项目 journal 里的旧 id
+/// 不许再撑大分母、也不许在面板露裸 id(评审 P1)。
+fn live_roster(
+    stats: &catalog::ProjectStats,
+    cards: &[registry::StorageCard],
+) -> Option<Vec<String>> {
+    stats.card_roster.as_ref().map(|roster| {
+        roster
+            .iter()
+            .filter(|id| cards.iter().any(|c| &c.id == *id))
+            .cloned()
+            .collect()
+    })
+}
+
 fn project_cards_dto(
     stats: &catalog::ProjectStats,
     cards: &[registry::StorageCard],
 ) -> ProjectCardsDto {
-    let roster = stats.card_roster.clone().unwrap_or_default();
+    let roster = live_roster(stats, cards).unwrap_or_default();
     let done = resolve_done_card_ids(&stats.completed_sources, cards);
     ProjectCardsDto {
         copied_card_ids: roster
@@ -561,18 +611,37 @@ pub fn set_project_cards<R: tauri::Runtime>(
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
     let cards = registry::load(&nas).map_err(err)?.registry.cards;
-    // 引用校验 + 去重保序:清单里的每张卡必须真实登记过
+    let existing: std::collections::HashSet<&String> = stats
+        .card_roster
+        .as_ref()
+        .map(|r| r.iter().collect())
+        .unwrap_or_default();
+    // 去重保序;引用校验只针对**新增**的 id——已在清单里但登记卡被注销的 id
+    // 静默剔除并可见告知,否则清单会被死 id 锁到只能整单重置(评审 P1)
     let mut seen = std::collections::HashSet::new();
     let mut ids: Vec<String> = Vec::new();
+    let mut dropped = 0usize;
     for id in card_ids {
-        if !cards.iter().any(|c| c.id == id) {
+        let registered = cards.iter().any(|c| c.id == id);
+        if !registered {
+            if existing.contains(&id) {
+                dropped += 1;
+                continue;
+            }
             return Err(format!("卡未登记,无法加入项目用卡清单: {id}"));
         }
         if seen.insert(id.clone()) {
             ids.push(id);
         }
     }
-    tasks::append_audit(
+    if dropped > 0 {
+        notify::warn(
+            &app,
+            "project-cards-pruned",
+            format!("清单中有 {dropped} 张卡的登记已被删除,已一并从用卡清单移除"),
+        );
+    }
+    let outcome = tasks::append_audit(
         &app,
         &stats.root,
         &state.config_dir,
@@ -583,6 +652,11 @@ pub fn set_project_cards<R: tauri::Runtime>(
             serde_json::json!({ "cardIds": ids }),
         ),
     );
+    // 这条事件是**配置**不是纯审计:没写进项目日志 = 清单没保存,
+    // outbox 里的副本不会被折叠读到,必须如实报失败(评审 P1)
+    if outcome != tasks::AuditWrite::Written {
+        return Err("用卡清单未能写入项目日志(NAS 可能不可达),本次修改未保存,请稍后重试".into());
+    }
     catalog::invalidate_cache(&nas);
     let stats = find_project(&nas, &project_id)?;
     Ok(project_cards_dto(&stats, &cards))

@@ -144,11 +144,13 @@ export function Shell() {
     >
       <Sidebar />
       <main className="main">
-        <NoticeToasts />
         <Routes />
       </main>
       <SettingsDialog />
       <SessionGuard />
+      {/* toast 必须在 .main 之外:会话门会把 .main 整体 inert,
+          挂在里面的 error toast 视觉在最上层却点不了、读屏也不播报(评审 P1) */}
+      <NoticeToasts />
     </div>
   );
 }

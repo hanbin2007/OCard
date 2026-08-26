@@ -3,6 +3,7 @@
 import { Checkbox } from "./controls";
 import { useEffect, useRef, useState } from "react";
 import * as api from "../api";
+import { useNotify } from "../state/store";
 import type { DeliveryStatus, FinalCutReport } from "../api/types";
 import { formatTimestamp } from "../lib/format";
 import { Badge } from "./ui";
@@ -153,8 +154,10 @@ export function FinalCutPanel({ projectId }: { projectId: string }) {
 
 /** 「已上传网盘」——OCard 不代传，只如实记录人工勾选 */
 export function DeliveryStatusToggle({ projectId }: { projectId: string }) {
+  const notify = useNotify();
   const [status, setStatus] = useState<DeliveryStatus | null>(null);
   const [busy, setBusy] = useState(false);
+  /** 轮询读取失败:留在字段旁(解释勾选为何不可用);写失败走 toast */
   const [error, setError] = useState<string | null>(null);
 
   /*
@@ -235,7 +238,12 @@ export function DeliveryStatusToggle({ projectId }: { projectId: string }) {
       setStatus(value);
     } catch (err) {
       if (mine !== issuedRef.current) return;
-      setError(err instanceof Error ? err.message : String(err));
+      // 提交后失败统一走 toast(UX 波三)
+      notify(
+        "error",
+        "delivery-status-save-failed",
+        `交付状态没有保存成功：${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       setBusy(false);
     }

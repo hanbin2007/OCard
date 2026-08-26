@@ -34,6 +34,8 @@ export function DevicesScreen() {
   /** 插卡绑定:选中的挂载路径("" = 不绑定) */
   const [bindMount, setBindMount] = useState("");
   const [bindRefreshing, setBindRefreshing] = useState(false);
+  /** 刷新后发现所选卷已拔出:系统改写了表单状态,必须贴着控件说(评审 P1) */
+  const [bindStale, setBindStale] = useState(false);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   /** 登记成功后的回执，避免「表单清空」被读成「没提交上」 */
   const [lastCamera, setLastCamera] = useState<string | null>(null);
@@ -67,7 +69,7 @@ export function DevicesScreen() {
       // 不许把过期路径提交给后端再靠"未挂载"报错兜底
       setBindMount((prev) => {
         if (prev && !next.some((v) => v.mountPath === prev)) {
-          notify("warning", "card-bind-stale", "之前选的卡已拔出,请重新选择要绑定的卡");
+          setBindStale(true);
           return "";
         }
         return prev;
@@ -307,6 +309,7 @@ export function DevicesScreen() {
                         value={bindMount}
                         onChange={(next) => {
                           setBindMount(next);
+                          setBindStale(false);
                           const vol = volumes.find((v) => v.mountPath === next);
                           if (vol) setCardLabel(vol.name);
                         }}
@@ -331,6 +334,11 @@ export function DevicesScreen() {
                       >
                         {bindRefreshing ? "刷新中…" : "刷新卷列表"}
                       </button>
+                      {bindStale ? (
+                        <span className="text-xs text-warn" role="alert">
+                          之前选的卡已拔出,请重新选择
+                        </span>
+                      ) : null}
                     </div>
 
                     <Field
