@@ -1,5 +1,6 @@
 /** 屏 3：设备登记（相机 → 实时编码预览；存储卡与相机关联）。 */
 
+import { Select } from "../components/controls";
 import { useMemo, useState } from "react";
 import * as api from "../api";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
@@ -29,6 +30,9 @@ export function DevicesScreen() {
   const [cardCapacity, setCardCapacity] = useState(512);
   const [cardSerial, setCardSerial] = useState("");
   const [cardSubmitted, setCardSubmitted] = useState(false);
+  /** 插卡绑定:选中的挂载路径("" = 不绑定) */
+  const [bindMount, setBindMount] = useState("");
+  const [bindRefreshing, setBindRefreshing] = useState(false);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   /** 删除失败必须说出来——不能乐观移除后让界面谎报成功 */
@@ -51,6 +55,24 @@ export function DevicesScreen() {
       ),
     [model, position, alias, note, cameras, code],
   );
+
+  const { volumes } = state;
+  const boundVolume = volumes.find((v) => v.mountPath === bindMount) ?? null;
+
+  /** 卷列表可能是启动时拉的旧账:绑定前给个手动刷新 */
+  async function refreshBindVolumes() {
+    setBindRefreshing(true);
+    try {
+      const next = await api.listVolumes();
+      dispatch({ type: "volumesUpdated", volumes: next });
+    } catch (err) {
+      setSubmitError(
+        `刷新卷列表失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setBindRefreshing(false);
+    }
+  }
 
   const cardCountByCamera = useMemo(() => {
     const map = new Map<string, number>();
@@ -96,13 +118,16 @@ export function DevicesScreen() {
       const card = await api.createStorageCard({
         label: cardLabel,
         cameraId: cardCameraId,
-        capacityBytes: cardCapacity * GB,
+        // 绑定时容量取真实卷容量,不用档位近似值
+        capacityBytes: boundVolume ? boundVolume.capacityBytes : cardCapacity * GB,
         serial: cardSerial,
+        ...(bindMount ? { bindMountPath: bindMount } : {}),
       });
       dispatch({ type: "cardCreated", card });
       setLastCard(card.label);
       setCardLabel("");
       setCardSerial("");
+      setBindMount("");
       setCardSubmitted(false);
       setSubmitError(null);
     } catch (err) {
@@ -262,6 +287,50 @@ export function DevicesScreen() {
                       void addCard();
                     }}
                   >
+                    {/* 插卡绑定(推荐):不绑物理卡,之后只能靠「卷标==标签」认卡,
+                        改卷标/同名卡都会认错(用户指正的登记盲区)。绑定 =
+                        当场在卡根写身份指纹,今后凭指纹强匹配 */}
+                    <Field
+                      label="绑定已插入的卡(推荐)"
+                      htmlFor="card-bind"
+                      hint={
+                        bindMount
+                          ? "登记时会在这张卡上写入身份指纹,今后凭指纹认卡"
+                          : "插入卡并选择后,凭指纹强匹配;不绑定则只按卷标弱匹配"
+                      }
+                    >
+                      <div className="row-inline">
+                        <Select
+                          id="card-bind"
+                          testId="card-bind"
+                          value={bindMount}
+                          onChange={(next) => {
+                            setBindMount(next);
+                            const vol = volumes.find((v) => v.mountPath === next);
+                            if (vol) setCardLabel(vol.name);
+                          }}
+                          options={[
+                            { value: "", label: "不绑定(手工登记)" },
+                            ...volumes
+                              .filter((v) => !v.isSystem)
+                              .map((v) => ({
+                                value: v.mountPath,
+                                label: `${v.name}（${v.mountPath} · ${formatBytes(v.capacityBytes, 0)}）`,
+                              })),
+                          ]}
+                        />
+                        <button
+                          type="button"
+                          className="btn btn--sm"
+                          data-testid="card-bind-refresh"
+                          disabled={bindRefreshing}
+                          onClick={() => void refreshBindVolumes()}
+                        >
+                          {bindRefreshing ? "…" : "刷新"}
+                        </button>
+                      </div>
+                    </Field>
+
                     <Field
                       label="卡面标签"
                       htmlFor="card-label"
@@ -286,35 +355,43 @@ export function DevicesScreen() {
                         cardSubmitted && !cardCameraId ? "请选择所属相机" : undefined
                       }
                     >
-                      <select
+                      <Select
                         id="card-camera"
-                        className="select"
                         value={cardCameraId}
-                        onChange={(e) => setCardCameraId(e.currentTarget.value)}
-                      >
-                        <option value="">请选择…</option>
-                        {cameras.map((camera) => (
-                          <option key={camera.id} value={camera.id}>
-                            {camera.model} · {camera.code}
-                          </option>
-                        ))}
-                      </select>
+                        onChange={setCardCameraId}
+                        options={cameras.map((camera) => ({
+                          value: camera.id,
+                          label: `${camera.model} · ${camera.code}`,
+                        }))}
+                      />
                     </Field>
 
                     <div className="form-grid form-grid--2">
-                      <Field label="容量" htmlFor="card-capacity">
-                        <select
-                          id="card-capacity"
-                          className="select"
-                          value={cardCapacity}
-                          onChange={(e) => setCardCapacity(Number(e.currentTarget.value))}
-                        >
-                          {CAPACITY_OPTIONS.map((size) => (
-                            <option key={size} value={size}>
-                              {size} GB
-                            </option>
-                          ))}
-                        </select>
+                      <Field
+                        label="容量"
+                        htmlFor="card-capacity"
+                        hint={boundVolume ? "由所绑卡自动带出" : undefined}
+                      >
+                        {boundVolume ? (
+                          <input
+                            id="card-capacity"
+                            className="input input--mono"
+                            type="text"
+                            readOnly
+                            disabled
+                            value={formatBytes(boundVolume.capacityBytes, 0)}
+                          />
+                        ) : (
+                          <Select
+                            id="card-capacity"
+                            value={String(cardCapacity)}
+                            onChange={(next) => setCardCapacity(Number(next))}
+                            options={CAPACITY_OPTIONS.map((size) => ({
+                              value: String(size),
+                              label: `${size} GB`,
+                            }))}
+                          />
+                        )}
                       </Field>
 
                       <Field label="序列号" htmlFor="card-serial">
@@ -438,8 +515,17 @@ export function DevicesScreen() {
                     const camera = cameras.find((c) => c.id === card.cameraId);
                     return (
                       <div className="list__row cards__row" key={card.id}>
-                        <span>
+                        <span className="row-inline">
                           <Badge mono>{card.label}</Badge>
+                          {card.volumeUid ? (
+                            <span title="登记时已绑定物理卡,凭指纹强匹配">
+                              <Badge tone="ok">指纹</Badge>
+                            </span>
+                          ) : (
+                            <span title="未绑定物理卡,只能按卷标弱匹配">
+                              <Badge tone="warn">卷标</Badge>
+                            </span>
+                          )}
                         </span>
                         <span className="projects__name truncate">
                           {camera?.model ?? "未关联"}

@@ -192,7 +192,7 @@ export function createProject(input: NewProjectInput): Promise<Project> {
     relativePath: folderName,
     status: "draft",
     cardsCopied: 0,
-    cardsTotal: 0,
+    copyIncomplete: false,
     bytesCopied: 0,
     assetCount: 0,
     sortedCount: 0,
@@ -255,6 +255,7 @@ export function createStorageCard(
     cameraId: input.cameraId,
     capacityBytes: input.capacityBytes,
     serial: input.serial?.trim() || undefined,
+    volumeUid: input.bindMountPath ? nextId("uid") : undefined,
     createdAt: new Date().toISOString(),
   };
   return reply(card);

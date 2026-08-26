@@ -212,10 +212,11 @@ export function Sidebar() {
                     ? "交付打包进行中，完成后才能切换项目"
                     : undefined
                 }
-                onClick={() => {
-                  dispatch({ type: "selectProject", projectId: project.id });
-                  dispatch({ type: "navigate", route: "projects" });
-                }}
+                /* 只换当前项目,不换页面:在拷卡/分类屏切项目就是想
+                   在当前屏操作另一个项目,跳回项目列表是打断(用户反馈) */
+                onClick={() =>
+                  dispatch({ type: "selectProject", projectId: project.id })
+                }
               >
                 <span className="sidebar__project-name">{project.name}</span>
                 <span className="sidebar__project-meta">

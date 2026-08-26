@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api";
 import App from "../App";
-import { mockCameras, mockStorageCards } from "../api/mock";
+import { mockCameras, mockStorageCards, mockVolumes } from "../api/mock";
 
 afterEach(cleanup);
 
@@ -189,5 +189,61 @@ describe("设备登记", () => {
 
     const alerts = screen.getAllByRole("alert").map((el) => el.textContent);
     expect(alerts).toContain("请选择所属相机");
+  });
+});
+
+describe("插卡绑定登记(UX 波二)", () => {
+  it("选择已插入的卷:预填卡面标签,提交带 bindMountPath 与真实容量", async () => {
+    const spy = vi.spyOn(api, "createStorageCard");
+    const user = userEvent.setup();
+    render(
+      <App
+        preloaded={{ ...preloaded, volumes: mockVolumes, cameras: mockCameras }}
+      />,
+    );
+
+    await user.click(screen.getByTestId("card-bind"));
+    await user.click(
+      screen.getByRole("option", { name: /SONY_A7M4/ }),
+    );
+    // 卷名预填为卡面标签
+    expect((screen.getByLabelText("卡面标签") as HTMLInputElement).value).toBe(
+      "SONY_A7M4",
+    );
+
+    // 选相机后提交
+    await user.click(document.getElementById("card-camera") as HTMLElement);
+    await user.click(screen.getAllByRole("option")[0]);
+    await user.click(screen.getByRole("button", { name: "登记存储卡" }));
+
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    const input = spy.mock.calls[0][0];
+    expect(input.bindMountPath).toBe("/Volumes/SONY_A7M4");
+    expect(input.capacityBytes).toBe(512 * 1024 ** 3);
+    spy.mockRestore();
+  });
+
+  it("系统盘不出现在可绑定卷里", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={{ ...preloaded, volumes: mockVolumes }} />);
+    await user.click(screen.getByTestId("card-bind"));
+    expect(screen.queryByRole("option", { name: /Macintosh HD/ })).toBeNull();
+  });
+
+  it("已绑定指纹的卡在列表带「指纹」徽标,未绑定带「卷标」", () => {
+    render(
+      <App
+        preloaded={{
+          ...preloaded,
+          cameras: mockCameras,
+          cards: [
+            { ...mockStorageCards[0], volumeUid: "uid-1" },
+            mockStorageCards[1],
+          ],
+        }}
+      />,
+    );
+    expect(screen.getAllByText("指纹")).toHaveLength(1);
+    expect(screen.getAllByText("卷标").length).toBeGreaterThan(0);
   });
 });

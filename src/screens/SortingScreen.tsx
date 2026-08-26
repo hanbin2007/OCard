@@ -15,6 +15,7 @@ import { DeliveryButton } from "../components/DeliveryPanel";
 import { TopBar } from "../components/TopBar";
 import { Badge, EmptyState, Kbd, ProgressBar, PulseValue } from "../components/ui";
 import { VirtualGrid } from "../components/VirtualGrid";
+import { Checkbox } from "../components/controls";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import { withViewTransition } from "../lib/motion";
 import {
@@ -883,15 +884,14 @@ export function SortingScreen() {
               </button>
             ))}
 
-            <label className="row-inline text-xs push-right">
-              <input
-                type="checkbox"
-                data-testid="sorting-suggestion-filter"
-                checked={suggestionOnly}
-                onChange={(e) => setSuggestionOnly(e.currentTarget.checked)}
-              />
+            <Checkbox
+              className="push-right text-xs"
+              testId="sorting-suggestion-filter"
+              checked={suggestionOnly}
+              onChange={setSuggestionOnly}
+            >
               只看建议保留
-            </label>
+            </Checkbox>
           </div>
 
           {analysisError ? (

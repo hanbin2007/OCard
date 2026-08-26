@@ -33,6 +33,10 @@ pub struct StorageCard {
     pub capacity_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serial: Option<String>,
+    /// 卡上 `.ocard-volume-id` 指纹(登记时插卡绑定写入)。有它 = 强身份匹配;
+    /// 没有 = 只能按卷标弱匹配(改卷标/同名卡都会认错,用户指正的登记盲区)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_uid: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -118,6 +122,8 @@ pub fn delete_camera(
     })
 }
 
+// 登记参数本就是一张表单的字段集,拆结构体徒增一层搬运
+#[allow(clippy::too_many_arguments)]
 pub fn register_card(
     nas_root: &Path,
     machine: &str,
@@ -126,6 +132,7 @@ pub fn register_card(
     camera_id: &str,
     capacity_bytes: u64,
     serial: Option<String>,
+    volume_uid: Option<String>,
 ) -> Result<StorageCard> {
     if label.trim().is_empty() {
         return Err(CoreError::Invalid("卡标签不能为空".into()));
@@ -145,6 +152,7 @@ pub fn register_card(
         camera_id: camera_id.to_string(),
         capacity_bytes,
         serial,
+        volume_uid,
         created_at: Utc::now(),
     };
     let ev = Event::new(
@@ -248,6 +256,7 @@ mod tests {
             &cam.id,
             128_000_000_000,
             None,
+            None,
         )
         .unwrap();
 
@@ -260,7 +269,8 @@ mod tests {
     fn delete_removes_from_fold() {
         let tmp = tempdir().unwrap();
         let cam = register_camera(tmp.path(), "m1", "ZS", "A7M4", "A", "ZS", None).unwrap();
-        let card = register_card(tmp.path(), "m2", "LQ", "SD-01", &cam.id, 64_000, None).unwrap();
+        let card =
+            register_card(tmp.path(), "m2", "LQ", "SD-01", &cam.id, 64_000, None, None).unwrap();
         delete_camera(tmp.path(), "m2", "LQ", &cam.id).unwrap();
         delete_card(tmp.path(), "m1", "ZS", &card.id).unwrap();
 
@@ -270,10 +280,31 @@ mod tests {
     }
 
     #[test]
+    fn volume_uid_persists_through_fold() {
+        // 插卡绑定写入的指纹必须在折叠后还在——匹配靠它做强身份
+        let tmp = tempdir().unwrap();
+        let cam = register_camera(tmp.path(), "m1", "ZS", "A7M4", "A", "ZS", None).unwrap();
+        let card = register_card(
+            tmp.path(),
+            "m1",
+            "ZS",
+            "SD-09",
+            &cam.id,
+            64_000,
+            None,
+            Some("uid-1234".into()),
+        )
+        .unwrap();
+        assert_eq!(card.volume_uid.as_deref(), Some("uid-1234"));
+        let reg = load(tmp.path()).unwrap().registry;
+        assert_eq!(reg.cards[0].volume_uid.as_deref(), Some("uid-1234"));
+    }
+
+    #[test]
     fn validation_errors() {
         let tmp = tempdir().unwrap();
         assert!(register_camera(tmp.path(), "m", "o", "A7M4", "AB", "ZS", None).is_err());
         assert!(register_camera(tmp.path(), "m", "o", "A7M4", "1", "ZS", None).is_err());
-        assert!(register_card(tmp.path(), "m", "o", "  ", "cid", 1, None).is_err());
+        assert!(register_card(tmp.path(), "m", "o", "  ", "cid", 1, None, None).is_err());
     }
 }

@@ -11,7 +11,7 @@ import { TopBar } from "../components/TopBar";
 import { ProgressRing } from "../components/charts";
 import { Badge, EmptyState, Kbd, ProgressBar } from "../components/ui";
 import { useListNavigation } from "../hooks/useListNavigation";
-import { formatBytes, formatCompactDate, formatTimestamp, ratio } from "../lib/format";
+import { formatBytes, formatCompactDate, formatTimestamp } from "../lib/format";
 import { buildFolderTree, countFolders } from "../lib/folderTree";
 import {
   PROJECT_STATUS_LABEL,
@@ -103,28 +103,30 @@ export function ProjectsScreen() {
                       </span>
 
                       <span className="projects__cell projects__cell--mono">
-                        {project.cardsCopied}/{project.cardsTotal} 张
-                        <span className="projects__folder">
-                          {formatBytes(project.bytesCopied)}
-                        </span>
+                        {/* 只报事实:已拷 N 张(+未完成标记)。不存在「计划总数」,
+                            此前 x/y 的分母是任务数自我计数,是假进度(用户指正) */}
+                        {project.cardsCopied} 张
+                        {project.copyIncomplete ? (
+                          <span className="projects__folder text-warn">有未完成任务</span>
+                        ) : (
+                          <span className="projects__folder">
+                            {formatBytes(project.bytesCopied)}
+                          </span>
+                        )}
                       </span>
 
                       <span className="projects__meter">
-                        <ProgressBar
-                          value={
-                            project.scenario === "B"
-                              ? project.sortedCount
-                              : project.cardsCopied
-                          }
-                          total={
-                            project.scenario === "B"
-                              ? project.assetCount
-                              : project.cardsTotal
-                          }
-                          tone={project.status === "done" ? "ok" : "accent"}
-                          thin
-                          decorative
-                        />
+                        {/* 进度条只画有真实分母的量(工况 B 的分类进度);
+                            工况 A 没有可信总量,不画假条 */}
+                        {project.scenario === "B" ? (
+                          <ProgressBar
+                            value={project.sortedCount}
+                            total={project.assetCount}
+                            tone={project.status === "done" ? "ok" : "accent"}
+                            thin
+                            decorative
+                          />
+                        ) : null}
                         <span className="projects__cell text-xs">
                           {progressLabel(
                             project.scenario,
@@ -251,20 +253,20 @@ export function ProjectsScreen() {
 
                       <div className="stack stack--sm">
                         <div className="row-inline">
-                          <span className="text-xs dim">拷卡进度</span>
+                          <span className="text-xs dim">拷卡</span>
                           <span className="text-xs mono muted push-right">
-                            {selected.cardsCopied}/{selected.cardsTotal} 张 ·{" "}
-                            {Math.round(ratio(selected.cardsCopied, selected.cardsTotal) * 100)}%
+                            已拷 {selected.cardsCopied} 张 ·{" "}
+                            {formatBytes(selected.bytesCopied)}
                           </span>
                         </div>
-                        <ProgressBar
-                          value={selected.cardsCopied}
-                          total={selected.cardsTotal}
-                          tone={
-                            selected.cardsCopied === selected.cardsTotal ? "ok" : "accent"
-                          }
-                          label="拷卡进度"
-                        />
+                        {selected.copyIncomplete ? (
+                          <span
+                            className="text-xs text-warn"
+                            data-testid="project-copy-incomplete"
+                          >
+                            有已发起但未完成的拷卡任务,可在「拷卡任务」里续传
+                          </span>
+                        ) : null}
                       </div>
 
                       {/* 分类进度只在工况 B 有意义，且拷入素材前的 0% 是噪音不是信息 */}

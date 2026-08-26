@@ -16,7 +16,9 @@ pub struct ProjectDto {
     pub relative_path: String,
     pub status: &'static str,
     pub cards_copied: usize,
-    pub cards_total: usize,
+    /// 有已发起但未完成的拷卡任务。注意:不存在「计划卡总数」——现场用几张卡
+    /// 事先不可知,此前用任务数冒充总数是自我计数的假进度(用户指正)。
+    pub copy_incomplete: bool,
     pub bytes_copied: u64,
     pub asset_count: usize,
     pub sorted_count: usize,
@@ -61,6 +63,10 @@ pub struct NewStorageCardInput {
     pub capacity_bytes: u64,
     #[serde(default)]
     pub serial: Option<String>,
+    /// 插卡绑定:当前挂载的卷路径。传入时当场在卡根写 `.ocard-volume-id`
+    /// 指纹并存入登记表(强身份);不传 = 仅卷标弱匹配。
+    #[serde(default)]
+    pub bind_mount_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

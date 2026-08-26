@@ -1,5 +1,6 @@
 /** 成片命名校验（工况 A，PRD §5.8）+ 交付状态勾选（PRD §5.7）。 */
 
+import { Checkbox } from "./controls";
 import { useEffect, useRef, useState } from "react";
 import * as api from "../api";
 import type { DeliveryStatus, FinalCutReport } from "../api/types";
@@ -242,16 +243,14 @@ export function DeliveryStatusToggle({ projectId }: { projectId: string }) {
 
   return (
     <div className="stack stack--sm" data-testid="delivery-status">
-      <label className="row-inline text-sm">
-        <input
-          type="checkbox"
-          data-testid="delivery-uploaded"
-          checked={status?.uploaded ?? false}
-          disabled={busy || status === null}
-          onChange={(e) => void toggle(e.currentTarget.checked)}
-        />
+      <Checkbox
+        testId="delivery-uploaded"
+        checked={status?.uploaded ?? false}
+        disabled={busy || status === null}
+        onChange={(next) => void toggle(next)}
+      >
         已上传网盘（人工完成，OCard 只记录状态）
-      </label>
+      </Checkbox>
       {status?.updatedAt ? (
         <span className="text-2xs dim" data-testid="delivery-status-meta">
           {status.updatedBy ?? "未知"} · {formatTimestamp(status.updatedAt)}

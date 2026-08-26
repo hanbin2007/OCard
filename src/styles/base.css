@@ -114,24 +114,14 @@ kbd,
   font-variant-ligatures: none;
 }
 
-/* 滚动条：细、无存在感 */
-::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-::-webkit-scrollbar-thumb {
-  background: var(--border-strong);
-  border: 3px solid var(--bg);
-  border-radius: var(--radius-pill);
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: var(--border-focus);
+/* 滚动条:细、无存在感。
+   必须用标准属性而不是 ::-webkit-scrollbar 伪元素——WebKit 里 legacy
+   滚动条样式会把滚动容器踢出合成器异步滚动路径,退回主线程滚动:
+   触控板弹性回弹消失、主线程忙时内容跳变、滚动条滞后于内容(实测三症状
+   同源)。scrollbar-width/scrollbar-color 走标准通道,不碰滚动路径。 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
 }
 
 ::selection {

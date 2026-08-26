@@ -87,8 +87,7 @@ fn project_dto(stats: &catalog::ProjectStats, running: bool) -> ProjectDto {
             "draft"
         },
         cards_copied: stats.cards_copied,
-        // 口径:本项目已发起拷卡的任务数(评审 M15/P2-16;项目级卡登记未建模,不冒充全局数)
-        cards_total: stats.manifest_count,
+        copy_incomplete: stats.has_incomplete_copy,
         bytes_copied: stats.bytes_copied,
         asset_count: stats.asset_count,
         sorted_count: 0,
@@ -343,6 +342,27 @@ pub fn create_storage_card<R: tauri::Runtime>(
     state: State<AppState>,
     input: NewStorageCardInput,
 ) -> CmdResult<registry::StorageCard> {
+    // 插卡绑定(用户指正的登记盲区):不绑物理卡,之后只能靠「卷标==卡标签」
+    // 弱匹配认卡。绑定 = 校验该卷确实挂载中 → 当场在卡根写身份指纹 → uid 入表。
+    let volume_uid = match &input.bind_mount_path {
+        None => None,
+        Some(raw) => {
+            let mount = PathBuf::from(raw);
+            let mounted = volumes::list_volumes()
+                .into_iter()
+                .find(|v| v.mount_point == mount)
+                .ok_or_else(|| format!("要绑定的卷未挂载: {raw}"))?;
+            if mounted.system {
+                return Err(format!("拒绝绑定系统内置盘: {raw}"));
+            }
+            let uid = volumes::ensure_volume_uid(&mount).ok_or_else(|| {
+                format!(
+                    "无法在卡上写入身份指纹(卡可能写保护或只读): {raw}。                     解除写保护后重试,或改用「不绑定」登记(退化为卷标匹配)"
+                )
+            })?;
+            Some(uid)
+        }
+    };
     registry::register_card(
         &nas_root(&app, &state)?,
         &state.machine_id,
@@ -351,6 +371,7 @@ pub fn create_storage_card<R: tauri::Runtime>(
         &input.camera_id,
         input.capacity_bytes,
         input.serial,
+        volume_uid,
     )
     .map_err(err)
 }
@@ -398,9 +419,14 @@ pub fn list_volumes<R: tauri::Runtime>(
     volumes::list_volumes()
         .into_iter()
         .map(|v| {
-            let matched = cards
-                .iter()
-                .find(|c| c.label.eq_ignore_ascii_case(&v.name))
+            // 指纹优先:卡根 `.ocard-volume-id` 与登记表 volume_uid 对上 = 强匹配;
+            // 读不到指纹或没登记 uid 时退回卷标弱匹配(改卷标/同名卡会认错,
+            // 由登记时的绑定引导逐步收敛)
+            let uid = volumes::read_volume_uid(&v.mount_point);
+            let matched = uid
+                .as_deref()
+                .and_then(|u| cards.iter().find(|c| c.volume_uid.as_deref() == Some(u)))
+                .or_else(|| cards.iter().find(|c| c.label.eq_ignore_ascii_case(&v.name)))
                 .map(|c| c.id.clone());
             VolumeDto {
                 id: v.mount_point.display().to_string(),

@@ -97,8 +97,17 @@ export function VirtualGrid<T>({
    * 不会排队——滚动天然是可中断的。
    * 减少动效时退回瞬时定位（见 scrollElementTo）。
    */
+  // 只在焦点下标真的变了时才滚动定位。此前把 viewport.height/columns 也当
+  // 触发条件:工具条换行、滚动条出没等布局抖动都会把用户手上的滚动位置
+  // 拽回焦点格——触控板滚动中途"跳变"的来源之一(UX 波二)。
+  const lastScrolledIndexRef = useRef<number | null>(null);
   useEffect(() => {
-    if (scrollToIndex == null || scrollToIndex < 0) return;
+    if (scrollToIndex == null || scrollToIndex < 0) {
+      lastScrolledIndexRef.current = null;
+      return;
+    }
+    if (scrollToIndex === lastScrolledIndexRef.current) return;
+    lastScrolledIndexRef.current = scrollToIndex;
     const el = viewportRef.current;
     if (!el) return;
     const row = Math.floor(scrollToIndex / columns);

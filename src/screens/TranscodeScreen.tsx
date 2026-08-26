@@ -5,6 +5,7 @@ import * as api from "../api";
 import type { ArchiveTier, FfmpegStatus, TranscodeJob } from "../api/types";
 import { isArchiveResult, isJobTerminal } from "../api/types";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
+import { Checkbox } from "../components/controls";
 import { PathField } from "../components/PathField";
 import { TopBar } from "../components/TopBar";
 import { Badge, EmptyState, Field, ProgressBar } from "../components/ui";
@@ -281,17 +282,15 @@ export function TranscodeScreen() {
               </div>
               <div className="card__body">
                 <div className="stack stack--lg">
-                  <label className="row-inline text-sm">
-                    <input
-                      type="checkbox"
-                      data-testid="transcode-force-all"
-                      checked={forceAll}
-                      disabled={working || ffmpegMissing}
-                      onChange={(e) => setForceAll(e.currentTarget.checked)}
-                    />
+                  <Checkbox
+                    testId="transcode-force-all"
+                    checked={forceAll}
+                    disabled={working || ffmpegMissing}
+                    onChange={setForceAll}
+                  >
                     强制全转（忽略「高负载」判定，把所有素材纳入；
                     <strong>不会</strong>重转已经有代理的素材）
-                  </label>
+                  </Checkbox>
 
                   <div className="row-inline">
                     <button

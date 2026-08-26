@@ -595,3 +595,21 @@ describe("源卷过滤与刷新(UX 波)", () => {
     spy.mockRestore();
   });
 });
+
+describe("侧栏切项目不换页(UX 波二)", () => {
+  it("在拷卡屏点侧栏最近项目:项目切换,页面留在拷卡", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+    await screen.findAllByText("SONY_A7M4");
+
+    // 侧栏最近项目里点第二个项目
+    const sideButtons = screen.getAllByText(mockProjects[1].name);
+    await user.click(sideButtons[0]);
+
+    // 仍在拷卡任务屏(源卷区还在),但当前项目已变
+    expect(screen.getByTestId("copy-volume-select")).toBeDefined();
+    expect(screen.getByTestId("current-project-chip").textContent).toContain(
+      mockProjects[1].name,
+    );
+  });
+});

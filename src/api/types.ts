@@ -35,8 +35,8 @@ export interface Project {
   status: ProjectStatus;
   /** 已拷卡张数 */
   cardsCopied: number;
-  /** 本项目登记的卡总数 */
-  cardsTotal: number;
+  /** 有已发起但未完成的拷卡任务(不存在「计划卡总数」,任务数冒充总数是假进度) */
+  copyIncomplete: boolean;
   /** 已拷入容量 */
   bytesCopied: number;
   /** 素材总数 */
@@ -97,6 +97,8 @@ export interface StorageCard {
   capacityBytes: number;
   /** 卡序列号（可读到时由卷信息带出） */
   serial?: string;
+  /** 登记时插卡绑定写入的身份指纹;有它 = 凭指纹强匹配,没有 = 仅卷标弱匹配 */
+  volumeUid?: string;
   createdAt: string;
 }
 
@@ -105,6 +107,8 @@ export interface NewStorageCardInput {
   cameraId: string;
   capacityBytes: number;
   serial?: string;
+  /** 插卡绑定:当前挂载的卷路径,后端当场在卡根写指纹并存入登记表 */
+  bindMountPath?: string;
 }
 
 /** 可移动卷（读卡器插入的卡）（PRD §6.5） */

@@ -899,8 +899,10 @@
 .dialog {
   width: 100%;
   max-width: 420px;
-  /* body 已全局禁滚:矮窗口下超高的对话框必须自己能滚,否则内容彻底不可达 */
-  max-height: calc(100dvh - var(--space-8));
+  /* body 已全局禁滚:超窗对话框必须自己收缩+内部滚,否则内容彻底不可达。
+     100% 按 overlay 的网格区结算(overlay 是 fixed inset:0 加内边距),
+     任何窗口尺寸都自动贴合——比 dvh 减常数更不容易和 padding 漂移打架 */
+  max-height: 100%;
   overflow-y: auto;
   padding: var(--space-5);
   border: 1px solid var(--border-strong);
@@ -1647,4 +1649,171 @@
   font-size: var(--text-2xs);
   font-weight: var(--weight-semibold);
   white-space: nowrap;
+}
+
+/* ---------- 自绘勾选框(UX 波二) ---------- */
+
+.checkbox {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+
+.checkbox--disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.checkbox__control {
+  position: relative;
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  /* 与首行文字光学对齐 */
+  margin-top: 2px;
+}
+
+/* 真 input 铺满方块:命中区/焦点/键盘全走原生 */
+.checkbox__control input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: inherit;
+}
+
+.checkbox__box {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--field);
+  color: var(--on-accent);
+  pointer-events: none;
+  transition:
+    background var(--dur-micro) var(--ease-out),
+    border-color var(--dur-micro) var(--ease-out);
+}
+
+.checkbox__control input:hover:not(:disabled) + .checkbox__box {
+  border-color: var(--border-focus);
+}
+
+.checkbox__control input:checked + .checkbox__box {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.checkbox__control input:focus-visible + .checkbox__box {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.checkbox__mark {
+  width: 10px;
+  height: 8px;
+  opacity: 0;
+  transform: scale(0.6);
+  transition:
+    opacity var(--dur-micro) var(--ease-out),
+    transform var(--dur-spring-fast) var(--spring);
+}
+
+.checkbox__control input:checked + .checkbox__box .checkbox__mark {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.checkbox__label {
+  min-width: 0;
+}
+
+/* ---------- 自绘下拉(UX 波二) ---------- */
+
+/* 触发器复用 .select 的底/边/箭头;按钮语义补齐文本对齐 */
+.select--trigger {
+  display: inline-flex;
+  align-items: center;
+  text-align: left;
+  cursor: pointer;
+}
+
+.select--trigger:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.select--invalid,
+.select--invalid:hover {
+  border-color: var(--danger);
+}
+
+.select__value {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.select__value--empty {
+  color: var(--text-tertiary);
+}
+
+/* 浮层:portal 到 body,fixed 定位;高于普通浮层(可出现在 dialog 里),
+   低于会话门 —— 层级关系由 stacking.test 钉住 */
+.select-pop {
+  position: fixed;
+  z-index: 70;
+  margin: 0;
+  padding: var(--space-1);
+  list-style: none;
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--panel-raised);
+  /* 浮层层级允许克制阴影(与 dialog 同白名单) */
+  box-shadow: var(--shadow-overlay);
+  animation: select-pop-in var(--dur-spring-fast) var(--spring);
+}
+
+@keyframes select-pop-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, -4px, 0);
+  }
+}
+
+.select-pop__option {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.select-pop__option[data-active="true"] {
+  background: var(--hover);
+}
+
+.select-pop__option[aria-selected="true"] {
+  font-weight: var(--weight-medium);
+}
+
+.select-pop__check {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 8px;
+  margin-left: auto;
+  color: var(--accent);
+}
+
+/* 警示语气文字(黄):用于「有未完成任务」这类需要注意但非错误的事实 */
+.text-warn {
+  color: var(--warn);
 }

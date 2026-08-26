@@ -9,6 +9,7 @@ import type {
   StartCopyInput,
 } from "../api/types";
 import { SpeedSparkline, useSpeedSamples } from "../components/charts";
+import { Checkbox, Select } from "../components/controls";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { IconPlus, IconRetry, IconTrash } from "../components/Icon";
 import { PathField } from "../components/PathField";
@@ -626,20 +627,17 @@ export function CopyTaskScreen() {
                             </p>
                           ) : null}
                         </div>
-                        <label className="row-inline text-xs dim">
-                          <input
-                            type="checkbox"
-                            data-testid="volumes-hide-system"
-                            checked={!showSystemVolumes}
-                            onChange={(e) =>
-                              setShowSystemVolumes(!e.currentTarget.checked)
-                            }
-                          />
+                        <Checkbox
+                          className="text-xs dim"
+                          testId="volumes-hide-system"
+                          checked={!showSystemVolumes}
+                          onChange={(next) => setShowSystemVolumes(!next)}
+                        >
                           忽略系统内置盘
                           {!showSystemVolumes && hiddenSystemCount > 0
                             ? `（已隐藏 ${hiddenSystemCount} 个）`
                             : ""}
-                        </label>
+                        </Checkbox>
                         {submitted && validation.errors.volumeId ? (
                           <span className="field__error" role="alert">
                             {validation.errors.volumeId}
@@ -652,20 +650,16 @@ export function CopyTaskScreen() {
                         htmlFor="copy-camera"
                         error={submitted ? validation.errors.cameraId : undefined}
                       >
-                        <select
+                        <Select
                           id="copy-camera"
-                          data-testid="copy-camera-select"
-                          className="select"
+                          testId="copy-camera-select"
                           value={cameraId}
-                          onChange={(e) => setCameraId(e.currentTarget.value)}
-                        >
-                          <option value="">请选择…</option>
-                          {cameras.map((c) => (
-                            <option key={c.id} value={c.id}>
-                              {c.model} · {c.code}
-                            </option>
-                          ))}
-                        </select>
+                          onChange={setCameraId}
+                          options={cameras.map((c) => ({
+                            value: c.id,
+                            label: `${c.model} · ${c.code}`,
+                          }))}
+                        />
                       </Field>
 
                       <Field
@@ -723,15 +717,13 @@ export function CopyTaskScreen() {
                       </Field>
 
                       {project.scenario === "A" ? (
-                        <label className="row-inline text-sm">
-                          <input
-                            type="checkbox"
-                            data-testid="copy-auto-proxy"
-                            checked={autoProxy}
-                            onChange={(e) => setAutoProxy(e.currentTarget.checked)}
-                          />
+                        <Checkbox
+                          testId="copy-auto-proxy"
+                          checked={autoProxy}
+                          onChange={setAutoProxy}
+                        >
                           拷完自动转代理（转入「4. 转码素材」）
-                        </label>
+                        </Checkbox>
                       ) : null}
 
                       <div className="field">
@@ -740,28 +732,24 @@ export function CopyTaskScreen() {
                           {dests.map((dest, index) => (
                             <div key={dest.id}>
                             <div className="dest-row">
-                              <select
-                                className="select"
+                              <Select
+                                ariaLabel={`第 ${index + 1} 个目的地类型`}
                                 value={dest.kind}
-                                aria-label={`第 ${index + 1} 个目的地类型`}
-                                onChange={(e) => {
-                                  // 先取值再进 updater：updater 延后执行时 currentTarget 已为 null
-                                  const kind = e.currentTarget.value as DestinationKind;
+                                onChange={(next) => {
+                                  const kind = next as DestinationKind;
                                   setDests((prev) =>
                                     prev.map((d) =>
                                       d.id === dest.id ? { ...d, kind } : d,
                                     ),
                                   );
                                 }}
-                              >
-                                {(
+                                options={(
                                   Object.keys(DESTINATION_KIND_LABEL) as DestinationKind[]
-                                ).map((kind) => (
-                                  <option key={kind} value={kind}>
-                                    {DESTINATION_KIND_LABEL[kind]}
-                                  </option>
-                                ))}
-                              </select>
+                                ).map((kind) => ({
+                                  value: kind,
+                                  label: DESTINATION_KIND_LABEL[kind],
+                                }))}
+                              />
                               <PathField
                                 value={dest.kind === "nas" ? "" : dest.path}
                                 ariaLabel={`第 ${index + 1} 个目的地路径`}

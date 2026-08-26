@@ -22,7 +22,7 @@ const project: Project = {
   relativePath: "20260824_校运会",
   status: "draft",
   cardsCopied: 0,
-  cardsTotal: 0,
+  copyIncomplete: false,
   bytesCopied: 0,
   assetCount: 0,
   sortedCount: 0,
