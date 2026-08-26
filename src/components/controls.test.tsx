@@ -26,7 +26,6 @@ describe("Checkbox", () => {
 
   it("禁用时不可切换", async () => {
     const onChange = vi.fn();
-    const user = userEvent.setup();
     render(
       <Checkbox testId="cb" checked disabled onChange={onChange}>
         锁定
@@ -121,12 +120,10 @@ describe("Select", () => {
 
   it("禁用时点击不展开", async () => {
     const onChange = vi.fn();
-    const user = userEvent.setup();
     render(
       <Select testId="sel" value="" onChange={onChange} options={OPTIONS} disabled />,
     );
     fireEvent.click(screen.getByTestId("sel"));
     expect(screen.queryByRole("listbox")).toBeNull();
-    void user;
   });
 });
