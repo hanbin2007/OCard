@@ -833,13 +833,27 @@ describe("分类工作台", () => {
     await renderSorting();
     const img = screen.getAllByTestId("asset-thumb")[0];
     const cell = img.closest("[data-testid='asset-cell']") as HTMLElement;
+    // 慢机器(CI 高负载)上后台刷新可能落进等待窗,把持有的旧 cell 节点
+    // 变成 detached——按 data-asset 每轮重查;重挂载让缩略图重新出现时
+    // 再触发一次 error,收敛后必然出占位(deflake:run 32876* 首次抖动)
+    const assetId = cell.getAttribute("data-asset");
+    expect(assetId).toBeTruthy();
 
     fireEvent.error(img);
 
-    await waitFor(() =>
-      expect(within(cell).getByTestId("asset-no-thumb").textContent).toContain(
-        "预览不可用",
-      ),
+    await waitFor(
+      () => {
+        const current = document.querySelector<HTMLElement>(
+          `[data-testid='asset-cell'][data-asset='${assetId}']`,
+        );
+        expect(current).not.toBeNull();
+        const freshImg = within(current as HTMLElement).queryByTestId("asset-thumb");
+        if (freshImg) fireEvent.error(freshImg);
+        expect(
+          within(current as HTMLElement).getByTestId("asset-no-thumb").textContent,
+        ).toContain("预览不可用");
+      },
+      { timeout: 4000 },
     );
   });
 
