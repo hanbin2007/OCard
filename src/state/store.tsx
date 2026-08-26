@@ -160,7 +160,9 @@ export type AppAction =
   | { type: "copyDraftSet"; volumeId: string; cameraId?: string }
   | { type: "copyDraftConsumed" }
   | { type: "cardDraftSet"; volumeId: string }
-  | { type: "cardDraftConsumed" };
+  | { type: "cardDraftConsumed" }
+  | { type: "projectsLoaded"; projects: Project[] }
+  | { type: "volumeMatchPatched"; volumeId: string; cardId: string };
 
 /** 孤儿对账的退避档位：失败一次等 2s，再失败 5s，之后稳定在 10s */
 const ORPHAN_BACKOFF_MS = [2000, 5000, 10000];
@@ -380,9 +382,13 @@ export function reducer(state: AppState, action: AppAction): AppState {
       const keepTask = action.payload.tasks.some(
         (t) => t.id === state.selectedTaskId,
       );
+      // 快捷拷卡队列与卷快照的同一条不变量:任何整表替换处都要剪
+      // (评审 P1:bootstrapped 不剪会留下悬空队首,后面的卡全部饿死)
+      const volumeIds = new Set(action.payload.volumes.map((v) => v.id));
       return {
         ...state,
         ...action.payload,
+        quickCopyQueue: state.quickCopyQueue.filter((id) => volumeIds.has(id)),
         loading: false,
         error: null,
         selectedProjectId: keepProject
@@ -422,16 +428,23 @@ export function reducer(state: AppState, action: AppAction): AppState {
     }
 
     case "volumesInserted": {
-      // 只对可移动的非系统卷起提示(系统盘/内置盘插拔不是「插卡」);
-      // 去重:已在队列里的不重复入队
+      // 过滤口径与全 App 一致:只排除系统盘,不信 removable 位——
+      // sysinfo 对 USB/雷电读卡器常给 false,硬过滤会让功能在部分机器上
+      // 无声失效(双路评审 P1);另排除 NAS 挂载卷(连 NAS 不是「插卡」)。
+      // 去重:已在队列里的不重复入队。
+      const nasRoot = state.workstation?.nasRoot ?? "";
       const fresh = action.volumeIds.filter((id) => {
         const v = state.volumes.find((x) => x.id === id);
-        return (
-          v !== undefined &&
-          v.removable &&
-          !v.isSystem &&
-          !state.quickCopyQueue.includes(id)
-        );
+        if (v === undefined || v.isSystem || state.quickCopyQueue.includes(id)) {
+          return false;
+        }
+        if (
+          nasRoot &&
+          (nasRoot.startsWith(v.mountPath) || v.mountPath.startsWith(nasRoot))
+        ) {
+          return false;
+        }
+        return true;
       });
       if (fresh.length === 0) return state;
       return { ...state, quickCopyQueue: [...state.quickCopyQueue, ...fresh] };
@@ -457,6 +470,22 @@ export function reducer(state: AppState, action: AppAction): AppState {
 
     case "cardDraftConsumed":
       return { ...state, cardDraft: null };
+
+    case "projectsLoaded":
+      // 轻量项目对账(不整站 reload):清单写入后 x/y 分母立即同源
+      return { ...state, projects: action.projects };
+
+    case "volumeMatchPatched":
+      // 定点补卡匹配(登记成功但卷列表刷新失败的降级路径):
+      // 只改这一张卷,不整表覆盖——闭包旧表覆盖会复活已拔的卷
+      return {
+        ...state,
+        volumes: state.volumes.map((v) =>
+          v.id === action.volumeId
+            ? { ...v, matchedCardId: action.cardId, matchStatus: "matched" }
+            : v,
+        ),
+      };
 
     case "projectCreated":
       return {
@@ -859,29 +888,45 @@ export function StoreProvider({
    * 带卡匹配的完整卷列表,再把新插入的卷交给引导队列。
    */
   useEffect(() => {
+    // 并发响应乱序守卫:两次事件各自拉 listVolumes,慢的旧响应后到会
+    // 覆盖新快照、顺带把新卡裁出队列(评审 P2)——只接受最新一次的响应
+    let latestSeq = 0;
+    const refreshAndEnqueue = async (insertedIds: string[] | "all") => {
+      const seq = ++latestSeq;
+      try {
+        const volumes = await api.listVolumes();
+        if (seq !== latestSeq) return;
+        dispatch({ type: "volumesUpdated", volumes });
+        dispatch({
+          type: "volumesInserted",
+          volumeIds: insertedIds === "all" ? volumes.map((v) => v.id) : insertedIds,
+        });
+      } catch (err) {
+        if (seq !== latestSeq) return;
+        if (insertedIds === "all") return; // 启动对账失败:bootstrap 失败已有可见路径
+        // 拉不回列表 = 本次插拔无法反映到界面,必须可见
+        dispatch({
+          type: "noticeReceived",
+          notice: {
+            level: "warning",
+            code: "volumes-refresh-failed",
+            message: `检测到卷插拔,但卷列表刷新失败：${
+              err instanceof Error ? err.message : String(err)
+            }。请手动刷新。`,
+            occurredAt: new Date().toISOString(),
+          },
+        });
+      }
+    };
+    // 启动对账:开机前就插着的卡不会有插入事件(监视线程首轮只建基线),
+    // 而 DIT 的标准动作恰是先插读卡器再开软件——当前挂载的卷全量入队一次,
+    // reducer 按口径过滤(评审 P1:常驻订阅不对账 = M2 #13 同型竞态)。
+    // 只在真后端跑:mock/测试环境没有「开机前已插卡」,对账只会制造噪声
+    if (api.volumesWatchAvailable()) {
+      void refreshAndEnqueue("all");
+    }
     return api.subscribeVolumesChanged(
-      (event) => {
-        void (async () => {
-          try {
-            const volumes = await api.listVolumes();
-            dispatch({ type: "volumesUpdated", volumes });
-            dispatch({ type: "volumesInserted", volumeIds: event.insertedIds });
-          } catch (err) {
-            // 拉不回列表 = 本次插拔无法反映到界面,必须可见
-            dispatch({
-              type: "noticeReceived",
-              notice: {
-                level: "warning",
-                code: "volumes-refresh-failed",
-                message: `检测到卷插拔,但卷列表刷新失败：${
-                  err instanceof Error ? err.message : String(err)
-                }。请手动刷新。`,
-                occurredAt: new Date().toISOString(),
-              },
-            });
-          }
-        })();
-      },
+      (event) => void refreshAndEnqueue(event.insertedIds),
       (err) =>
         dispatch({
           type: "noticeReceived",

@@ -51,13 +51,13 @@ pub fn is_system_mount(mount: &std::path::Path) -> bool {
     false
 }
 
-/// 列出全部挂载卷。
-/// 两次挂载表快照的差集(卷 id = 挂载路径):返回 (新插入, 已移除)。
+/// 两次挂载表快照的差集(卷 id = 挂载路径):返回 (新插入, 已移除, 当前 id 集)。
 /// 纯函数,卷监视线程用它判定插拔事件;顺序稳定(按 current/prev 原序)。
+/// 当前 id 集一并返回,调用方直接作为下一轮基线,不重复计算。
 pub fn diff_ids(
     prev: &std::collections::BTreeSet<String>,
     current: &[VolumeInfo],
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<String>, Vec<String>, std::collections::BTreeSet<String>) {
     let cur_ids: std::collections::BTreeSet<String> = current
         .iter()
         .map(|v| v.mount_point.display().to_string())
@@ -72,9 +72,10 @@ pub fn diff_ids(
         .filter(|id| !cur_ids.contains(*id))
         .cloned()
         .collect();
-    (inserted, removed)
+    (inserted, removed, cur_ids)
 }
 
+/// 列出全部挂载卷。
 pub fn list_volumes() -> Vec<VolumeInfo> {
     let disks = Disks::new_with_refreshed_list();
     disks
@@ -249,15 +250,16 @@ mod uid_tests {
         let prev: std::collections::BTreeSet<String> =
             ["/Volumes/A".to_string(), "/Volumes/B".to_string()].into();
         let cur = [vol("/Volumes/B"), vol("/Volumes/C")];
-        let (ins, rem) = diff_ids(&prev, &cur);
+        let (ins, rem, cur_ids) = diff_ids(&prev, &cur);
         assert_eq!(ins, vec!["/Volumes/C".to_string()]);
         assert_eq!(rem, vec!["/Volumes/A".to_string()]);
+        assert!(cur_ids.contains("/Volumes/B") && cur_ids.contains("/Volumes/C"));
     }
 
     #[test]
     fn diff_ids_no_change_is_empty() {
         let prev: std::collections::BTreeSet<String> = ["/Volumes/A".to_string()].into();
-        let (ins, rem) = diff_ids(&prev, &[vol("/Volumes/A")]);
+        let (ins, rem, _) = diff_ids(&prev, &[vol("/Volumes/A")]);
         assert!(ins.is_empty());
         assert!(rem.is_empty());
     }

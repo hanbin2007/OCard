@@ -92,14 +92,16 @@ export function SessionGuard() {
   }, []);
 
   /**
-   * 焦点陷阱:询问/门弹出期间把侧栏与主区设为 inert——否则 Tab 一下就能
-   * 绕过门去操作背后的应用,会话终止后的动作仍会记到上一位操作人头上
-   * (opus 评审 P1)。inert 同时挡焦点与点击,是整块屏蔽的正解。
+   * 焦点陷阱:询问/门弹出期间把侧栏、主区与门外浮层设为 inert——否则
+   * Tab 一下就能绕过门去操作背后的应用,会话终止后的动作仍会记到上一位
+   * 操作人头上(opus 评审 P1)。快捷拷卡浮层挂在 .main 之外,z-index 只
+   * 挡鼠标挡不住键盘,必须一并 inert(双路评审 P0:门开着 Tab+Enter
+   * 就能以上一位操作人身份写 NAS)。
    */
   useEffect(() => {
     if (phase === "active") return;
     const blocked = document.querySelectorAll<HTMLElement>(
-      ".shell > .sidebar, .shell > .main",
+      ".shell > .sidebar, .shell > .main, .shell > .quick-copy",
     );
     for (const el of blocked) el.setAttribute("inert", "");
     return () => {

@@ -220,6 +220,26 @@ export function listProjectCards(projectId: string): Promise<ProjectCards> {
   return reply(mockProjectCards[projectId] ?? { cardIds: [], copiedCardIds: [] });
 }
 
+/**
+ * 原子追加一张卡到项目用卡清单(快捷拷卡)。后端写可交换的增量事件,
+ * 两台工作站同时各加一张不会像整表覆盖那样互相丢(评审 P0)。
+ */
+export function addProjectCard(
+  projectId: string,
+  cardId: string,
+): Promise<ProjectCards> {
+  if (IS_TAURI) return ipc("add_project_card", { projectId, cardId });
+  const current = mockProjectCards[projectId] ?? { cardIds: [], copiedCardIds: [] };
+  const next = {
+    cardIds: current.cardIds.includes(cardId)
+      ? current.cardIds
+      : [...current.cardIds, cardId],
+    copiedCardIds: current.copiedCardIds,
+  };
+  mockProjectCards[projectId] = next;
+  return reply(next);
+}
+
 export function setProjectCards(
   projectId: string,
   cardIds: string[],
@@ -567,6 +587,11 @@ export function subscribeNotices(
  * 订阅卷插拔事件(快捷拷卡):后端监视线程 2s 轮询挂载表,有插拔即推。
  * 与其它订阅同构。浏览器/测试环境无后端推送,测试直接驱动 store action。
  */
+/** 插卡检测是否可用(真后端才有卷监视线程;mock 环境无「开机前已插卡」概念) */
+export function volumesWatchAvailable(): boolean {
+  return IS_TAURI;
+}
+
 export function subscribeVolumesChanged(
   onEvent: (event: VolumesChangedEvent) => void,
   onError?: (error: unknown) => void,

@@ -1,10 +1,15 @@
 /** 快捷拷卡(插卡引导):未登记引导登记、已登记问加入清单、引导创建拷卡任务。 */
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api";
 import App from "../App";
+import {
+  IDLE_PROMPT_MS,
+  IDLE_TICK_MS,
+  PROMPT_GRACE_MS,
+} from "./SessionGuard";
 import {
   mockCameras,
   mockCopyTasks,
@@ -51,9 +56,14 @@ describe("快捷拷卡引导", () => {
     expect(screen.queryByTestId("quick-copy-prompt")).toBeNull();
   });
 
-  it("已登记卡不在当前项目清单:「加入清单并拷卡」追加清单后跳拷卡屏并预选卷与相机", async () => {
+  it("已登记卡不在当前项目清单:「加入清单并拷卡」原子追加后跳拷卡屏并预选卷与相机", async () => {
     const user = userEvent.setup();
-    const setSpy = vi.spyOn(api, "setProjectCards");
+    // mockResolvedValue 而非 call-through:真实 mock 实现会持久污染
+    // 模块级 mockProjectCards,用例顺序一换就翻(评审 P2)
+    const addSpy = vi.spyOn(api, "addProjectCard").mockResolvedValue({
+      cardIds: ["card-sd-03"],
+      copiedCardIds: [],
+    });
     // mockProjects[1] 没有配置用卡清单 → card-sd-03 不在清单里
     render(
       <App
@@ -73,7 +83,7 @@ describe("快捷拷卡引导", () => {
     await user.click(addBtn);
 
     await waitFor(() =>
-      expect(setSpy).toHaveBeenCalledWith(mockProjects[1].id, ["card-sd-03"]),
+      expect(addSpy).toHaveBeenCalledWith(mockProjects[1].id, "card-sd-03"),
     );
     // 落在拷卡屏:卷已预选,相机按匹配卡带出
     await waitFor(() => {
@@ -226,7 +236,9 @@ describe("快捷拷卡引导", () => {
     vi.spyOn(api, "createStorageCard").mockResolvedValue(created);
     vi.spyOn(api, "listVolumes").mockResolvedValue(
       mockVolumes.map((v) =>
-        v.id === "vol-untitled-3" ? { ...v, matchedCardId: "card-new-1" } : v,
+        v.id === "vol-untitled-3"
+          ? { ...v, matchedCardId: "card-new-1", matchStatus: "matched" as const }
+          : v,
       ),
     );
     render(
@@ -257,5 +269,79 @@ describe("快捷拷卡引导", () => {
       ),
     );
     expect(screen.getByTestId("qc-add-and-copy")).toBeDefined();
+  });
+
+  it("会话门开启时浮层整体 inert:键盘也进不去(双路评审 P0)", async () => {
+    vi.useFakeTimers();
+    try {
+      render(<App preloaded={{ ...base, quickCopyQueue: ["vol-untitled-1"] }} />);
+      // 15 分钟无操作 → 询问 → 再 5 分钟 → 会话结束,门弹出
+      act(() => {
+        vi.advanceTimersByTime(IDLE_PROMPT_MS + IDLE_TICK_MS);
+      });
+      act(() => {
+        vi.advanceTimersByTime(PROMPT_GRACE_MS + IDLE_TICK_MS);
+      });
+      const prompt = screen.getByTestId("quick-copy-prompt");
+      expect(prompt.closest("[inert]")).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("Esc 等同「忽略」", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={{ ...base, quickCopyQueue: ["vol-untitled-3"] }} />);
+    expect(screen.getByTestId("quick-copy-prompt")).toBeDefined();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByTestId("quick-copy-prompt")).toBeNull();
+  });
+
+  it("登记表读不到(unavailable):不引导登记,只给重试与忽略", async () => {
+    render(
+      <App
+        preloaded={{
+          ...base,
+          volumes: mockVolumes.map((v) =>
+            v.id === "vol-untitled-3"
+              ? { ...v, matchStatus: "unavailable" as const }
+              : v,
+          ),
+          quickCopyQueue: ["vol-untitled-3"],
+        }}
+      />,
+    );
+    const prompt = screen.getByTestId("quick-copy-prompt");
+    expect(prompt.textContent).toContain("暂时无法核对登记");
+    expect(screen.queryByTestId("qc-register")).toBeNull();
+    expect(screen.getByTestId("qc-rematch")).toBeDefined();
+  });
+
+  it("加入在途时「直接拷卡」同样禁用,不允许并行两条路", async () => {
+    const user = userEvent.setup();
+    let release: () => void = () => {};
+    vi.spyOn(api, "addProjectCard").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = () =>
+            resolve({ cardIds: ["card-sd-03"], copiedCardIds: [] });
+        }),
+    );
+    render(
+      <App
+        preloaded={{
+          ...base,
+          selectedProjectId: mockProjects[1].id,
+          quickCopyQueue: ["vol-untitled-1"],
+        }}
+      />,
+    );
+    const addBtn = screen.getByTestId("qc-add-and-copy") as HTMLButtonElement;
+    await waitFor(() => expect(addBtn.disabled).toBe(false));
+    await user.click(addBtn);
+    expect((screen.getByTestId("qc-copy") as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    release();
   });
 });

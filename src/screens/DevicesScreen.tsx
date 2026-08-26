@@ -1,7 +1,7 @@
 /** 屏 3：设备登记（相机 → 实时编码预览；存储卡与相机关联）。 */
 
 import { Select } from "../components/controls";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { IconTrash } from "../components/Icon";
@@ -61,21 +61,33 @@ export function DevicesScreen() {
 
   /**
    * 快捷拷卡引导「去登记」预填:绑定卷、卡标签(以卷标起步,可改)。
-   * 草稿在提交成功后消费;卷已被拔走则直接丢弃(绑定区自会提示)。
+   * 草稿**只消费一次**——预填后立即 consumed,续接判定走本地 ref。
+   * 之前草稿常驻 + effect 依赖卷对象引用,任意一次卷列表刷新都会把
+   * 用户手改的绑定卷改回草稿卷,甚至在登记完下一张卡时复活旧卷,
+   * 把指纹写错物理卡(双路评审 P0)。
    */
-  const draftVolume = state.cardDraft
-    ? (volumes.find((v) => v.id === state.cardDraft?.volumeId) ?? null)
-    : null;
+  const quickDraftRef = useRef<{ volumeId: string; mountPath: string } | null>(
+    null,
+  );
   useEffect(() => {
-    if (!state.cardDraft) return;
-    if (!draftVolume) {
-      dispatch({ type: "cardDraftConsumed" });
+    const draft = state.cardDraft;
+    if (!draft) return;
+    dispatch({ type: "cardDraftConsumed" });
+    const vol = volumes.find((v) => v.id === draft.volumeId);
+    if (!vol) {
+      // 卷已被拔走:草稿作废必须出声,不能让「去登记」落地后毫无动静
+      notify(
+        "info",
+        "quick-copy-draft-dropped",
+        "刚插入的卡已被拔出,登记表单未预填,请重新插卡或手动选择绑定卷。",
+      );
       return;
     }
-    setBindMount(draftVolume.mountPath);
-    setCardLabel((prev) => (prev.trim() ? prev : draftVolume.name));
-    // 草稿保留到登记成功:成功后靠它续接快捷拷卡引导
-  }, [state.cardDraft, draftVolume, dispatch]);
+    quickDraftRef.current = { volumeId: vol.id, mountPath: vol.mountPath };
+    setBindMount(vol.mountPath);
+    setCardLabel((prev) => (prev.trim() ? prev : vol.name));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.cardDraft]);
 
   /** 卷列表可能是启动时拉的旧账:绑定前给个手动刷新 */
   async function refreshBindVolumes() {
@@ -154,8 +166,11 @@ export function DevicesScreen() {
       });
       dispatch({ type: "cardCreated", card });
       setLastCard(card.label);
-      const fromDraft =
-        state.cardDraft !== null && bindMount === draftVolume?.mountPath;
+      // 续接判定与草稿清理解耦:登记一旦成功,草稿 ref 一律作废——
+      // 否则改过绑定的提交会让旧草稿存活,下一张卡静默绑回旧卷(评审 P0)
+      const draft = quickDraftRef.current;
+      quickDraftRef.current = null;
+      const fromDraft = draft !== null && bindMount === draft.mountPath;
       setCardLabel("");
       setCardSerial("");
       setBindMount("");
@@ -163,21 +178,26 @@ export function DevicesScreen() {
       if (fromDraft) {
         // 快捷拷卡引导的登记环节完成:刷新卷列表拿到新的卡匹配,
         // 再把这张卷重新入队——引导自动进入「加入清单/去拷卡」阶段
-        dispatch({ type: "cardDraftConsumed" });
-        const volumeId = draftVolume.id;
         try {
           const next = await api.listVolumes();
           dispatch({ type: "volumesUpdated", volumes: next });
-        } catch {
-          // 刷新失败也不断引导:本地补 matchedCardId,提示照常弹出
+        } catch (err) {
+          // 刷新失败是降级,必须可见;补匹配走定点 patch,
+          // 不拿闭包旧表整体覆盖(会复活已拔的卷)(评审 P1)
+          notify(
+            "warning",
+            "volumes-refresh-failed",
+            `登记已完成,但卷列表刷新失败：${
+              err instanceof Error ? err.message : String(err)
+            }。卡匹配按本地结果显示,可能不准确。`,
+          );
           dispatch({
-            type: "volumesUpdated",
-            volumes: volumes.map((v) =>
-              v.id === volumeId ? { ...v, matchedCardId: card.id } : v,
-            ),
+            type: "volumeMatchPatched",
+            volumeId: draft.volumeId,
+            cardId: card.id,
           });
         }
-        dispatch({ type: "volumesInserted", volumeIds: [volumeId] });
+        dispatch({ type: "volumesInserted", volumeIds: [draft.volumeId] });
       }
     } catch (err) {
       notify(

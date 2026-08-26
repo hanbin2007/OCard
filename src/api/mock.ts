@@ -255,6 +255,7 @@ export const mockVolumes: Volume[] = [
     removable: true,
     isSystem: false,
     matchedCardId: "card-sd-03",
+    matchStatus: "matched",
   },
   {
     id: "vol-untitled-2",
@@ -265,6 +266,7 @@ export const mockVolumes: Volume[] = [
     removable: true,
     isSystem: false,
     matchedCardId: "card-sd-06",
+    matchStatus: "matched",
   },
   {
     id: "vol-untitled-3",
@@ -274,6 +276,7 @@ export const mockVolumes: Volume[] = [
     usedBytes: 91 * GB,
     removable: true,
     isSystem: false,
+    matchStatus: "unregistered",
   },
   {
     id: "vol-system",

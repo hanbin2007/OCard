@@ -662,6 +662,52 @@ pub fn set_project_cards<R: tauri::Runtime>(
     Ok(project_cards_dto(&stats, &cards))
 }
 
+/// 原子追加一张卡到项目用卡清单(快捷拷卡引导)。
+/// 与 set_project_cards 的整表覆盖不同:写可交换的增量事件,
+/// 两台工作站同时各加一张卡不会互相覆盖(评审 P0)。
+#[tauri::command]
+pub fn add_project_card<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<AppState>,
+    project_id: String,
+    card_id: String,
+) -> CmdResult<ProjectCardsDto> {
+    let nas = nas_root(&app, &state)?;
+    let stats = find_project(&nas, &project_id)?;
+    let cards = registry::load(&nas).map_err(err)?.registry.cards;
+    if !cards.iter().any(|c| c.id == card_id) {
+        return Err(format!("卡未登记,无法加入项目用卡清单: {card_id}"));
+    }
+    // 已在清单里 = 幂等成功,不再写重复事件(折叠端也去重,双保险)
+    let already = stats
+        .card_roster
+        .as_ref()
+        .map(|r| r.iter().any(|x| x == &card_id))
+        .unwrap_or(false);
+    if !already {
+        let outcome = tasks::append_audit(
+            &app,
+            &stats.root,
+            &state.config_dir,
+            &journal::Event::new(
+                state.machine_id.clone(),
+                operator(&app, &state),
+                journal::kind::PROJECT_CARD_ADDED,
+                serde_json::json!({ "cardId": card_id }),
+            ),
+        );
+        // 配置类事件:没写进项目日志 = 没保存,必须如实报失败
+        if outcome != tasks::AuditWrite::Written {
+            return Err(
+                "用卡清单未能写入项目日志(NAS 可能不可达),本次修改未保存,请稍后重试".into(),
+            );
+        }
+        catalog::invalidate_cache(&nas);
+    }
+    let stats = find_project(&nas, &project_id)?;
+    Ok(project_cards_dto(&stats, &cards))
+}
+
 // ---------- 卷 ----------
 
 #[tauri::command]
@@ -669,13 +715,14 @@ pub fn list_volumes<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
 ) -> Vec<VolumeDto> {
-    // 卡匹配是增强信息:登记表读不到时降级为「不匹配」,但必须告知(零静默)
-    let cards = match nas_root(&app, &state) {
-        Err(_) => Vec::new(), // NAS 未配置:首跑正常态,引导页已在处理,不算降级
+    // 卡匹配是增强信息:登记表读不到时降级为「无法核对」,但必须告知(零静默);
+    // 判别上「读不到」≠「未登记」——混为一谈会引导重复登记(评审 P0)
+    let (cards, registry_ok) = match nas_root(&app, &state) {
+        Err(_) => (Vec::new(), false), // NAS 未配置:首跑正常态,同样属「无法核对」
         Ok(nas) => match registry::load(&nas) {
             Ok(load) => {
                 notice_registry_health(&app, &load);
-                load.registry.cards
+                (load.registry.cards, true)
             }
             Err(e) => {
                 notify::warn(
@@ -683,7 +730,7 @@ pub fn list_volumes<R: tauri::Runtime>(
                     "volumes-registry-unavailable",
                     format!("登记表读取失败,卷列表暂无法关联已登记的卡: {e}"),
                 );
-                Vec::new()
+                (Vec::new(), false)
             }
         },
     };
@@ -699,6 +746,15 @@ pub fn list_volumes<R: tauri::Runtime>(
                 volumes::read_volume_uid(&v.mount_point)
             };
             let (matched, conflict) = match_card(&cards, uid.as_deref(), &v.name);
+            let match_status = if !registry_ok {
+                "unavailable"
+            } else if conflict.is_some() && matched.is_none() {
+                "conflict"
+            } else if matched.is_some() {
+                "matched"
+            } else {
+                "unregistered"
+            };
             if let Some(msg) = conflict {
                 notify::warn(&app, "card-match-conflict", msg);
             }
@@ -711,6 +767,7 @@ pub fn list_volumes<R: tauri::Runtime>(
                 removable: v.removable,
                 is_system: v.system,
                 matched_card_id: matched,
+                match_status,
             }
         })
         .collect()

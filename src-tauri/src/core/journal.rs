@@ -24,6 +24,10 @@ pub mod kind {
     pub const PROJECT_CARDS_SET: &str = "project_cards_set";
     /// 拷卡时实际用到某张登记卡(自动并入用卡清单)。data: {"cardId": "..."}
     pub const PROJECT_CARD_USED: &str = "project_card_used";
+    /// 手动把一张卡增量加入用卡清单(快捷拷卡引导)。与 USED 同型折叠——
+    /// 可交换的追加事件,多机并发加卡不会像整表 SET 那样互相覆盖。
+    /// data: {"cardId": "..."}
+    pub const PROJECT_CARD_ADDED: &str = "project_card_added";
     pub const COPY_STARTED: &str = "copy_started";
     pub const COPY_COMPLETED: &str = "copy_completed";
     pub const COPY_FILE_FAILED: &str = "copy_file_failed";

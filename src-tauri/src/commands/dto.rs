@@ -92,6 +92,11 @@ pub struct VolumeDto {
     pub is_system: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_card_id: Option<String>,
+    /// 卡匹配判别:matched(认出登记卡)/unregistered(确认未登记)/
+    /// unavailable(登记表读不到,无法核对)/conflict(匹配冲突)。
+    /// 「读不到」与「确认未登记」必须可分——快捷拷卡把 unavailable
+    /// 当 unregistered 会引导重复登记(评审 P0)。
+    pub match_status: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]

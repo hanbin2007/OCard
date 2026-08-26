@@ -52,7 +52,7 @@ describe("浮层层叠", () => {
     expect(zIndexOf(".select-pop")).toBeLessThan(zIndexOf(".overlay--gate"));
   });
 
-  it("快捷拷卡浮层低于模态浮层与会话门(不破坏模态语义、不构成绕门旁路)", () => {
+  it("快捷拷卡浮层 z 层低于模态浮层与会话门(可达性另由行为用例钉:门开时浮层 inert)", () => {
     expect(zIndexOf(".quick-copy")).toBeLessThan(zIndexOf(".overlay {"));
     expect(zIndexOf(".quick-copy")).toBeLessThan(zIndexOf(".overlay--gate"));
   });

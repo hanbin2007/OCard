@@ -137,6 +137,12 @@ export interface Volume {
   isSystem: boolean;
   /** 若能与已登记存储卡匹配上，带出卡 id */
   matchedCardId?: string;
+  /**
+   * 卡匹配判别:matched/unregistered/unavailable(登记表读不到,无法核对)/
+   * conflict(匹配冲突)。快捷拷卡靠它区分「确认未登记」与「无法核对」——
+   * 混为一谈会引导重复登记(评审 P0)。旧快照缺省时按 matchedCardId 推断。
+   */
+  matchStatus?: "matched" | "unregistered" | "unavailable" | "conflict";
 }
 
 /** 逐文件哈希状态（PRD §5.3） */
@@ -307,6 +313,7 @@ export interface WorkstationInfo {
 /** 卷插拔事件(volumes://changed):id = 挂载路径,与 Volume.id 同源 */
 export interface VolumesChangedEvent {
   insertedIds: string[];
+  /** 保留字段:前端目前不消费(拔卡出队走 volumesUpdated 全量对账,更稳) */
   removedIds: string[];
 }
 

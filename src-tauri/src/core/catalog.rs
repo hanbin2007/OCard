@@ -211,7 +211,8 @@ pub fn scan(nas_root: &Path) -> Result<CatalogScan> {
                                 )),
                             }
                         }
-                        crate::core::journal::kind::PROJECT_CARD_USED => {
+                        crate::core::journal::kind::PROJECT_CARD_USED
+                        | crate::core::journal::kind::PROJECT_CARD_ADDED => {
                             if let Some(id) = ev.data.get("cardId").and_then(|v| v.as_str()) {
                                 let r = roster.get_or_insert_with(Vec::new);
                                 if !r.iter().any(|x| x == id) {

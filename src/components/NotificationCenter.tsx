@@ -57,6 +57,7 @@ const NOTICE_TITLES: Record<string, string> = {
   "project-cards-updated": "用卡清单已更新",
   "volumes-listen-failed": "插卡检测未能建立",
   "volumes-watch-degraded": "插卡检测降级",
+  "quick-copy-draft-dropped": "快捷拷卡预填未完成",
   "analysis-start-failed": "分析没有启动成功",
   "delivery-status-save-failed": "交付状态没有保存成功",
   "reveal-failed": "无法打开文件管理器",

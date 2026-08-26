@@ -7,6 +7,7 @@ import type {
   CopyTaskPreview,
   DestinationKind,
   StartCopyInput,
+  NoticeLevel,
 } from "../api/types";
 import { SpeedSparkline, useSpeedSamples } from "../components/charts";
 import { Checkbox, Select } from "../components/controls";
@@ -74,20 +75,36 @@ export function CopyTaskScreen() {
 
   /**
    * 快捷拷卡引导「去拷卡」预填:预选卷,匹配卡带出相机。
-   * 卷已被拔走则直接丢弃草稿(表单保持原样,不预选一个不存在的源)。
+   * 预填同时把确认态整体归零——用户可能正停在上一张卡的确认屏,
+   * 只换卷不清确认会「对着 A 的预览确认,任务落到 B」(codex 评审 P0,
+   * 与切项目归零同一条铁律)。卷已被拔走则丢弃草稿并出声。
    */
   useEffect(() => {
     const draft = state.copyDraft;
     if (!draft) return;
-    const vol = state.volumes.find((v) => v.id === draft.volumeId);
-    if (vol) {
-      setVolumeId(vol.id);
-      if (draft.cameraId && state.cameras.some((c) => c.id === draft.cameraId)) {
-        setCameraId(draft.cameraId);
-      }
-    }
     dispatch({ type: "copyDraftConsumed" });
-  }, [state.copyDraft, state.volumes, state.cameras, dispatch]);
+    const vol = state.volumes.find((v) => v.id === draft.volumeId);
+    if (!vol) {
+      pushNotice(
+        "info",
+        "quick-copy-draft-dropped",
+        "刚插入的卡已被拔出,拷卡表单未预选源卷,请重新插卡或手动选择。",
+      );
+      return;
+    }
+    setVolumeId(vol.id);
+    if (draft.cameraId && state.cameras.some((c) => c.id === draft.cameraId)) {
+      setCameraId(draft.cameraId);
+    }
+    setConfirming(false);
+    setPreview(null);
+    setPreviewFailed(false);
+    setSubmitted(false);
+    setTargetPrefix("");
+    setPrefixInferred(false);
+    prefixEditedRef.current = false;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.copyDraft]);
   const [volumesRefreshing, setVolumesRefreshing] = useState(false);
   const [cameraId, setCameraId] = useState("");
   const [note, setNote] = useState("");
@@ -131,7 +148,7 @@ export function CopyTaskScreen() {
 
   /** 本屏内失败上抛通知中心的统一出口（零静默铁律） */
   const pushNotice = useCallback(
-    (level: "warning" | "error", code: string, message: string) =>
+    (level: NoticeLevel, code: string, message: string) =>
       dispatch({
         type: "noticeReceived",
         notice: { level, code, message, occurredAt: new Date().toISOString() },

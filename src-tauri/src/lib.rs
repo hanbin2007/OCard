@@ -25,6 +25,7 @@ macro_rules! ocard_invoke_handler {
             $crate::commands::delete_storage_card,
             $crate::commands::list_project_cards,
             $crate::commands::set_project_cards,
+            $crate::commands::add_project_card,
             $crate::commands::list_volumes,
             $crate::commands::inspect_volume,
             $crate::commands::list_copy_tasks,
@@ -160,35 +161,70 @@ pub fn run() {
                 std::thread::spawn(move || {
                     let mut known: Option<std::collections::BTreeSet<String>> = None;
                     let mut emit_fail_reported = false;
+                    let mut panic_reported = false;
                     loop {
-                        let vols = core::volumes::list_volumes();
-                        let ids: std::collections::BTreeSet<String> = vols
-                            .iter()
-                            .map(|v| v.mount_point.display().to_string())
-                            .collect();
-                        if let Some(prev) = &known {
-                            let (inserted, removed) = core::volumes::diff_ids(prev, &vols);
-                            if !inserted.is_empty() || !removed.is_empty() {
-                                let payload = serde_json::json!({
-                                    "insertedIds": inserted,
-                                    "removedIds": removed,
-                                });
-                                if let Err(e) = handle.emit("volumes://changed", payload) {
-                                    // 事件发不出去 = 插卡检测静默失效,必须可见;
-                                    // 但监视循环每 2s 一轮,只报一次防刷屏
-                                    log::warn!("volumes://changed 事件发送失败: {e}");
-                                    if !emit_fail_reported {
-                                        emit_fail_reported = true;
-                                        commands::notify::warn(
-                                            &handle,
-                                            "volumes-watch-degraded",
-                                            format!("插卡检测事件发送失败,快捷拷卡引导可能不工作,可手动刷新卷列表: {e}"),
-                                        );
+                        // 每一轮都包 catch_unwind:sysinfo 在个别挂载状态下 panic
+                        // 不该让监视线程静默死掉——那等于插卡检测永久失效且无提示
+                        let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || -> Option<(Vec<String>, std::collections::BTreeSet<String>)> {
+                                let vols = core::volumes::list_volumes();
+                                match &known {
+                                    None => {
+                                        let (_, _, ids) =
+                                            core::volumes::diff_ids(&Default::default(), &vols);
+                                        Some((Vec::new(), ids))
                                     }
+                                    Some(prev) => {
+                                        let (inserted, removed, ids) =
+                                            core::volumes::diff_ids(prev, &vols);
+                                        if !inserted.is_empty() || !removed.is_empty() {
+                                            let payload = serde_json::json!({
+                                                "insertedIds": inserted,
+                                                "removedIds": removed,
+                                            });
+                                            if let Err(e) =
+                                                handle.emit("volumes://changed", payload)
+                                            {
+                                                // 事件发不出去 = 插卡检测静默失效,必须可见;
+                                                // 循环每 2s 一轮,只报一次防刷屏
+                                                log::warn!("volumes://changed 事件发送失败: {e}");
+                                                if !emit_fail_reported {
+                                                    emit_fail_reported = true;
+                                                    commands::notify::warn(
+                                                        &handle,
+                                                        "volumes-watch-degraded",
+                                                        format!("插卡检测事件发送失败,快捷拷卡引导可能不工作,可手动刷新卷列表: {e}"),
+                                                    );
+                                                }
+                                                // 发送失败:不推进基线,下一轮重试同一批差集
+                                                return None;
+                                            }
+                                            // 发送成功:失败锁存复位,恢复后再坏还能报
+                                            emit_fail_reported = false;
+                                        }
+                                        Some((inserted, ids))
+                                    }
+                                }
+                            },
+                        ));
+                        match round {
+                            Ok(Some((_, ids))) => {
+                                known = Some(ids);
+                                panic_reported = false;
+                            }
+                            Ok(None) => {} // emit 失败,保留旧基线重试
+                            Err(_) => {
+                                log::error!("卷监视轮询 panic,已跳过本轮");
+                                if !panic_reported {
+                                    panic_reported = true;
+                                    commands::notify::warn(
+                                        &handle,
+                                        "volumes-watch-degraded",
+                                        "插卡检测本轮异常,已自动继续;若反复出现请手动刷新卷列表".to_string(),
+                                    );
                                 }
                             }
                         }
-                        known = Some(ids);
                         std::thread::sleep(std::time::Duration::from_secs(2));
                     }
                 });
