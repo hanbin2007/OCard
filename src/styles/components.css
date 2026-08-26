@@ -1626,6 +1626,68 @@
   gap: var(--space-2);
 }
 
+/* ---------- 快捷拷卡引导(插卡检测) ---------- */
+
+/* 右下角浮层:高于页面内容,低于选择弹层(70)/会话门(80)/toast(100)——
+   低于模态浮层(50):对话框/会话门开着时先被压住,不破坏模态语义;
+   层叠关系由 stacking.test 钉住 */
+.quick-copy {
+  position: fixed;
+  right: var(--space-4);
+  bottom: var(--space-4);
+  z-index: 45;
+  width: min(360px, calc(100vw - var(--space-8)));
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--panel-raised);
+  box-shadow: var(--shadow-overlay);
+  display: grid;
+  gap: var(--space-2);
+  animation: toast-in var(--dur-quick) var(--ease-out);
+}
+
+.quick-copy__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.quick-copy__title {
+  font-weight: 600;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quick-copy__close {
+  flex: none;
+}
+
+.quick-copy__meta {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.quick-copy__hint {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.quick-copy__hint--warn {
+  color: var(--warn);
+}
+
+.quick-copy__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
 /* ---------- 会话守卫(UX 波) ---------- */
 
 /* 会话门必须压过一切浮层(普通 overlay z=50):没确认操作员之前什么都不能点 */

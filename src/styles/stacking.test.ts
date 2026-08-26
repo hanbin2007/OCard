@@ -52,6 +52,11 @@ describe("浮层层叠", () => {
     expect(zIndexOf(".select-pop")).toBeLessThan(zIndexOf(".overlay--gate"));
   });
 
+  it("快捷拷卡浮层低于模态浮层与会话门(不破坏模态语义、不构成绕门旁路)", () => {
+    expect(zIndexOf(".quick-copy")).toBeLessThan(zIndexOf(".overlay {"));
+    expect(zIndexOf(".quick-copy")).toBeLessThan(zIndexOf(".overlay--gate"));
+  });
+
   it("对话框在锁死页面滚动的前提下自己能滚(矮窗口不可达回归)", () => {
     const start = css.indexOf(".dialog {");
     const body = css.slice(start, css.indexOf("}", start));

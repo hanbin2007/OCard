@@ -71,6 +71,23 @@ export function CopyTaskScreen() {
   const [volumeId, setVolumeId] = useState("");
   /** 忽略系统内置盘（默认开）：本机启动盘不是拷卡源,误选后果严重 */
   const [showSystemVolumes, setShowSystemVolumes] = useState(false);
+
+  /**
+   * 快捷拷卡引导「去拷卡」预填:预选卷,匹配卡带出相机。
+   * 卷已被拔走则直接丢弃草稿(表单保持原样,不预选一个不存在的源)。
+   */
+  useEffect(() => {
+    const draft = state.copyDraft;
+    if (!draft) return;
+    const vol = state.volumes.find((v) => v.id === draft.volumeId);
+    if (vol) {
+      setVolumeId(vol.id);
+      if (draft.cameraId && state.cameras.some((c) => c.id === draft.cameraId)) {
+        setCameraId(draft.cameraId);
+      }
+    }
+    dispatch({ type: "copyDraftConsumed" });
+  }, [state.copyDraft, state.volumes, state.cameras, dispatch]);
   const [volumesRefreshing, setVolumesRefreshing] = useState(false);
   const [cameraId, setCameraId] = useState("");
   const [note, setNote] = useState("");

@@ -152,6 +152,47 @@ pub fn run() {
                 notices: Default::default(),
                 ops: Default::default(),
             });
+            // 卷插拔监视(快捷拷卡):2s 轮询本地挂载表(不碰 NAS/登记表),
+            // 有插拔即发 volumes://changed;前端收到后再拉带卡匹配的完整列表。
+            {
+                use tauri::Emitter;
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let mut known: Option<std::collections::BTreeSet<String>> = None;
+                    let mut emit_fail_reported = false;
+                    loop {
+                        let vols = core::volumes::list_volumes();
+                        let ids: std::collections::BTreeSet<String> = vols
+                            .iter()
+                            .map(|v| v.mount_point.display().to_string())
+                            .collect();
+                        if let Some(prev) = &known {
+                            let (inserted, removed) = core::volumes::diff_ids(prev, &vols);
+                            if !inserted.is_empty() || !removed.is_empty() {
+                                let payload = serde_json::json!({
+                                    "insertedIds": inserted,
+                                    "removedIds": removed,
+                                });
+                                if let Err(e) = handle.emit("volumes://changed", payload) {
+                                    // 事件发不出去 = 插卡检测静默失效,必须可见;
+                                    // 但监视循环每 2s 一轮,只报一次防刷屏
+                                    log::warn!("volumes://changed 事件发送失败: {e}");
+                                    if !emit_fail_reported {
+                                        emit_fail_reported = true;
+                                        commands::notify::warn(
+                                            &handle,
+                                            "volumes-watch-degraded",
+                                            format!("插卡检测事件发送失败,快捷拷卡引导可能不工作,可手动刷新卷列表: {e}"),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        known = Some(ids);
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                });
+            }
             // sidecar 缺失立即可见(零静默 ffmpeg-missing)
             commands::transcode_cmds::notify_ffmpeg_missing_on_startup(app.handle());
             // AI 模型启动校验(D1:哈希不符=禁用 AI,硬失败可见)

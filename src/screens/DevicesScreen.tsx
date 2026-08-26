@@ -1,7 +1,7 @@
 /** 屏 3：设备登记（相机 → 实时编码预览；存储卡与相机关联）。 */
 
 import { Select } from "../components/controls";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import * as api from "../api";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { IconTrash } from "../components/Icon";
@@ -58,6 +58,24 @@ export function DevicesScreen() {
 
   const { volumes } = state;
   const boundVolume = volumes.find((v) => v.mountPath === bindMount) ?? null;
+
+  /**
+   * 快捷拷卡引导「去登记」预填:绑定卷、卡标签(以卷标起步,可改)。
+   * 草稿在提交成功后消费;卷已被拔走则直接丢弃(绑定区自会提示)。
+   */
+  const draftVolume = state.cardDraft
+    ? (volumes.find((v) => v.id === state.cardDraft?.volumeId) ?? null)
+    : null;
+  useEffect(() => {
+    if (!state.cardDraft) return;
+    if (!draftVolume) {
+      dispatch({ type: "cardDraftConsumed" });
+      return;
+    }
+    setBindMount(draftVolume.mountPath);
+    setCardLabel((prev) => (prev.trim() ? prev : draftVolume.name));
+    // 草稿保留到登记成功:成功后靠它续接快捷拷卡引导
+  }, [state.cardDraft, draftVolume, dispatch]);
 
   /** 卷列表可能是启动时拉的旧账:绑定前给个手动刷新 */
   async function refreshBindVolumes() {
@@ -136,10 +154,31 @@ export function DevicesScreen() {
       });
       dispatch({ type: "cardCreated", card });
       setLastCard(card.label);
+      const fromDraft =
+        state.cardDraft !== null && bindMount === draftVolume?.mountPath;
       setCardLabel("");
       setCardSerial("");
       setBindMount("");
       setCardSubmitted(false);
+      if (fromDraft) {
+        // 快捷拷卡引导的登记环节完成:刷新卷列表拿到新的卡匹配,
+        // 再把这张卷重新入队——引导自动进入「加入清单/去拷卡」阶段
+        dispatch({ type: "cardDraftConsumed" });
+        const volumeId = draftVolume.id;
+        try {
+          const next = await api.listVolumes();
+          dispatch({ type: "volumesUpdated", volumes: next });
+        } catch {
+          // 刷新失败也不断引导:本地补 matchedCardId,提示照常弹出
+          dispatch({
+            type: "volumesUpdated",
+            volumes: volumes.map((v) =>
+              v.id === volumeId ? { ...v, matchedCardId: card.id } : v,
+            ),
+          });
+        }
+        dispatch({ type: "volumesInserted", volumeIds: [volumeId] });
+      }
     } catch (err) {
       notify(
         "error",

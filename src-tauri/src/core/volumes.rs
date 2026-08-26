@@ -52,6 +52,29 @@ pub fn is_system_mount(mount: &std::path::Path) -> bool {
 }
 
 /// 列出全部挂载卷。
+/// 两次挂载表快照的差集(卷 id = 挂载路径):返回 (新插入, 已移除)。
+/// 纯函数,卷监视线程用它判定插拔事件;顺序稳定(按 current/prev 原序)。
+pub fn diff_ids(
+    prev: &std::collections::BTreeSet<String>,
+    current: &[VolumeInfo],
+) -> (Vec<String>, Vec<String>) {
+    let cur_ids: std::collections::BTreeSet<String> = current
+        .iter()
+        .map(|v| v.mount_point.display().to_string())
+        .collect();
+    let inserted = current
+        .iter()
+        .map(|v| v.mount_point.display().to_string())
+        .filter(|id| !prev.contains(id))
+        .collect();
+    let removed = prev
+        .iter()
+        .filter(|id| !cur_ids.contains(*id))
+        .cloned()
+        .collect();
+    (inserted, removed)
+}
+
 pub fn list_volumes() -> Vec<VolumeInfo> {
     let disks = Disks::new_with_refreshed_list();
     disks
@@ -207,5 +230,35 @@ mod uid_tests {
         assert!(read_volume_uid(tmp.path()).is_none());
         std::fs::write(tmp.path().join(VOLUME_UID_FILE), "  \n").unwrap();
         assert!(read_volume_uid(tmp.path()).is_none());
+    }
+
+    fn vol(path: &str) -> VolumeInfo {
+        VolumeInfo {
+            name: path.trim_start_matches("/Volumes/").to_string(),
+            mount_point: std::path::PathBuf::from(path),
+            removable: true,
+            system: false,
+            total_bytes: 0,
+            available_bytes: 0,
+            file_system: "exfat".to_string(),
+        }
+    }
+
+    #[test]
+    fn diff_ids_detects_insert_and_remove() {
+        let prev: std::collections::BTreeSet<String> =
+            ["/Volumes/A".to_string(), "/Volumes/B".to_string()].into();
+        let cur = [vol("/Volumes/B"), vol("/Volumes/C")];
+        let (ins, rem) = diff_ids(&prev, &cur);
+        assert_eq!(ins, vec!["/Volumes/C".to_string()]);
+        assert_eq!(rem, vec!["/Volumes/A".to_string()]);
+    }
+
+    #[test]
+    fn diff_ids_no_change_is_empty() {
+        let prev: std::collections::BTreeSet<String> = ["/Volumes/A".to_string()].into();
+        let (ins, rem) = diff_ids(&prev, &[vol("/Volumes/A")]);
+        assert!(ins.is_empty());
+        assert!(rem.is_empty());
     }
 }

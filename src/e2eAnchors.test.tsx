@@ -88,6 +88,33 @@ describe("E2E 锚点", () => {
     ]);
   });
 
+  it("快捷拷卡引导锚点", async () => {
+    // 未登记卡(NO NAME 无 matchedCardId)
+    render(
+      <App
+        preloaded={{
+          ...base,
+          route: "projects",
+          quickCopyQueue: ["vol-untitled-3"],
+        }}
+      />,
+    );
+    expectAnchors(["quick-copy-prompt", "qc-register", "qc-ignore"]);
+    cleanup();
+    // 已登记卡:清单读回后出现拷卡入口
+    render(
+      <App
+        preloaded={{
+          ...base,
+          route: "projects",
+          quickCopyQueue: ["vol-untitled-1"],
+        }}
+      />,
+    );
+    await screen.findByTestId("qc-copy");
+    expectAnchors(["quick-copy-prompt", "qc-copy", "qc-ignore"]);
+  });
+
   it("分类工作台锚点", async () => {
     render(<App preloaded={{ ...base, route: "sorting" }} />);
     await screen.findAllByTestId("asset-cell");

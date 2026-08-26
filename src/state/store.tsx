@@ -108,6 +108,15 @@ export interface AppState {
   jobs: JobSnapshot[];
   /** 已摄入通知的 `code@occurredAt`，供启动回放去重 */
   noticeKeys: Record<string, true>;
+  /**
+   * 快捷拷卡(插卡引导):待处理的新插入卷 id 队列,一次提示一张。
+   * 卷被拔走时随 volumesUpdated 自动出队。
+   */
+  quickCopyQueue: string[];
+  /** 拷卡屏预填草稿:快捷拷卡引导「去拷卡」时带上卷(和匹配卡的相机) */
+  copyDraft: { volumeId: string; cameraId?: string } | null;
+  /** 设备屏卡登记预填草稿:快捷拷卡引导「去登记」时带上待绑定的卷 */
+  cardDraft: { volumeId: string } | null;
 }
 
 type BootstrapPayload = Pick<
@@ -145,7 +154,13 @@ export type AppAction =
   | { type: "noticesPanelClosed" }
   | { type: "jobsLoaded"; jobs: JobSnapshot[] }
   | { type: "jobProgress"; job: JobSnapshot }
-  | { type: "volumesUpdated"; volumes: Volume[] };
+  | { type: "volumesUpdated"; volumes: Volume[] }
+  | { type: "volumesInserted"; volumeIds: string[] }
+  | { type: "quickCopyResolved"; volumeId: string }
+  | { type: "copyDraftSet"; volumeId: string; cameraId?: string }
+  | { type: "copyDraftConsumed" }
+  | { type: "cardDraftSet"; volumeId: string }
+  | { type: "cardDraftConsumed" };
 
 /** 孤儿对账的退避档位：失败一次等 2s，再失败 5s，之后稳定在 10s */
 const ORPHAN_BACKOFF_MS = [2000, 5000, 10000];
@@ -170,6 +185,9 @@ export const initialState: AppState = {
   noticeSeq: 0,
   noticeKeys: {},
   jobs: [],
+  quickCopyQueue: [],
+  copyDraft: null,
+  cardDraft: null,
 };
 
 /** 把增量事件合并进文件列表；未在事件里出现的文件保持原样 */
@@ -389,8 +407,56 @@ export function reducer(state: AppState, action: AppAction): AppState {
     case "selectTask":
       return { ...state, selectedTaskId: action.taskId };
 
-    case "volumesUpdated":
-      return { ...state, volumes: action.volumes };
+    case "volumesUpdated": {
+      // 卷被拔走时,对应的快捷拷卡提示自动出队(卷不在了提示无意义)
+      const ids = new Set(action.volumes.map((v) => v.id));
+      const queue = state.quickCopyQueue.filter((id) => ids.has(id));
+      return {
+        ...state,
+        volumes: action.volumes,
+        quickCopyQueue:
+          queue.length === state.quickCopyQueue.length
+            ? state.quickCopyQueue
+            : queue,
+      };
+    }
+
+    case "volumesInserted": {
+      // 只对可移动的非系统卷起提示(系统盘/内置盘插拔不是「插卡」);
+      // 去重:已在队列里的不重复入队
+      const fresh = action.volumeIds.filter((id) => {
+        const v = state.volumes.find((x) => x.id === id);
+        return (
+          v !== undefined &&
+          v.removable &&
+          !v.isSystem &&
+          !state.quickCopyQueue.includes(id)
+        );
+      });
+      if (fresh.length === 0) return state;
+      return { ...state, quickCopyQueue: [...state.quickCopyQueue, ...fresh] };
+    }
+
+    case "quickCopyResolved":
+      return {
+        ...state,
+        quickCopyQueue: state.quickCopyQueue.filter((id) => id !== action.volumeId),
+      };
+
+    case "copyDraftSet":
+      return {
+        ...state,
+        copyDraft: { volumeId: action.volumeId, cameraId: action.cameraId },
+      };
+
+    case "copyDraftConsumed":
+      return { ...state, copyDraft: null };
+
+    case "cardDraftSet":
+      return { ...state, cardDraft: { volumeId: action.volumeId } };
+
+    case "cardDraftConsumed":
+      return { ...state, cardDraft: null };
 
     case "projectCreated":
       return {
@@ -782,6 +848,49 @@ export function StoreProvider({
               err instanceof Error
                 ? `进度监听未能建立：${err.message}。拷卡进度不会自动刷新，请重启应用；已在进行的拷贝不受影响。`
                 : "进度监听未能建立，拷卡进度不会自动刷新，请重启应用；已在进行的拷贝不受影响。",
+            occurredAt: new Date().toISOString(),
+          },
+        }),
+    );
+  }, []);
+
+  /**
+   * 卷插拔常驻订阅(快捷拷卡):事件只当触发器,收到后重新拉一次
+   * 带卡匹配的完整卷列表,再把新插入的卷交给引导队列。
+   */
+  useEffect(() => {
+    return api.subscribeVolumesChanged(
+      (event) => {
+        void (async () => {
+          try {
+            const volumes = await api.listVolumes();
+            dispatch({ type: "volumesUpdated", volumes });
+            dispatch({ type: "volumesInserted", volumeIds: event.insertedIds });
+          } catch (err) {
+            // 拉不回列表 = 本次插拔无法反映到界面,必须可见
+            dispatch({
+              type: "noticeReceived",
+              notice: {
+                level: "warning",
+                code: "volumes-refresh-failed",
+                message: `检测到卷插拔,但卷列表刷新失败：${
+                  err instanceof Error ? err.message : String(err)
+                }。请手动刷新。`,
+                occurredAt: new Date().toISOString(),
+              },
+            });
+          }
+        })();
+      },
+      (err) =>
+        dispatch({
+          type: "noticeReceived",
+          notice: {
+            level: "warning",
+            code: "volumes-listen-failed",
+            message: `插卡检测未能建立：${
+              err instanceof Error ? err.message : String(err)
+            }。快捷拷卡引导不可用,插卡后请手动刷新卷列表。`,
             occurredAt: new Date().toISOString(),
           },
         }),

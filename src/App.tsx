@@ -1,5 +1,6 @@
 import { NoticeToasts } from "./components/NotificationCenter";
 import { OnboardingWizard } from "./components/OnboardingWizard";
+import { QuickCopyPrompt } from "./components/QuickCopyPrompt";
 import { SessionGuard } from "./components/SessionGuard";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { Sidebar } from "./components/Sidebar";
@@ -151,6 +152,9 @@ export function Shell() {
       {/* toast 必须在 .main 之外:会话门会把 .main 整体 inert,
           挂在里面的 error toast 视觉在最上层却点不了、读屏也不播报(评审 P1) */}
       <NoticeToasts />
+      {/* 快捷拷卡引导:同在 .main 之外(路由切换不打断引导);
+          z-index 低于会话门,门开时被压住,不构成绕门旁路 */}
+      <QuickCopyPrompt />
     </div>
   );
 }

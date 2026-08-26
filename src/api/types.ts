@@ -304,6 +304,12 @@ export interface WorkstationInfo {
  * 通知（tauri 事件 `app://notice`）
  * ------------------------------------------------------------------ */
 
+/** 卷插拔事件(volumes://changed):id = 挂载路径,与 Volume.id 同源 */
+export interface VolumesChangedEvent {
+  insertedIds: string[];
+  removedIds: string[];
+}
+
 export type NoticeLevel = "info" | "warning" | "error";
 
 /**

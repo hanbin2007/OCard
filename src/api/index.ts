@@ -83,6 +83,7 @@ import type {
   Volume,
   VolumeInspection,
   WorkstationInfo,
+  VolumesChangedEvent,
 } from "./types";
 
 import { invoke } from "@tauri-apps/api/core";
@@ -560,6 +561,35 @@ export function subscribeNotices(
   }
   // 浏览器/测试环境没有后端推送；测试通过 spy 注入通知
   return { dispose: () => {}, ready: Promise.resolve() };
+}
+
+/**
+ * 订阅卷插拔事件(快捷拷卡):后端监视线程 2s 轮询挂载表,有插拔即推。
+ * 与其它订阅同构。浏览器/测试环境无后端推送,测试直接驱动 store action。
+ */
+export function subscribeVolumesChanged(
+  onEvent: (event: VolumesChangedEvent) => void,
+  onError?: (error: unknown) => void,
+): () => void {
+  if (IS_TAURI) {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    listen<VolumesChangedEvent>("volumes://changed", (e) => {
+      if (!disposed) onEvent(e.payload);
+    })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => {
+        if (!disposed) onError?.(err);
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }
+  return () => {};
 }
 
 /**
