@@ -47,6 +47,11 @@ describe("浮层层叠", () => {
     expect(toastBody).toContain("pointer-events: auto");
   });
 
+  it("下拉浮层压过普通浮层、低于会话门(门内禁放 Select 的口径要成立)", () => {
+    expect(zIndexOf(".select-pop")).toBeGreaterThan(zIndexOf(".overlay {"));
+    expect(zIndexOf(".select-pop")).toBeLessThan(zIndexOf(".overlay--gate"));
+  });
+
   it("对话框在锁死页面滚动的前提下自己能滚(矮窗口不可达回归)", () => {
     const start = css.indexOf(".dialog {");
     const body = css.slice(start, css.indexOf("}", start));

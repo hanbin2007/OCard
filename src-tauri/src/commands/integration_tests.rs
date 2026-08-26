@@ -1014,3 +1014,111 @@ fn analysis_runs_real_yunet_inference() {
         "真模型不得报损坏: {notices}"
     );
 }
+
+#[test]
+fn create_storage_card_bind_rejects_unmounted_and_system_paths() {
+    // 插卡绑定的两道闸(UX 波二评审 P1/P4):
+    // 1) 任意目录(未挂载)不许写指纹;2) 系统内置盘一律拒绑。
+    let (window, _tmp, _nas) = mock_app();
+    let cam = invoke(
+        &window,
+        "create_camera",
+        json!({"input": {"model": "A7M4", "position": "A", "operatorAlias": "ZS"}}),
+    )
+    .expect("登记相机应成功");
+    let cam_id = cam["id"].as_str().unwrap().to_string();
+
+    // 未挂载的任意目录:ensure_volume_uid 之前就必须拦下(不留无主指纹)
+    let stray = tempfile::tempdir().unwrap();
+    let err = invoke(
+        &window,
+        "create_storage_card",
+        json!({"input": {"label": "SD-X", "cameraId": cam_id, "capacityBytes": 1,
+                "bindMountPath": stray.path().to_string_lossy()}}),
+    )
+    .expect_err("未挂载路径必须拒绝");
+    assert!(
+        err.as_str().unwrap().contains("未挂载"),
+        "错误应指明未挂载: {err}"
+    );
+    assert!(
+        !stray
+            .path()
+            .join(crate::core::volumes::VOLUME_UID_FILE)
+            .exists(),
+        "拒绝路径上不得留下指纹文件"
+    );
+
+    // 系统盘(mac/linux 上 `/` 必在挂载列表且 system=true)
+    let err = invoke(
+        &window,
+        "create_storage_card",
+        json!({"input": {"label": "SD-Y", "cameraId": cam_id, "capacityBytes": 1,
+                "bindMountPath": "/"}}),
+    )
+    .expect_err("系统盘必须拒绝");
+    assert!(
+        err.as_str().unwrap().contains("系统内置盘"),
+        "错误应指明系统盘: {err}"
+    );
+}
+
+#[cfg(test)]
+mod match_card_tests {
+    use crate::commands::match_card;
+    use crate::core::registry::StorageCard;
+
+    fn card(id: &str, label: &str, uid: Option<&str>) -> StorageCard {
+        StorageCard {
+            id: id.into(),
+            label: label.into(),
+            camera_id: "cam".into(),
+            capacity_bytes: 1,
+            serial: None,
+            volume_uid: uid.map(str::to_string),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn uid_beats_label() {
+        // 指纹指向 A、卷标同 B:以指纹为准,且差异必须上报
+        let cards = vec![card("a", "CFE-01", Some("u1")), card("b", "SDCARD", None)];
+        let (hit, conflict) = match_card(&cards, Some("u1"), "SDCARD");
+        assert_eq!(hit.as_deref(), Some("a"));
+        assert!(conflict.unwrap().contains("以指纹为准"));
+    }
+
+    #[test]
+    fn duplicate_uid_matches_nothing_and_reports() {
+        let cards = vec![
+            card("a", "CFE-01", Some("u1")),
+            card("b", "CFE-02", Some("u1")),
+        ];
+        let (hit, conflict) = match_card(&cards, Some("u1"), "ANY");
+        assert!(hit.is_none());
+        assert!(conflict.unwrap().contains("多张卡"));
+    }
+
+    #[test]
+    fn unknown_uid_only_falls_back_to_unbound_cards() {
+        // 卷带未登记指纹,卷标对上的卡绑着别的指纹:不许静默配对
+        let cards = vec![card("b", "SDCARD", Some("u2"))];
+        let (hit, conflict) = match_card(&cards, Some("u-unknown"), "SDCARD");
+        assert!(hit.is_none());
+        assert!(conflict.unwrap().contains("重新绑定"));
+        // 卷标对上的是从未绑过指纹的旧卡:允许弱匹配
+        let cards = vec![card("b", "SDCARD", None)];
+        let (hit, conflict) = match_card(&cards, Some("u-unknown"), "SDCARD");
+        assert_eq!(hit.as_deref(), Some("b"));
+        assert!(conflict.is_none());
+    }
+
+    #[test]
+    fn no_uid_label_match_stays() {
+        let cards = vec![card("b", "SDCARD", None)];
+        let (hit, conflict) = match_card(&cards, None, "sdcard");
+        assert_eq!(hit.as_deref(), Some("b"));
+        assert!(conflict.is_none());
+    }
+}

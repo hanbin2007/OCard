@@ -105,14 +105,13 @@ export function ProjectsScreen() {
                       <span className="projects__cell projects__cell--mono">
                         {/* 只报事实:已拷 N 张(+未完成标记)。不存在「计划总数」,
                             此前 x/y 的分母是任务数自我计数,是假进度(用户指正) */}
-                        {project.cardsCopied} 张
-                        {project.copyIncomplete ? (
-                          <span className="projects__folder text-warn">有未完成任务</span>
-                        ) : (
-                          <span className="projects__folder">
-                            {formatBytes(project.bytesCopied)}
-                          </span>
-                        )}
+                        {project.cardsCopied} 次
+                        <span className="projects__folder">
+                          {formatBytes(project.bytesCopied)}
+                          {project.copyIncomplete ? (
+                            <span className="text-warn"> · 有未完成任务</span>
+                          ) : null}
+                        </span>
                       </span>
 
                       <span className="projects__meter">
@@ -255,7 +254,7 @@ export function ProjectsScreen() {
                         <div className="row-inline">
                           <span className="text-xs dim">拷卡</span>
                           <span className="text-xs mono muted push-right">
-                            已拷 {selected.cardsCopied} 张 ·{" "}
+                            完成 {selected.cardsCopied} 次拷卡 ·{" "}
                             {formatBytes(selected.bytesCopied)}
                           </span>
                         </div>

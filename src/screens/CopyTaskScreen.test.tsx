@@ -613,3 +613,22 @@ describe("侧栏切项目不换页(UX 波二)", () => {
     );
   });
 });
+
+describe("切项目的状态隔离(codex 评审 P1)", () => {
+  it("确认屏在切项目时立刻失效:不许对着 A 的预览把任务落进 B", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    await user.click(screen.getByRole("radio", { name: "选择源卷 NIKON_Z9" }));
+    await waitForInferredPrefix();
+    await user.type(screen.getByLabelText("内容备注"), "下午径赛");
+    await fillDestinations(user);
+    await user.click(screen.getByRole("button", { name: "开始拷卡" }));
+    expect(screen.getByText("确认拷卡信息")).toBeDefined();
+
+    // 侧栏切到另一个项目:确认屏必须整体退回表单
+    await user.click(screen.getByText(mockProjects[1].name));
+    expect(screen.queryByText("确认拷卡信息")).toBeNull();
+    expect(screen.getByLabelText("内容备注")).toBeDefined();
+  });
+});

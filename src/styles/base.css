@@ -119,7 +119,7 @@ kbd,
    滚动条样式会把滚动容器踢出合成器异步滚动路径,退回主线程滚动:
    触控板弹性回弹消失、主线程忙时内容跳变、滚动条滞后于内容(实测三症状
    同源)。scrollbar-width/scrollbar-color 走标准通道,不碰滚动路径。 */
-* {
+:root {
   scrollbar-width: thin;
   scrollbar-color: var(--border-strong) transparent;
 }

@@ -230,6 +230,19 @@ export function SortingScreen() {
 
   /* ---------------- 数据加载 ---------------- */
 
+  // 切项目把旧项目的资产/选择/预览/待删标记全部清零(codex 评审 P1):
+  // 侧栏切项目页面不再卸载,旧相对路径 + 新 projectId 组合起来
+  // 可能移动/删除新项目里的同名文件
+  useEffect(() => {
+    setAssets([]);
+    setTotal(0);
+    setSelection(emptySelection);
+    setPreviewId(null);
+    setOpenGroup(null);
+    setCommit(null);
+    dispatchDelete({ type: "clear" });
+  }, [projectId]);
+
   useEffect(() => {
     if (!projectId) return;
     let cancelled = false;

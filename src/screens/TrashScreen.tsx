@@ -37,6 +37,14 @@ export function TrashScreen() {
     }
   }, [projectId]);
 
+  // 切项目立刻清旧账并收起确认框(codex 评审 P0):侧栏切项目页面不再卸载,
+  // 若留着 A 项目的条目,确认框会显示 A 的数量却对 B 执行清空——不可逆误删
+  useEffect(() => {
+    setEntries([]);
+    setConfirm(null);
+    setEmptyFailed(0);
+  }, [projectId]);
+
   useEffect(() => {
     void reload();
   }, [reload]);
@@ -75,7 +83,8 @@ export function TrashScreen() {
   }
 
   function requestEmpty() {
-    if (entries.length === 0) return;
+    // 加载中的清单不可作为删除依据(数量可能属于上一个项目)
+    if (entries.length === 0 || loading || busy) return;
     setConfirm({
       title: `永久删除回收站里的 ${entries.length} 个文件？`,
       message:
@@ -122,7 +131,7 @@ export function TrashScreen() {
               type="button"
               className="btn btn--sm btn--danger-solid"
               data-testid="trash-empty"
-              disabled={entries.length === 0 || busy}
+              disabled={entries.length === 0 || busy || loading}
               onClick={requestEmpty}
             >
               清空回收站

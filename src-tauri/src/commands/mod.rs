@@ -336,6 +336,70 @@ pub fn list_storage_cards<R: tauri::Runtime>(
     Ok(load.registry.cards)
 }
 
+/// 卷 ↔ 登记卡匹配(纯函数,单测锚点):uid 强匹配优先,卷标弱匹配兜底。
+/// 返回 (匹配卡 id, 需要上报的冲突说明)。
+/// - 同 uid 命中多张卡:克隆/重复登记,拒绝匹配并要求清理(零静默);
+/// - uid 命中 A 而卷标同 B:以指纹为准,但差异必须可见。
+pub(crate) fn match_card(
+    cards: &[registry::StorageCard],
+    uid: Option<&str>,
+    volume_name: &str,
+) -> (Option<String>, Option<String>) {
+    let uid_hits: Vec<&registry::StorageCard> = uid
+        .map(|u| {
+            cards
+                .iter()
+                .filter(|c| c.volume_uid.as_deref() == Some(u))
+                .collect()
+        })
+        .unwrap_or_default();
+    if uid_hits.len() > 1 {
+        let labels = uid_hits
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect::<Vec<_>>()
+            .join("、");
+        return (
+            None,
+            Some(format!(
+                "卷「{volume_name}」的身份指纹同时登记在多张卡名下({labels}),已不匹配任何一张,请删除重复登记"
+            )),
+        );
+    }
+    if let Some(hit) = uid_hits.first() {
+        let conflict = cards
+            .iter()
+            .find(|c| c.label.eq_ignore_ascii_case(volume_name))
+            .filter(|b| b.id != hit.id)
+            .map(|b| {
+                format!(
+                    "卷「{volume_name}」按指纹认定为「{}」,但卷标与另一张卡「{}」相同;以指纹为准",
+                    hit.label, b.label
+                )
+            });
+        return (Some(hit.id.clone()), conflict);
+    }
+    let label_hit = cards
+        .iter()
+        .find(|c| c.label.eq_ignore_ascii_case(volume_name));
+    // 卷带着未登记的指纹时,卷标兜底只许落在「从未绑定过指纹」的旧卡上:
+    // 卷标对上的卡绑着**别的**指纹 = 克隆/换卡,静默配对会稳定认错(codex P1)
+    if uid.is_some() {
+        if let Some(b) = label_hit {
+            if b.volume_uid.is_some() {
+                return (
+                    None,
+                    Some(format!(
+                        "卷「{volume_name}」带有未登记的身份指纹,而同卷标的卡「{}」绑着另一枚指纹——可能是克隆卡或换过卡,请重新绑定登记",
+                        b.label
+                    )),
+                );
+            }
+        }
+    }
+    (label_hit.map(|c| c.id.clone()), None)
+}
+
 #[tauri::command]
 pub fn create_storage_card<R: tauri::Runtime>(
     app: AppHandle<R>,
@@ -344,8 +408,18 @@ pub fn create_storage_card<R: tauri::Runtime>(
 ) -> CmdResult<registry::StorageCard> {
     // 插卡绑定(用户指正的登记盲区):不绑物理卡,之后只能靠「卷标==卡标签」
     // 弱匹配认卡。绑定 = 校验该卷确实挂载中 → 当场在卡根写身份指纹 → uid 入表。
-    let volume_uid = match &input.bind_mount_path {
-        None => None,
+    // 顺序原则(评审):一切无副作用校验(NAS 可达/标签/相机/卷名核对)先行,
+    // 往卡上写指纹放在最后——校验失败不许在卡上留无主文件。
+    let nas = nas_root(&app, &state)?;
+    if input.label.trim().is_empty() {
+        return Err("卡标签不能为空".into());
+    }
+    let reg = registry::load(&nas).map_err(err)?.registry;
+    if !reg.cameras.iter().any(|c| c.id == input.camera_id) {
+        return Err(format!("相机未登记: {}", input.camera_id));
+    }
+    let (volume_uid, capacity_bytes) = match &input.bind_mount_path {
+        None => (None, input.capacity_bytes),
         Some(raw) => {
             let mount = PathBuf::from(raw);
             let mounted = volumes::list_volumes()
@@ -355,21 +429,42 @@ pub fn create_storage_card<R: tauri::Runtime>(
             if mounted.system {
                 return Err(format!("拒绝绑定系统内置盘: {raw}"));
             }
+            // 挂载点复用是现实场景(拔 A 插 B 都挂 /Volumes/UNTITLED):
+            // 与前端所见卷名核对,不一致 = 卡已换,拒绝并要求刷新(评审 P1)
+            if let Some(expect) = input.bind_volume_name.as_deref() {
+                if !expect.trim().is_empty() && expect != mounted.name {
+                    return Err(format!(
+                        "该挂载点上的卡已变化(选择时是「{expect}」,现在是「{}」),请刷新卷列表后重选",
+                        mounted.name
+                    ));
+                }
+            }
             let uid = volumes::ensure_volume_uid(&mount).ok_or_else(|| {
-                format!(
-                    "无法在卡上写入身份指纹(卡可能写保护或只读): {raw}。                     解除写保护后重试,或改用「不绑定」登记(退化为卷标匹配)"
-                )
+                format!("无法在卡上写入身份指纹(卡可能写保护或只读): {raw}。解除写保护后重试,或改用「不绑定」登记(退化为卷标匹配)")
             })?;
-            Some(uid)
+            // 指纹唯一性:同 uid 已在别的卡名下 = 克隆卡/重复登记,
+            // 「强匹配」会稳定认错卡,必须拒绝(评审 P1)
+            if let Some(dup) = reg
+                .cards
+                .iter()
+                .find(|c| c.volume_uid.as_deref() == Some(uid.as_str()))
+            {
+                return Err(format!(
+                    "这张卡的身份指纹已登记在「{}」名下,不能重复登记;如需改绑请先删除原登记",
+                    dup.label
+                ));
+            }
+            // 容量以后端实测挂载卷为准,不信前端缓存(评审 P1)
+            (Some(uid), mounted.total_bytes)
         }
     };
     registry::register_card(
-        &nas_root(&app, &state)?,
+        &nas,
         &state.machine_id,
         &operator(&app, &state),
         &input.label,
         &input.camera_id,
-        input.capacity_bytes,
+        capacity_bytes,
         input.serial,
         volume_uid,
     )
@@ -420,14 +515,17 @@ pub fn list_volumes<R: tauri::Runtime>(
         .into_iter()
         .map(|v| {
             // 指纹优先:卡根 `.ocard-volume-id` 与登记表 volume_uid 对上 = 强匹配;
-            // 读不到指纹或没登记 uid 时退回卷标弱匹配(改卷标/同名卡会认错,
-            // 由登记时的绑定引导逐步收敛)
-            let uid = volumes::read_volume_uid(&v.mount_point);
-            let matched = uid
-                .as_deref()
-                .and_then(|u| cards.iter().find(|c| c.volume_uid.as_deref() == Some(u)))
-                .or_else(|| cards.iter().find(|c| c.label.eq_ignore_ascii_case(&v.name)))
-                .map(|c| c.id.clone());
+            // 读不到指纹或没登记 uid 时退回卷标弱匹配。系统盘不做指纹探测:
+            // 在 `/` 放一个指纹文件不该让启动盘被认成登记卡(评审 P2)
+            let uid = if v.system {
+                None
+            } else {
+                volumes::read_volume_uid(&v.mount_point)
+            };
+            let (matched, conflict) = match_card(&cards, uid.as_deref(), &v.name);
+            if let Some(msg) = conflict {
+                notify::warn(&app, "card-match-conflict", msg);
+            }
             VolumeDto {
                 id: v.mount_point.display().to_string(),
                 name: v.name,
@@ -669,7 +767,16 @@ pub fn start_copy_task<R: tauri::Runtime>(
 
     // 卡片指纹:身份随卡走。**全部路径校验通过后**才允许往卡上写文件;
     // 写保护/非挂载卷拿不到指纹要告知(退化为卷名匹配,零静默)
-    let source_uid = if mounted.is_some() {
+    let source_uid = if mounted.as_ref().is_some_and(|m| m.system) {
+        // 系统盘不写指纹:create_storage_card 拒绑系统盘,这里保持同一道闸,
+        // 否则拷贝路径能在 `/` 造出指纹文件让启动盘被认成登记卡(评审 P2)
+        notify::warn(
+            &app,
+            "volume-uid-skipped",
+            format!("源「{volume_name}」是系统内置盘,不在其上写身份指纹"),
+        );
+        None
+    } else if mounted.is_some() {
         volumes::ensure_volume_uid(&source_root)
     } else {
         notify::warn(

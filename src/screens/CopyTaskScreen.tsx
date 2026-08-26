@@ -171,6 +171,20 @@ export function CopyTaskScreen() {
       ? buildCopyTargetPath(project.scenario, targetPrefix, camera.code)
       : "";
 
+  // 切项目把发起表单整体归零(codex 评审 P1):侧栏切项目页面不再卸载,
+  // 留着旧项目的确认预览会出现「对着 A 的预览确认,任务落进 B」
+  const projectKey = project?.id ?? null;
+  useEffect(() => {
+    setConfirming(false);
+    setPreview(null);
+    setPreviewError(null);
+    setSubmitted(false);
+    setStartError(null);
+    setTargetPrefix("");
+    setPrefixInferred(false);
+    prefixEditedRef.current = false;
+  }, [projectKey]);
+
   // 选中源卷后探查素材时间戳，据此推断时段前缀（PRD §5.3：从素材时间戳推断，可改）
   useEffect(() => {
     if (!volumeId || !project || prefixEditedRef.current) return;

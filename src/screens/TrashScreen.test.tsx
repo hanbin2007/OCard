@@ -170,3 +170,23 @@ describe("回收站", () => {
     spy.mockRestore();
   });
 });
+
+describe("切项目的状态隔离(codex 评审 P0)", () => {
+  it("侧栏切项目立刻清旧账并收起确认框:A 的数量绝不能对 B 执行清空", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+    await screen.findAllByTestId("trash-row");
+
+    // 打开「清空」确认框(显示的是项目 A 的数量)
+    await user.click(screen.getByTestId("trash-empty"));
+    expect(screen.getByText(/永久删除回收站里的/)).toBeDefined();
+
+    // 切到项目 B:确认框必须立刻消失,旧条目清零,清空按钮在新账加载完成前禁用
+    await user.click(screen.getByText(mockProjects[1].name));
+    expect(screen.queryByText(/永久删除回收站里的/)).toBeNull();
+    expect(screen.queryAllByTestId("trash-row")).toHaveLength(0);
+    expect((screen.getByTestId("trash-empty") as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+  });
+});

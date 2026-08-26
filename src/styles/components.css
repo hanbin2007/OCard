@@ -1658,7 +1658,7 @@
   align-items: flex-start;
   gap: var(--space-2);
   cursor: pointer;
-  font-size: var(--text-sm);
+  /* 不设 font-size:继承上下文,让 text-xs 等透传排版类真正生效 */
   line-height: var(--leading-normal);
 }
 
@@ -1763,7 +1763,8 @@
 }
 
 /* 浮层:portal 到 body,fixed 定位;高于普通浮层(可出现在 dialog 里),
-   低于会话门 —— 层级关系由 stacking.test 钉住 */
+   低于会话门(z=80)——门/门上确认框内不得放 Select(会被盖住)。
+   与 overlay/gate 的大小关系由 stacking.test 静态钉住 */
 .select-pop {
   position: fixed;
   z-index: 70;

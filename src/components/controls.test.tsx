@@ -32,7 +32,7 @@ describe("Checkbox", () => {
         锁定
       </Checkbox>,
     );
-    await user.click(screen.getByText("锁定")).catch(() => undefined);
+    fireEvent.click(screen.getByText("锁定"));
     expect(onChange).not.toHaveBeenCalled();
   });
 });
@@ -80,20 +80,32 @@ describe("Select", () => {
     expect(document.activeElement).toBe(screen.getByTestId("sel"));
   });
 
-  it("键盘:↓ 移动活动项,Enter 提交,Esc 关闭", async () => {
+  it("键盘:↓ 移动活动项,Enter 提交,Esc 关闭(走真实焦点路径)", async () => {
     const user = userEvent.setup();
     const { onChange } = setupSelect("a");
     await user.click(screen.getByTestId("sel"));
-    const list = screen.getByRole("listbox");
-
-    fireEvent.keyDown(list, { key: "ArrowDown" });
-    fireEvent.keyDown(list, { key: "Enter" });
+    // 打开后焦点应真的落在 listbox 上——user.keyboard 打到 activeElement,
+    // 若 focus() 断了这里立刻红(评审:fireEvent 直打 ul 会绕开焦点时序)
+    expect(document.activeElement).toBe(screen.getByRole("listbox"));
+    await user.keyboard("{ArrowDown}{Enter}");
     expect(onChange).toHaveBeenCalledWith("b");
     expect(screen.queryByRole("listbox")).toBeNull();
 
     await user.click(screen.getByTestId("sel"));
-    fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+    await user.keyboard("{Escape}");
     expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("键盘活动项由 aria-activedescendant 指名(读屏可宣布)", async () => {
+    const user = userEvent.setup();
+    setupSelect("a");
+    await user.click(screen.getByTestId("sel"));
+    const list = screen.getByRole("listbox");
+    await user.keyboard("{ArrowDown}");
+    const activeId = list.getAttribute("aria-activedescendant");
+    expect(activeId).toBeTruthy();
+    const active = document.getElementById(activeId as string);
+    expect(active?.textContent).toContain("乙");
   });
 
   it("点外面收起且不提交", async () => {
@@ -113,7 +125,8 @@ describe("Select", () => {
     render(
       <Select testId="sel" value="" onChange={onChange} options={OPTIONS} disabled />,
     );
-    await user.click(screen.getByTestId("sel")).catch(() => undefined);
+    fireEvent.click(screen.getByTestId("sel"));
     expect(screen.queryByRole("listbox")).toBeNull();
+    void user;
   });
 });

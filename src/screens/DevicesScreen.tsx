@@ -33,6 +33,8 @@ export function DevicesScreen() {
   /** 插卡绑定:选中的挂载路径("" = 不绑定) */
   const [bindMount, setBindMount] = useState("");
   const [bindRefreshing, setBindRefreshing] = useState(false);
+  /** 刷新后发现之前选的卷已拔出:必须可见地要求重选,不能等后端拒绝 */
+  const [bindStale, setBindStale] = useState(false);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   /** 删除失败必须说出来——不能乐观移除后让界面谎报成功 */
@@ -65,6 +67,15 @@ export function DevicesScreen() {
     try {
       const next = await api.listVolumes();
       dispatch({ type: "volumesUpdated", volumes: next });
+      // 之前选的卷不在新列表里(卡被拔了):立刻清掉并可见提示,
+      // 不许把过期路径提交给后端再靠"未挂载"报错兜底
+      setBindMount((prev) => {
+        if (prev && !next.some((v) => v.mountPath === prev)) {
+          setBindStale(true);
+          return "";
+        }
+        return prev;
+      });
     } catch (err) {
       setSubmitError(
         `刷新卷列表失败：${err instanceof Error ? err.message : String(err)}`,
@@ -121,7 +132,9 @@ export function DevicesScreen() {
         // 绑定时容量取真实卷容量,不用档位近似值
         capacityBytes: boundVolume ? boundVolume.capacityBytes : cardCapacity * GB,
         serial: cardSerial,
-        ...(bindMount ? { bindMountPath: bindMount } : {}),
+        ...(bindMount
+          ? { bindMountPath: bindMount, bindVolumeName: boundVolume?.name }
+          : {}),
       });
       dispatch({ type: "cardCreated", card });
       setLastCard(card.label);
@@ -290,6 +303,8 @@ export function DevicesScreen() {
                     {/* 插卡绑定(推荐):不绑物理卡,之后只能靠「卷标==标签」认卡,
                         改卷标/同名卡都会认错(用户指正的登记盲区)。绑定 =
                         当场在卡根写身份指纹,今后凭指纹强匹配 */}
+                    {/* Select 是 Field 的直接子级:cloneElement 注入的
+                        aria-describedby 才能真落到触发器上(opus 评审 P2) */}
                     <Field
                       label="绑定已插入的卡(推荐)"
                       htmlFor="card-bind"
@@ -299,37 +314,43 @@ export function DevicesScreen() {
                           : "插入卡并选择后,凭指纹强匹配;不绑定则只按卷标弱匹配"
                       }
                     >
-                      <div className="row-inline">
-                        <Select
-                          id="card-bind"
-                          testId="card-bind"
-                          value={bindMount}
-                          onChange={(next) => {
-                            setBindMount(next);
-                            const vol = volumes.find((v) => v.mountPath === next);
-                            if (vol) setCardLabel(vol.name);
-                          }}
-                          options={[
-                            { value: "", label: "不绑定(手工登记)" },
-                            ...volumes
-                              .filter((v) => !v.isSystem)
-                              .map((v) => ({
-                                value: v.mountPath,
-                                label: `${v.name}（${v.mountPath} · ${formatBytes(v.capacityBytes, 0)}）`,
-                              })),
-                          ]}
-                        />
-                        <button
-                          type="button"
-                          className="btn btn--sm"
-                          data-testid="card-bind-refresh"
-                          disabled={bindRefreshing}
-                          onClick={() => void refreshBindVolumes()}
-                        >
-                          {bindRefreshing ? "…" : "刷新"}
-                        </button>
-                      </div>
+                      <Select
+                        id="card-bind"
+                        testId="card-bind"
+                        value={bindMount}
+                        onChange={(next) => {
+                          setBindMount(next);
+                          setBindStale(false);
+                          const vol = volumes.find((v) => v.mountPath === next);
+                          if (vol) setCardLabel(vol.name);
+                        }}
+                        options={[
+                          { value: "", label: "不绑定(手工登记)" },
+                          ...volumes
+                            .filter((v) => !v.isSystem)
+                            .map((v) => ({
+                              value: v.mountPath,
+                              label: `${v.name}（${v.mountPath} · ${formatBytes(v.capacityBytes, 0)}）`,
+                            })),
+                        ]}
+                      />
                     </Field>
+                    <div className="row-inline">
+                      <button
+                        type="button"
+                        className="btn btn--sm"
+                        data-testid="card-bind-refresh"
+                        disabled={bindRefreshing}
+                        onClick={() => void refreshBindVolumes()}
+                      >
+                        {bindRefreshing ? "刷新中…" : "刷新卷列表"}
+                      </button>
+                      {bindStale ? (
+                        <span className="text-xs text-warn" role="alert">
+                          之前选的卡已不在,请重新选择
+                        </span>
+                      ) : null}
+                    </div>
 
                     <Field
                       label="卡面标签"

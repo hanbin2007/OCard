@@ -67,6 +67,10 @@ pub struct NewStorageCardInput {
     /// 指纹并存入登记表(强身份);不传 = 仅卷标弱匹配。
     #[serde(default)]
     pub bind_mount_path: Option<String>,
+    /// 绑定时前端所见的卷名:后端与实际挂载核对,防「拔 A 插 B 同挂载点」
+    /// 把指纹写到另一张卡(评审 P1)。
+    #[serde(default)]
+    pub bind_volume_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

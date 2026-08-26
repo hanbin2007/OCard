@@ -97,28 +97,27 @@ export function VirtualGrid<T>({
    * 不会排队——滚动天然是可中断的。
    * 减少动效时退回瞬时定位（见 scrollElementTo）。
    */
-  // 只在焦点下标真的变了时才滚动定位。此前把 viewport.height/columns 也当
-  // 触发条件:工具条换行、滚动条出没等布局抖动都会把用户手上的滚动位置
-  // 拽回焦点格——触控板滚动中途"跳变"的来源之一(UX 波二)。
-  const lastScrolledIndexRef = useRef<number | null>(null);
+  // 只在焦点下标变化时滚动定位。此前把 viewport.height/columns 也当触发条件:
+  // 工具条换行、滚动条出没等布局抖动都会把用户手上的滚动位置拽回焦点格——
+  // 触控板滚动中途"跳变"的来源之一(UX 波二)。几何参数经 ref 取最新值。
+  // 已声明的语义边界:同一下标的重复定位请求(值没变)不会再次滚动,
+  // 例如连续两次落在同一失败项;要强制回滚需调用方换成 {index, seq} 语义。
+  const geoRef = useRef({ columns, rowStride, rowHeight, viewportH: viewport.height });
+  geoRef.current = { columns, rowStride, rowHeight, viewportH: viewport.height };
   useEffect(() => {
-    if (scrollToIndex == null || scrollToIndex < 0) {
-      lastScrolledIndexRef.current = null;
-      return;
-    }
-    if (scrollToIndex === lastScrolledIndexRef.current) return;
-    lastScrolledIndexRef.current = scrollToIndex;
+    if (scrollToIndex == null || scrollToIndex < 0) return;
     const el = viewportRef.current;
     if (!el) return;
-    const row = Math.floor(scrollToIndex / columns);
-    const top = row * rowStride;
-    const bottom = top + rowHeight;
-    const height = el.clientHeight || viewport.height;
+    const g = geoRef.current;
+    const row = Math.floor(scrollToIndex / g.columns);
+    const top = row * g.rowStride;
+    const bottom = top + g.rowHeight;
+    const height = el.clientHeight || g.viewportH;
     if (top < el.scrollTop) scrollElementTo(el, top);
     else if (height > 0 && bottom > el.scrollTop + height) {
       scrollElementTo(el, bottom - height);
     }
-  }, [scrollToIndex, columns, rowStride, rowHeight, viewport.height]);
+  }, [scrollToIndex]);
 
   return (
     <div

@@ -123,7 +123,8 @@ export function Select({
   const close = useCallback((refocus = true) => {
     setOpen(false);
     setRect(null);
-    if (refocus) triggerRef.current?.focus();
+    // preventScroll:回焦不许把视口拽回触发器——那正是本波要根治的"滚动跳变"
+    if (refocus) triggerRef.current?.focus({ preventScroll: true });
   }, []);
 
   const openList = useCallback(() => {
@@ -135,11 +136,16 @@ export function Select({
     const above = r.top - 12;
     // 下方优先;放不下 160px 且上方更宽裕时翻上去
     const flip = below < 160 && above > below;
+    // 横向也夹在视口内:触发器贴右缘时浮层不许溢出
+    const left = Math.max(
+      8,
+      Math.min(r.left, window.innerWidth - r.width - 8),
+    );
     setRect({
-      left: r.left,
+      left,
       width: r.width,
       ...(flip
-        ? { bottom: viewportH - r.top + 4, maxHeight: Math.min(280, above) }
+        ? { bottom: viewportH - r.top + 4, maxHeight: Math.min(280, Math.max(120, above)) }
         : { top: r.bottom + 4, maxHeight: Math.min(280, Math.max(120, below)) }),
     });
     setActiveIndex(selectedIndex >= 0 ? selectedIndex : 0);
@@ -155,9 +161,9 @@ export function Select({
       if (listRef.current && e.target instanceof Node && listRef.current.contains(e.target)) {
         return;
       }
-      close();
+      close(false);
     };
-    const onResize = () => close();
+    const onResize = () => close(false);
     const onPointerDown = (e: PointerEvent) => {
       const t = e.target as Node;
       if (triggerRef.current?.contains(t) || listRef.current?.contains(t)) return;
@@ -174,6 +180,17 @@ export function Select({
       });
     };
   }, [open, close]);
+
+  // options 在开着时缩短(如卷刷新):活动项收敛回界内;清空直接收起,
+  // 否则 Enter 落在不存在的项上,列表看着像卡死
+  useEffect(() => {
+    if (!open) return;
+    if (options.length === 0) {
+      close(false);
+      return;
+    }
+    setActiveIndex((i) => Math.min(i, options.length - 1));
+  }, [open, options.length, close]);
 
   // 活动项跟随键盘时滚进可视区
   useLayoutEffect(() => {
@@ -215,6 +232,10 @@ export function Select({
         break;
       case "Escape":
         e.preventDefault();
+        // 不许冒泡:portal 在 body 下,ConfirmDialog/SettingsDialog 的 Escape
+        // 监听挂在 document——一次按键不能同时关掉下拉和外层对话框
+        e.stopPropagation();
+        e.nativeEvent.stopImmediatePropagation();
         close();
         break;
       case "Tab":
@@ -260,6 +281,8 @@ export function Select({
               id={listId}
               role="listbox"
               tabIndex={-1}
+              aria-label={ariaLabel}
+              aria-activedescendant={`${listId}-opt-${activeIndex}`}
               data-testid={testId ? `${testId}-list` : undefined}
               className="select-pop"
               style={{
@@ -274,6 +297,7 @@ export function Select({
               {options.map((opt, i) => (
                 <li
                   key={opt.value}
+                  id={`${listId}-opt-${i}`}
                   role="option"
                   aria-selected={i === selectedIndex}
                   data-active={i === activeIndex ? "true" : undefined}

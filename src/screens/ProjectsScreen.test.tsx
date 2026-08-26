@@ -145,9 +145,9 @@ describe("当前项目的显性指示(UX 波)", () => {
 describe("已拷卡的诚实语义(UX 波二)", () => {
   it("显示「已拷 N 张」,有未完成任务时给显式标记——不再有自我计数的 x/y 假进度", () => {
     render(<App preloaded={preloaded} />);
-    // mock 校运会:5 张已拷 + copyIncomplete
-    expect(screen.getAllByText(/^5 张$/).length).toBeGreaterThan(0);
-    expect(screen.getAllByText("有未完成任务").length).toBeGreaterThan(0);
+    // mock 校运会:5 次完成拷卡 + copyIncomplete(同卡重拷会计多次,按次说)
+    expect(screen.getAllByText(/^5 次$/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/有未完成任务/).length).toBeGreaterThan(0);
     // 详情面板的续传提示
     expect(screen.getByTestId("project-copy-incomplete")).toBeDefined();
     // 不再出现 x/y 形式
