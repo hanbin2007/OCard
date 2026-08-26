@@ -1282,21 +1282,17 @@
 .notice-item__dot,
 .toast__dot {
   margin-top: 6px;
-  color: var(--warn);
+  color: var(--notice-warning);
 }
 
 .notice-item__dot--error,
 .toast__dot--error {
-  color: var(--danger);
+  color: var(--notice-error);
 }
 
 .notice-item__dot--info,
 .toast__dot--info {
-  color: var(--accent);
-}
-
-.toast--info {
-  background: var(--accent-soft);
+  color: var(--notice-info);
 }
 
 .notice-item__actions {
@@ -1360,25 +1356,48 @@
   bottom: var(--space-3);
   right: var(--space-3);
   width: min(380px, calc(100% - var(--space-6)));
-  z-index: 30;
+  /* 高于一切浮层(dialog 50/会话门 80/门上确认 90):提交失败一律走 toast 后,
+     对话框里发生的失败也必须立刻可见 */
+  z-index: 100;
   display: grid;
   gap: var(--space-2);
   pointer-events: none;
 }
 
-/* 从下缘滑入,落位为独立卡片:实底面 + 语气色左沿 */
+/* 从下缘滑入,落位为独立卡片:实底面 + 左侧语气色竖条。
+   竖条不用 border-left(会跟着圆角画出弧线,用户点名不要):
+   用 ::before 实心矩形 + overflow:hidden 让圆角直接裁剪它。 */
 .toast {
   pointer-events: auto;
+  position: relative;
+  overflow: hidden;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   gap: var(--space-3);
   align-items: start;
   padding: var(--space-3) var(--space-4);
   border: 1px solid var(--border-strong);
-  border-left: 3px solid var(--warn);
   border-radius: var(--radius-md);
   background: var(--panel-raised);
   animation: toast-in var(--dur-spring-fast) var(--spring);
+}
+
+.toast::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--notice-info);
+}
+
+.toast--warning::before {
+  background: var(--notice-warning);
+}
+
+.toast--error::before {
+  background: var(--notice-error);
 }
 
 @keyframes toast-in {
@@ -1386,10 +1405,6 @@
     opacity: 0;
     transform: translate3d(0, 6px, 0);
   }
-}
-
-.toast--error {
-  border-left-color: var(--danger);
 }
 
 .toast__body {

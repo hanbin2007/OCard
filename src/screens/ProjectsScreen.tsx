@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { AuditLogDrawer } from "../components/AuditLogDrawer";
+import { ProjectCardsPanel } from "../components/ProjectCardsPanel";
 import {
   DeliveryStatusToggle,
   FinalCutPanel,
@@ -103,25 +104,41 @@ export function ProjectsScreen() {
                       </span>
 
                       <span className="projects__cell projects__cell--mono">
-                        {/* 只报事实:已拷 N 张(+未完成标记)。不存在「计划总数」,
-                            此前 x/y 的分母是任务数自我计数,是假进度(用户指正) */}
-                        {project.cardsCopied} 次
+                        {/* x/y 的分母是项目用卡清单(可编辑,详见详情面板)。
+                            未配置清单时回退按完成次数——分母必须真实,不许任务数冒充 */}
+                        {project.cardRosterTotal != null
+                          ? `${project.cardRosterDone ?? 0}/${project.cardRosterTotal} 张`
+                          : `${project.cardsCopied} 次`}
                         <span className="projects__folder">
                           {formatBytes(project.bytesCopied)}
                           {project.copyIncomplete ? (
                             <span className="text-warn"> · 有未完成任务</span>
                           ) : null}
+                          {project.cardRosterTotal == null ? (
+                            <span className="dim"> · 未配置用卡</span>
+                          ) : null}
                         </span>
                       </span>
 
                       <span className="projects__meter">
-                        {/* 进度条只画有真实分母的量(工况 B 的分类进度);
-                            工况 A 没有可信总量,不画假条 */}
+                        {/* 进度条只画有真实分母的量:B 的分类进度 / 配了清单的拷卡进度 */}
                         {project.scenario === "B" ? (
                           <ProgressBar
                             value={project.sortedCount}
                             total={project.assetCount}
                             tone={project.status === "done" ? "ok" : "accent"}
+                            thin
+                            decorative
+                          />
+                        ) : project.cardRosterTotal != null ? (
+                          <ProgressBar
+                            value={project.cardRosterDone ?? 0}
+                            total={project.cardRosterTotal}
+                            tone={
+                              (project.cardRosterDone ?? 0) >= project.cardRosterTotal
+                                ? "ok"
+                                : "accent"
+                            }
                             thin
                             decorative
                           />
@@ -254,10 +271,25 @@ export function ProjectsScreen() {
                         <div className="row-inline">
                           <span className="text-xs dim">拷卡</span>
                           <span className="text-xs mono muted push-right">
-                            完成 {selected.cardsCopied} 次拷卡 ·{" "}
-                            {formatBytes(selected.bytesCopied)}
+                            {selected.cardRosterTotal != null
+                              ? `已拷 ${selected.cardRosterDone ?? 0}/${selected.cardRosterTotal} 张`
+                              : `完成 ${selected.cardsCopied} 次拷卡`}{" "}
+                            · {formatBytes(selected.bytesCopied)}
                           </span>
                         </div>
+                        {selected.cardRosterTotal != null ? (
+                          <ProgressBar
+                            value={selected.cardRosterDone ?? 0}
+                            total={selected.cardRosterTotal}
+                            tone={
+                              (selected.cardRosterDone ?? 0) >=
+                              selected.cardRosterTotal
+                                ? "ok"
+                                : "accent"
+                            }
+                            label="拷卡进度"
+                          />
+                        ) : null}
                         {selected.copyIncomplete ? (
                           <span
                             className="text-xs text-warn"
@@ -289,6 +321,12 @@ export function ProjectsScreen() {
                       ) : null}
                     </div>
                   </div>
+
+                  <ProjectCardsPanel
+                    key={selected.id}
+                    projectId={selected.id}
+                    cards={state.cards}
+                  />
 
                   <div className="card">
                     <div className="card__head">

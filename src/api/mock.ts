@@ -21,6 +21,7 @@ import type {
   CopyFileItem,
   CopyTask,
   Project,
+  ProjectCards,
   StorageCard,
   Volume,
   WorkstationInfo,
@@ -47,6 +48,8 @@ export const mockProjects: Project[] = [
     status: "copying",
     cardsCopied: 5,
     copyIncomplete: true,
+    cardRosterTotal: 6,
+    cardRosterDone: 5,
     bytesCopied: 412 * GB,
     assetCount: 8421,
     sortedCount: 3180,
@@ -220,6 +223,27 @@ export const mockStorageCards: StorageCard[] = [
     createdAt: "2026-08-05T10:45:00+08:00",
   },
 ];
+
+/** 项目用卡清单(x/y 真分母)。其余项目故意不配置,覆盖「未配置」回退 */
+export const mockProjectCards: Record<string, ProjectCards> = {
+  "p-2026-0824-sports": {
+    cardIds: [
+      "card-cfe-01",
+      "card-cfe-02",
+      "card-sd-03",
+      "card-cf-04",
+      "card-sd-05",
+      "card-sd-06",
+    ],
+    copiedCardIds: [
+      "card-cfe-01",
+      "card-cfe-02",
+      "card-sd-03",
+      "card-cf-04",
+      "card-sd-05",
+    ],
+  },
+};
 
 export const mockVolumes: Volume[] = [
   {

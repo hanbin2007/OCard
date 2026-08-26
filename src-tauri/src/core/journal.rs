@@ -20,6 +20,10 @@ pub mod kind {
     pub const CAMERA_DELETED: &str = "camera_deleted";
     pub const CARD_REGISTERED: &str = "card_registered";
     pub const CARD_DELETED: &str = "card_deleted";
+    /// 项目用卡清单整体设定(UX 波三:x/y 的真分母)。data: {"cardIds": [...]}
+    pub const PROJECT_CARDS_SET: &str = "project_cards_set";
+    /// 拷卡时实际用到某张登记卡(自动并入用卡清单)。data: {"cardId": "..."}
+    pub const PROJECT_CARD_USED: &str = "project_card_used";
     pub const COPY_STARTED: &str = "copy_started";
     pub const COPY_COMPLETED: &str = "copy_completed";
     pub const COPY_FILE_FAILED: &str = "copy_file_failed";

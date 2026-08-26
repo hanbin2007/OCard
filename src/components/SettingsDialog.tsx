@@ -14,7 +14,7 @@ import type {
 import * as api from "../api";
 import { withViewTransition } from "../lib/motion";
 import { validateWorkstation } from "../lib/validation";
-import { useStore } from "../state/store";
+import { useNotify, useStore } from "../state/store";
 import { PathField } from "./PathField";
 import { Badge, Field } from "./ui";
 
@@ -31,13 +31,13 @@ const UPDATE_RESULT_TEXT: Record<UpdateCheckResult, string> = {
 
 export function SettingsDialog() {
   const { state, dispatch, reload } = useStore();
+  const notify = useNotify();
   const { settingsOpen, workstation } = state;
 
   const [operator, setOperator] = useState("");
   const [nasRoot, setNasRoot] = useState("");
   const [submitted, setSubmitted] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
   const operatorRef = useRef<HTMLInputElement>(null);
 
   const [version, setVersion] = useState<string | null>(null);
@@ -67,7 +67,6 @@ export function SettingsDialog() {
     setOperator(workstation?.operator ?? "");
     setNasRoot(workstation?.nasRoot ?? "");
     setSubmitted(false);
-    setSaveError(null);
     operatorRef.current?.focus();
   }, [settingsOpen, workstation]);
 
@@ -200,7 +199,6 @@ export function SettingsDialog() {
     setSubmitted(true);
     if (!valid || busy) return;
     setBusy(true);
-    setSaveError(null);
     try {
       const previousRoot = state.workstation?.nasRoot?.trim() ?? "";
       const next = await api.setWorkstationInfo(operator.trim(), nasRoot.trim());
@@ -211,7 +209,11 @@ export function SettingsDialog() {
         reload();
       }
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : "保存失败，请重试");
+      notify(
+        "error",
+        "settings-save-failed",
+        `保存工作站设置失败：${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       setBusy(false);
     }
@@ -421,12 +423,6 @@ export function SettingsDialog() {
               </span>
             ) : null}
           </div>
-
-          {saveError ? (
-            <span className="field__error" role="alert">
-              {saveError}
-            </span>
-          ) : null}
 
           <div className="dialog__actions">
             <button

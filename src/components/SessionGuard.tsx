@@ -14,7 +14,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../api";
 import { OPERATOR_NAME_MAX } from "../lib/validation";
-import { useStore } from "../state/store";
+import { useNotify, useStore } from "../state/store";
 import { ConfirmDialog, type ConfirmRequest } from "./ConfirmDialog";
 import { Field } from "./ui";
 
@@ -29,6 +29,7 @@ type Phase = "active" | "prompt" | "ended";
 
 export function SessionGuard() {
   const { state, dispatch } = useStore();
+  const notify = useNotify();
   const [phase, setPhase] = useState<Phase>("active");
   const lastActivityRef = useRef(Date.now());
   const promptAtRef = useRef(0);
@@ -142,7 +143,10 @@ export function SessionGuard() {
       dispatch({ type: "workstationUpdated", workstation: next });
       resume();
     } catch (err) {
-      setGateError(
+      // 提交后失败走 toast(z=100,压过会话门也看得见);gateError 只留输入校验
+      notify(
+        "error",
+        "settings-save-failed",
         `切换操作人失败：${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {

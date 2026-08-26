@@ -16,9 +16,15 @@ pub struct ProjectDto {
     pub relative_path: String,
     pub status: &'static str,
     pub cards_copied: usize,
-    /// 有已发起但未完成的拷卡任务。注意:不存在「计划卡总数」——现场用几张卡
-    /// 事先不可知,此前用任务数冒充总数是自我计数的假进度(用户指正)。
+    /// 有已发起但未完成的拷卡任务。
     pub copy_incomplete: bool,
+    /// 项目用卡清单大小(x/y 的 y;UX 波三)。None = 尚未配置/记录过用卡,
+    /// 前端回退按「N 次拷卡」显示——分母必须是真实清单,不许任务数冒充。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_roster_total: Option<usize>,
+    /// 用卡清单中已有完成拷卡的卡数(x)。与 card_roster_total 同生同灭。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_roster_done: Option<usize>,
     pub bytes_copied: u64,
     pub asset_count: usize,
     pub sorted_count: usize,
@@ -219,4 +225,13 @@ pub struct CopyProgressEventDto {
     pub state: &'static str,
     pub changed_files: Vec<CopyFileItemDto>,
     pub changed_destinations: Vec<CopyDestinationDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCardsDto {
+    /// 项目用卡清单(登记卡 id,保持配置顺序)
+    pub card_ids: Vec<String>,
+    /// 清单中已有完成拷卡的卡 id
+    pub copied_card_ids: Vec<String>,
 }

@@ -88,12 +88,13 @@ export function CopyTaskScreen() {
   const [autoProxy, setAutoProxy] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [startError, setStartError] = useState<string | null>(null);
+
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
 
   // 后端解析出的真实落盘位置（双确认屏只显示这个，不显示用户填的路径）
   const [preview, setPreview] = useState<CopyTaskPreview | null>(null);
-  const [previewError, setPreviewError] = useState<string | null>(null);
+  /** 落盘预览失败:面板给静态提示 + 返回修改;具体原因走 toast */
+  const [previewFailed, setPreviewFailed] = useState(false);
 
   // 文件明细分页拉取：list_copy_tasks 按契约不带 files
   const [files, setFiles] = useState<CopyFileItem[]>([]);
@@ -177,9 +178,8 @@ export function CopyTaskScreen() {
   useEffect(() => {
     setConfirming(false);
     setPreview(null);
-    setPreviewError(null);
+    setPreviewFailed(false);
     setSubmitted(false);
-    setStartError(null);
     setTargetPrefix("");
     setPrefixInferred(false);
     prefixEditedRef.current = false;
@@ -323,7 +323,6 @@ export function CopyTaskScreen() {
   async function submitStart(confirmExisting: boolean) {
     if (!project) return;
     setBusy(true);
-    setStartError(null);
     try {
       const input: StartCopyInput = {
         projectId: project.id,
@@ -356,7 +355,8 @@ export function CopyTaskScreen() {
           onConfirm: () => void submitStart(true),
         });
       } else {
-        setStartError(message);
+        // 提交后失败统一走 toast(UX 波三)
+        pushNotice("error", "copy-start-failed", `发起拷卡失败：${message}`);
       }
     } finally {
       setBusy(false);
@@ -374,7 +374,7 @@ export function CopyTaskScreen() {
     if (!validation.valid || !project) return;
     setConfirming(true);
     setPreview(null);
-    setPreviewError(null);
+    setPreviewFailed(false);
     try {
       const result = await api.previewCopyTask({
         projectId: project.id,
@@ -386,8 +386,11 @@ export function CopyTaskScreen() {
       });
       setPreview(result);
     } catch (err) {
-      setPreviewError(
-        err instanceof Error ? err.message : "无法解析目标路径，请检查配置",
+      setPreviewFailed(true);
+      pushNotice(
+        "error",
+        "copy-preview-failed",
+        `无法解析实际落盘路径：${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
@@ -491,9 +494,9 @@ export function CopyTaskScreen() {
                         <div className="dl__row">
                           <span className="dl__key">实际落盘</span>
                           <span className="dl__val" data-testid="confirm-destinations">
-                            {previewError ? (
-                              <span className="field__error" role="alert">
-                                {previewError}
+                            {previewFailed ? (
+                              <span className="text-warn" role="alert">
+                                落盘路径解析失败(详见右下角提示),请返回修改后重试
                               </span>
                             ) : preview ? (
                               preview.destinations.map((d) => (
@@ -512,12 +515,6 @@ export function CopyTaskScreen() {
                       <p className="text-xs dim">
                         确认后开始读卡。校验全部通过前请勿拔卡，OCard 不会代为格式化。
                       </p>
-
-                      {startError ? (
-                        <span className="field__error" role="alert">
-                          {startError}
-                        </span>
-                      ) : null}
 
                       {volume?.isSystem ? (
                         /* 过滤只是「藏」,这里是「拦」:用户显式打开开关选了

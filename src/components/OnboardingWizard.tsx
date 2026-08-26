@@ -7,7 +7,7 @@
 import { useState } from "react";
 import * as api from "../api";
 import { validateWorkstation } from "../lib/validation";
-import { useStore } from "../state/store";
+import { useNotify, useStore } from "../state/store";
 import { Field } from "./ui";
 import { PathField } from "./PathField";
 
@@ -22,7 +22,7 @@ export function OnboardingWizard() {
   const [nasRoot, setNasRoot] = useState(state.workstation?.nasRoot ?? "");
   const [touched, setTouched] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
+  const notify = useNotify();
 
   const { errors } = validateWorkstation({ operator, nasRoot });
   const operatorError = touched && step === "operator" ? errors.operator : undefined;
@@ -45,7 +45,6 @@ export function OnboardingWizard() {
     if (errors.nasRoot) return;
     if (saving) return;
     setSaving(true);
-    setSaveError(null);
     try {
       const workstation = await api.setWorkstationInfo(
         operator.trim(),
@@ -56,7 +55,11 @@ export function OnboardingWizard() {
       // 否则第二台工作站指向已有 NAS 时会看到假的「还没有项目」(opus P1)
       reload();
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : String(err));
+      notify(
+        "error",
+        "settings-save-failed",
+        `保存初始设置失败：${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       setSaving(false);
     }
@@ -152,11 +155,6 @@ export function OnboardingWizard() {
                     invalid={Boolean(nasRootError)}
                   />
                 </Field>
-                {saveError ? (
-                  <p className="field__error" role="alert">
-                    保存失败：{saveError}
-                  </p>
-                ) : null}
                 <div className="onboarding__actions">
                   <button
                     type="button"

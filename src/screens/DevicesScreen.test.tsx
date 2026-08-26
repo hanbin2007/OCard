@@ -146,11 +146,11 @@ describe("设备登记", () => {
     );
     await user.click(screen.getByRole("button", { name: "删除相机" }));
 
-    const alert = await screen.findByTestId("dev-delete-error");
-    expect(alert.getAttribute("role")).toBe("alert");
+    // 提交后失败统一走 toast(UX 波三)
+    const toast = await screen.findByTestId("notice-toasts");
     // 直接展示后端消息，前端不再替后端断言"未改动"
-    expect(alert.textContent).toContain("NAS 只读，无法写入登记表");
-    expect(alert.textContent).not.toContain("登记表未改动");
+    expect(toast.textContent).toContain("NAS 只读，无法写入登记表");
+    expect(toast.textContent).not.toContain("登记表未改动");
     // 相机与其名下的卡都还在
     expect(screen.getAllByText(target.code).length).toBeGreaterThan(0);
     expect(screen.getByText("CFE-01")).toBeDefined();
@@ -173,8 +173,8 @@ describe("设备登记", () => {
     await user.click(screen.getByRole("button", { name: "删除存储卡 CFE-01" }));
     await user.click(screen.getByRole("button", { name: "删除存储卡" }));
 
-    const alert = await screen.findByTestId("dev-delete-error");
-    expect(alert.textContent).toContain("NAS 断连");
+    const toast = await screen.findByTestId("notice-toasts");
+    expect(toast.textContent).toContain("NAS 断连");
     expect(screen.getByText("CFE-01")).toBeDefined();
 
     spy.mockRestore();

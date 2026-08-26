@@ -23,6 +23,8 @@ macro_rules! ocard_invoke_handler {
             $crate::commands::list_storage_cards,
             $crate::commands::create_storage_card,
             $crate::commands::delete_storage_card,
+            $crate::commands::list_project_cards,
+            $crate::commands::set_project_cards,
             $crate::commands::list_volumes,
             $crate::commands::inspect_volume,
             $crate::commands::list_copy_tasks,

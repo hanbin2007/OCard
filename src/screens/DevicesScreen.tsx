@@ -10,13 +10,14 @@ import { Badge, EmptyState, Field } from "../components/ui";
 import { formatBytes } from "../lib/format";
 import { buildCameraCode } from "../lib/naming";
 import { validateNewCamera } from "../lib/validation";
-import { useStore } from "../state/store";
+import { useNotify, useStore } from "../state/store";
 
 const GB = 1024 ** 3;
 const CAPACITY_OPTIONS = [128, 256, 512, 1024];
 
 export function DevicesScreen() {
   const { state, dispatch } = useStore();
+  const notify = useNotify();
   const { cameras, cards } = state;
 
   const [model, setModel] = useState("");
@@ -33,12 +34,7 @@ export function DevicesScreen() {
   /** 插卡绑定:选中的挂载路径("" = 不绑定) */
   const [bindMount, setBindMount] = useState("");
   const [bindRefreshing, setBindRefreshing] = useState(false);
-  /** 刷新后发现之前选的卷已拔出:必须可见地要求重选,不能等后端拒绝 */
-  const [bindStale, setBindStale] = useState(false);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
-  const [submitError, setSubmitError] = useState<string | null>(null);
-  /** 删除失败必须说出来——不能乐观移除后让界面谎报成功 */
-  const [deleteError, setDeleteError] = useState<string | null>(null);
   /** 登记成功后的回执，避免「表单清空」被读成「没提交上」 */
   const [lastCamera, setLastCamera] = useState<string | null>(null);
   const [lastCard, setLastCard] = useState<string | null>(null);
@@ -71,13 +67,15 @@ export function DevicesScreen() {
       // 不许把过期路径提交给后端再靠"未挂载"报错兜底
       setBindMount((prev) => {
         if (prev && !next.some((v) => v.mountPath === prev)) {
-          setBindStale(true);
+          notify("warning", "card-bind-stale", "之前选的卡已拔出,请重新选择要绑定的卡");
           return "";
         }
         return prev;
       });
     } catch (err) {
-      setSubmitError(
+      notify(
+        "error",
+        "volumes-refresh-failed",
         `刷新卷列表失败：${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
@@ -96,8 +94,6 @@ export function DevicesScreen() {
   async function addCamera() {
     setCameraSubmitted(true);
     if (!cameraValidation.valid) return;
-    // 新一次提交先清旧报错:别让上次的失败横幅一直挂着误导(opus 评审)
-    setSubmitError(null);
     try {
       const camera = await api.createCamera({
         model,
@@ -112,10 +108,11 @@ export function DevicesScreen() {
       setAlias("");
       setNote("");
       setCameraSubmitted(false);
-      setSubmitError(null);
     } catch (err) {
-      // 登记表写失败(NAS 掉了/重码)不能只让按钮弹一下(零静默铁律)
-      setSubmitError(
+      // 提交后失败统一走 toast(UX 波三)
+      notify(
+        "error",
+        "device-register-failed",
         `登记相机失败：${err instanceof Error ? err.message : String(err)}`,
       );
     }
@@ -124,7 +121,6 @@ export function DevicesScreen() {
   async function addCard() {
     setCardSubmitted(true);
     if (!cardLabel.trim() || !cardCameraId) return;
-    setSubmitError(null);
     try {
       const card = await api.createStorageCard({
         label: cardLabel,
@@ -142,9 +138,10 @@ export function DevicesScreen() {
       setCardSerial("");
       setBindMount("");
       setCardSubmitted(false);
-      setSubmitError(null);
     } catch (err) {
-      setSubmitError(
+      notify(
+        "error",
+        "device-register-failed",
         `登记存储卡失败：${err instanceof Error ? err.message : String(err)}`,
       );
     }
@@ -164,16 +161,6 @@ export function DevicesScreen() {
 
       <div className="content">
         <div className="content__inner">
-          {submitError ? (
-            <div
-              className="notice notice--danger"
-              role="alert"
-              data-testid="devices-submit-error"
-            >
-              <strong>登记没有成功</strong>
-              <span>{submitError}</span>
-            </div>
-          ) : null}
           <div className="devices">
             <div className="devices__form">
               <div className="card">
@@ -320,7 +307,6 @@ export function DevicesScreen() {
                         value={bindMount}
                         onChange={(next) => {
                           setBindMount(next);
-                          setBindStale(false);
                           const vol = volumes.find((v) => v.mountPath === next);
                           if (vol) setCardLabel(vol.name);
                         }}
@@ -345,11 +331,6 @@ export function DevicesScreen() {
                       >
                         {bindRefreshing ? "刷新中…" : "刷新卷列表"}
                       </button>
-                      {bindStale ? (
-                        <span className="text-xs text-warn" role="alert">
-                          之前选的卡已不在,请重新选择
-                        </span>
-                      ) : null}
                     </div>
 
                     <Field
@@ -442,11 +423,6 @@ export function DevicesScreen() {
             </div>
 
             <div className="stack stack--lg">
-              {deleteError ? (
-                <div className="notice notice--warn" role="alert" data-testid="dev-delete-error">
-                  <strong>{deleteError}</strong>
-                </div>
-              ) : null}
 
               <section>
                 <div className="section__head">
@@ -490,8 +466,8 @@ export function DevicesScreen() {
                                 : "登记表全项目共享，删除后无法撤销。",
                             confirmLabel: "删除相机",
                             onConfirm: async () => {
-                              // 等后端确实删掉了再动本地列表
-                              setDeleteError(null);
+                              // 等后端确实删掉了再动本地列表;失败走 toast(级联
+                              // 删除中断时后端消息才知道真实状态)
                               try {
                                 await api.deleteCamera(camera.id);
                                 dispatch({
@@ -499,8 +475,9 @@ export function DevicesScreen() {
                                   cameraId: camera.id,
                                 });
                               } catch (err) {
-                                // 直接展示后端消息：级联删除中断时它才知道真实状态
-                                setDeleteError(
+                                notify(
+                                  "error",
+                                  "device-delete-failed",
                                   `删除相机 ${camera.model} 失败：${
                                     err instanceof Error ? err.message : String(err)
                                   }`,
@@ -567,12 +544,13 @@ export function DevicesScreen() {
                               message: "登记表全项目共享，删除后无法撤销。",
                               confirmLabel: "删除存储卡",
                               onConfirm: async () => {
-                                setDeleteError(null);
                                 try {
                                   await api.deleteStorageCard(card.id);
                                   dispatch({ type: "cardRemoved", cardId: card.id });
                                 } catch (err) {
-                                  setDeleteError(
+                                  notify(
+                                    "error",
+                                    "device-delete-failed",
                                     `删除存储卡 ${card.label} 失败：${
                                       err instanceof Error ? err.message : String(err)
                                     }`,

@@ -7,6 +7,7 @@
 
 import { useState } from "react";
 import * as api from "../api";
+import { useNotify } from "../state/store";
 import { isAbsoluteNasRoot } from "../lib/validation";
 
 export function PathField({
@@ -34,12 +35,11 @@ export function PathField({
   ariaLabel?: string;
 }) {
   const [picking, setPicking] = useState(false);
-  const [pickError, setPickError] = useState<string | null>(null);
+  const notify = useNotify();
 
   async function browse() {
     if (picking) return;
     setPicking(true);
-    setPickError(null);
     try {
       const picked = await api.pickFolder({
         title: pickerTitle,
@@ -49,8 +49,10 @@ export function PathField({
       });
       if (picked !== null) onChange(picked);
     } catch (err) {
-      // 对话框弹不出来也不能无声——降级提示改用手填
-      setPickError(
+      // 对话框弹不出来也不能无声——降级提示统一走 toast,改用手填
+      notify(
+        "warning",
+        "folder-picker-failed",
         `文件夹选择器打开失败：${err instanceof Error ? err.message : String(err)}。请直接粘贴路径。`,
       );
     } finally {
@@ -85,11 +87,6 @@ export function PathField({
           </button>
         ) : null}
       </div>
-      {pickError ? (
-        <p className="field__error" role="alert">
-          {pickError}
-        </p>
-      ) : null}
     </div>
   );
 }

@@ -316,8 +316,9 @@ describe("作业生命周期", () => {
     );
     await user.click(screen.getByTestId("transcode-start"));
 
-    const err = await screen.findByTestId("transcode-start-error");
-    expect(err.textContent).toContain("已有转码作业在运行");
+    // 提交后失败统一走 toast(UX 波三):屏内不再有内联横幅
+    const toast = await screen.findByTestId("notice-toasts");
+    expect(toast.textContent).toContain("已有转码作业在运行");
 
     await user.click(screen.getByTestId("notice-bell"));
     expect(

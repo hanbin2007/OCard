@@ -1,7 +1,9 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as api from "../api";
 import App from "../App";
-import { mockProjects, mockWorkstation } from "../api/mock";
+import { mockProjects, mockStorageCards, mockWorkstation } from "../api/mock";
 
 afterEach(cleanup);
 
@@ -142,15 +144,47 @@ describe("当前项目的显性指示(UX 波)", () => {
   });
 });
 
-describe("已拷卡的诚实语义(UX 波二)", () => {
-  it("显示「已拷 N 张」,有未完成任务时给显式标记——不再有自我计数的 x/y 假进度", () => {
+describe("已拷卡语义(UX 波三:分母=项目用卡清单)", () => {
+  it("配了用卡清单的项目显示 x/y 张;未配置的回退按次数并明说", () => {
     render(<App preloaded={preloaded} />);
-    // mock 校运会:5 次完成拷卡 + copyIncomplete(同卡重拷会计多次,按次说)
-    expect(screen.getAllByText(/^5 次$/).length).toBeGreaterThan(0);
+    // 校运会:清单 6 张、已拷 5 → 5/6 张(分母是真实清单,不是任务数)
+    expect(screen.getAllByText(/5\/6 张/).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/有未完成任务/).length).toBeGreaterThan(0);
-    // 详情面板的续传提示
     expect(screen.getByTestId("project-copy-incomplete")).toBeDefined();
-    // 不再出现 x/y 形式
-    expect(screen.queryByText(/5\/8/)).toBeNull();
+    // 未配置清单的项目(年中发布会):N 次 + 未配置用卡
+    expect(screen.getAllByText(/^6 次$/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/未配置用卡/).length).toBeGreaterThan(0);
+  });
+
+  it("详情面板的用卡清单可增删、可套用登记表模板", async () => {
+    const user = userEvent.setup();
+    const spy = vi.spyOn(api, "setProjectCards");
+    render(
+      <App
+        preloaded={{ ...preloaded, cards: mockStorageCards }}
+      />,
+    );
+
+    // 校运会清单 6 张,全部显示
+    const rows = await screen.findAllByTestId("project-card-row");
+    expect(rows).toHaveLength(6);
+    expect(screen.getAllByText("已拷")).toHaveLength(5);
+
+    // 移除一张
+    await user.click(
+      screen.getByRole("button", { name: "移出用卡清单 CFE-01" }),
+    );
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    expect(spy.mock.calls[0][1]).not.toContain("card-cfe-01");
+    // 等保存落定(busy 复位、清单变 5 张)再做下一步
+    await waitFor(() =>
+      expect(screen.getAllByTestId("project-card-row")).toHaveLength(5),
+    );
+
+    // 套用模板 = 登记表全部卡
+    await user.click(screen.getByTestId("cards-apply-template"));
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(2));
+    expect(spy.mock.calls[1][1]).toHaveLength(mockStorageCards.length);
+    spy.mockRestore();
   });
 });

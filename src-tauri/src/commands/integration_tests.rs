@@ -1122,3 +1122,71 @@ mod match_card_tests {
         assert!(conflict.is_none());
     }
 }
+
+#[test]
+fn project_cards_roundtrip_and_validation() {
+    // 项目用卡清单(UX 波三):set→读回;未登记的卡拒绝;x/y 随清单出现
+    let (window, _tmp, _nas) = mock_app();
+    let project_id = create_b_project(&window);
+    let cam = invoke(
+        &window,
+        "create_camera",
+        json!({"input": {"model": "Z9", "position": "E", "operatorAlias": "CQ"}}),
+    )
+    .expect("登记相机应成功");
+    let card = invoke(
+        &window,
+        "create_storage_card",
+        json!({"input": {"label": "SD-06", "cameraId": cam["id"], "capacityBytes": 1}}),
+    )
+    .expect("登记卡应成功");
+    let card_id = card["id"].as_str().unwrap().to_string();
+
+    // 未配置时:项目不带 x/y 字段
+    let projects = invoke(&window, "list_projects", json!({})).unwrap();
+    let p = projects
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == json!(project_id.clone()))
+        .unwrap();
+    assert!(p.get("cardRosterTotal").is_none(), "未配置不得伪造分母");
+
+    // 未登记的卡进清单必须拒绝
+    let err = invoke(
+        &window,
+        "set_project_cards",
+        json!({"projectId": project_id, "cardIds": ["ghost-card"]}),
+    )
+    .expect_err("幽灵卡必须拒绝");
+    assert!(err.as_str().unwrap().contains("未登记"));
+
+    // set → 读回(含去重)
+    let dto = invoke(
+        &window,
+        "set_project_cards",
+        json!({"projectId": project_id, "cardIds": [card_id.clone(), card_id.clone()]}),
+    )
+    .expect("设置清单应成功");
+    assert_eq!(dto["cardIds"], json!([card_id.clone()]));
+    assert_eq!(dto["copiedCardIds"], json!([]));
+
+    let listed = invoke(
+        &window,
+        "list_project_cards",
+        json!({"projectId": project_id}),
+    )
+    .unwrap();
+    assert_eq!(listed["cardIds"], json!([card_id.clone()]));
+
+    // x/y 字段随清单出现:y=1,x=0
+    let projects = invoke(&window, "list_projects", json!({})).unwrap();
+    let p = projects
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == json!(project_id))
+        .unwrap();
+    assert_eq!(p["cardRosterTotal"], json!(1));
+    assert_eq!(p["cardRosterDone"], json!(0));
+}

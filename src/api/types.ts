@@ -35,8 +35,12 @@ export interface Project {
   status: ProjectStatus;
   /** 已拷卡张数 */
   cardsCopied: number;
-  /** 有已发起但未完成的拷卡任务(不存在「计划卡总数」,任务数冒充总数是假进度) */
+  /** 有已发起但未完成的拷卡任务 */
   copyIncomplete: boolean;
+  /** 项目用卡清单大小(x/y 的 y)。缺省 = 尚未配置/记录过用卡,回退按次数显示 */
+  cardRosterTotal?: number;
+  /** 用卡清单中已完成拷卡的卡数(x),与 cardRosterTotal 同生同灭 */
+  cardRosterDone?: number;
   /** 已拷入容量 */
   bytesCopied: number;
   /** 素材总数 */
@@ -100,6 +104,14 @@ export interface StorageCard {
   /** 登记时插卡绑定写入的身份指纹;有它 = 凭指纹强匹配,没有 = 仅卷标弱匹配 */
   volumeUid?: string;
   createdAt: string;
+}
+
+/** 项目用卡清单(UX 波三):x/y 的真分母,可随时编辑、可套用登记表模板 */
+export interface ProjectCards {
+  /** 登记卡 id,保持配置顺序 */
+  cardIds: string[];
+  /** 其中已有完成拷卡的卡 id */
+  copiedCardIds: string[];
 }
 
 export interface NewStorageCardInput {

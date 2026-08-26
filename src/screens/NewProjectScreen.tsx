@@ -11,7 +11,7 @@ import { buildFolderTree, countFolders, DEFAULT_B_CATEGORIES } from "../lib/fold
 import { SCENARIO_DESC, SCENARIO_LABEL } from "../lib/labels";
 import { buildProjectFolderName } from "../lib/naming";
 import { validateNewProject } from "../lib/validation";
-import { useStore } from "../state/store";
+import { useNotify, useStore } from "../state/store";
 
 const FORM_ID = "new-project-form";
 
@@ -49,7 +49,7 @@ export function NewProjectScreen() {
   );
   const [submitted, setSubmitted] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [submitError, setSubmitError] = useState<string | null>(null);
+  const notify = useNotify();
 
   const date = toCompactDate(isoDate);
   const categoryValues = useMemo(() => categories.map((c) => c.value), [categories]);
@@ -87,7 +87,6 @@ export function NewProjectScreen() {
     }
     if (busy) return;
     setBusy(true);
-    setSubmitError(null);
     try {
       const project = await api.createProject({
         name: name.trim(),
@@ -97,10 +96,11 @@ export function NewProjectScreen() {
       });
       dispatch({ type: "projectCreated", project });
     } catch (err) {
-      // 同名项目等后端拒绝在这之前会被整个吞掉(按钮闪一下什么都不发生)——
-      // 失败必须落在表单里说清原因(零静默铁律)
+      // 提交后失败统一走 toast 通道(UX 波三:不允许散落的内联横幅)
       const message = err instanceof Error ? err.message : String(err);
-      setSubmitError(
+      notify(
+        "error",
+        "project-create-failed",
         message.includes("目标已存在")
           ? `已有同名项目夹（${folderName}）。换个项目名，或直接打开已有项目。`
           : `创建项目失败：${message}`,
@@ -150,16 +150,6 @@ export function NewProjectScreen() {
                 void submit();
               }}
             >
-              {submitError ? (
-                <div
-                  className="notice notice--danger"
-                  role="alert"
-                  data-testid="np-submit-error"
-                >
-                  <strong>没有创建成功</strong>
-                  <span>{submitError}</span>
-                </div>
-              ) : null}
               <div className="card">
                 <div className="card__head">
                   <span className="card__title">基本信息</span>

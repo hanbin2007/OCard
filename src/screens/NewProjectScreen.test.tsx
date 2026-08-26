@@ -106,7 +106,7 @@ describe("新建项目向导", () => {
     expect(row.textContent).toContain("20260824_校运会");
   });
 
-  it("同名项目被后端拒绝时表单里给出明确报错(不再静默吞掉)", async () => {
+  it("同名项目被后端拒绝时给出明确报错(统一走 toast,不再静默吞掉)", async () => {
     vi.spyOn(api, "createProject").mockRejectedValueOnce(
       new Error("目标已存在: /Volumes/DIT-NAS/Projects/20260824_校运会"),
     );
@@ -115,9 +115,9 @@ describe("新建项目向导", () => {
     await user.type(screen.getByLabelText("项目名"), "校运会");
     await user.click(screen.getByRole("button", { name: "创建项目" }));
 
-    const alertBox = await screen.findByTestId("np-submit-error");
-    expect(alertBox.textContent).toContain("同名项目夹");
-    expect(alertBox.textContent).toContain("20260824_校运会");
+    const toast = await screen.findByTestId("notice-toasts");
+    expect(toast.textContent).toContain("同名项目夹");
+    expect(toast.textContent).toContain("20260824_校运会");
     // 仍停留在向导页,可以改名重试
     expect(screen.getByText("将创建")).toBeDefined();
   });
@@ -129,8 +129,8 @@ describe("新建项目向导", () => {
     await user.type(screen.getByLabelText("项目名"), "毕业典礼");
     await user.click(screen.getByRole("button", { name: "创建项目" }));
 
-    const alertBox = await screen.findByTestId("np-submit-error");
-    expect(alertBox.textContent).toContain("创建项目失败");
-    expect(alertBox.textContent).toContain("NAS 不可写");
+    const toast = await screen.findByTestId("notice-toasts");
+    expect(toast.textContent).toContain("创建项目失败");
+    expect(toast.textContent).toContain("NAS 不可写");
   });
 });

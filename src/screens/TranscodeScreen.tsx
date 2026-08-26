@@ -34,7 +34,6 @@ export function TranscodeScreen() {
   const [ffmpeg, setFfmpeg] = useState<FfmpegStatus | null>(null);
   const [forceAll, setForceAll] = useState(false);
   const [starting, setStarting] = useState(false);
-  const [startError, setStartError] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [tier, setTier] = useState<ArchiveTier>("balanced");
@@ -81,8 +80,8 @@ export function TranscodeScreen() {
       });
       dispatch({ type: "jobProgress", job: snapshot });
     } catch (err) {
+      // 提交后失败统一走 toast;archiveError 只承载提交前的路径校验
       const message = err instanceof Error ? err.message : String(err);
-      setArchiveError(message);
       notify("error", "archive-start-failed", `归档转码未能启动：${message}`);
     } finally {
       setStarting(false);
@@ -121,7 +120,6 @@ export function TranscodeScreen() {
   async function start(retranscode = false) {
     if (!project || starting) return;
     setStarting(true);
-    setStartError(null);
     try {
       const snapshot = await api.startProxyTranscode({
         projectId: project.id,
@@ -130,8 +128,8 @@ export function TranscodeScreen() {
       });
       dispatch({ type: "jobProgress", job: snapshot });
     } catch (err) {
+      // 提交后失败统一走 toast(UX 波三)
       const message = err instanceof Error ? err.message : String(err);
-      setStartError(message);
       notify("error", "transcode-start-failed", `转码作业未能启动：${message}`);
     } finally {
       setStarting(false);
@@ -322,15 +320,6 @@ export function TranscodeScreen() {
                     ) : null}
                   </div>
 
-                  {startError ? (
-                    <span
-                      className="field__error"
-                      role="alert"
-                      data-testid="transcode-start-error"
-                    >
-                      {startError}
-                    </span>
-                  ) : null}
                 </div>
               </div>
             </div>

@@ -1031,6 +1031,22 @@ export function selectLatestAnalyzeJob(
 }
 
 /** 便捷选择器 */
+/**
+ * 统一提示出口(UX 波三):提交后失败/降级提醒一律走通知通道(toast+铃铛),
+ * 不允许散落成各屏的内联横幅。客户端预校验的字段错误不在此列(留在字段旁)。
+ */
+export function useNotify() {
+  const { dispatch } = useStore();
+  return useCallback(
+    (level: NoticeLevel, code: string, message: string) =>
+      dispatch({
+        type: "noticeReceived",
+        notice: { level, code, message, occurredAt: new Date().toISOString() },
+      }),
+    [dispatch],
+  );
+}
+
 export function useAppState(): AppState {
   return useStore().state;
 }

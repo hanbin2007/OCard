@@ -120,8 +120,10 @@ kbd,
    触控板弹性回弹消失、主线程忙时内容跳变、滚动条滞后于内容(实测三症状
    同源)。scrollbar-width/scrollbar-color 走标准通道,不碰滚动路径。 */
 :root {
+  /* 只声明宽度,不上 scrollbar-color:macOS 上一旦自定义颜色就会放弃
+     原生"悬浮自动隐藏"滚动条,改画常驻粗条(用户实测反馈)。
+     thin 在原生悬浮条出现时收细,平时完全隐藏。 */
   scrollbar-width: thin;
-  scrollbar-color: var(--border-strong) transparent;
 }
 
 ::selection {

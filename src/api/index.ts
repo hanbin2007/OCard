@@ -32,6 +32,7 @@ import {
   mockPendingAssets,
   mockTrash,
   mockProjects,
+  mockProjectCards,
   mockStorageCards,
   mockVolumes,
   mockWorkstation,
@@ -75,6 +76,7 @@ import type {
   NewProjectInput,
   NewStorageCardInput,
   Project,
+  ProjectCards,
   Scenario,
   StartCopyInput,
   StorageCard,
@@ -209,6 +211,27 @@ export function previewFolderTree(
 ): Promise<FolderNode[]> {
   if (IS_TAURI) return ipc("preview_folder_tree", { scenario, categories });
   return reply(buildFolderTree(scenario, categories));
+}
+
+/** 项目用卡清单:x/y 的真分母(可编辑、可套用登记表模板;UX 波三) */
+export function listProjectCards(projectId: string): Promise<ProjectCards> {
+  if (IS_TAURI) return ipc("list_project_cards", { projectId });
+  return reply(mockProjectCards[projectId] ?? { cardIds: [], copiedCardIds: [] });
+}
+
+export function setProjectCards(
+  projectId: string,
+  cardIds: string[],
+): Promise<ProjectCards> {
+  if (IS_TAURI) return ipc("set_project_cards", { projectId, cardIds });
+  const next = {
+    cardIds: [...new Set(cardIds)],
+    copiedCardIds: (mockProjectCards[projectId]?.copiedCardIds ?? []).filter((id) =>
+      cardIds.includes(id),
+    ),
+  };
+  mockProjectCards[projectId] = next;
+  return reply({ ...next });
 }
 
 /* ------------------------------------------------------------------ *

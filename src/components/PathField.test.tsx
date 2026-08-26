@@ -3,6 +3,8 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api";
+import { NoticeToasts } from "./NotificationCenter";
+import { StoreProvider } from "../state/store";
 import { PathField } from "./PathField";
 
 afterEach(() => {
@@ -13,13 +15,17 @@ afterEach(() => {
 function setup(over: Partial<Parameters<typeof PathField>[0]> = {}) {
   const onChange = vi.fn();
   render(
-    <PathField
-      testId="pf"
-      value=""
-      onChange={onChange}
-      pickerTitle="选择目录"
-      {...over}
-    />,
+    // PathField 的失败提醒走统一通知通道,需要 Store + toast 渲染面
+    <StoreProvider preloaded={{}}>
+      <NoticeToasts />
+      <PathField
+        testId="pf"
+        value=""
+        onChange={onChange}
+        pickerTitle="选择目录"
+        {...over}
+      />
+    </StoreProvider>,
   );
   return { onChange };
 }
@@ -55,15 +61,15 @@ describe("选择与失败", () => {
     expect(onChange).toHaveBeenCalledTimes(1);
   });
 
-  it("对话框打开失败必须可见,并提示可手填兜底", async () => {
+  it("对话框打开失败必须可见(统一走 toast),并提示可手填兜底", async () => {
     vi.spyOn(api, "canPickFolder").mockReturnValue(true);
     vi.spyOn(api, "pickFolder").mockRejectedValue(new Error("no display"));
     setup();
 
     fireEvent.click(screen.getByTestId("pf-browse"));
-    const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toContain("文件夹选择器打开失败");
-    expect(alert.textContent).toContain("请直接粘贴路径");
+    const toast = await screen.findByTestId("notice-toasts");
+    expect(toast.textContent).toContain("文件夹选择器打开失败");
+    expect(toast.textContent).toContain("请直接粘贴路径");
   });
 
   it("已填合法绝对路径时作为 defaultPath 传给对话框;半截串不传", async () => {

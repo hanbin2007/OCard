@@ -69,7 +69,22 @@ fn parse_compact_date(s: &str) -> CmdResult<NaiveDate> {
     NaiveDate::parse_from_str(s, "%Y%m%d").map_err(|_| format!("日期格式应为 YYYYMMDD: {s}"))
 }
 
-fn project_dto(stats: &catalog::ProjectStats, running: bool) -> ProjectDto {
+/// 把完成拷卡的来源(指纹优先/卷名兜底)映射为登记卡 id 集。
+fn resolve_done_card_ids(
+    sources: &[catalog::CopySource],
+    cards: &[registry::StorageCard],
+) -> std::collections::HashSet<String> {
+    sources
+        .iter()
+        .filter_map(|src| match_card(cards, src.source_uid.as_deref(), &src.volume_name).0)
+        .collect()
+}
+
+fn project_dto(
+    stats: &catalog::ProjectStats,
+    cards: &[registry::StorageCard],
+    running: bool,
+) -> ProjectDto {
     ProjectDto {
         id: stats.folder_name.clone(),
         name: stats.meta.name.clone(),
@@ -88,6 +103,11 @@ fn project_dto(stats: &catalog::ProjectStats, running: bool) -> ProjectDto {
         },
         cards_copied: stats.cards_copied,
         copy_incomplete: stats.has_incomplete_copy,
+        card_roster_total: stats.card_roster.as_ref().map(|r| r.len()),
+        card_roster_done: stats.card_roster.as_ref().map(|roster| {
+            let done = resolve_done_card_ids(&stats.completed_sources, cards);
+            roster.iter().filter(|id| done.contains(*id)).count()
+        }),
         bytes_copied: stats.bytes_copied,
         asset_count: stats.asset_count,
         sorted_count: 0,
@@ -197,10 +217,24 @@ pub fn list_projects<R: tauri::Runtime>(
         .collect();
     let scan = catalog::scan_cached(&nas).map_err(err)?;
     notice_catalog_warnings(&app, &scan.warnings);
+    let cards = match registry::load(&nas) {
+        Ok(load) => {
+            notice_registry_health(&app, &load);
+            load.registry.cards
+        }
+        Err(e) => {
+            notify::warn(
+                &app,
+                "volumes-registry-unavailable",
+                format!("登记表读取失败,用卡进度暂无法映射到登记卡: {e}"),
+            );
+            Vec::new()
+        }
+    };
     Ok(scan
         .projects
         .iter()
-        .map(|s| project_dto(s, running.contains(&s.folder_name)))
+        .map(|s| project_dto(s, &cards, running.contains(&s.folder_name)))
         .collect())
 }
 
@@ -238,7 +272,8 @@ pub fn create_project<R: tauri::Runtime>(
     );
     catalog::invalidate_cache(&nas);
     let stats = find_project(&nas, &root.file_name().unwrap().to_string_lossy())?;
-    Ok(project_dto(&stats, false))
+    // 新建项目还没有用卡记录,登记卡表在映射里用不上,给空表即可
+    Ok(project_dto(&stats, &[], false))
 }
 
 #[tauri::command]
@@ -484,6 +519,73 @@ pub fn delete_storage_card<R: tauri::Runtime>(
         &card_id,
     )
     .map_err(err)
+}
+
+// ---------- 项目用卡(UX 波三:x/y 的真分母) ----------
+
+fn project_cards_dto(
+    stats: &catalog::ProjectStats,
+    cards: &[registry::StorageCard],
+) -> ProjectCardsDto {
+    let roster = stats.card_roster.clone().unwrap_or_default();
+    let done = resolve_done_card_ids(&stats.completed_sources, cards);
+    ProjectCardsDto {
+        copied_card_ids: roster
+            .iter()
+            .filter(|id| done.contains(*id))
+            .cloned()
+            .collect(),
+        card_ids: roster,
+    }
+}
+
+#[tauri::command]
+pub fn list_project_cards<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<AppState>,
+    project_id: String,
+) -> CmdResult<ProjectCardsDto> {
+    let nas = nas_root(&app, &state)?;
+    let stats = find_project(&nas, &project_id)?;
+    let cards = registry::load(&nas).map_err(err)?.registry.cards;
+    Ok(project_cards_dto(&stats, &cards))
+}
+
+#[tauri::command]
+pub fn set_project_cards<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<AppState>,
+    project_id: String,
+    card_ids: Vec<String>,
+) -> CmdResult<ProjectCardsDto> {
+    let nas = nas_root(&app, &state)?;
+    let stats = find_project(&nas, &project_id)?;
+    let cards = registry::load(&nas).map_err(err)?.registry.cards;
+    // 引用校验 + 去重保序:清单里的每张卡必须真实登记过
+    let mut seen = std::collections::HashSet::new();
+    let mut ids: Vec<String> = Vec::new();
+    for id in card_ids {
+        if !cards.iter().any(|c| c.id == id) {
+            return Err(format!("卡未登记,无法加入项目用卡清单: {id}"));
+        }
+        if seen.insert(id.clone()) {
+            ids.push(id);
+        }
+    }
+    tasks::append_audit(
+        &app,
+        &stats.root,
+        &state.config_dir,
+        &journal::Event::new(
+            state.machine_id.clone(),
+            operator(&app, &state),
+            journal::kind::PROJECT_CARDS_SET,
+            serde_json::json!({ "cardIds": ids }),
+        ),
+    );
+    catalog::invalidate_cache(&nas);
+    let stats = find_project(&nas, &project_id)?;
+    Ok(project_cards_dto(&stats, &cards))
 }
 
 // ---------- 卷 ----------
@@ -797,7 +899,7 @@ pub fn start_copy_task<R: tauri::Runtime>(
             ),
         );
     }
-    m.source_uid = source_uid;
+    m.source_uid = source_uid.clone();
     // 拷完自动转代理意图持久化(M3 T1.5:intent = manifest id,at-least-once 补投递)
     m.auto_proxy = input.auto_proxy && stats.meta.scenario == project::Scenario::A;
 
@@ -827,7 +929,7 @@ pub fn start_copy_task<R: tauri::Runtime>(
         &state.config_dir,
         &journal::Event::new(
             state.machine_id.clone(),
-            op,
+            op.clone(),
             journal::kind::COPY_STARTED,
             serde_json::json!({
                 "taskId": dto.id,
@@ -838,6 +940,22 @@ pub fn start_copy_task<R: tauri::Runtime>(
             }),
         ),
     );
+
+    // 用卡自动并入(UX 波三):这张卡真实用在了本项目上,清单跟着长——
+    // 现场临时加卡不需要回头手改清单。折叠端按集合并入,重复事件无害。
+    if let (Some(card_id), _) = match_card(&reg.cards, source_uid.as_deref(), &volume_name) {
+        tasks::append_audit(
+            &app,
+            &stats.root,
+            &state.config_dir,
+            &journal::Event::new(
+                state.machine_id.clone(),
+                op,
+                journal::kind::PROJECT_CARD_USED,
+                serde_json::json!({ "cardId": card_id }),
+            ),
+        );
+    }
 
     let handle = Arc::new(TaskHandle {
         pause_requested: AtomicBool::new(false),

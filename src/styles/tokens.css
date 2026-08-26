@@ -147,6 +147,11 @@
 
   /* 状态色（低饱和，仅用于文字/圆点，不做大面积填充） */
   --ok: #2f7d54;
+  /* 提示级别色的唯一出口(UX 波三:各级别颜色全 App 统一)。
+     alias 引用基色,深浅主题自动跟随,禁止任何提示面直接用别的色 */
+  --notice-info: var(--accent);
+  --notice-warning: var(--warn);
+  --notice-error: var(--danger);
   --ok-soft: rgba(47, 125, 84, 0.1);
   --warn: #8a6216;
   --warn-soft: rgba(138, 98, 22, 0.1);

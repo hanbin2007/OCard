@@ -142,7 +142,7 @@ describe("回收站", () => {
     list.mockRestore();
   });
 
-  it("#4 清空有失败时屏内明说「已保留可重试」，不只靠通知", async () => {
+  it("#4 清空有失败时可见提示「已保留可重试」(统一走 toast)", async () => {
     const user = userEvent.setup();
     const empty = vi
       .spyOn(api, "emptyTrash")
@@ -154,10 +154,9 @@ describe("回收站", () => {
     await user.click(screen.getByTestId("trash-empty"));
     await user.click(screen.getByRole("button", { name: "永久删除" }));
 
-    const box = await screen.findByTestId("trash-empty-failed");
-    expect(box.getAttribute("role")).toBe("alert");
-    expect(box.textContent).toContain("2 个文件删除失败");
-    expect(box.textContent).toContain("已保留在回收站");
+    const toast = await screen.findByTestId("notice-toasts");
+    expect(toast.textContent).toContain("2 个文件删除失败");
+    expect(toast.textContent).toContain("已保留在回收站");
     empty.mockRestore();
   });
 

@@ -19,8 +19,7 @@ export function TrashScreen() {
   const [busy, setBusy] = useState(false);
   /** 读取失败绝不能渲染成「回收站是空的」——那会让人以为文件已经没了 */
   const [loadError, setLoadError] = useState<string | null>(null);
-  /** 上一次清空里删除失败的条数：屏内明说，不只靠通知 */
-  const [emptyFailed, setEmptyFailed] = useState(0);
+
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
 
   const reload = useCallback(async () => {
@@ -42,7 +41,6 @@ export function TrashScreen() {
   useEffect(() => {
     setEntries([]);
     setConfirm(null);
-    setEmptyFailed(0);
   }, [projectId]);
 
   useEffect(() => {
@@ -95,7 +93,13 @@ export function TrashScreen() {
         setBusy(true);
         try {
           const result = await api.emptyTrash(projectId);
-          setEmptyFailed(result.failed);
+          if (result.failed > 0) {
+            // 部分失败统一走 toast(UX 波三);失败条目仍留在下方列表里
+            notify(
+              `${result.failed} 个文件删除失败,已保留在回收站,可重试清空`,
+              "trash-empty-partial",
+            );
+          }
           await reload();
         } catch (err) {
           notify(
@@ -154,15 +158,6 @@ export function TrashScreen() {
               {entries.length} 个 · {formatBytes(totalBytes)}
             </span>
           </div>
-
-          {emptyFailed > 0 ? (
-            <div className="notice notice--warn" role="alert" data-testid="trash-empty-failed">
-              <strong>{emptyFailed} 个文件删除失败，已保留在回收站</strong>
-              <span>
-                这些文件仍然存在、可以重试删除。常见原因是文件被占用或权限不足。
-              </span>
-            </div>
-          ) : null}
 
           {loadError ? (
             <div className="sorting__error" data-testid="trash-load-error">

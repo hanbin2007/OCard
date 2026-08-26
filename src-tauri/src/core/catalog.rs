@@ -23,7 +23,19 @@ pub struct ProjectStats {
     pub manifest_count: usize,
     /// 各次拷卡的最大目的地数(0 表示还没拷过)。
     pub destination_max: usize,
+    /// 项目用卡清单(登记卡 id;UX 波三):journal 折叠结果。
+    /// None = 从未配置也从未自动记录——x/y 无从谈起,回退按次数显示。
+    pub card_roster: Option<Vec<String>>,
+    /// 已完成拷卡的来源身份(指纹优先,卷名兜底),供命令层映射到登记卡。
+    pub completed_sources: Vec<CopySource>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// 一次已完成拷卡的来源识别信息。
+#[derive(Debug, Clone)]
+pub struct CopySource {
+    pub volume_name: String,
+    pub source_uid: Option<String>,
 }
 
 /// 扫描结果:项目列表 + 需要上报用户的告警(UX 原则:跳过不允许静默)。
@@ -161,6 +173,54 @@ pub fn scan(nas_root: &Path) -> Result<CatalogScan> {
             .max()
             .unwrap_or(meta.created_at);
         let manifest_count = manifests.len();
+        let completed_sources: Vec<CopySource> = manifests
+            .iter()
+            .filter(|m| m.completed)
+            .map(|m| CopySource {
+                volume_name: m.source_label.clone(),
+                source_uid: m.source_uid.clone(),
+            })
+            .collect();
+        // 用卡清单:项目 journal 按时序折叠(set 整体替换,used 增量并入)。
+        // 读失败进 warnings(零静默),清单按「未配置」处理。
+        let card_roster: Option<Vec<String>> = match crate::core::journal::read_all(&path) {
+            Ok(read) => {
+                let mut roster: Option<Vec<String>> = None;
+                for ev in &read.events {
+                    match ev.kind.as_str() {
+                        crate::core::journal::kind::PROJECT_CARDS_SET => {
+                            let ids: Vec<String> = ev
+                                .data
+                                .get("cardIds")
+                                .and_then(|v| v.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|x| x.as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            roster = Some(ids);
+                        }
+                        crate::core::journal::kind::PROJECT_CARD_USED => {
+                            if let Some(id) = ev.data.get("cardId").and_then(|v| v.as_str()) {
+                                let r = roster.get_or_insert_with(Vec::new);
+                                if !r.iter().any(|x| x == id) {
+                                    r.push(id.to_string());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                roster
+            }
+            Err(e) => {
+                out.warnings.push(format!(
+                    "项目「{folder}」的日志不可读,用卡清单按未配置处理: {e}"
+                ));
+                None
+            }
+        };
         let destination_max = manifests
             .iter()
             .map(|m| m.destinations.len())
@@ -176,6 +236,8 @@ pub fn scan(nas_root: &Path) -> Result<CatalogScan> {
             asset_count,
             manifest_count,
             destination_max,
+            card_roster,
+            completed_sources,
             updated_at,
         });
     }
