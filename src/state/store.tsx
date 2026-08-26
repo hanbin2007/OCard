@@ -92,6 +92,8 @@ export interface AppState {
   selectedTaskId: string | null;
   /** 工作站设置对话框是否打开 */
   settingsOpen: boolean;
+  /** 任务中心面板是否打开 */
+  taskCenterOpen: boolean;
   /**
    * 收到了事件、但本地还没有这个任务（别的窗口/重启后重建的任务，
    * 或快照还没拉回来）。先按 taskId 缓存最新一条，拉到快照后补上。
@@ -129,6 +131,8 @@ export type AppAction =
   | { type: "taskProgress"; event: CopyProgressEvent }
   | { type: "settingsOpened" }
   | { type: "settingsClosed" }
+  | { type: "taskCenterOpened" }
+  | { type: "taskCenterClosed" }
   | { type: "workstationUpdated"; workstation: WorkstationInfo }
   | { type: "taskSnapshot"; task: CopyTask }
   | { type: "noticeReceived"; notice: NoticeDto }
@@ -159,6 +163,7 @@ export const initialState: AppState = {
   selectedProjectId: null,
   selectedTaskId: null,
   settingsOpen: false,
+  taskCenterOpen: false,
   orphanProgress: {},
   notices: [],
   noticesOpen: false,
@@ -548,6 +553,12 @@ export function reducer(state: AppState, action: AppAction): AppState {
       jobs[index] = job;
       return { ...state, jobs };
     }
+
+    case "taskCenterOpened":
+      return { ...state, taskCenterOpen: true };
+
+    case "taskCenterClosed":
+      return { ...state, taskCenterOpen: false };
 
     case "settingsOpened":
       return { ...state, settingsOpen: true };

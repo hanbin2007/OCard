@@ -1835,3 +1835,73 @@
 .text-warn {
   color: var(--warn);
 }
+
+/* ---------- 任务中心(复用 notice-panel 骨架) ---------- */
+
+.task-badge {
+  /* 活跃任务计数用强调蓝,不是告警红 */
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.task-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
+.task-item:first-child {
+  border-top: 0;
+}
+
+.task-item__main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  gap: var(--space-1);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.task-item__main:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.task-item__title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  min-width: 0;
+}
+
+.task-item__meta {
+  font-size: var(--text-2xs);
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-item--history {
+  display: grid;
+  gap: 2px;
+}
+
+.task-panel__divider {
+  padding: var(--space-2) var(--space-4);
+  border-top: 1px solid var(--border);
+  background: var(--bg-subtle);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-medium);
+  color: var(--text-tertiary);
+  letter-spacing: 0.04em;
+}

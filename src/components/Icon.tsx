@@ -157,6 +157,17 @@ export function IconClose(props: IconProps) {
   );
 }
 
+export function IconTasks(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M2.5 4h11" />
+      <path d="M2.5 8h11" />
+      <path d="M2.5 12h6" />
+      <circle cx="12" cy="12" r="2" />
+    </Svg>
+  );
+}
+
 export function IconSettings(props: IconProps) {
   return (
     <Svg {...props}>

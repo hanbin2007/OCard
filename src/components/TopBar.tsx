@@ -3,6 +3,7 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { IconSettings } from "./Icon";
 import { NoticeBell } from "./NotificationCenter";
+import { TaskCenter } from "./TaskCenter";
 import { selectDeliveryWorking, useStore } from "../state/store";
 
 /**
@@ -107,6 +108,8 @@ export function TopBar({
       <CurrentProjectChip />
       <div className="topbar__actions">
         {actions}
+        {/* 任务中心:跨项目/跨类型后台任务的统一入口(常驻) */}
+        <TaskCenter />
         {/* 通知铃铛常驻所有屏幕：降级/失败必须随时看得见 */}
         <NoticeBell />
         {/* 设置入口常驻：首跑没配 NAS 时也要够得着 */}
