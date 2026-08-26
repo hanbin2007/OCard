@@ -202,12 +202,16 @@ function applyProgress(task: CopyTask, event: CopyProgressEvent): CopyTask {
   if (task.progressRevision !== undefined && event.revision <= task.progressRevision) {
     return task;
   }
+  // 终态事件要把完成时间落下来:快照对账之外唯一的 finishedAt 来源,
+  // 不落的话任务中心历史会拿启动时间冒充完成时间排序(codex P1)
+  const terminal = event.state === "done" || event.state === "failed";
   return {
     ...task,
     progressRevision: event.revision,
     copiedBytes: event.copiedBytes,
     speedBytesPerSec: event.speedBytesPerSec,
     state: event.state,
+    finishedAt: task.finishedAt ?? (terminal ? event.occurredAt : undefined),
     files: mergeFiles(task.files, event.changedFiles),
     destinations: mergeDestinations(task.destinations, event.changedDestinations),
   };
@@ -520,6 +524,8 @@ export function reducer(state: AppState, action: AppAction): AppState {
       return {
         ...state,
         noticesOpen: open,
+        // 互斥:打开通知面板时收起任务中心(评审 P2)
+        taskCenterOpen: open ? false : state.taskCenterOpen,
         // 打开只把 warning/info 置已读；error 必须逐条确认，否则可能从未被独立看到
         notices: open
           ? state.notices.map((n) =>
@@ -555,13 +561,15 @@ export function reducer(state: AppState, action: AppAction): AppState {
     }
 
     case "taskCenterOpened":
-      return { ...state, taskCenterOpen: true };
+      // 顶栏浮层互斥:任务中心与通知面板并排弹出会完全重叠(评审 P2)
+      return { ...state, taskCenterOpen: true, noticesOpen: false };
 
     case "taskCenterClosed":
       return { ...state, taskCenterOpen: false };
 
     case "settingsOpened":
-      return { ...state, settingsOpen: true };
+      // 互斥:打开设置时收起顶栏浮层
+      return { ...state, settingsOpen: true, taskCenterOpen: false, noticesOpen: false };
 
     case "settingsClosed":
       return { ...state, settingsOpen: false };

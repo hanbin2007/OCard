@@ -58,6 +58,10 @@ const NOTICE_TITLES: Record<string, string> = {
   "delivery-status-save-failed": "交付状态没有保存成功",
   "reveal-failed": "无法打开文件管理器",
   "card-match-conflict": "卡片匹配存在冲突",
+  "job-cancel-too-late": "取消未生效",
+  "job-cancel-failed": "取消作业失败",
+  "copy-pause-failed": "拷卡挂起/继续失败",
+  "delivery-cancelled": "交付打包已取消",
 };
 
 /** 未知 code 也要有体面的抬头，不能露出空白 */

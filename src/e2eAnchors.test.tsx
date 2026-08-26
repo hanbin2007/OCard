@@ -53,6 +53,41 @@ describe("E2E 锚点", () => {
     ]);
   });
 
+  it("任务中心锚点", async () => {
+    const user = userEvent.setup();
+    const runningJob = {
+      id: "job-e2e-1",
+      kind: "transcode" as const,
+      projectId: mockProjects[0].id,
+      state: "running" as const,
+      done: 1,
+      total: 4,
+      bytesDone: 0,
+      revision: 1,
+      startedAt: "2026-08-26T10:00:00+08:00",
+    };
+    const doneJob = {
+      ...runningJob,
+      id: "job-e2e-2",
+      state: "done" as const,
+      finishedAt: "2026-08-26T10:10:00+08:00",
+    };
+    render(
+      <App
+        preloaded={{ ...base, route: "projects", jobs: [runningJob, doneJob] }}
+      />,
+    );
+    expectAnchors(["task-center-toggle", "task-active-count"]);
+    await user.click(screen.getByTestId("task-center-toggle"));
+    expectAnchors([
+      "task-center-panel",
+      "task-item",
+      "task-pause",
+      "task-cancel",
+      "task-history-item",
+    ]);
+  });
+
   it("分类工作台锚点", async () => {
     render(<App preloaded={{ ...base, route: "sorting" }} />);
     await screen.findAllByTestId("asset-cell");

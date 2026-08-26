@@ -66,6 +66,10 @@ impl JobState {
 pub struct JobSnapshot {
     pub id: String,
     pub kind: JobKind,
+    /// kind 内的子类型判别(transcode: "proxy"/"archive")。进行中快照没有
+    /// result.mode 可认,聚合视图(任务中心)需要这个字段才不会把归档误标成转码。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<&'static str>,
     pub project_id: String,
     pub state: JobState,
     pub done: usize,
@@ -171,11 +175,22 @@ pub struct JobManager {
 
 impl JobManager {
     pub fn create(&self, kind: JobKind, project_id: &str) -> Arc<JobHandle> {
+        self.create_op(kind, None, project_id)
+    }
+
+    /// 带子类型判别的创建(transcode 必须传 proxy/archive)。
+    pub fn create_op(
+        &self,
+        kind: JobKind,
+        operation: Option<&'static str>,
+        project_id: &str,
+    ) -> Arc<JobHandle> {
         let id = uuid::Uuid::new_v4().to_string();
         let handle = Arc::new(JobHandle {
             snapshot: Mutex::new(JobSnapshot {
                 id: id.clone(),
                 kind,
+                operation,
                 project_id: project_id.to_string(),
                 state: JobState::Queued,
                 done: 0,

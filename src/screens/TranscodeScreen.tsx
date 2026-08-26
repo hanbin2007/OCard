@@ -2,7 +2,12 @@
 
 import { useCallback, useEffect, useState } from "react";
 import * as api from "../api";
-import type { ArchiveTier, FfmpegStatus, TranscodeJob } from "../api/types";
+import type {
+  ArchiveTier,
+  FfmpegStatus,
+  NoticeLevel,
+  TranscodeJob,
+} from "../api/types";
 import { isArchiveResult, isJobTerminal } from "../api/types";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { Checkbox } from "../components/controls";
@@ -60,7 +65,7 @@ export function TranscodeScreen() {
   }, []);
 
   const notify = useCallback(
-    (level: "warning" | "error", code: string, message: string) =>
+    (level: NoticeLevel, code: string, message: string) =>
       dispatch({
         type: "noticeReceived",
         notice: { level, code, message, occurredAt: new Date().toISOString() },
@@ -150,7 +155,7 @@ export function TranscodeScreen() {
       // 取消在路上时作业自己跑完了：如实说没生效
       if (isJobTerminal(snapshot.state) && snapshot.state !== "cancelled") {
         notify(
-          "warning",
+          "info",
           "job-cancel-too-late",
           "转码作业在取消生效前已经结束，本次取消未生效。",
         );

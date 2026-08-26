@@ -496,7 +496,7 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
     if meta.scenario != project::Scenario::A {
         return Err("代理转码仅适用于工况 A(视频)项目".into());
     }
-    let handle = jobs.create(JobKind::Transcode, &input.project_id);
+    let handle = jobs.create_op(JobKind::Transcode, Some("proxy"), &input.project_id);
     // intent 绑定到作业(R5:排队期被取消也能按 job 释放,不再卡到重启)
     if let Some(mid) = &intent_manifest {
         intent_bind(mid, &handle.snapshot().id);
@@ -1179,7 +1179,7 @@ pub fn start_archive_transcode<R: tauri::Runtime>(
         std::fs::canonicalize(&out_root).map_err(|e| format!("输出目录解析失败: {e}"))?;
     archive_bans(&out_root)?;
 
-    let handle = jobs.create(JobKind::Transcode, &input.project_id);
+    let handle = jobs.create_op(JobKind::Transcode, Some("archive"), &input.project_id);
     let root = stats.root.clone();
     let meta = stats.meta.clone();
     let machine_id = state.machine_id.clone();

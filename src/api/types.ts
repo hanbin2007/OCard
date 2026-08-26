@@ -564,6 +564,11 @@ export interface DeliveryJob extends JobBase {
 export interface TranscodeJob extends JobBase {
   kind: "transcode";
   /**
+   * 代理/归档子类型判别,进行中快照唯一可认的字段(result.mode 只在终态有)。
+   * 后端创建作业时写死;缺省(旧快照)按代理显示并不再确定性误标。
+   */
+  operation?: "proxy" | "archive";
+  /**
    * 代理与归档共用 kind = "transcode"，结果因此是两种之一，
    * 由结果自带的 `mode` 判别字段分流（后端 ProxyResultDto / ArchiveResultDto
    * 都显式写死这个值）。不做结构嗅探——字段有无是实现细节，判别字段才是契约。

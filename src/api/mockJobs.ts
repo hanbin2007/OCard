@@ -12,6 +12,7 @@ import type {
   TranscodeJob,
 } from "./types";
 import { isJobTerminal } from "./types";
+import { nowLocalIso } from "../lib/format";
 import { mockArchiveResult, mockDelivery } from "./mock";
 
 const TICK_MS = 120;
@@ -58,7 +59,7 @@ export function mockStartDelivery(projectId: string): DeliveryJob {
     total: TOTAL_FILES,
     bytesDone: 0,
     revision: 1,
-    startedAt: new Date().toISOString(),
+    startedAt: nowLocalIso(),
   };
   jobs.set(id, job);
 
@@ -80,7 +81,7 @@ export function mockStartDelivery(projectId: string): DeliveryJob {
           done: TOTAL_FILES,
           bytesDone: mockDelivery.totalBytes,
           message: undefined,
-          finishedAt: new Date().toISOString(),
+          finishedAt: nowLocalIso(),
           result: mockDelivery,
         }),
       );
@@ -115,7 +116,7 @@ export function mockCancelJob(jobId: string): JobSnapshot {
   // 取消是终态且 result 为空：已完成量看 done/total
   const cancelled = bump(current, {
     state: "cancelled",
-    finishedAt: new Date().toISOString(),
+    finishedAt: nowLocalIso(),
     message: undefined,
   });
   emit(cancelled);
@@ -157,13 +158,14 @@ export function mockStartProxyTranscode(projectId: string): TranscodeJob {
   const job: TranscodeJob = {
     id,
     kind: "transcode",
+    operation: "proxy",
     projectId,
     state: "queued",
     done: 0,
     total: TRANSCODE_TOTAL,
     bytesDone: 0,
     revision: 1,
-    startedAt: new Date().toISOString(),
+    startedAt: nowLocalIso(),
   };
   jobs.set(id, job);
 
@@ -184,7 +186,7 @@ export function mockStartProxyTranscode(projectId: string): TranscodeJob {
           state: "done",
           done: TRANSCODE_TOTAL,
           message: undefined,
-          finishedAt: new Date().toISOString(),
+          finishedAt: nowLocalIso(),
           result: mockProxyResult,
         }),
       );
@@ -236,7 +238,7 @@ export function mockStartAnalysis(projectId: string): AnalyzeJob {
     total: ANALYZE_TOTAL,
     bytesDone: 0,
     revision: 1,
-    startedAt: new Date().toISOString(),
+    startedAt: nowLocalIso(),
   };
   jobs.set(id, job);
 
@@ -257,7 +259,7 @@ export function mockStartAnalysis(projectId: string): AnalyzeJob {
           state: "done",
           done: ANALYZE_TOTAL,
           message: undefined,
-          finishedAt: new Date().toISOString(),
+          finishedAt: nowLocalIso(),
           result: mockAnalysisResult,
         }),
       );
@@ -279,13 +281,14 @@ export function mockStartArchive(projectId: string): TranscodeJob {
   const job: TranscodeJob = {
     id,
     kind: "transcode",
+    operation: "archive",
     projectId,
     state: "queued",
     done: 0,
     total: 44,
     bytesDone: 0,
     revision: 1,
-    startedAt: new Date().toISOString(),
+    startedAt: nowLocalIso(),
   };
   jobs.set(id, job);
 
@@ -306,7 +309,7 @@ export function mockStartArchive(projectId: string): TranscodeJob {
           state: "done",
           done: 44,
           message: undefined,
-          finishedAt: new Date().toISOString(),
+          finishedAt: nowLocalIso(),
           result: mockArchiveResult,
         }),
       );
