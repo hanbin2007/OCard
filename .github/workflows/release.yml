@@ -263,3 +263,22 @@ jobs:
       - name: Verify sidecars & model in release bundle (fail-closed)
         shell: bash
         run: bash scripts/verify-bundle.sh --signed
+
+  # 发布防呆(v0.3.3 事故复盘):draft 在 linux 腿(最慢,AppImage 重打包)
+  # 完成前被 publish,后续产物落进游离 draft。三平台全部收尾后才在
+  # release 说明末尾盖「产物齐备」标记——publish 前先看到这行再点。
+  finalize:
+    name: Finalize (产物齐备标记)
+    needs: [release-linux, release-windows, release-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark release assets complete
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          BODY=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json body --jq .body)
+          COUNT=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')
+          NOTE="✅ 三平台产物齐备(共 $COUNT 个,finalize 自动标记)——现在可以 publish。看不到这一行时请勿发布:linux 腿可能还在跑,提前 publish 会把剩余产物挤进游离 draft(v0.3.3 事故)。"
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --notes "$BODY"$'\n\n'"$NOTE"
