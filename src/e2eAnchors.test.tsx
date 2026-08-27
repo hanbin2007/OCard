@@ -42,7 +42,6 @@ describe("E2E 锚点", () => {
     render(<App preloaded={{ ...base, route: "projects" }} />);
     expectAnchors([
       "nav-projects",
-      "nav-new-project",
       "nav-devices",
       "nav-copy",
       "nav-sorting",

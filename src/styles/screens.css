@@ -888,10 +888,10 @@
   background: var(--panel);
 }
 
-/* 回收站 */
+/* 回收站(首列为勾选框:批量恢复,评审 4.2) */
 .trash__head,
 .trash__row {
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) 108px 80px 64px;
+  grid-template-columns: 28px minmax(0, 1fr) minmax(0, 1.4fr) 108px 80px 64px;
 }
 
 @media (max-width: 1180px) {

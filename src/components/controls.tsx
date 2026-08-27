@@ -26,6 +26,7 @@ export function Checkbox({
   disabled = false,
   testId,
   className,
+  ariaLabel,
   children,
 }: {
   checked: boolean;
@@ -33,6 +34,8 @@ export function Checkbox({
   disabled?: boolean;
   testId?: string;
   className?: string;
+  /** 无可见文字标签(如表格行首勾选框)时的读屏名 */
+  ariaLabel?: string;
   children?: ReactNode;
 }) {
   return (
@@ -48,6 +51,7 @@ export function Checkbox({
           data-testid={testId}
           checked={checked}
           disabled={disabled}
+          aria-label={ariaLabel}
           onChange={(e) => onChange(e.currentTarget.checked)}
         />
         <span className="checkbox__box" aria-hidden="true">

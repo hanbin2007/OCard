@@ -309,9 +309,68 @@
  * 拷卡/分类/转码都作用在「当前项目」上,这个状态必须常驻可见:
  * 顶栏正中、黄底、加粗;超长跑马灯;点击回项目列表。
  * 占据网格中列,由轨道分配保证与两翼互不压盖;窄窗下限宽,超长交给跑马灯。 */
-.topbar__project {
+/* 包一层 wrap:下拉浮层的定位锚(评审 5.2 原地切项目) */
+.topbar__project-wrap {
   grid-column: 2;
   justify-self: center;
+  position: relative;
+}
+
+.topbar__project-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 280px;
+  max-height: min(50vh, 420px);
+  padding: var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--panel);
+  animation: chrome-fade-in var(--dur-quick) var(--ease-out);
+}
+
+.topbar__project-menu-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.topbar__project-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  text-align: left;
+  cursor: pointer;
+  width: 100%;
+}
+
+.topbar__project-item:hover {
+  background: var(--bg-subtle);
+}
+
+.topbar__project-item[aria-selected="true"] {
+  background: var(--warn-soft);
+}
+
+.topbar__project-empty {
+  padding: var(--space-2) var(--space-3);
+}
+
+.topbar__project {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);

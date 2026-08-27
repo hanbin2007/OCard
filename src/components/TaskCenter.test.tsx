@@ -143,7 +143,7 @@ describe("任务中心", () => {
     refetch.mockRestore();
   });
 
-  it("交付打包进行中时任务行跳转禁用(与侧栏同一把锁)", async () => {
+  it("交付打包进行中任务行跳转不再禁用(评审 4.3):导航放行", async () => {
     const user = userEvent.setup();
     render(
       <App
@@ -160,10 +160,8 @@ describe("任务中心", () => {
     const row = screen.getByRole("button", {
       name: /打开转码：年中发布会/,
     }) as HTMLButtonElement;
-    expect(row.disabled).toBe(true);
-    expect(row.title).toContain("交付打包进行中");
-    // 锁禁的是「离开」,不是「取消打包」——取消恰是唯一能解锁的动作,
-    // 交付行的取消按钮必须仍然可用
+    expect(row.disabled).toBe(false);
+    // 取消打包仍然可用
     const cancels = screen.getAllByTestId("task-cancel") as HTMLButtonElement[];
     expect(cancels.some((b) => !b.disabled)).toBe(true);
   });

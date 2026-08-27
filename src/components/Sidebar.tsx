@@ -1,7 +1,7 @@
 /** 左侧窄边栏：导航 + 最近项目 + 操作人/主题。 */
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ROUTE_ORDER, selectDeliveryWorking, useStore } from "../state/store";
+import { ROUTE_ORDER, useStore } from "../state/store";
 import type { RouteName } from "../state/store";
 import { THEME_LABELS, useTheme } from "../state/theme";
 import { formatCompactDate } from "../lib/format";
@@ -25,12 +25,20 @@ const NAV_ITEMS: Record<RouteName, { label: string; icon: typeof IconProjects }>
   "new-project": { label: "新建项目", icon: IconPlus },
   devices: { label: "设备登记", icon: IconCamera },
   copy: { label: "拷卡任务", icon: IconCard },
-  sorting: { label: "分类工作台", icon: IconGrid },
+  // 交付打包住在这一屏里,名字必须盖得住它(评审 5.1):
+  // 核心流程「…→选片→交付」的最后一环不能在导航上失踪
+  sorting: { label: "选片与交付", icon: IconGrid },
   transcode: { label: "代理转码", icon: IconFilm },
   trash: { label: "回收站", icon: IconTrash },
 };
 
-const NAV = ROUTE_ORDER.map((route) => ({ route, ...NAV_ITEMS[route] }));
+/**
+ * 「新建项目」是动作不是场所(评审 5.5):用完即走,不占常驻导航位。
+ * 入口在项目屏顶栏与空态;路由本身保留,屏间过渡顺序不变。
+ */
+const NAV = ROUTE_ORDER.filter((route) => route !== "new-project").map(
+  (route) => ({ route, ...NAV_ITEMS[route] }),
+);
 
 /**
  * 量出当前项在列表里的位置，交给一块**会移动的**选中底。
@@ -111,15 +119,14 @@ function ThemeSwitch() {
 
 export function Sidebar() {
   const { state, dispatch } = useStore();
-  const deliveryWorking = selectDeliveryWorking(state);
   const selectedProject = state.projects.find(
     (p) => p.id === state.selectedProjectId,
   );
   // 代理转码是工况 A 概念，工况 B 项目下不给入口
   const transcodeAvailable = selectedProject?.scenario === "A";
+  // 角标只保留有行动意义的量(评审 5.6):「拷卡 2」=有 2 个在跑,
+  // 值得一瞥;「项目 12」只是总数,徒增噪音
   const counts: Partial<Record<RouteName, number>> = {
-    projects: state.projects.length,
-    devices: state.cameras.length,
     copy: state.tasks.filter((t) => t.state === "running").length,
   };
   const { listRef, rail, ready } = useNavRail(state.route, NAV.length);
@@ -167,19 +174,17 @@ export function Sidebar() {
                   data-testid={`nav-${route}`}
                   className="nav-item"
                   aria-current={state.route === route ? "page" : undefined}
-                  /* 打包期间锁住导航：离开会让结果面板（含未交付明细）静默蒸发。
-                     「代理转码」不再禁用（macOS 禁用按钮连 tooltip 都不出,
-                     等于无提示的死门）：不适用时进屏由屏内空态解释并给出去路 */
-                  disabled={deliveryWorking}
+                  /* 打包期间不再锁死导航(评审 4.3):进度/结果由 store 里的
+                     job 状态承载,离屏回来面板自动恢复,不存在「静默蒸发」。
+                     「代理转码」不禁用(macOS 禁用按钮连 tooltip 都不出,
+                     等于无提示的死门)：不适用时进屏由屏内空态解释并给出去路 */
                   data-inapplicable={
                     route === "transcode" && !transcodeAvailable ? true : undefined
                   }
                   title={
-                    deliveryWorking
-                      ? "交付打包进行中，完成后才能切换页面"
-                      : route === "transcode" && !transcodeAvailable
-                        ? "代理转码只适用于工况 A 项目，点击查看说明"
-                        : undefined
+                    route === "transcode" && !transcodeAvailable
+                      ? "代理转码只适用于工况 A 项目，点击查看说明"
+                      : undefined
                   }
                   onClick={() => dispatch({ type: "navigate", route })}
                 >
@@ -206,14 +211,9 @@ export function Sidebar() {
                 type="button"
                 className="sidebar__project"
                 aria-current={project.id === state.selectedProjectId}
-                disabled={deliveryWorking}
-                title={
-                  deliveryWorking
-                    ? "交付打包进行中，完成后才能切换项目"
-                    : undefined
-                }
                 /* 只换当前项目,不换页面:在拷卡/分类屏切项目就是想
-                   在当前屏操作另一个项目,跳回项目列表是打断(用户反馈) */
+                   在当前屏操作另一个项目,跳回项目列表是打断(用户反馈)。
+                   打包期间也放行(评审 4.3):作业挂在项目上,切走不打断 */
                 onClick={() =>
                   dispatch({ type: "selectProject", projectId: project.id })
                 }

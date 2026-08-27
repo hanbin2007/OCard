@@ -196,7 +196,7 @@ describe("快捷拷卡引导", () => {
     );
   });
 
-  it("交付打包进行中:引导按钮与侧栏同一把锁", async () => {
+  it("交付打包进行中引导不再上锁(评审 4.3):拷卡写待分类,与打包不冲突", async () => {
     render(
       <App
         preloaded={{
@@ -219,8 +219,7 @@ describe("快捷拷卡引导", () => {
       />,
     );
     const copyBtn = screen.getByTestId("qc-copy") as HTMLButtonElement;
-    expect(copyBtn.disabled).toBe(true);
-    expect(copyBtn.title).toContain("交付打包进行中");
+    expect(copyBtn.disabled).toBe(false);
   });
 
   it("登记成功后续接引导:同一张卷以已登记身份重新入队", async () => {

@@ -4,13 +4,13 @@
  * 默认动作永远是不删。
  */
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, type ReactNode } from "react";
 import { withViewTransition } from "../lib/motion";
 
 export interface ConfirmRequest {
   title: string;
-  /** 说清影响范围，例如级联删除多少张卡 */
-  message: string;
+  /** 说清影响范围，例如级联删除多少张卡;可传节点做清单式确认(评审 4.1) */
+  message: ReactNode;
   confirmLabel: string;
   /** 可返回 Promise：调用方需要等后端结果再更新本地状态 */
   onConfirm: () => void | Promise<void>;
@@ -71,9 +71,9 @@ export function ConfirmDialog({
         <h2 className="dialog__title" id="confirm-title">
           {request.title}
         </h2>
-        <p className="dialog__message" id="confirm-message">
+        <div className="dialog__message" id="confirm-message">
           {request.message}
-        </p>
+        </div>
         <div className="dialog__actions">
           <button type="button" className="btn" ref={cancelRef} onClick={close}>
             取消

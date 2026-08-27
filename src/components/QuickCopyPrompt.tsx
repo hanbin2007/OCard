@@ -15,7 +15,7 @@ import { useEffect, useState } from "react";
 import * as api from "../api";
 import type { Project, StorageCard, Volume } from "../api/types";
 import { formatBytes } from "../lib/format";
-import { selectDeliveryWorking, useNotify, useStore } from "../state/store";
+import { useNotify, useStore } from "../state/store";
 import { IconCard, IconClose } from "./Icon";
 
 type RosterState =
@@ -44,7 +44,6 @@ export function QuickCopyPrompt() {
 function PromptBody({ volume }: { volume: Volume }) {
   const { state, dispatch } = useStore();
   const notify = useNotify();
-  const deliveryWorking = selectDeliveryWorking(state);
 
   // 缺省(旧快照/mock 未填)按 matchedCardId 推断,不武断当未登记
   const matchStatus =
@@ -150,10 +149,6 @@ function PromptBody({ volume }: { volume: Volume }) {
     goCopy();
   };
 
-  const lockTitle = deliveryWorking
-    ? "交付打包进行中，完成后才能切换页面"
-    : undefined;
-
   return (
     <div
       className="quick-copy"
@@ -202,8 +197,6 @@ function PromptBody({ volume }: { volume: Volume }) {
               type="button"
               className="btn btn--primary btn--sm"
               data-testid="qc-copy-manual"
-              disabled={deliveryWorking}
-              title={lockTitle}
               onClick={() => {
                 dispatch({ type: "copyDraftSet", volumeId: volume.id });
                 resolve();
@@ -217,8 +210,6 @@ function PromptBody({ volume }: { volume: Volume }) {
                 type="button"
                 className="btn btn--sm"
                 data-testid="qc-goto-devices"
-                disabled={deliveryWorking}
-                title={lockTitle}
                 onClick={() => {
                   resolve();
                   dispatch({ type: "navigate", route: "devices" });
@@ -262,8 +253,6 @@ function PromptBody({ volume }: { volume: Volume }) {
               type="button"
               className="btn btn--primary btn--sm"
               data-testid="qc-register"
-              disabled={deliveryWorking}
-              title={lockTitle}
               onClick={goRegister}
             >
               去登记
@@ -285,8 +274,6 @@ function PromptBody({ volume }: { volume: Volume }) {
               type="button"
               className="btn btn--sm"
               data-testid="qc-goto-projects"
-              disabled={deliveryWorking}
-              title={lockTitle}
               onClick={() => dispatch({ type: "navigate", route: "projects" })}
             >
               去选择项目
@@ -318,8 +305,6 @@ function PromptBody({ volume }: { volume: Volume }) {
               type="button"
               className="btn btn--primary btn--sm"
               data-testid="qc-copy"
-              disabled={deliveryWorking}
-              title={lockTitle}
               onClick={() => copyWithAutoJoin(project, card)}
             >
               去拷卡

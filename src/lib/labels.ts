@@ -87,13 +87,17 @@ export const DESTINATION_STATE_LABEL: Record<DestinationState, string> = {
   error: "出错",
 };
 
-/** 工况 A 用「转码/交付」衡量，工况 B 用「已分类/总数」衡量 */
+/**
+ * 进度列文字。工况 B 有真实分母(已分类/总数);工况 A 未配用卡清单时
+ * 只有素材量可说——如实说「已入库」,阶段状态由同行的状态徽标承载
+ * (评审 5.8:注释不许承诺实现没有的「转码/交付」口径)。
+ */
 export function progressLabel(
   scenario: Scenario,
   sorted: number,
   total: number,
 ): string {
   if (total === 0) return "尚无素材";
-  if (scenario === "A") return `${total} 个素材`;
+  if (scenario === "A") return `${total} 个素材已入库`;
   return `${sorted} / ${total} 已分类`;
 }

@@ -294,7 +294,9 @@ describe("应用外壳", () => {
     await user.click(screen.getByRole("button", { name: /设备登记/ }));
     expect(screen.getByRole("button", { name: "登记相机" })).toBeDefined();
 
-    await user.click(screen.getByRole("button", { name: /新建项目/ }));
+    // 「新建项目」已移出侧栏(评审 5.5):入口在项目屏顶栏
+    await user.click(screen.getByTestId("nav-projects"));
+    await user.click(screen.getByRole("button", { name: "新建项目" }));
     expect(screen.getByText("将创建")).toBeDefined();
   });
 });
@@ -314,7 +316,8 @@ describe("导航方向", () => {
       .map((el) => el.getAttribute("data-testid"))
       .filter((id): id is string => !!id && id.startsWith("nav-"))
       .map((id) => id.slice("nav-".length));
-    expect(rendered).toEqual(ROUTE_ORDER);
+    // 「新建项目」是动作不是场所,不再占导航位(评审 5.5)
+    expect(rendered).toEqual(ROUTE_ORDER.filter((r) => r !== "new-project"));
   });
 
   it("首屏不带方向：不是导航引起的整屏替换不该做方向性位移", () => {
@@ -334,12 +337,12 @@ describe("导航方向", () => {
       />,
     );
 
-    // projects(0) → devices(2)
-    await user.click(screen.getByTestId("nav-devices"));
+    // projects(0) → sorting(4)
+    await user.click(screen.getByTestId("nav-sorting"));
     await waitFor(() => expect(shell().getAttribute("data-nav")).toBe("forward"));
 
-    // devices(2) → new-project(1)
-    await user.click(screen.getByTestId("nav-new-project"));
+    // sorting(4) → devices(2)
+    await user.click(screen.getByTestId("nav-devices"));
     await waitFor(() => expect(shell().getAttribute("data-nav")).toBe("back"));
   });
 });

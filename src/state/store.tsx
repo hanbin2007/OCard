@@ -524,14 +524,29 @@ export function reducer(state: AppState, action: AppAction): AppState {
         ),
       };
 
-    case "projectCreated":
-      return {
+    case "projectCreated": {
+      const next = {
         ...state,
         projects: [action.project, ...state.projects],
         selectedProjectId: action.project.id,
         selectedTaskId: null,
-        route: "projects",
+        route: "projects" as RouteName,
       };
+      // 建完项目把人往下一步送(评审 5.3/G2):插卡引导会接手后续
+      return {
+        ...next,
+        ...ingestNotice(
+          next,
+          {
+            level: "info",
+            code: "project-created",
+            message: `项目「${action.project.name}」已创建。插入存储卡即可开始拷卡。`,
+            occurredAt: new Date().toISOString(),
+          },
+          { live: true },
+        ),
+      };
+    }
 
     case "cameraCreated":
       return { ...state, cameras: [...state.cameras, action.camera] };

@@ -80,6 +80,7 @@ async function startWith(job: JobSnapshot) {
   const spy = vi.spyOn(api, "startDelivery").mockResolvedValue(job);
   const user = await openWorkbench();
   await user.click(screen.getByTestId("delivery-open"));
+  await screen.findByRole("alertdialog");
   await user.click(screen.getByRole("button", { name: "开始打包" }));
   return { user, spy };
 }
@@ -90,7 +91,7 @@ describe("确认与启动", () => {
     const user = await openWorkbench();
     await user.click(screen.getByTestId("delivery-open"));
 
-    const dialog = screen.getByRole("alertdialog");
+    const dialog = await screen.findByRole("alertdialog");
     expect(dialog.textContent).toContain("精选/已修");
     expect(dialog.textContent).toContain("待分类与待修不交付");
     expect(dialog.textContent).toContain("不改动分类夹里的原件");
@@ -103,6 +104,7 @@ describe("确认与启动", () => {
     const spy = vi.spyOn(api, "startDelivery");
     const user = await openWorkbench();
     await user.click(screen.getByTestId("delivery-open"));
+    await screen.findByRole("alertdialog");
     await user.click(screen.getByRole("button", { name: "取消" }));
 
     expect(spy).not.toHaveBeenCalled();
@@ -115,6 +117,7 @@ describe("确认与启动", () => {
       .mockRejectedValue(new Error("交付打包进行中，请稍候"));
     const user = await openWorkbench();
     await user.click(screen.getByTestId("delivery-open"));
+    await screen.findByRole("alertdialog");
     await user.click(screen.getByRole("button", { name: "开始打包" }));
 
     const err = await screen.findByTestId("delivery-error");
@@ -398,14 +401,28 @@ describe("作业进行中的互斥（M2 收口行为必须保持）", () => {
     expect(screen.queryByTestId("sorting-pending-delete")).toBeNull();
   });
 
-  it("侧栏导航与回收站入口都被锁住", async () => {
+  it("打包期间导航放行(评审 4.3):进度/结果由 store 承载,不再锁死全站", async () => {
     await enterWorking();
-    const nav = screen.getByTestId("nav-projects") as HTMLButtonElement;
-    expect(nav.disabled).toBe(true);
-    expect(nav.title).toContain("交付打包进行中");
+    // 分类操作仍锁(同一批文件不能边打包边挪),但导航自由
+    expect(screen.getByTestId("sorting-delivery-lock")).toBeDefined();
+    expect(
+      (screen.getByTestId("nav-projects") as HTMLButtonElement).disabled,
+    ).toBe(false);
     expect(
       (screen.getByTestId("sorting-open-trash") as HTMLButtonElement).disabled,
-    ).toBe(true);
+    ).toBe(false);
+  });
+
+  it("进度对话框可转入后台,任务中心接管;完成时结果自动弹回", async () => {
+    const user = await enterWorking();
+    await user.click(screen.getByTestId("delivery-background"));
+    expect(screen.queryByTestId("delivery-progress")).toBeNull();
+
+    const done = deliveryJob({ state: "done", revision: 99 });
+    await act(async () => {
+      jobEmitters.forEach((emit) => emit(done));
+    });
+    await screen.findByTestId("delivery-result");
   });
 
   it("作业转终态后互斥解除", async () => {

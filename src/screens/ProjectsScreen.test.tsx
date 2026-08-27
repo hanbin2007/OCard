@@ -100,13 +100,24 @@ describe("当前项目的显性指示(UX 波)", () => {
     expect(flaggedRow?.textContent).toContain(mockProjects[1].folderName);
   });
 
-  it("顶栏正中常驻当前项目名,点击回项目列表", () => {
+  it("顶栏正中常驻当前项目名,点击弹出原地切换下拉(评审 5.2)", () => {
     render(<App preloaded={{ ...preloaded, route: "devices" as const }} />);
     const chip = screen.getByTestId("current-project-chip");
     expect(chip.textContent).toContain(mockProjects[0].name);
 
     fireEvent.click(chip);
-    expect(screen.getByRole("listbox", { name: "项目列表" })).toBeDefined();
+    // 原地切项目:不跳回列表,直接在下拉里选
+    expect(screen.getByTestId("project-switch-menu")).toBeDefined();
+    const items = screen.getAllByTestId("project-switch-item");
+    expect(items.length).toBe(mockProjects.length);
+
+    fireEvent.click(items[1]);
+    // 下拉收起,当前项目切换,人还留在设备屏
+    expect(screen.queryByTestId("project-switch-menu")).toBeNull();
+    expect(screen.getByTestId("current-project-chip").textContent).toContain(
+      mockProjects[1].name,
+    );
+    expect(screen.getByRole("button", { name: "登记相机" })).toBeDefined();
   });
 
   it("没有选中项目时顶栏指示为「未选择项目」", () => {
@@ -116,7 +127,7 @@ describe("当前项目的显性指示(UX 波)", () => {
     );
   });
 
-  it("交付打包进行中时黄标禁用:不能成为绕过导航锁的旁门", () => {
+  it("交付打包进行中黄标不再禁用(评审 4.3):导航放行,进度由 store 承载", () => {
     render(
       <App
         preloaded={{
@@ -139,8 +150,7 @@ describe("当前项目的显性指示(UX 波)", () => {
       />,
     );
     const chip = screen.getByTestId("current-project-chip") as HTMLButtonElement;
-    expect(chip.disabled).toBe(true);
-    expect(chip.title).toContain("交付打包进行中");
+    expect(chip.disabled).toBe(false);
   });
 });
 

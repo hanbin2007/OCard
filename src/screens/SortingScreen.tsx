@@ -1014,7 +1014,7 @@ export function SortingScreen() {
   if (!project) {
     return (
       <>
-        <TopBar title="分类工作台" />
+        <TopBar title="选片与交付" />
         <div className="content">
           <div className="content__inner">
             <p className="text-sm" role="alert">
@@ -1033,7 +1033,7 @@ export function SortingScreen() {
   return (
     <>
       <TopBar
-        title="分类工作台"
+        title="选片与交付"
         subtitle={project.folderName}
         subtitleMono
         actions={
@@ -1058,9 +1058,7 @@ export function SortingScreen() {
               type="button"
               className="btn btn--sm"
               data-testid="sorting-open-trash"
-              /* 打包期间不许离开本屏：结果面板不能静默蒸发 */
-              disabled={deliveryWorking}
-              title={deliveryWorking ? "打包进行中，请稍候" : "回收站"}
+              /* 打包期间导航已放行(评审 4.3):进度/结果由 store 承载,回屏自动恢复 */
               onClick={() => dispatch({ type: "navigate", route: "trash" })}
             >
               回收站

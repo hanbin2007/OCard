@@ -242,7 +242,7 @@ export function TranscodeScreen() {
               <div className="stack" data-testid="transcode-scenario-b">
                 <p className="text-sm" role="status">
                   代理转码只适用于工况 A（视频剪辑）项目。当前项目「{project.name}」是工况
-                  B（相片精修），素材整理走「分类工作台」。
+                  B（纯拍照），素材整理走「选片与交付」。
                 </p>
                 <div>
                   <button
