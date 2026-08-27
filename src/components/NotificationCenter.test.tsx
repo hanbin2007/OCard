@@ -253,9 +253,9 @@ describe("通知中心", () => {
 
     const toast = await screen.findByTestId("notice-toast-error");
     expect(toast.textContent).toContain("未来才会出现的降级");
-    // 抬头有通用回落，机器码原样以等宽字体展示
+    // 抬头有通用回落;原始 code 已移出 toast 标题行(评审 E3),报障走铃铛面板
     expect(toast.textContent).toContain("发生错误");
-    expect(toast.textContent).toContain("some-future-code-2027");
+    expect(toast.textContent).not.toContain("some-future-code-2027");
 
     await user.click(screen.getByTestId("notice-bell"));
     expect(screen.getByTestId("notice-item").getAttribute("data-code")).toBe(

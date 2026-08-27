@@ -49,6 +49,8 @@ export function NewProjectScreen() {
   );
   const [submitted, setSubmitted] = useState(false);
   const [busy, setBusy] = useState(false);
+  /** 本地撞名预检(评审 D1):软件明知道是哪个项目,别只让人自己去列表里找 */
+  const [dupProjectId, setDupProjectId] = useState<string | null>(null);
   const notify = useNotify();
 
   const date = toCompactDate(isoDate);
@@ -81,8 +83,16 @@ export function NewProjectScreen() {
 
   async function submit() {
     setSubmitted(true);
+    setDupProjectId(null);
     if (!valid) {
       focusFirstError();
+      return;
+    }
+    // 撞名前移到提交前(评审 D1):错误就近、且直接给「打开该项目」的路
+    const existing = state.projects.find((p) => p.folderName === folderName);
+    if (existing) {
+      setDupProjectId(existing.id);
+      document.getElementById("project-name")?.focus();
       return;
     }
     if (busy) return;
@@ -185,10 +195,29 @@ export function NewProjectScreen() {
                         type="text"
                         value={name}
                         placeholder="如：校运会"
-                        onChange={(e) => setName(e.currentTarget.value)}
+                        onChange={(e) => {
+                          setName(e.currentTarget.value);
+                          setDupProjectId(null);
+                        }}
                       />
                     </Field>
                   </div>
+                  {dupProjectId ? (
+                    <p className="text-xs text-warn" role="alert" data-testid="np-duplicate">
+                      已有同名项目夹（{folderName}）。换个项目名，或{" "}
+                      <button
+                        type="button"
+                        className="btn btn--sm"
+                        data-testid="np-open-duplicate"
+                        onClick={() => {
+                          dispatch({ type: "selectProject", projectId: dupProjectId });
+                          dispatch({ type: "navigate", route: "projects" });
+                        }}
+                      >
+                        打开该项目
+                      </button>
+                    </p>
+                  ) : null}
                 </div>
               </div>
 
@@ -244,6 +273,12 @@ export function NewProjectScreen() {
                   </div>
                   <div className="card__body">
                     <div className="stack stack--sm">
+                      {/* 固定夹以只读行显形(评审 D2):「为什么从 2 开始」自解释,
+                          不再靠用户把左表单和右预览自己对起来 */}
+                      <div className="category-row category-row--fixed" aria-hidden="true">
+                        <span className="category-row__index">1.</span>
+                        <span className="text-sm dim">待分类（固定）</span>
+                      </div>
                       {categories.map((category, index) => {
                         // 屏幕上的编号 = 建夹后的编号（待分类占 1），读屏器用同一个数字
                         const displayIndex = index + 2;
@@ -303,6 +338,15 @@ export function NewProjectScreen() {
                         );
                       })}
 
+                      <div className="category-row category-row--fixed" aria-hidden="true">
+                        <span className="category-row__index">{categories.length + 2}.</span>
+                        <span className="text-sm dim">精选（固定，内含 待修 / 已修）</span>
+                      </div>
+                      <div className="category-row category-row--fixed" aria-hidden="true">
+                        <span className="category-row__index">{categories.length + 3}.</span>
+                        <span className="text-sm dim">其他（固定）</span>
+                      </div>
+
                       {categories.length === 0 ? (
                         <p className="text-sm dim">还没有分类，至少添加一个。</p>
                       ) : null}
@@ -316,6 +360,18 @@ export function NewProjectScreen() {
                   </div>
                 </div>
               ) : null}
+
+              {/* 表单末尾再给一个提交(评审 D3):读完表单不必把视线折返右上角 */}
+              <div>
+                <button
+                  type="submit"
+                  data-testid="np-submit-bottom"
+                  className="btn btn--primary"
+                  disabled={busy}
+                >
+                  {busy ? "创建中…" : "创建项目"}
+                </button>
+              </div>
             </form>
 
             <aside className="wizard__preview" aria-label="建夹预览">

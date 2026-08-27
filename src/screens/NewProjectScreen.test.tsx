@@ -91,7 +91,7 @@ describe("新建项目向导", () => {
   it("项目名为空时提交被拦下并报错", async () => {
     const user = userEvent.setup();
     setup();
-    await user.click(screen.getByRole("button", { name: "创建项目" }));
+    await user.click(screen.getByTestId("np-submit"));
     expect(screen.getByRole("alert").textContent).toContain("请填写项目名");
     // 仍停留在向导页
     expect(screen.getByText("将创建")).toBeDefined();
@@ -101,7 +101,7 @@ describe("新建项目向导", () => {
     const user = userEvent.setup();
     setup();
     await user.type(screen.getByLabelText("项目名"), "校运会");
-    await user.click(screen.getByRole("button", { name: "创建项目" }));
+    await user.click(screen.getByTestId("np-submit"));
     const row = await screen.findByRole("option", {}, { timeout: 3000 });
     expect(row.textContent).toContain("20260824_校运会");
   });
@@ -113,7 +113,7 @@ describe("新建项目向导", () => {
     const user = userEvent.setup();
     setup();
     await user.type(screen.getByLabelText("项目名"), "校运会");
-    await user.click(screen.getByRole("button", { name: "创建项目" }));
+    await user.click(screen.getByTestId("np-submit"));
 
     const toast = await screen.findByTestId("notice-toasts");
     expect(toast.textContent).toContain("同名项目夹");
@@ -127,7 +127,7 @@ describe("新建项目向导", () => {
     const user = userEvent.setup();
     setup();
     await user.type(screen.getByLabelText("项目名"), "毕业典礼");
-    await user.click(screen.getByRole("button", { name: "创建项目" }));
+    await user.click(screen.getByTestId("np-submit"));
 
     const toast = await screen.findByTestId("notice-toasts");
     expect(toast.textContent).toContain("创建项目失败");

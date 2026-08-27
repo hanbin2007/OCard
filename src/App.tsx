@@ -1,3 +1,4 @@
+import { KeyboardHelp } from "./components/KeyboardHelp";
 import { NoticeToasts } from "./components/NotificationCenter";
 import { OnboardingWizard } from "./components/OnboardingWizard";
 import { QuickCopyPrompt } from "./components/QuickCopyPrompt";
@@ -155,6 +156,8 @@ export function Shell() {
       {/* 快捷拷卡引导:同在 .main 之外(路由切换不打断引导);
           z-index 低于会话门,门开时被压住,不构成绕门旁路 */}
       <QuickCopyPrompt />
+      {/* 任意屏按 ? 呼出快捷键速查(评审 #26):键盘流的可发现性 */}
+      <KeyboardHelp />
     </div>
   );
 }

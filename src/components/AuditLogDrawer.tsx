@@ -258,7 +258,13 @@ export function AuditLogDrawer({
         </header>
 
         <div className="drawer__filters" role="group" aria-label="审计日志过滤">
-          {AUDIT_GROUP_FILTERS.map((filter) => (
+          {/* 「其他」组有货才显示 chip(评审 G1):落进 other 的事件不该只能在「全部」里翻 */}
+          {[
+            ...AUDIT_GROUP_FILTERS,
+            ...(counts.other > 0
+              ? [{ id: "other" as const, label: "其他" }]
+              : []),
+          ].map((filter) => (
             <button
               key={filter.id}
               type="button"

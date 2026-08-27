@@ -888,6 +888,11 @@
   background: var(--panel);
 }
 
+/* 新建项目:固定夹只读行(评审 D2),编号自解释 */
+.category-row--fixed {
+  opacity: 0.75;
+}
+
 /* 回收站(首列为勾选框:批量恢复,评审 4.2) */
 .trash__head,
 .trash__row {

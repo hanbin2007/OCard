@@ -179,7 +179,7 @@ function PromptBody({ volume }: { volume: Volume }) {
         </button>
       </div>
       <p className="quick-copy__meta mono">
-        卷「{volume.name}」 · {formatBytes(volume.capacityBytes)}
+        卡「{volume.name}」 · {formatBytes(volume.capacityBytes)}
       </p>
 
       {matchStatus === "unavailable" || matchStatus === "conflict" ? (

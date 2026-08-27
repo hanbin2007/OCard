@@ -151,6 +151,7 @@ export type AppAction =
   | { type: "noticeReceived"; notice: NoticeDto }
   | { type: "noticesReplayed"; notices: NoticeDto[] }
   | { type: "noticeAcknowledged"; id: string }
+  | { type: "noticesAllAcknowledged" }
   | { type: "noticeToastDismissed"; id: string }
   | { type: "noticeDismissed"; id: string }
   | { type: "noticesCleared" }
@@ -652,6 +653,14 @@ export function reducer(state: AppState, action: AppAction): AppState {
         notices: state.notices.map((n) =>
           n.id === action.id ? { ...n, read: true, live: false } : n,
         ),
+      };
+
+    case "noticesAllAcknowledged":
+      // 一次动作代表「我都看到了」(评审 6.8):一场 NAS 断连的 N 条 error
+      // 不该要求点 2N 下。零静默要求的是「看见」,不是逐条点击。
+      return {
+        ...state,
+        notices: state.notices.map((n) => ({ ...n, read: true, live: false })),
       };
 
     case "noticeToastDismissed":

@@ -232,11 +232,22 @@ export function Sidebar() {
       </div>
 
       <div className="sidebar__foot">
-        <span className="sidebar__operator" title={state.workstation?.nasRoot}>
+        {/* 换班是每日事件(评审 6.4):操作人可点,直达设置(操作人字段自动聚焦) */}
+        <button
+          type="button"
+          className="sidebar__operator sidebar__operator--btn"
+          data-testid="sidebar-operator"
+          title={
+            state.workstation
+              ? `点击换操作人(当前:${state.workstation.operator})`
+              : undefined
+          }
+          onClick={() => dispatch({ type: "settingsOpened" })}
+        >
           {state.workstation
             ? `${state.workstation.operator} · ${state.workstation.machineId}`
             : "未连接工作站"}
-        </span>
+        </button>
         <ThemeSwitch />
       </div>
     </aside>

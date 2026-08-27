@@ -233,6 +233,21 @@
   white-space: nowrap;
 }
 
+/* 操作人可点(评审 6.4:换班直达设置),视觉仍保持安静 */
+.sidebar__operator--btn {
+  border: none;
+  background: transparent;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.sidebar__operator--btn:hover {
+  color: var(--text-primary);
+  text-decoration: underline;
+}
+
 /* ---------- 主区 ---------- */
 
 .main {

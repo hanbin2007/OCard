@@ -109,14 +109,16 @@ function NoticeBanner({ entry }: { entry: NoticeEntry }) {
   const isError = entry.level === "error";
 
   useEffect(() => {
-    // error 不自动消失：必须由用户逐条确认，避免降级被一晃而过地忽略
+    // error 不自动消失：必须由用户逐条确认，避免降级被一晃而过地忽略。
+    // 折叠计数增长**不再**重置隐藏计时(评审 6.8):持续故障期间
+    // 同一条 warning 会 ×N 不断累积,跟着续命就成了赖着不走的 toast。
     if (isError) return;
     const timer = setTimeout(
       () => dispatch({ type: "noticeToastDismissed", id: entry.id }),
       AUTO_HIDE_MS,
     );
     return () => clearTimeout(timer);
-  }, [isError, entry.id, entry.count, dispatch]);
+  }, [isError, entry.id, dispatch]);
 
   return (
     <div
@@ -131,7 +133,8 @@ function NoticeBanner({ entry }: { entry: NoticeEntry }) {
       <div className="toast__body">
         <div className="toast__head">
           <strong className="toast__title">{noticeTitle(entry)}</strong>
-          <code className="toast__code">{entry.code}</code>
+          {/* 原始 code 移出最醒目的标题行(评审 E3):对现场 DIT 是纯噪音,
+              报障时在铃铛面板里仍能查到 */}
           {entry.count > 1 ? (
             <span className="toast__count">×{entry.count}</span>
           ) : null}
@@ -252,10 +255,25 @@ export function NoticeBell() {
         <div className="notice-panel" data-testid="notice-panel">
           <div className="notice-panel__head">
             <span className="card__title">通知</span>
+            {notices.some((n) => n.level === "error" && !n.read) ? (
+              /* 一场故障多条 error 不必逐条点(评审 6.8) */
+              <button
+                type="button"
+                className="btn btn--sm push-right"
+                data-testid="notice-ack-all"
+                onClick={() => dispatch({ type: "noticesAllAcknowledged" })}
+              >
+                全部确认
+              </button>
+            ) : null}
             {notices.length > 0 ? (
               <button
                 type="button"
-                className="btn btn--ghost btn--sm push-right"
+                className={`btn btn--ghost btn--sm${
+                  notices.some((n) => n.level === "error" && !n.read)
+                    ? ""
+                    : " push-right"
+                }`}
                 data-testid="notice-clear-all"
                 onClick={() => dispatch({ type: "noticesCleared" })}
               >

@@ -223,7 +223,7 @@ export function TaskCenter() {
       notify(
         "warning",
         "copy-pause-failed",
-        `${task.state === "paused" ? "继续" : "挂起"}拷卡失败：${
+        `${task.state === "paused" ? "继续" : "暂停"}拷卡失败：${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -312,7 +312,7 @@ export function TaskCenter() {
                   data-testid={
                     task.state === "paused" ? "task-resume" : "task-pause"
                   }
-                  aria-label={`${task.state === "paused" ? "继续" : "挂起"}拷卡：${projectName(task.projectId)}`}
+                  aria-label={`${task.state === "paused" ? "继续" : "暂停"}拷卡：${projectName(task.projectId)}`}
                   disabled={busyId === task.id}
                   onClick={() => void pauseOrResume(task)}
                 >
@@ -320,7 +320,7 @@ export function TaskCenter() {
                     ? "处理中…"
                     : task.state === "paused"
                       ? "继续"
-                      : "挂起"}
+                      : "暂停"}
                 </button>
               </div>
             ))}

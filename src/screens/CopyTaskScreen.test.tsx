@@ -55,7 +55,7 @@ describe("拷卡任务面板", () => {
     expect(await screen.findByText("C0001.MP4")).toBeDefined();
     expect(screen.getByText("8f2a1c04b7d9e355")).toBeDefined();
     expect(screen.getAllByText("已校验").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("已拷").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("已拷·待校验").length).toBeGreaterThan(0);
     expect(screen.getAllByText("待拷").length).toBeGreaterThan(0);
     expect(screen.getAllByText("失败").length).toBeGreaterThan(0);
   });
@@ -244,7 +244,7 @@ describe("#4 任务快照刷新失败", () => {
     await screen.findByText("C0001.MP4");
 
     // 挂起后会 refreshTask 对账，此处让它失败
-    await user.click(screen.getByRole("button", { name: "挂起" }));
+    await user.click(screen.getByRole("button", { name: "暂停" }));
 
     await user.click(screen.getByTestId("notice-bell"));
     await waitFor(() =>
@@ -628,7 +628,7 @@ describe("源卷过滤与刷新(UX 波)", () => {
     await user.click(screen.getByTestId("volumes-refresh"));
     await waitFor(() =>
       expect(
-        screen.getAllByText(/刷新卷列表失败/).length,
+        screen.getAllByText(/刷新卡列表失败/).length,
       ).toBeGreaterThan(0),
     );
     spy.mockRestore();

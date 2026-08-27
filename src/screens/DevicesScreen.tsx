@@ -69,6 +69,10 @@ export function DevicesScreen() {
   const quickDraftRef = useRef<{ volumeId: string; mountPath: string } | null>(
     null,
   );
+  /** 卡登记表单的 DOM 锚点:「去登记」落地要滚到并聚焦(评审 6.2) */
+  const cardFormRef = useRef<HTMLDivElement>(null);
+  /** 正在续接引导登记的卷名:表单头部亮出来,预填不再发生在视口之外 */
+  const [draftVolumeName, setDraftVolumeName] = useState<string | null>(null);
   useEffect(() => {
     const draft = state.cardDraft;
     if (!draft) return;
@@ -86,8 +90,31 @@ export function DevicesScreen() {
     quickDraftRef.current = { volumeId: vol.id, mountPath: vol.mountPath };
     setBindMount(vol.mountPath);
     setCardLabel((prev) => (prev.trim() ? prev : vol.name));
+    setDraftVolumeName(vol.name);
+    // 预填发生在哪,视线就该落在哪(评审 6.2):滚到卡表单并聚焦标签
+    setTimeout(() => {
+      cardFormRef.current?.scrollIntoView?.({ block: "start", behavior: "smooth" });
+      document.getElementById("card-label")?.focus();
+    }, 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.cardDraft]);
+
+  /**
+   * 登记时恰好插着一张非系统卡:默认选中绑定(评审 6.3)——
+   * 标着「推荐」的路径不该还要用户自己打开下拉去找。只在初次进屏
+   * 且用户没动过绑定时套用一次,不与手动清除对抗。
+   */
+  const autoBoundRef = useRef(false);
+  useEffect(() => {
+    if (autoBoundRef.current || bindMount || quickDraftRef.current) return;
+    const removable = volumes.filter((v) => !v.isSystem);
+    if (removable.length === 1) {
+      autoBoundRef.current = true;
+      setBindMount(removable[0].mountPath);
+      setCardLabel((prev) => (prev.trim() ? prev : removable[0].name));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [volumes]);
 
   /** 卷列表可能是启动时拉的旧账:绑定前给个手动刷新 */
   async function refreshBindVolumes() {
@@ -108,7 +135,7 @@ export function DevicesScreen() {
       notify(
         "error",
         "volumes-refresh-failed",
-        `刷新卷列表失败：${err instanceof Error ? err.message : String(err)}`,
+        `刷新卡列表失败：${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
       setBindRefreshing(false);
@@ -257,6 +284,7 @@ export function DevicesScreen() {
                       <Field
                         label="机位"
                         htmlFor="cam-position"
+                        hint="A–Z 单个字母"
                         error={
                           cameraSubmitted ? cameraValidation.errors.position : undefined
                         }
@@ -278,6 +306,7 @@ export function DevicesScreen() {
                       <Field
                         label="使用者代称"
                         htmlFor="cam-alias"
+                        hint="1–4 位英文字母,如姓名拼音缩写 ZS"
                         error={
                           cameraSubmitted
                             ? cameraValidation.errors.operatorAlias
@@ -335,12 +364,17 @@ export function DevicesScreen() {
                 </div>
               </div>
 
-              <div className="card">
+              <div className="card" ref={cardFormRef}>
                 <div className="card__head">
                   <span className="card__title">登记存储卡</span>
                   <span className="card__hint">一卡一机</span>
                 </div>
                 <div className="card__body">
+                  {draftVolumeName ? (
+                    <p className="text-xs" role="status" data-testid="card-draft-hint">
+                      正在登记刚插入的卡「{draftVolumeName}」——标签与绑定已预填
+                    </p>
+                  ) : null}
                   <form
                     className="stack stack--lg"
                     onSubmit={(e) => {
@@ -358,8 +392,8 @@ export function DevicesScreen() {
                       htmlFor="card-bind"
                       hint={
                         bindMount
-                          ? "登记时会在这张卡上写入身份指纹,今后凭指纹认卡"
-                          : "插入卡并选择后,凭指纹强匹配;不绑定则只按卷标弱匹配"
+                          ? "登记时会在这张卡上写入身份标识,今后插入即自动认出"
+                          : "插入卡并选择后,今后插入即自动认出;不绑定则只按卡名认,重命名/同名会认错"
                       }
                     >
                       <Select
@@ -391,7 +425,7 @@ export function DevicesScreen() {
                         disabled={bindRefreshing}
                         onClick={() => void refreshBindVolumes()}
                       >
-                        {bindRefreshing ? "刷新中…" : "刷新卷列表"}
+                        {bindRefreshing ? "刷新中…" : "刷新已插入的卡"}
                       </button>
                       {bindStale ? (
                         <span className="text-xs text-warn" role="alert">
@@ -428,12 +462,32 @@ export function DevicesScreen() {
                         id="card-camera"
                         value={cardCameraId}
                         onChange={setCardCameraId}
+                        disabled={cameras.length === 0}
                         options={cameras.map((camera) => ({
                           value: camera.id,
                           label: `${camera.model} · ${camera.code}`,
                         }))}
                       />
                     </Field>
+                    {cameras.length === 0 ? (
+                      /* 没相机时登记卡是死胡同(评审 6.1):把依赖关系说破,给去路 */
+                      <p className="text-xs text-warn" role="alert" data-testid="card-no-camera-hint">
+                        还没有登记任何相机——卡必须关联相机(一卡一机)。{" "}
+                        <button
+                          type="button"
+                          className="btn btn--sm"
+                          data-testid="card-goto-camera"
+                          onClick={() => {
+                            document
+                              .getElementById("cam-model")
+                              ?.scrollIntoView?.({ block: "center", behavior: "smooth" });
+                            document.getElementById("cam-model")?.focus();
+                          }}
+                        >
+                          先登记相机
+                        </button>
+                      </p>
+                    ) : null}
 
                     <div className="form-grid form-grid--2">
                       <Field
@@ -582,13 +636,14 @@ export function DevicesScreen() {
                       <div className="list__row cards__row" key={card.id}>
                         <span className="row-inline">
                           <Badge mono>{card.label}</Badge>
+                          {/* 说结果不说算法(评审 E4):用户关心的是「插卡认不认得出」 */}
                           {card.volumeUid ? (
-                            <span title="登记时已绑定物理卡,凭指纹强匹配">
-                              <Badge tone="ok">指纹</Badge>
+                            <span title="插入即可自动认出这张卡(登记时已写入身份指纹)">
+                              <Badge tone="ok">自动识别</Badge>
                             </span>
                           ) : (
-                            <span title="未绑定物理卡,只能按卷标弱匹配">
-                              <Badge tone="warn">卷标</Badge>
+                            <span title="只按卡名认卡:重命名或同名卡会认错,建议插卡后重新绑定">
+                              <Badge tone="warn">仅按名称识别</Badge>
                             </span>
                           )}
                         </span>

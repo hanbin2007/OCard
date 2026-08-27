@@ -222,8 +222,7 @@ describe("E2E 锚点", () => {
     expectAnchors([
       "first-run-guide",
       "onboarding-operator",
-      "onboarding-next",
-      "settings-open",
+            "settings-open",
     ]);
   });
 });

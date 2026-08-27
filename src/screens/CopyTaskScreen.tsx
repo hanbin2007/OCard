@@ -194,7 +194,7 @@ export function CopyTaskScreen() {
       pushNotice(
         "error",
         "volumes-refresh-failed",
-        `刷新卷列表失败：${err instanceof Error ? err.message : String(err)}`,
+        `刷新卡列表失败：${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
       setVolumesRefreshing(false);
@@ -1038,9 +1038,14 @@ export function CopyTaskScreen() {
                     type="button"
                     className="btn btn--sm"
                     aria-pressed={t.id === task?.id}
+                    title={`开始于 ${formatTimestamp(t.startedAt)}`}
                     onClick={() => dispatch({ type: "selectTask", taskId: t.id })}
                   >
                     <span className="mono">{t.volumeName}</span>
+                    {/* 同名卷拷两次靠时间区分(评审 B6) */}
+                    <span className="text-2xs dim mono">
+                      {formatTimestamp(t.startedAt).slice(-5)}
+                    </span>
                     <Badge tone={TASK_STATE_TONE[t.state]}>
                       {TASK_STATE_LABEL[t.state]}
                     </Badge>
@@ -1123,7 +1128,7 @@ export function CopyTaskScreen() {
                                 .then(() => refreshTask(task.id));
                             }}
                           >
-                            挂起
+                            暂停
                           </button>
                         ) : null}
                         {task.state === "paused" ? (
