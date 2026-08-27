@@ -13,6 +13,7 @@ import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog"
 import { Checkbox } from "../components/controls";
 import { PathField } from "../components/PathField";
 import { TopBar } from "../components/TopBar";
+import { IllTranscodeEmpty } from "../components/illustrations";
 import { Badge, EmptyState, Field, ProgressBar } from "../components/ui";
 import { isAbsoluteNasRoot } from "../lib/validation";
 import { formatBytes, formatTimestamp } from "../lib/format";
@@ -178,7 +179,7 @@ export function TranscodeScreen() {
         <TopBar title="代理转码" />
         <div className="content">
           <div className="content__inner">
-            <EmptyState>
+            <EmptyState art={<IllTranscodeEmpty />}>
               <div className="stack" data-testid="transcode-no-project">
                 <p className="text-sm" role="status">
                   {state.projects.length === 0
@@ -214,7 +215,7 @@ export function TranscodeScreen() {
         <TopBar title="代理转码" subtitle={project.folderName} subtitleMono />
         <div className="content">
           <div className="content__inner">
-            <EmptyState>
+            <EmptyState art={<IllTranscodeEmpty />}>
               <div className="stack" data-testid="transcode-scenario-b">
                 <p className="text-sm" role="status">
                   代理转码只适用于工况 A（视频剪辑）项目。当前项目「{project.name}」是工况

@@ -687,6 +687,88 @@
   user-select: none;
 }
 
+/* ---------- 拟物插画（空态素材 / 拷贝流向图） ---------- */
+
+/* 空态插画：进场时整体浮起落定；终态即静态样式，减少动效时直接静止 */
+.list__empty-art {
+  display: block;
+  animation: illu-enter var(--dur-spring) var(--spring);
+}
+
+.list__empty-art svg {
+  display: block;
+}
+
+@keyframes illu-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(4px);
+  }
+}
+
+/* 插画描边/文字：SVG 里只允许引这几个类与 --ill-* 令牌，不写字面色值 */
+.illu-ln {
+  stroke: var(--ill-line);
+  stroke-width: 1;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.illu-ln-soft {
+  stroke: var(--ill-line-soft);
+  stroke-width: 0.8;
+}
+
+.illu-t {
+  font-family: var(--font-mono);
+  font-size: 6.5px;
+  fill: var(--text-tertiary);
+  letter-spacing: 0.05em;
+}
+
+.illu-t-inv {
+  font-family: var(--font-mono);
+  font-size: 6px;
+  fill: var(--ill-text-inv);
+  letter-spacing: 0.08em;
+}
+
+/* 「还原真实动作」的两个低频循环：插卡往复趋近插槽、LED 呼吸。
+   都只动 transform / opacity；周期同拍（2.4s），画面才不显得各动各的 */
+.illu-nudge {
+  animation: illu-nudge 2.4s var(--ease-out) infinite;
+}
+
+@keyframes illu-nudge {
+  50% {
+    transform: translateX(4px);
+  }
+}
+
+.illu-breathe {
+  animation: illu-breathe 2.4s ease-in-out infinite;
+}
+
+@keyframes illu-breathe {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+/* 拷贝流向图（双确认页顶部）：限宽居中，随列宽缩放 */
+.copy-flow {
+  display: grid;
+  justify-items: center;
+  gap: var(--space-1);
+}
+
+.copy-flow__svg {
+  display: block;
+  width: 100%;
+  max-width: 348px;
+  height: auto;
+}
+
 /* ---------- 定义列表（详情面板） ---------- */
 
 .dl {

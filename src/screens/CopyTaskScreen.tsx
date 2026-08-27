@@ -16,6 +16,7 @@ import { IconPlus, IconRetry, IconTrash } from "../components/Icon";
 import { PathField } from "../components/PathField";
 import { RemoteActivityBanner } from "../components/RemoteActivityBanner";
 import { TopBar } from "../components/TopBar";
+import { IllCopyEmpty, IllCopyFlow } from "../components/illustrations";
 import { Badge, EmptyState, Field, ProgressBar } from "../components/ui";
 import {
   formatBytes,
@@ -492,6 +493,14 @@ export function CopyTaskScreen() {
                   ) : confirming ? (
                     /* 第二步：汇总复核，对应规范「摄影师和 DIT 两方确认」 */
                     <div className="stack stack--lg">
+                      {/* 流程辅助图：把「源读一次、多目的地、双端校验」画成实物流向 */}
+                      <div className="copy-flow">
+                        <IllCopyFlow
+                          destinations={preview?.destinations.map(
+                            (d) => DESTINATION_KIND_LABEL[d.kind],
+                          )}
+                        />
+                      </div>
                       <div className="dl">
                         <div className="dl__row">
                           <span className="dl__key">项目</span>
@@ -1132,7 +1141,7 @@ export function CopyTaskScreen() {
                 </>
               ) : (
                 <div className="list">
-                  <EmptyState>
+                  <EmptyState art={project ? <IllCopyEmpty /> : undefined}>
                     {project ? "本项目还没有拷卡任务，从左侧发起一个。" : "先选择项目。"}
                   </EmptyState>
                 </div>

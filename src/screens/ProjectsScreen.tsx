@@ -10,6 +10,7 @@ import {
 import { FolderTreeView } from "../components/FolderTreeView";
 import { TopBar } from "../components/TopBar";
 import { ProgressRing } from "../components/charts";
+import { IllProjectsEmpty } from "../components/illustrations";
 import { Badge, EmptyState, Kbd, ProgressBar } from "../components/ui";
 import { useListNavigation } from "../hooks/useListNavigation";
 import { formatBytes, formatCompactDate, formatTimestamp } from "../lib/format";
@@ -82,7 +83,7 @@ export function ProjectsScreen() {
                 </div>
 
                 {projects.length === 0 ? (
-                  <EmptyState>还没有项目，先新建一个。</EmptyState>
+                  <EmptyState art={<IllProjectsEmpty />}>还没有项目，先新建一个。</EmptyState>
                 ) : (
                 <div {...nav.containerProps} aria-label="项目列表">
                   {projects.map((project) => (
