@@ -22,7 +22,10 @@ const itemFor = (fileName) =>
 
 describe("OCard M3 成片命名校验冒烟", () => {
   it("新建工况A项目并注入成片(合规/名实不符/命名不合规)", async () => {
-    await $('[data-testid="nav-new-project"]').click();
+    // 「新建项目」已移出侧栏(UX 波四),入口在项目页头部
+    await $('[data-testid="nav-projects"]').click();
+    await $('[data-testid="projects-new"]').waitForClickable({ timeout: 15000 });
+    await $('[data-testid="projects-new"]').click();
     await $('[data-testid="np-name"]').waitForExist();
     await $('[data-testid="np-name"]').setValue("E2E成片");
     await $('[data-testid="np-scenario-a"]').click();

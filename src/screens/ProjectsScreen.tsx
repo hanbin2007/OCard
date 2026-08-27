@@ -69,6 +69,7 @@ export function ProjectsScreen() {
           <button
             type="button"
             className="btn btn--primary btn--pill"
+            data-testid="projects-new"
             onClick={() => dispatch({ type: "navigate", route: "new-project" })}
           >
             新建项目

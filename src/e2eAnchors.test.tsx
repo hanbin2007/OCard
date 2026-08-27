@@ -139,7 +139,8 @@ describe("E2E 锚点", () => {
 
   it("项目列表行 + 详情面板的审计日志入口", () => {
     render(<App preloaded={{ ...base, route: "projects" }} />);
-    expectAnchors(["project-row", "audit-open"]);
+    // 「新建项目」移出侧栏后,项目页头部按钮是 E2E 建项目的唯一入口
+    expectAnchors(["project-row", "audit-open", "projects-new"]);
     expect(screen.getAllByTestId("project-row")).toHaveLength(mockProjects.length);
   });
 
