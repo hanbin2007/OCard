@@ -35,8 +35,11 @@ pub struct CopyManifest {
     pub source_label: String,
     pub camera_code: String,
     pub operator: String,
-    /// 摄影师+DIT 双确认的内容备注。
+    /// 摄影师+DIT 双确认的内容备注(新任务 = 标签拼串,保持人可读)。
     pub note: String,
+    /// 内容标签(Notion 式;老 manifest 没有此字段,默认空)。
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// 目的地路径(展示用,同时支撑项目统计里的目的地数)。
     #[serde(default)]
     pub destinations: Vec<String>,
@@ -76,6 +79,7 @@ impl CopyManifest {
             camera_code: camera_code.into(),
             operator: operator.into(),
             note: note.into(),
+            tags: Vec::new(),
             destinations: Vec::new(),
             planned: Vec::new(),
             source_uid: None,

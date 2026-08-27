@@ -26,6 +26,7 @@ fn mock_app() -> (
         &crate::core::config::WorkstationConfig {
             operator: "集成测试".into(),
             nas_root: Some(nas.clone()),
+            recent_projects: Vec::new(),
         },
     )
     .unwrap();
@@ -522,6 +523,7 @@ fn resume_rejects_tampered_manifest_through_real_handler() {
                 camera_id: "cam-1".into(),
                 camera_code: "A7M4_A_ZS".into(),
                 note: String::new(),
+                tags: Vec::new(),
                 target_folder: "0824上午_A7M4_A_ZS".into(),
                 destinations: Vec::new(),
                 files: Vec::new(),

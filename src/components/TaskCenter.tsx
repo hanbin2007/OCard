@@ -25,6 +25,7 @@ import {
   useStore,
   type RouteName,
 } from "../state/store";
+import { useWindowBridge } from "../state/windowBridge";
 import { IconTasks } from "./Icon";
 import { Badge, ProgressBar } from "./ui";
 
@@ -66,6 +67,7 @@ function isCopyActive(t: CopyTask): boolean {
 export function TaskCenter() {
   const { state, dispatch, refreshTask, reconcileJobs } = useStore();
   const notify = useNotify();
+  const bridge = useWindowBridge();
   const open = state.taskCenterOpen;
   /** 在途操作的行 id:按下即禁用并显示进行中回执(评审 P2) */
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -433,10 +435,11 @@ export function TaskCenter() {
                   data-testid="task-history-audit"
                   onClick={() => {
                     closePanel();
-                    dispatch({ type: "navigate", route: "projects" });
+                    // 审计日志入口在项目管理窗口的项目详情里
+                    void bridge.openManager();
                   }}
                 >
-                  查看完整记录（项目详情 → 审计日志）
+                  查看完整记录（项目管理 → 审计日志）
                 </button>
               </>
             ) : null}

@@ -1,0 +1,299 @@
+/* ================================================================
+ * 欢迎/项目管理窗口(仿 Xcode Welcome)
+ *
+ * 布局:左侧品牌区(图标 + 大标题 + 主操作),右侧最近项目列表。
+ * 首跑时整窗被首次设置向导占据;「所有项目」与「新项目引导」
+ * 是同窗口内的全屏子视图。
+ * ================================================================ */
+
+.welcome-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: var(--bg);
+  color: var(--text-primary);
+  overflow: hidden;
+}
+
+/* 无边框窗口的可拖动条(macOS 红绿灯悬浮其上) */
+.welcome-shell__drag {
+  flex: 0 0 auto;
+  height: 36px;
+}
+
+.welcome-shell__body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* ---- 左侧品牌区 ---- */
+.welcome-hero {
+  flex: 1 1 55%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--space-6);
+  padding: var(--space-10) var(--space-12);
+}
+
+.welcome-hero__mark {
+  width: 88px;
+  height: 88px;
+  display: grid;
+  place-items: center;
+  border-radius: 22px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.welcome-hero__title {
+  margin: 0;
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.2px;
+}
+
+.welcome-hero__subtitle {
+  margin: 4px 0 0;
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+}
+
+.welcome-hero__actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: 320px;
+}
+
+/* Xcode 式大按钮:图标 + 主文案 + 说明副行 */
+.welcome-action {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid transparent;
+  border-radius: var(--radius-lg);
+  background: none;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition), border-color var(--transition);
+}
+.welcome-action:hover {
+  background: var(--hover);
+  border-color: var(--border);
+}
+.welcome-action__icon {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+.welcome-action__title {
+  display: block;
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+}
+.welcome-action__desc {
+  display: block;
+  margin-top: 1px;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.welcome-hero__foot {
+  color: var(--text-tertiary);
+  font-size: var(--text-2xs);
+}
+
+/* ---- 右侧最近项目 ---- */
+.welcome-recents {
+  flex: 1 1 45%;
+  min-width: 300px;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--bg-subtle);
+}
+
+.welcome-recents__head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-4) var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+}
+
+.welcome-recents__list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 var(--space-2) var(--space-2);
+}
+
+.welcome-recent {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition);
+}
+.welcome-recent:hover {
+  background: var(--hover);
+}
+.welcome-recent:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: -2px;
+}
+.welcome-recent__badge {
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+.welcome-recent__meta {
+  min-width: 0;
+  flex: 1;
+}
+.welcome-recent__name {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+.welcome-recent__folder {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+.welcome-recent__time {
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+  font-size: var(--text-2xs);
+}
+
+.welcome-recents__empty {
+  padding: var(--space-6) var(--space-4);
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+}
+
+/* ---- 全屏子视图(所有项目 / 新项目引导 / 首跑设置) ---- */
+.welcome-sub {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.welcome-sub__bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 0 var(--space-4) var(--space-2);
+}
+.welcome-sub__title {
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+}
+.welcome-sub__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-2) var(--space-6) var(--space-6);
+}
+
+/* 首跑设置居中态 */
+.welcome-onboarding {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  place-items: center;
+  padding: var(--space-6);
+}
+
+/* ---- 新项目引导(多步) ---- */
+.npw {
+  max-width: 860px;
+  margin: 0 auto;
+}
+.npw__steps {
+  display: flex;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-5);
+  padding: 0;
+  list-style: none;
+  flex-wrap: wrap;
+}
+.npw__step {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+.npw__step[aria-current="step"] {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: var(--weight-medium);
+}
+.npw__step[data-done] {
+  color: var(--text-secondary);
+  border-color: var(--border-strong);
+}
+.npw__step-index {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--bg-subtle);
+  font-size: var(--text-2xs);
+}
+.npw__step[aria-current="step"] .npw__step-index {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+.npw__actions {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-top: var(--space-5);
+}
+.npw__actions-right {
+  display: flex;
+  gap: var(--space-2);
+}
+.npw__summary-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}

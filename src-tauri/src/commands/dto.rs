@@ -101,10 +101,22 @@ pub struct VolumeDto {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RecentProjectDto {
+    pub id: String,
+    pub name: String,
+    pub folder_name: String,
+    pub scenario: String,
+    pub last_opened_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkstationInfoDto {
     pub machine_id: String,
     pub operator: String,
     pub nas_root: String,
+    /// 本机最近打开的项目,新→旧(欢迎窗口列表)
+    pub recent_projects: Vec<RecentProjectDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -167,7 +179,10 @@ pub struct CopyTaskDto {
     pub volume_name: String,
     pub camera_id: String,
     pub camera_code: String,
+    /// 兼容留存的可读备注(新任务 = 标签拼串);界面呈现以 tags 为准
     pub note: String,
+    /// 内容标签(Notion 式);旧 manifest 重建的任务为空
+    pub tags: Vec<String>,
     pub target_folder: String,
     pub destinations: Vec<CopyDestinationDto>,
     pub files: Vec<CopyFileItemDto>,
@@ -202,6 +217,9 @@ pub struct StartCopyInput {
     pub camera_id: String,
     #[serde(default)]
     pub note: String,
+    /// 内容标签;老客户端不传时默认空(note 仍可承载自由文本)
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub target_prefix: String,
     pub destinations: Vec<StartCopyDestination>,
     #[serde(default)]

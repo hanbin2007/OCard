@@ -6,13 +6,12 @@ import App from "../App";
 import {
   mockCameras,
   mockCopyTasks,
-  mockInspection,
   mockProjects,
   mockStorageCards,
   mockVolumes,
   mockWorkstation,
 } from "../api/mock";
-import { inferTimeSlot } from "../lib/naming";
+import { currentTimeSlot, todayCompactDate } from "../lib/naming";
 import type { CopyProgressEvent } from "../api/types";
 
 afterEach(cleanup);
@@ -29,12 +28,16 @@ const preloaded = {
   selectedTaskId: mockCopyTasks[0].id,
 };
 
+/** 工况 B 的默认前缀:本机今天 + 当前时段(不再探查卡内素材) */
+function expectedSlotPrefix() {
+  return `${todayCompactDate().slice(4)}${currentTimeSlot()}`;
+}
 
-/** 等探查回来的时段前缀落到输入框，再继续操作 */
-async function waitForInferredPrefix() {
-  await waitFor(() =>
-    expect((screen.getByLabelText(/目标夹/) as HTMLInputElement).value).not.toBe(""),
-  );
+/** 在标签选择器里创建并选中一个标签(替代旧的备注文本框) */
+async function addTag(user: ReturnType<typeof userEvent.setup>, name: string) {
+  const input = screen.getByLabelText("内容标签");
+  await user.type(input, name);
+  await user.keyboard("{Enter}");
 }
 
 async function fillDestinations(user: ReturnType<typeof userEvent.setup>) {
@@ -81,11 +84,10 @@ describe("拷卡任务面板", () => {
     expect(targetPreview()).toBe("选择相机后生成");
     await user.click(screen.getByRole("radio", { name: "选择源卷 SONY_A7M4" }));
 
-    // 卡 SD-03 关联 Sony A7M4，编码随之带出；时段前缀由卡内素材时间戳推断
+    // 卡 SD-03 关联 Sony A7M4，编码随之带出
     await waitFor(() => expect(targetPreview()).toContain("SonyA7M4_A_LM"));
-    // 工况 B 落到「1. 待分类」，前缀由素材最早拍摄时间推断，而不是当前时钟
-    const expectedSlot = inferTimeSlot(mockInspection.earliestShotAt);
-    expect(targetPreview()).toBe(`1. 待分类/${expectedSlot}_SonyA7M4_A_LM`);
+    // 工况 B 落到「1. 待分类」，前缀按本机今天 + 当前时段自动填(不探查卡内素材)
+    expect(targetPreview()).toBe(`1. 待分类/${expectedSlotPrefix()}_SonyA7M4_A_LM`);
   });
 
   it("默认只有 NAS 一行:不再预置会拦提交的空移动盘行(评审 1.1)", () => {
@@ -106,10 +108,15 @@ describe("拷卡任务面板", () => {
     render(<App preloaded={preloaded} />);
 
     await user.click(screen.getByRole("radio", { name: "选择源卷 SONY_A7M4" }));
-    await waitForInferredPrefix();
-    await user.type(screen.getByLabelText("内容备注"), "上午田赛");
-    // 加了第 2 行(移动盘)但留空就提交
-    await user.click(screen.getByRole("button", { name: "添加目的地" }));
+    await addTag(user, "上午田赛");
+    // 项目设置里预设的备份盘会预填进第 2 行:先等它落地再清空,
+    // 复现「行存在但没填路径」的场景
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText("第 2 个目的地路径") as HTMLInputElement).value,
+      ).not.toBe(""),
+    );
+    await user.clear(screen.getByLabelText("第 2 个目的地路径"));
     await user.click(screen.getByRole("button", { name: "开始拷卡" }));
 
     const alerts = screen.getAllByRole("alert").map((el) => el.textContent);
@@ -117,7 +124,7 @@ describe("拷卡任务面板", () => {
     expect(screen.queryByText("确认拷卡信息")).toBeNull();
   });
 
-  it("缺备注时拦下，不新建任务", async () => {
+  it("缺内容标签时拦下，不新建任务", async () => {
     const user = userEvent.setup();
     render(<App preloaded={preloaded} />);
 
@@ -125,7 +132,7 @@ describe("拷卡任务面板", () => {
     await user.click(screen.getByRole("button", { name: "开始拷卡" }));
 
     const alerts = screen.getAllByRole("alert").map((el) => el.textContent);
-    expect(alerts.some((t) => t?.includes("必填"))).toBe(true);
+    expect(alerts.some((t) => t?.includes("标签"))).toBe(true);
 
     const tabs = within(screen.getByRole("group", { name: "任务切换" })).getAllByRole(
       "button",
@@ -138,14 +145,13 @@ describe("拷卡任务面板", () => {
     render(<App preloaded={preloaded} />);
 
     await user.click(screen.getByRole("radio", { name: "选择源卷 NIKON_Z9" }));
-    await waitForInferredPrefix();
-    await user.type(screen.getByLabelText("内容备注"), "下午径赛");
+    await addTag(user, "下午径赛");
     await fillDestinations(user);
     await user.click(screen.getByRole("button", { name: "开始拷卡" }));
     expect(screen.getByText("确认拷卡信息")).toBeDefined();
 
     await user.click(screen.getByRole("button", { name: "返回修改" }));
-    expect(screen.getByLabelText("内容备注")).toBeDefined();
+    expect(screen.getByLabelText("内容标签")).toBeDefined();
     const group = screen.getByRole("group", { name: "任务切换" });
     expect(within(group).getAllByRole("button")).toHaveLength(mockCopyTasks.length);
   });
@@ -155,8 +161,7 @@ describe("拷卡任务面板", () => {
     render(<App preloaded={preloaded} />);
 
     await user.click(screen.getByRole("radio", { name: "选择源卷 NIKON_Z9" }));
-    await waitForInferredPrefix();
-    await user.type(screen.getByLabelText("内容备注"), "下午径赛");
+    await addTag(user, "下午径赛");
     await fillDestinations(user);
     await user.click(screen.getByRole("button", { name: "开始拷卡" }));
 
@@ -206,11 +211,10 @@ describe("autoProxy（工况 A）", () => {
     await user.click(checkbox);
 
     await user.click(screen.getByRole("radio", { name: "选择源卷 SONY_A7M4" }));
-    await waitFor(() =>
-      expect((screen.getByLabelText(/目标夹/) as HTMLInputElement).value).not.toBe(""),
-    );
-    await user.type(screen.getByLabelText("内容备注"), "发布会主机位");
-    await fillDestinations(user);
+    await addTag(user, "发布会主机位");
+    // 该项目无预设备份盘:默认只有 NAS 行(评审 1.1),第二块盘显式添加
+    await user.click(screen.getByRole("button", { name: "添加目的地" }));
+    await user.type(screen.getByLabelText("第 2 个目的地路径"), "/backup/ocard");
     await user.click(screen.getByRole("button", { name: "开始拷卡" }));
 
     // 双确认屏要如实显示这项
@@ -264,8 +268,7 @@ describe("目标夹已存在（TARGET_EXISTS）", () => {
   /** 走到确认屏并等后端解析完成 */
   async function reachConfirm(user: ReturnType<typeof userEvent.setup>) {
     await user.click(screen.getByRole("radio", { name: "选择源卷 NIKON_Z9" }));
-    await waitForInferredPrefix();
-    await user.type(screen.getByLabelText("内容备注"), "下午径赛");
+    await addTag(user, "下午径赛");
     await fillDestinations(user);
     await user.click(screen.getByRole("button", { name: "开始拷卡" }));
     await waitFor(() =>
@@ -659,8 +662,7 @@ describe("切项目的状态隔离(codex 评审 P1)", () => {
     render(<App preloaded={preloaded} />);
 
     await user.click(screen.getByRole("radio", { name: "选择源卷 NIKON_Z9" }));
-    await waitForInferredPrefix();
-    await user.type(screen.getByLabelText("内容备注"), "下午径赛");
+    await addTag(user, "下午径赛");
     await fillDestinations(user);
     await user.click(screen.getByRole("button", { name: "开始拷卡" }));
     expect(screen.getByText("确认拷卡信息")).toBeDefined();
@@ -668,6 +670,6 @@ describe("切项目的状态隔离(codex 评审 P1)", () => {
     // 侧栏切到另一个项目:确认屏必须整体退回表单
     await user.click(screen.getByText(mockProjects[1].name));
     expect(screen.queryByText("确认拷卡信息")).toBeNull();
-    expect(screen.getByLabelText("内容备注")).toBeDefined();
+    expect(screen.getByLabelText("内容标签")).toBeDefined();
   });
 });

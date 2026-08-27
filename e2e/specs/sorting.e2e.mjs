@@ -9,6 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
+import { createProjectViaWizard } from "../lib/windows.mjs";
 
 const nasRoot = process.env.OCARD_E2E_NAS_ROOT;
 
@@ -30,26 +31,12 @@ async function confirmDangerDialog() {
   await btn.click();
 }
 
-async function clickProjectRow(name) {
-  // 名字列有 truncate 样式,WebDriver getText 可能取不到;title 属性是稳定锚点
-  const el = $(`[data-testid="project-row"] span[title="${name}"]`);
-  await el.waitForClickable({ timeout: 15000 });
-  await el.click();
-}
-
 describe("OCard M2 分类工作台冒烟", () => {
-  it("新建工况B项目并注入待分类素材", async () => {
-    // 「新建项目」已移出侧栏(UX 波四),入口在项目页头部
-    await $('[data-testid="nav-projects"]').click();
-    await $('[data-testid="projects-new"]').waitForClickable({ timeout: 15000 });
-    await $('[data-testid="projects-new"]').click();
-    await $('[data-testid="np-name"]').waitForExist();
-    await $('[data-testid="np-name"]').setValue("E2E分类");
-    await $('[data-testid="np-scenario-b"]').click();
+  it("引导新建工况B项目并注入待分类素材", async () => {
     // 采用向导预填的默认分类(领导/会场/花絮):
     // 布局 = 1.待分类 / 2.领导 / 3.会场 / 4.花絮 / 5.精选 / 6.其他
-    await $('[data-testid="np-submit"]').click();
-    await $('[data-testid="project-row"]').waitForExist({ timeout: 20000 });
+    // 创建后主窗口打开并选中该项目,无需再去项目列表点行
+    await createProjectViaWizard("E2E分类", "b");
 
     const root = projectRoot();
     expect(existsSync(path.join(root, "2. 领导"))).toBe(true);
@@ -64,7 +51,6 @@ describe("OCard M2 分类工作台冒烟", () => {
   });
 
   it("分类移动:点分类条,文件真实落到分类夹", async () => {
-    await clickProjectRow("E2E分类");
     await $('[data-testid="nav-sorting"]').click();
     await $('[data-testid="asset-cell"]').waitForExist({ timeout: 30000 });
 

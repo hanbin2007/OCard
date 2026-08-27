@@ -3,6 +3,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ROUTE_ORDER, useStore } from "../state/store";
 import type { RouteName } from "../state/store";
+import { useWindowBridge } from "../state/windowBridge";
 import { THEME_LABELS, useTheme } from "../state/theme";
 import { formatCompactDate } from "../lib/format";
 import { PulseValue } from "./ui";
@@ -21,10 +22,8 @@ import {
 
 /** 只描述"长什么样"；顺序由 ROUTE_ORDER 单点决定，与屏间过渡方向永远一致 */
 const NAV_ITEMS: Record<RouteName, { label: string; icon: typeof IconProjects }> = {
-  projects: { label: "项目", icon: IconProjects },
-  "new-project": { label: "新建项目", icon: IconPlus },
-  devices: { label: "设备登记", icon: IconCamera },
   copy: { label: "拷卡任务", icon: IconCard },
+  devices: { label: "设备登记", icon: IconCamera },
   // 交付打包住在这一屏里,名字必须盖得住它(评审 5.1):
   // 核心流程「…→选片→交付」的最后一环不能在导航上失踪
   sorting: { label: "选片与交付", icon: IconGrid },
@@ -32,13 +31,7 @@ const NAV_ITEMS: Record<RouteName, { label: string; icon: typeof IconProjects }>
   trash: { label: "回收站", icon: IconTrash },
 };
 
-/**
- * 「新建项目」是动作不是场所(评审 5.5):用完即走,不占常驻导航位。
- * 入口在项目屏顶栏与空态;路由本身保留,屏间过渡顺序不变。
- */
-const NAV = ROUTE_ORDER.filter((route) => route !== "new-project").map(
-  (route) => ({ route, ...NAV_ITEMS[route] }),
-);
+const NAV = ROUTE_ORDER.map((route) => ({ route, ...NAV_ITEMS[route] }));
 
 /**
  * 量出当前项在列表里的位置，交给一块**会移动的**选中底。
@@ -119,6 +112,7 @@ function ThemeSwitch() {
 
 export function Sidebar() {
   const { state, dispatch } = useStore();
+  const bridge = useWindowBridge();
   const selectedProject = state.projects.find(
     (p) => p.id === state.selectedProjectId,
   );
@@ -150,6 +144,22 @@ export function Sidebar() {
       </div>
 
       <div className="sidebar__scroll">
+        {/* 项目管理/新建项目整体搬进了独立窗口:这里保留原「新建项目」的
+            位置作为它的入口(启动重构) */}
+        <div className="sidebar__section">
+          <button
+            type="button"
+            data-testid="nav-manager"
+            className="nav-item"
+            title="打开项目管理窗口(新建/切换项目)"
+            onClick={() => void bridge.openManager()}
+          >
+            <IconProjects className="nav-item__icon" />
+            <span>项目管理</span>
+            <IconPlus className="nav-item__count" size={13} />
+          </button>
+        </div>
+
         <nav className="sidebar__section sidebar__nav" aria-label="主导航">
           {rail ? (
             <span
@@ -203,7 +213,9 @@ export function Sidebar() {
         </nav>
 
         <div className="sidebar__section">
-          <div className="sidebar__label">最近项目</div>
+          {/* 「最近项目」语义已归欢迎窗口(本机最近打开);这里是当前 NAS
+              项目间的快速切换,不换窗口不换页面 */}
+          <div className="sidebar__label">快速切换</div>
           <div className="sidebar__projects">
             {state.projects.slice(0, 5).map((project) => (
               <button

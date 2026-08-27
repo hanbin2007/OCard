@@ -6,6 +6,7 @@ import { IconSettings } from "./Icon";
 import { NoticeBell } from "./NotificationCenter";
 import { TaskCenter } from "./TaskCenter";
 import { useStore } from "../state/store";
+import { useWindowBridge } from "../state/windowBridge";
 
 /**
  * 当前操作项目的常驻指示（UX 波）：拷卡/分类/转码全都作用在「当前项目」上，
@@ -14,6 +15,7 @@ import { useStore } from "../state/store";
  */
 function CurrentProjectChip() {
   const { state, dispatch } = useStore();
+  const bridge = useWindowBridge();
   const project =
     state.projects.find((p) => p.id === state.selectedProjectId) ?? null;
   // 首跑引导阶段没有「当前项目」概念,不显示(设置没配完,项目都还进不去)
@@ -144,11 +146,11 @@ function CurrentProjectChip() {
             className="btn btn--ghost btn--sm"
             data-testid="project-switch-open-list"
             onClick={() => {
-              dispatch({ type: "navigate", route: "projects" });
+              void bridge.openManager();
               setOpen(false);
             }}
           >
-            打开项目列表…
+            打开项目管理…
           </button>
         </div>
       ) : null}

@@ -14,7 +14,14 @@ import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog"
 import { DeliveryButton } from "../components/DeliveryPanel";
 import { JudgementBadges, LOW_SCORE_AT } from "../components/JudgementBadges";
 import { TopBar } from "../components/TopBar";
-import { Badge, Kbd, ProgressBar, PulseValue } from "../components/ui";
+import { IllSortingEmpty } from "../components/illustrations";
+import {
+  Badge,
+  EmptyState,
+  Kbd,
+  ProgressBar,
+  PulseValue,
+} from "../components/ui";
 import { VirtualGrid } from "../components/VirtualGrid";
 import { Select } from "../components/controls";
 import { formatBytes, formatTimestamp } from "../lib/format";
@@ -1255,23 +1262,26 @@ export function SortingScreen() {
                 </button>
               </div>
             ) : assets.length === 0 && !loading ? (
-              /* 清空不是死胡同(评审 3.12):此刻的下一步几乎必然是交付打包 */
-              <div className="sorting__error" data-testid="sorting-empty-cta">
-                <p className="text-sm">待分类已清空——都分完了。</p>
-                <p className="text-xs dim">
-                  下一步通常是交付打包;若有误删的,先去回收站找回。
-                </p>
-                <div className="row-inline">
-                  <DeliveryButton projectId={project.id} />
-                  <button
-                    type="button"
-                    className="btn btn--sm"
-                    onClick={() => dispatch({ type: "navigate", route: "trash" })}
-                  >
-                    查看回收站
-                  </button>
+              /* 清空不是死胡同(评审 3.12):此刻的下一步几乎必然是交付打包;
+                 空态插画(PR16)与行动出口(PR18)合流 */
+              <EmptyState art={<IllSortingEmpty />}>
+                <div className="stack" data-testid="sorting-empty-cta">
+                  <p className="text-sm">待分类已清空——都分完了。</p>
+                  <p className="text-xs dim">
+                    下一步通常是交付打包;若有误删的,先去回收站找回。
+                  </p>
+                  <div className="row-inline">
+                    <DeliveryButton projectId={project.id} />
+                    <button
+                      type="button"
+                      className="btn btn--sm"
+                      onClick={() => dispatch({ type: "navigate", route: "trash" })}
+                    >
+                      查看回收站
+                    </button>
+                  </div>
                 </div>
-              </div>
+              </EmptyState>
             ) : visibleAssets.length === 0 && !loading ? (
               /* 筛选下为空 ≠ 没素材:给一键回到全部,别让人以为素材丢了 */
               <div className="sorting__error" data-testid="sorting-filter-empty">

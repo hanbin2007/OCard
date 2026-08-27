@@ -63,6 +63,34 @@ export interface NewProjectInput {
   categories: string[];
 }
 
+/**
+ * 项目内容标签（Notion 式）：拷卡任务的「内容备注」由自由文本改为标签，
+ * 标签库随项目落在 `<项目>/.ocard/settings.json`——数据跟着项目走，
+ * 任何工作站打开同一项目看到同一套标签。
+ */
+export interface ProjectTag {
+  name: string;
+  /** 调色板色名（见 `lib/tags.ts` TAG_COLORS），不是任意 CSS 颜色 */
+  color: string;
+}
+
+/** 项目级设置（标签库 + 备份目的地预设），存项目 `.ocard/settings.json` */
+export interface ProjectSettings {
+  tags: ProjectTag[];
+  /** 新项目引导里预设的备份盘路径，拷卡表单据此预填目的地 */
+  backupPaths: string[];
+}
+
+/** 本机最近打开的项目（欢迎窗口列表用，存工作站配置，不进项目数据） */
+export interface RecentProject {
+  id: string;
+  name: string;
+  folderName: string;
+  scenario: Scenario;
+  /** ISO 8601 */
+  lastOpenedAt: string;
+}
+
 /** 建夹模板预览节点 */
 export interface FolderNode {
   name: string;
@@ -215,8 +243,13 @@ export interface CopyTask {
   cameraId: string;
   /** 冗余带出的相机编码，用于目标命名 */
   cameraCode: string;
-  /** 内容备注（规范「适当记录」） */
+  /**
+   * 内容备注的兼容留存：旧任务里是自由文本；新任务由后端以标签串填充，
+   * 供审计日志与 manifest 保持可读。界面呈现以 `tags` 为准。
+   */
   note: string;
+  /** 内容标签（Notion 式，替代自由文本备注）；旧任务为空数组 */
+  tags: string[];
   /** 目标子文件夹名，如 `20260824_DJIRonin4D_B_ZS` 或 `0824上午_A7M4_A_LM` */
   targetFolder: string;
   destinations: CopyDestination[];
@@ -247,7 +280,10 @@ export interface StartCopyInput {
   projectId: string;
   volumeId: string;
   cameraId: string;
+  /** 兼容字段：由 `tags` 拼出的可读串，写入 manifest 与审计日志 */
   note: string;
+  /** 内容标签（至少一个，规范「适当记录」的结构化形态） */
+  tags: string[];
   /**
    * 目标夹前缀：工况 A 为 `YYYYMMDD`，工况 B 为时段标签（如 `0824上午`）。
    * 由素材时间戳推断出默认值后交人工确认，故必须由前端显式传入（PRD §5.3）。
@@ -316,6 +352,8 @@ export interface WorkstationInfo {
   operator: string;
   /** 本机配置的 NAS 根路径 */
   nasRoot: string;
+  /** 本机最近打开的项目（新→旧），欢迎窗口据此渲染最近列表 */
+  recentProjects: RecentProject[];
 }
 
 /* ------------------------------------------------------------------ *

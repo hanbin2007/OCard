@@ -184,13 +184,19 @@ export function PulseValue({
   );
 }
 
-export function EmptyState({ children }: { children: ReactNode }) {
+export function EmptyState({ children, art }: { children: ReactNode; art?: ReactNode }) {
   return (
     <div className="list__empty">
-      {/* 与目录树预览同一套 box-drawing 视觉母题：空的是内容，不是界面 */}
-      <span className="list__empty-mark" aria-hidden="true">
-        └── ∅
-      </span>
+      {/* 插画与 box-drawing 树杈都是装饰：空的是内容，不是界面，含义由文字承担 */}
+      {art ? (
+        <span className="list__empty-art" aria-hidden="true">
+          {art}
+        </span>
+      ) : (
+        <span className="list__empty-mark" aria-hidden="true">
+          └── ∅
+        </span>
+      )}
       <div>{children}</div>
     </div>
   );

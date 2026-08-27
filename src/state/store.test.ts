@@ -55,6 +55,7 @@ const runningTask = {
   cameraId: "cam-1",
   cameraCode: "NikonZ9_E_CQ",
   note: "n",
+  tags: [],
   targetFolder: "f",
   destinations: [
     { id: "d-1", kind: "nas" as const, path: "/nas", state: "writing" as const, writtenBytes: 0 },
@@ -94,12 +95,13 @@ describe("reducer", () => {
 
   it("新建项目后置顶、选中并跳回项目列表", () => {
     const next = reducer(
-      { ...initialState, route: "new-project", loading: false },
+      { ...initialState, route: "copy", loading: false },
       { type: "projectCreated", project },
     );
     expect(next.projects[0].id).toBe("p-new");
     expect(next.selectedProjectId).toBe("p-new");
-    expect(next.route).toBe("projects");
+    // 路由不再跳转:创建发生在欢迎窗口,主窗口经「打开项目」进入
+    expect(next.route).toBe("copy");
   });
 
   it("删除相机时级联清掉它名下的卡", () => {
@@ -141,6 +143,7 @@ describe("reducer", () => {
           cameraId: "cam-1",
           cameraCode: "NikonZ9_E_CQ",
           note: "n",
+          tags: [],
           targetFolder: "f",
           destinations: [],
           files: [],
@@ -385,6 +388,7 @@ describe("reducer", () => {
         machineId: "WS-1",
         operator: "李默",
         nasRoot: "/Volumes/NAS2",
+        recentProjects: [],
       },
     });
     expect(saved.workstation?.operator).toBe("李默");

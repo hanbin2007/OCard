@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   buildCameraCode,
+  buildCopyPrefix,
   buildCopyTargetFolder,
+  currentTimeSlot,
+  todayCompactDate,
   buildCopyTargetPath,
   buildProjectFolderName,
   copyTargetParent,
@@ -188,5 +191,28 @@ describe("normalizePathKey", () => {
 
   it("不把不同目录折叠到一起（分隔符不能被删掉）", () => {
     expect(normalizePathKey("/a/b")).not.toBe(normalizePathKey("/ab"));
+  });
+});
+
+describe("拷卡前缀(启动重构:按本机日期自动填,不探查卡内素材)", () => {
+  it("todayCompactDate 输出 YYYYMMDD", () => {
+    expect(todayCompactDate(new Date(2026, 7, 27))).toBe("20260827");
+    expect(todayCompactDate(new Date(2026, 0, 5))).toBe("20260105");
+  });
+
+  it("currentTimeSlot 按小时分档:上午/下午/晚上", () => {
+    expect(currentTimeSlot(new Date(2026, 7, 27, 9))).toBe("上午");
+    expect(currentTimeSlot(new Date(2026, 7, 27, 12))).toBe("下午");
+    expect(currentTimeSlot(new Date(2026, 7, 27, 18))).toBe("晚上");
+  });
+
+  it("buildCopyPrefix:工况 A 出全日期,工况 B 出 MMDD+时段", () => {
+    expect(buildCopyPrefix("A", "20260827", "上午")).toBe("20260827");
+    expect(buildCopyPrefix("B", "20260827", "下午")).toBe("0827下午");
+  });
+
+  it("非法日期返回空串,由表单校验拦截", () => {
+    expect(buildCopyPrefix("A", "2026082", "上午")).toBe("");
+    expect(buildCopyPrefix("B", "20260840", "上午")).toBe("");
   });
 });

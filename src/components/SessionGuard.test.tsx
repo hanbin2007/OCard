@@ -14,11 +14,12 @@ import {
 } from "./SessionGuard";
 
 const preloaded = {
-  route: "projects" as const,
+  route: "copy" as const,
   workstation: {
     machineId: "WS-TEST",
     operator: "张三",
     nasRoot: "/Volumes/DIT-NAS/Projects",
+    recentProjects: [],
   },
   projects: [],
   cameras: [],
@@ -160,6 +161,7 @@ describe("操作员确认门", () => {
       machineId: "WS-TEST",
       operator: "李四",
       nasRoot: "/Volumes/DIT-NAS/Projects",
+      recentProjects: [],
     });
     endSession();
 
@@ -258,7 +260,7 @@ describe("未配置时不设防", () => {
       <App
         preloaded={{
           ...preloaded,
-          workstation: { machineId: "WS-NEW", operator: "", nasRoot: "" },
+          workstation: { machineId: "WS-NEW", operator: "", nasRoot: "", recentProjects: [] },
         }}
       />,
     );

@@ -36,14 +36,12 @@ import type {
 } from "../api/types";
 import { isDeliveryJob, isTranscodeJob } from "../api/types";
 
-export type RouteName =
-  | "projects"
-  | "new-project"
-  | "devices"
-  | "copy"
-  | "sorting"
-  | "trash"
-  | "transcode";
+/**
+ * 主窗口路由。「项目 / 新建项目」不再是主窗口路由——项目管理与新项目
+ * 引导整体搬进独立的欢迎/项目管理窗口(启动重构),主窗口专注单项目作业,
+ * 默认落在拷卡屏。
+ */
+export type RouteName = "devices" | "copy" | "sorting" | "trash" | "transcode";
 
 /**
  * 导航的**空间顺序**：侧栏就是按这个顺序排的，屏间过渡的方向也由它算。
@@ -51,10 +49,8 @@ export type RouteName =
  * 两处共用同一个常量，改了顺序不会出现"侧栏在下、动画说在上"的错位。
  */
 export const ROUTE_ORDER: RouteName[] = [
-  "projects",
-  "new-project",
-  "devices",
   "copy",
+  "devices",
   "sorting",
   "transcode",
   "trash",
@@ -173,7 +169,7 @@ export type AppAction =
 const ORPHAN_BACKOFF_MS = [2000, 5000, 10000];
 
 export const initialState: AppState = {
-  route: "projects",
+  route: "copy",
   loading: true,
   error: null,
   workstation: null,
@@ -526,12 +522,12 @@ export function reducer(state: AppState, action: AppAction): AppState {
       };
 
     case "projectCreated": {
+      // 不切路由:创建发生在欢迎窗口的引导里,主窗口经「打开项目」投递进入
       const next = {
         ...state,
         projects: [action.project, ...state.projects],
         selectedProjectId: action.project.id,
         selectedTaskId: null,
-        route: "projects" as RouteName,
       };
       // 建完项目把人往下一步送(评审 5.3/G2):插卡引导会接手后续
       return {

@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 const configured = {
-  route: "projects" as const,
+  route: "copy" as const,
   workstation: original,
   projects: mockProjects,
   cameras: [],
@@ -29,7 +29,7 @@ const configured = {
 /** 首跑状态：Rust 侧尚未配置，nasRoot 为空 */
 const firstRun = {
   ...configured,
-  workstation: { machineId: "WS-NEW", operator: "", nasRoot: "" },
+  workstation: { machineId: "WS-NEW", operator: "", nasRoot: "", recentProjects: [] },
 };
 
 describe("工作站设置", () => {
@@ -455,9 +455,13 @@ describe("首跑引导", () => {
     expect(screen.queryAllByTestId("project-row")).toHaveLength(0);
   });
 
-  it("引导单屏配完操作人与 NAS 根(评审 6.3)，完成后进入项目列表", async () => {
+  it("引导单屏配完操作人与 NAS 根(评审 6.3)，完成后进入拷卡界面", async () => {
     const user = userEvent.setup();
-    render(<App preloaded={firstRun} />);
+    render(
+      <App
+        preloaded={{ ...firstRun, selectedProjectId: mockProjects[0].id }}
+      />,
+    );
 
     // 单屏两个字段:全貌一眼可见,不再拆两步(手填路径,浏览按钮在测试环境隐藏)
     await user.type(screen.getByTestId("onboarding-operator"), "张三");
@@ -468,24 +472,27 @@ describe("首跑引导", () => {
     await user.click(screen.getByTestId("onboarding-finish"));
 
     await waitFor(() => expect(screen.queryByTestId("first-run-guide")).toBeNull());
-    expect(screen.getAllByTestId("project-row").length).toBeGreaterThan(0);
+    // 主窗口默认落在拷卡界面(启动重构):重拉后第一个项目被选中,表单可用
+    expect(await screen.findByTestId("copy-start")).toBeDefined();
   });
 
-  it("真实首跑:引导可达(不撞错误页),完成后自动重拉出项目列表", async () => {
+  it("真实首跑:引导可达(不撞错误页),完成后进入欢迎页", async () => {
     // NAS 未配置时后端会拒绝 list_projects:bootstrap 必须先看工作站配置、
     // 跳过 NAS 依赖的拉取,否则新用户直接进错误页,向导根本到不了(codex P1)
     const ws = vi
       .spyOn(api, "getWorkstationInfo")
-      .mockResolvedValueOnce({ machineId: "WS-NEW", operator: "", nasRoot: "" })
+      .mockResolvedValueOnce({ machineId: "WS-NEW", operator: "", nasRoot: "", recentProjects: [] })
       .mockResolvedValue({
         machineId: "WS-NEW",
         operator: "张三",
         nasRoot: "/Volumes/DIT-NAS/Projects",
+        recentProjects: [],
       });
     vi.spyOn(api, "setWorkstationInfo").mockResolvedValue({
       machineId: "WS-NEW",
       operator: "张三",
       nasRoot: "/Volumes/DIT-NAS/Projects",
+      recentProjects: [],
     });
     const user = userEvent.setup();
     render(<App />);
@@ -498,10 +505,17 @@ describe("首跑引导", () => {
     );
     await user.click(screen.getByTestId("onboarding-finish"));
 
-    // 完成设置触发整体重拉:第二台工作站指向已有 NAS 时必须立刻看到项目
-    const rows = await screen.findAllByTestId("project-row", {}, { timeout: 3000 });
-    expect(rows.length).toBeGreaterThan(0);
-    expect(ws).toHaveBeenCalledTimes(2);
+    // 完成设置触发整体重拉:重拉期间欢迎页会短暂让位给加载态。
+    // 稳定判据 = 第二次读工作站配置已发生 **且** 欢迎页可见——
+    // 只等其一会撞进「重拉尚未开始的过渡帧」(时序取样竞态)
+    await waitFor(
+      () => {
+        expect(ws).toHaveBeenCalledTimes(2);
+        expect(screen.getByTestId("welcome-home")).toBeDefined();
+        expect(screen.getByTestId("welcome-new-project")).toBeDefined();
+      },
+      { timeout: 3000 },
+    );
   });
 
   it("操作人为空时提交报错,引导留在原地", async () => {

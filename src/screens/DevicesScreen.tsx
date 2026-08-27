@@ -6,6 +6,7 @@ import * as api from "../api";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { IconTrash } from "../components/Icon";
 import { TopBar } from "../components/TopBar";
+import { IllCameraEmpty, IllCardsEmpty } from "../components/illustrations";
 import { Badge, EmptyState, Field } from "../components/ui";
 import { formatBytes } from "../lib/format";
 import { buildCameraCode } from "../lib/naming";
@@ -471,7 +472,7 @@ export function DevicesScreen() {
                     </Field>
                     {cameras.length === 0 ? (
                       /* 没相机时登记卡是死胡同(评审 6.1):把依赖关系说破,给去路 */
-                      <p className="text-xs text-warn" role="alert" data-testid="card-no-camera-hint">
+                      <p className="text-xs text-warn" role="status" data-testid="card-no-camera-hint">
                         还没有登记任何相机——卡必须关联相机(一卡一机)。{" "}
                         <button
                           type="button"
@@ -613,7 +614,7 @@ export function DevicesScreen() {
                     </div>
                   ))}
                   {cameras.length === 0 ? (
-                    <EmptyState>还没有登记相机。</EmptyState>
+                    <EmptyState art={<IllCameraEmpty />}>还没有登记相机。</EmptyState>
                   ) : null}
                 </div>
               </section>
@@ -688,7 +689,7 @@ export function DevicesScreen() {
                     );
                   })}
                   {cards.length === 0 ? (
-                    <EmptyState>还没有登记存储卡。</EmptyState>
+                    <EmptyState art={<IllCardsEmpty />}>还没有登记存储卡。</EmptyState>
                   ) : null}
                 </div>
               </section>

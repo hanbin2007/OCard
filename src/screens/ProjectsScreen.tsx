@@ -1,4 +1,8 @@
-/** 屏 1：项目列表（列表 + 详情，↑/↓ 键盘导航）。 */
+/**
+ * 项目管理（列表 + 详情，↑/↓ 键盘导航）。
+ * 启动重构后不再是主窗口路由：整体运行在欢迎/项目管理窗口里,
+ * 「打开项目」经窗口桥接切到主窗口。
+ */
 
 import { useEffect, useState } from "react";
 import { AuditLogDrawer } from "../components/AuditLogDrawer";
@@ -10,6 +14,7 @@ import {
 import { FolderTreeView } from "../components/FolderTreeView";
 import { TopBar } from "../components/TopBar";
 import { ProgressRing } from "../components/charts";
+import { IllProjectsEmpty } from "../components/illustrations";
 import { Badge, EmptyState, Kbd, ProgressBar } from "../components/ui";
 import { useListNavigation } from "../hooks/useListNavigation";
 import { formatBytes, formatCompactDate, formatTimestamp } from "../lib/format";
@@ -21,16 +26,19 @@ import {
   SCENARIO_SHORT,
   progressLabel,
 } from "../lib/labels";
-import { useStore } from "../state/store";
+import { useNotify, useStore } from "../state/store";
+import { useWindowBridge } from "../state/windowBridge";
 
-export function ProjectsScreen() {
+export function ProjectsScreen({ onNewProject }: { onNewProject: () => void }) {
   const { state, dispatch } = useStore();
+  const bridge = useWindowBridge();
+  const notify = useNotify();
   const { projects, selectedProjectId } = state;
 
   /**
-   * 浏览与切换分离(评审 5.4):点行/键盘只是「看一眼这个项目的详情」,
-   * 不再顺手把全局当前项目切走——那会不知情地影响拷卡屏、插卡引导。
-   * 「切换到此项目」按钮才动全局;全局切换时浏览焦点跟上。
+   * 浏览与打开分离(评审 5.4 × 欢迎窗口架构):点行/键盘只是「看一眼
+   * 这个项目的详情」,不动主窗口;「打开此项目」按钮才经窗口桥把项目
+   * 投递给主窗口。全局切换时浏览焦点跟上。
    */
   const [viewedId, setViewedId] = useState<string | null>(selectedProjectId);
   useEffect(() => {
@@ -38,6 +46,27 @@ export function ProjectsScreen() {
   }, [selectedProjectId]);
   const viewingId = viewedId ?? selectedProjectId;
   const selected = projects.find((p) => p.id === viewingId) ?? null;
+  const [opening, setOpening] = useState(false);
+
+  async function openInMain(projectId: string, name: string) {
+    if (opening) return;
+    setOpening(true);
+    try {
+      await bridge.openProject(projectId);
+      // 本窗口内也同步「当前项目」:黄标/浏览焦点即时跟上
+      // (Tauri 下欢迎窗口随打开动作关闭,这步无感;浏览器形态则必要)
+      dispatch({ type: "selectProject", projectId });
+    } catch (err) {
+      notify(
+        "error",
+        "open-project-failed",
+        `打开「${name}」失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setOpening(false);
+    }
+  }
+
 
   /* 审计日志抽屉的开合是这一屏的局部视图状态，不进全局 store：
      换项目时必须自动收起——否则抽屉里显示的还是上一个项目的时间线。 */
@@ -70,7 +99,7 @@ export function ProjectsScreen() {
             type="button"
             className="btn btn--primary btn--pill"
             data-testid="projects-new"
-            onClick={() => dispatch({ type: "navigate", route: "new-project" })}
+            onClick={onNewProject}
           >
             新建项目
           </button>
@@ -96,17 +125,15 @@ export function ProjectsScreen() {
                 </div>
 
                 {projects.length === 0 ? (
-                  <EmptyState>
+                  <EmptyState art={<IllProjectsEmpty />}>
                     <div className="stack">
-                      <span>还没有项目。</span>
+                      <span>还没有项目，先新建一个。</span>
                       <div>
                         <button
                           type="button"
                           className="btn btn--primary btn--sm"
                           data-testid="projects-empty-create"
-                          onClick={() =>
-                            dispatch({ type: "navigate", route: "new-project" })
-                          }
+                          onClick={onNewProject}
                         >
                           新建项目
                         </button>
@@ -220,12 +247,15 @@ export function ProjectsScreen() {
                             /* listbox 走 roving tabindex,option 内不能再冒出
                                tab 停靠点;鼠标可点,键盘用行选中(等价操作) */
                             tabIndex={-1}
+                            disabled={opening}
                             onClick={(e) => {
                               e.stopPropagation();
-                              dispatch({ type: "selectProject", projectId: project.id });
+                              /* 双窗口下 selectProject 只动本窗口,必须经
+                                 窗口桥把项目投递给主窗口 */
+                              void openInMain(project.id, project.name);
                             }}
                           >
-                            切换到此项目
+                            在主窗口打开
                           </button>
                         )}
                       </span>
@@ -430,6 +460,16 @@ export function ProjectsScreen() {
                   {selected.scenario === "A" ? (
                     <FinalCutPanel projectId={selected.id} />
                   ) : null}
+
+                  <button
+                    type="button"
+                    className="btn btn--primary"
+                    data-testid="project-open"
+                    disabled={opening}
+                    onClick={() => void openInMain(selected.id, selected.name)}
+                  >
+                    {opening ? "打开中…" : "打开此项目"}
+                  </button>
                 </>
               ) : (
                 <div className="card">

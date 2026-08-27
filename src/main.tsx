@@ -6,6 +6,7 @@ import "./styles/base.css";
 import "./styles/shell.css";
 import "./styles/components.css";
 import "./styles/screens.css";
+import "./styles/welcome.css";
 
 /**
  * DEV 专用场景注入（生产构建里 import.meta.env.DEV 为 false，整段被摇树剔除）:

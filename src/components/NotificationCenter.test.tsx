@@ -31,7 +31,7 @@ afterEach(() => {
 });
 
 const preloaded = {
-  route: "projects" as const,
+  route: "devices" as const,
   workstation: mockWorkstation,
   projects: mockProjects,
 };

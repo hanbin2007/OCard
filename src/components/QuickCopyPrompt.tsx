@@ -7,7 +7,8 @@
  *
  * 挂在 Shell 层(.main 之外):路由切换不打断引导。会话门开启时由
  * SessionGuard 把 .shell > .quick-copy 一并设为 inert(z-index 只挡鼠标,
- * 挡不住键盘——双路评审 P0);交付打包期间导航按钮与侧栏同一把锁。
+ * 挡不住键盘——双路评审 P0)。交付打包期间导航已放行(评审 4.3:
+ * 进度/结果入 store,任务中心接管,不再有「离开即蒸发」的锁因)。
  * 一次只提示队首一张卡;卷被拔走时提示随 volumesUpdated 自动消失。
  */
 
@@ -16,6 +17,7 @@ import * as api from "../api";
 import type { Project, StorageCard, Volume } from "../api/types";
 import { formatBytes } from "../lib/format";
 import { useNotify, useStore } from "../state/store";
+import { useWindowBridge } from "../state/windowBridge";
 import { IconCard, IconClose } from "./Icon";
 
 type RosterState =
@@ -43,6 +45,7 @@ export function QuickCopyPrompt() {
 
 function PromptBody({ volume }: { volume: Volume }) {
   const { state, dispatch } = useStore();
+  const bridge = useWindowBridge();
   const notify = useNotify();
 
   // 缺省(旧快照/mock 未填)按 matchedCardId 推断,不武断当未登记
@@ -274,7 +277,7 @@ function PromptBody({ volume }: { volume: Volume }) {
               type="button"
               className="btn btn--sm"
               data-testid="qc-goto-projects"
-              onClick={() => dispatch({ type: "navigate", route: "projects" })}
+              onClick={() => void bridge.openManager()}
             >
               去选择项目
             </button>

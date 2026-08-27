@@ -15,6 +15,7 @@ import {
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
+import { renderProjectsManager } from "../testUtils";
 import * as api from "../api";
 import { mockPendingAssets, mockProjects, mockWorkstation } from "../api/mock";
 import { mockAnalysisResult, resetMockJobs } from "../api/mockJobs";
@@ -486,14 +487,14 @@ describe("待修 → 已修 流转提示", () => {
 
 describe("成片校验（工况 A）", () => {
   const projects = {
-    route: "projects" as const,
+    route: "copy" as const,
     workstation: mockWorkstation,
     projects: mockProjects,
     selectedProjectId: projectA.id,
   };
 
   it("逐条给出合规/不合规理由、分辨率不符与无法校验", async () => {
-    render(<App preloaded={projects} />);
+    renderProjectsManager(projects);
     const panel = await screen.findByTestId("final-cut-panel");
     // 面板先渲染，数据后到
     const items = await within(panel).findAllByTestId("final-cut-item");
@@ -513,7 +514,7 @@ describe("成片校验（工况 A）", () => {
   });
 
   it("分辨率不符要把后端给的原因说出来，不能只亮一个红角标", async () => {
-    render(<App preloaded={projects} />);
+    renderProjectsManager(projects);
     const panel = await screen.findByTestId("final-cut-panel");
     await within(panel).findAllByTestId("final-cut-item");
 
@@ -537,7 +538,7 @@ describe("成片校验（工况 A）", () => {
         () => new Promise<FinalCutReport>((resolve) => pending.push(resolve)),
       );
 
-    render(<App preloaded={projects} />);
+    renderProjectsManager(projects);
     await screen.findByTestId("final-cut-panel");
     await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
 
@@ -568,9 +569,7 @@ describe("成片校验（工况 A）", () => {
   }, 15000);
 
   it("工况 B 项目不显示成片校验", async () => {
-    render(
-      <App preloaded={{ ...projects, selectedProjectId: projectB.id }} />,
-    );
+    renderProjectsManager({ ...projects, selectedProjectId: projectB.id });
     await screen.findAllByTestId("project-row");
     expect(screen.queryByTestId("final-cut-panel")).toBeNull();
   });
@@ -578,7 +577,7 @@ describe("成片校验（工况 A）", () => {
   it("页面不可见时停止轮询，切回前台恢复", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const spy = vi.spyOn(api, "checkFinalCuts");
-    render(<App preloaded={projects} />);
+    renderProjectsManager(projects);
     await screen.findByTestId("final-cut-panel");
     await waitFor(() => expect(spy).toHaveBeenCalled());
 
@@ -610,7 +609,7 @@ describe("成片校验（工况 A）", () => {
 
 describe("交付状态勾选", () => {
   const projects = {
-    route: "projects" as const,
+    route: "copy" as const,
     workstation: mockWorkstation,
     projects: mockProjects,
     selectedProjectId: projectA.id,
@@ -620,7 +619,7 @@ describe("交付状态勾选", () => {
     const user = userEvent.setup();
     const spy = vi.spyOn(api, "setDeliveryStatus");
 
-    render(<App preloaded={projects} />);
+    renderProjectsManager(projects);
     const checkbox = (await screen.findByTestId(
       "delivery-uploaded",
     )) as HTMLInputElement;
@@ -645,7 +644,7 @@ describe("交付状态勾选", () => {
   it("可见期 10s 轮询，隐藏时不打 NAS", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const spy = vi.spyOn(api, "getDeliveryStatus");
-    render(<App preloaded={projects} />);
+    renderProjectsManager(projects);
     await screen.findByTestId("delivery-status");
     await waitFor(() => expect(spy).toHaveBeenCalled());
 
@@ -700,7 +699,7 @@ describe("交付状态勾选", () => {
       updatedAt: "2026-08-24T12:00:00+08:00",
     });
 
-    render(<App preloaded={projects} />);
+    renderProjectsManager(projects);
     const checkbox = (await screen.findByTestId(
       "delivery-uploaded",
     )) as HTMLInputElement;
@@ -734,7 +733,7 @@ describe("交付状态勾选", () => {
       .spyOn(api, "setDeliveryStatus")
       .mockRejectedValue(new Error("NAS 只读"));
 
-    render(<App preloaded={projects} />);
+    renderProjectsManager(projects);
     const checkbox = (await screen.findByTestId(
       "delivery-uploaded",
     )) as HTMLInputElement;

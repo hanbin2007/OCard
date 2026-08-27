@@ -22,6 +22,7 @@ import type {
   CopyTask,
   Project,
   ProjectCards,
+  ProjectSettings,
   StorageCard,
   Volume,
   WorkstationInfo,
@@ -34,6 +35,39 @@ export const mockWorkstation: WorkstationInfo = {
   machineId: "WS-7C4A21",
   operator: "张涵斌",
   nasRoot: "/Volumes/DIT-NAS/Projects",
+  recentProjects: [
+    {
+      id: "p-2026-0824-sports",
+      name: "校运会",
+      folderName: "20260824_校运会",
+      scenario: "B",
+      lastOpenedAt: "2026-08-24T14:35:00+08:00",
+    },
+    {
+      id: "p-2026-0822-launch",
+      name: "新品发布会",
+      folderName: "20260822_新品发布会",
+      scenario: "A",
+      lastOpenedAt: "2026-08-22T18:02:00+08:00",
+    },
+  ],
+};
+
+/**
+ * 项目级设置（标签库 + 备份目的地预设）。缺省项目返回空设置——
+ * 与后端「settings.json 不存在 = 空设置」同语义。
+ */
+export const mockProjectSettings: Record<string, ProjectSettings> = {
+  "p-2026-0824-sports": {
+    tags: [
+      { name: "开幕式", color: "blue" },
+      { name: "田赛", color: "green" },
+      { name: "径赛", color: "orange" },
+      { name: "颁奖", color: "purple" },
+      { name: "花絮", color: "pink" },
+    ],
+    backupPaths: ["/Volumes/BACKUP-01"],
+  },
 };
 
 export const mockProjects: Project[] = [
@@ -345,7 +379,8 @@ export const mockCopyTasks: CopyTask[] = [
     volumeName: "SONY_A7M4",
     cameraId: "cam-a7m4",
     cameraCode: "SonyA7M4_A_LM",
-    note: "上午田赛，含 4×100 决赛全程",
+    note: "田赛、4×100决赛",
+    tags: ["田赛", "4×100决赛"],
     targetFolder: "0824上午_SonyA7M4_A_LM",
     destinations: [
       {
@@ -378,7 +413,8 @@ export const mockCopyTasks: CopyTask[] = [
     volumeName: "NIKON_Z9",
     cameraId: "cam-z9",
     cameraCode: "NikonZ9_E_CQ",
-    note: "开幕式方阵入场",
+    note: "开幕式",
+    tags: ["开幕式"],
     targetFolder: "0824上午_NikonZ9_E_CQ",
     destinations: [
       {

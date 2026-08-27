@@ -163,6 +163,41 @@
   /* 唯一允许的阴影：仅浮层（modal / popover / dropdown），小偏移低不透明度 */
   --shadow-overlay: 0 4px 16px rgba(15, 15, 15, 0.12);
 
+
+  /* ----------------------------------------------------------------
+   * 拟物插画（空态素材 / 拷贝流向图）专用调色。
+   * 写实塑形三件套：渐变面（hi→lo）、侧面/深面、高光 sheen 与落影 shadow。
+   * 空态素材整体单色；gold/glass 两组材质色只允许出现在拷贝流向图里。
+   * ---------------------------------------------------------------- */
+  --ill-line: rgba(40, 42, 48, 0.55);
+  --ill-line-soft: rgba(40, 42, 48, 0.3);
+  --ill-metal-hi: #fdfdfe;
+  --ill-metal-lo: #dddee1;
+  --ill-metal-side: #c9cbcf;
+  --ill-plastic-hi: #f4f5f6;
+  --ill-plastic-lo: #d8d9dc;
+  --ill-chrome-hi: #d7d8db;
+  --ill-chrome-lo: #a9abaf;
+  --ill-dark-hi: #56585e;
+  --ill-dark-lo: #303237;
+  --ill-dark-side: #232529;
+  --ill-slot: #26282c;
+  --ill-glass-hi: #8e9095;
+  --ill-glass-lo: #1f2029;
+  --ill-glass-edge: #0a0b10;
+  --ill-glass-ring: rgba(255, 255, 255, 0.18);
+  --ill-glint: rgba(255, 255, 255, 0.35);
+  --ill-gold-hi: #ecd08a;
+  --ill-gold-lo: #bd944a;
+  --ill-paper: #fcfcfc;
+  --ill-paper-lo: #ececee;
+  --ill-photo-a: #b9babd;
+  --ill-photo-b: #97999e;
+  --ill-mono: #85878c;
+  --ill-shadow: rgba(25, 27, 32, 0.18);
+  --ill-sheen: rgba(255, 255, 255, 0.75);
+  --ill-text-inv: #d8d9dd;
+
   color-scheme: light;
 }
 
@@ -235,6 +270,35 @@
     --overlay: rgba(0, 0, 0, 0.6);
     --shadow-overlay: 0 4px 16px rgba(0, 0, 0, 0.5);
 
+    --ill-line: rgba(0, 0, 0, 0.6);
+    --ill-line-soft: rgba(0, 0, 0, 0.4);
+    --ill-metal-hi: #55575c;
+    --ill-metal-lo: #35373b;
+    --ill-metal-side: #2b2d31;
+    --ill-plastic-hi: #4b4d52;
+    --ill-plastic-lo: #313337;
+    --ill-chrome-hi: #6a6c71;
+    --ill-chrome-lo: #4a4c50;
+    --ill-dark-hi: #4e5056;
+    --ill-dark-lo: #2a2c30;
+    --ill-dark-side: #1e2023;
+    --ill-slot: #101114;
+    --ill-glass-hi: #7b7d82;
+    --ill-glass-lo: #16171e;
+    --ill-glass-edge: #070709;
+    --ill-glass-ring: rgba(255, 255, 255, 0.14);
+    --ill-glint: rgba(255, 255, 255, 0.22);
+    --ill-gold-hi: #d8b96a;
+    --ill-gold-lo: #9a763a;
+    --ill-paper: #e8e8ea;
+    --ill-paper-lo: #cfcfd3;
+    --ill-photo-a: #6f7176;
+    --ill-photo-b: #55575c;
+    --ill-mono: #8f9195;
+    --ill-shadow: rgba(0, 0, 0, 0.5);
+    --ill-sheen: rgba(255, 255, 255, 0.28);
+    --ill-text-inv: #d8d9dd;
+
     color-scheme: dark;
   }
 }
@@ -284,5 +348,109 @@
   --overlay: rgba(0, 0, 0, 0.6);
   --shadow-overlay: 0 4px 16px rgba(0, 0, 0, 0.5);
 
+  --ill-line: rgba(0, 0, 0, 0.6);
+  --ill-line-soft: rgba(0, 0, 0, 0.4);
+  --ill-metal-hi: #55575c;
+  --ill-metal-lo: #35373b;
+  --ill-metal-side: #2b2d31;
+  --ill-plastic-hi: #4b4d52;
+  --ill-plastic-lo: #313337;
+  --ill-chrome-hi: #6a6c71;
+  --ill-chrome-lo: #4a4c50;
+  --ill-dark-hi: #4e5056;
+  --ill-dark-lo: #2a2c30;
+  --ill-dark-side: #1e2023;
+  --ill-slot: #101114;
+  --ill-glass-hi: #7b7d82;
+  --ill-glass-lo: #16171e;
+  --ill-glass-edge: #070709;
+  --ill-glass-ring: rgba(255, 255, 255, 0.14);
+  --ill-glint: rgba(255, 255, 255, 0.22);
+  --ill-gold-hi: #d8b96a;
+  --ill-gold-lo: #9a763a;
+  --ill-paper: #e8e8ea;
+  --ill-paper-lo: #cfcfd3;
+  --ill-photo-a: #6f7176;
+  --ill-photo-b: #55575c;
+  --ill-mono: #8f9195;
+  --ill-shadow: rgba(0, 0, 0, 0.5);
+  --ill-sheen: rgba(255, 255, 255, 0.28);
+  --ill-text-inv: #d8d9dd;
+
   color-scheme: dark;
+}
+
+/* ----------------------------------------------------------------
+ * 内容标签调色板(Notion 式)。色名与 `lib/tags.ts` TAG_COLORS 一一对应;
+ * 项目数据只存色名,亮/暗两套渲染在这里给值。
+ * ---------------------------------------------------------------- */
+:root {
+  --tag-gray-bg: #e7e7e5;
+  --tag-gray-fg: #52514e;
+  --tag-blue-bg: #d9e6f8;
+  --tag-blue-fg: #2b5797;
+  --tag-green-bg: #dcecdc;
+  --tag-green-fg: #2f6b3c;
+  --tag-yellow-bg: #f6eeca;
+  --tag-yellow-fg: #6d5717;
+  --tag-orange-bg: #f8e3cf;
+  --tag-orange-fg: #8f4d17;
+  --tag-red-bg: #f8d9d6;
+  --tag-red-fg: #a03430;
+  --tag-purple-bg: #e9def6;
+  --tag-purple-fg: #6b3fa0;
+  --tag-pink-bg: #f7dcea;
+  --tag-pink-fg: #a03c72;
+  --tag-teal-bg: #d5ecea;
+  --tag-teal-fg: #1f665f;
+  --tag-brown-bg: #eadfd4;
+  --tag-brown-fg: #6e4f34;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --tag-gray-bg: #3a3a3a;
+    --tag-gray-fg: #d4d4d2;
+    --tag-blue-bg: #274664;
+    --tag-blue-fg: #a8c7ee;
+    --tag-green-bg: #2b4a33;
+    --tag-green-fg: #a9d3b2;
+    --tag-yellow-bg: #4d4020;
+    --tag-yellow-fg: #e0c877;
+    --tag-orange-bg: #55361c;
+    --tag-orange-fg: #ecb582;
+    --tag-red-bg: #572e2b;
+    --tag-red-fg: #f0a09a;
+    --tag-purple-bg: #433059;
+    --tag-purple-fg: #cdb3f0;
+    --tag-pink-bg: #542e42;
+    --tag-pink-fg: #edaacd;
+    --tag-teal-bg: #1f4a47;
+    --tag-teal-fg: #94d3cd;
+    --tag-brown-bg: #473528;
+    --tag-brown-fg: #d3b394;
+  }
+}
+
+:root[data-theme="dark"] {
+  --tag-gray-bg: #3a3a3a;
+  --tag-gray-fg: #d4d4d2;
+  --tag-blue-bg: #274664;
+  --tag-blue-fg: #a8c7ee;
+  --tag-green-bg: #2b4a33;
+  --tag-green-fg: #a9d3b2;
+  --tag-yellow-bg: #4d4020;
+  --tag-yellow-fg: #e0c877;
+  --tag-orange-bg: #55361c;
+  --tag-orange-fg: #ecb582;
+  --tag-red-bg: #572e2b;
+  --tag-red-fg: #f0a09a;
+  --tag-purple-bg: #433059;
+  --tag-purple-fg: #cdb3f0;
+  --tag-pink-bg: #542e42;
+  --tag-pink-fg: #edaacd;
+  --tag-teal-bg: #1f4a47;
+  --tag-teal-fg: #94d3cd;
+  --tag-brown-bg: #473528;
+  --tag-brown-fg: #d3b394;
 }

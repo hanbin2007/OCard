@@ -13,11 +13,13 @@ import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog"
 import { Checkbox } from "../components/controls";
 import { PathField } from "../components/PathField";
 import { TopBar } from "../components/TopBar";
+import { IllTranscodeEmpty } from "../components/illustrations";
 import { Badge, EmptyState, Field, ProgressBar } from "../components/ui";
 import { isAbsoluteNasRoot } from "../lib/validation";
 import { loadPref, savePref } from "../lib/prefs";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import { selectLatestTranscodeJob, useStore } from "../state/store";
+import { useWindowBridge } from "../state/windowBridge";
 
 const TIER_LABEL: Record<ArchiveTier, string> = {
   quality: "高质量",
@@ -33,6 +35,7 @@ const TIER_HINT: Record<ArchiveTier, string> = {
 
 export function TranscodeScreen() {
   const { state, dispatch, reconcileJobs } = useStore();
+  const bridge = useWindowBridge();
   const project = state.projects.find((p) => p.id === state.selectedProjectId) ?? null;
   const job = project ? selectLatestTranscodeJob(state, project.id) : null;
   const working = job !== null && (job.state === "queued" || job.state === "running");
@@ -202,7 +205,7 @@ export function TranscodeScreen() {
         <TopBar title="代理转码" />
         <div className="content">
           <div className="content__inner">
-            <EmptyState>
+            <EmptyState art={<IllTranscodeEmpty />}>
               <div className="stack" data-testid="transcode-no-project">
                 <p className="text-sm" role="status">
                   {state.projects.length === 0
@@ -214,12 +217,7 @@ export function TranscodeScreen() {
                     type="button"
                     className="btn btn--primary"
                     data-testid="transcode-goto-projects"
-                    onClick={() =>
-                      dispatch({
-                        type: "navigate",
-                        route: state.projects.length === 0 ? "new-project" : "projects",
-                      })
-                    }
+                    onClick={() => void bridge.openManager()}
                   >
                     {state.projects.length === 0 ? "去新建项目" : "去选择项目"}
                   </button>
@@ -238,7 +236,7 @@ export function TranscodeScreen() {
         <TopBar title="代理转码" subtitle={project.folderName} subtitleMono />
         <div className="content">
           <div className="content__inner">
-            <EmptyState>
+            <EmptyState art={<IllTranscodeEmpty />}>
               <div className="stack" data-testid="transcode-scenario-b">
                 <p className="text-sm" role="status">
                   代理转码只适用于工况 A（视频剪辑）项目。当前项目「{project.name}」是工况
@@ -249,7 +247,7 @@ export function TranscodeScreen() {
                     type="button"
                     className="btn btn--primary"
                     data-testid="transcode-goto-projects"
-                    onClick={() => dispatch({ type: "navigate", route: "projects" })}
+                    onClick={() => void bridge.openManager()}
                   >
                     切换到其他项目
                   </button>

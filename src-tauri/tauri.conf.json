@@ -12,11 +12,24 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "OCard",
         "width": 1280,
         "height": 800,
         "minWidth": 1100,
         "minHeight": 720,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "visible": false
+      },
+      {
+        "label": "welcome",
+        "title": "欢迎使用 OCard",
+        "width": 920,
+        "height": 600,
+        "minWidth": 820,
+        "minHeight": 560,
+        "center": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true
       }

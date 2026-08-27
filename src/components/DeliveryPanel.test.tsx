@@ -403,10 +403,10 @@ describe("作业进行中的互斥（M2 收口行为必须保持）", () => {
 
   it("打包期间导航放行(评审 4.3):进度/结果由 store 承载,不再锁死全站", async () => {
     await enterWorking();
-    // 分类操作仍锁(同一批文件不能边打包边挪),但导航自由
+    // 分类操作仍锁(同一批文件不能边打包边挪),但导航自由(评审 4.3)
     expect(screen.getByTestId("sorting-delivery-lock")).toBeDefined();
     expect(
-      (screen.getByTestId("nav-projects") as HTMLButtonElement).disabled,
+      (screen.getByTestId("nav-manager") as HTMLButtonElement).disabled,
     ).toBe(false);
     expect(
       (screen.getByTestId("sorting-open-trash") as HTMLButtonElement).disabled,
@@ -438,7 +438,7 @@ describe("作业进行中的互斥（M2 收口行为必须保持）", () => {
       expect(screen.queryByTestId("sorting-delivery-lock")).toBeNull(),
     );
     expect(
-      (screen.getByTestId("nav-projects") as HTMLButtonElement).disabled,
+      (screen.getByTestId("nav-manager") as HTMLButtonElement).disabled,
     ).toBe(false);
   });
 });
