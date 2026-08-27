@@ -5,6 +5,7 @@ import * as api from "../api";
 import type { TrashEntry } from "../api/types";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { TopBar } from "../components/TopBar";
+import { IllTrashEmpty } from "../components/illustrations";
 import { EmptyState } from "../components/ui";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import { useNotify, useStore } from "../state/store";
@@ -204,7 +205,7 @@ export function TrashScreen() {
               </div>
             ))}
             {entries.length === 0 && !loading ? (
-              <EmptyState>回收站是空的。</EmptyState>
+              <EmptyState art={<IllTrashEmpty />}>回收站是空的。</EmptyState>
             ) : null}
           </div>
           )}

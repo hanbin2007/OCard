@@ -13,6 +13,7 @@ import { AssetLightbox } from "../components/AssetLightbox";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { DeliveryButton } from "../components/DeliveryPanel";
 import { TopBar } from "../components/TopBar";
+import { IllSortingEmpty } from "../components/illustrations";
 import { Badge, EmptyState, Kbd, ProgressBar, PulseValue } from "../components/ui";
 import { VirtualGrid } from "../components/VirtualGrid";
 import { Checkbox } from "../components/controls";
@@ -1015,7 +1016,7 @@ export function SortingScreen() {
                 </button>
               </div>
             ) : assets.length === 0 && !loading ? (
-              <EmptyState>待分类里没有素材了。</EmptyState>
+              <EmptyState art={<IllSortingEmpty />}>待分类里没有素材了。</EmptyState>
             ) : (
               <VirtualGrid
                 items={entries}

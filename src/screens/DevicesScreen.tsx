@@ -6,6 +6,7 @@ import * as api from "../api";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { IconTrash } from "../components/Icon";
 import { TopBar } from "../components/TopBar";
+import { IllCameraEmpty, IllCardsEmpty } from "../components/illustrations";
 import { Badge, EmptyState, Field } from "../components/ui";
 import { formatBytes } from "../lib/format";
 import { buildCameraCode } from "../lib/naming";
@@ -559,7 +560,7 @@ export function DevicesScreen() {
                     </div>
                   ))}
                   {cameras.length === 0 ? (
-                    <EmptyState>还没有登记相机。</EmptyState>
+                    <EmptyState art={<IllCameraEmpty />}>还没有登记相机。</EmptyState>
                   ) : null}
                 </div>
               </section>
@@ -633,7 +634,7 @@ export function DevicesScreen() {
                     );
                   })}
                   {cards.length === 0 ? (
-                    <EmptyState>还没有登记存储卡。</EmptyState>
+                    <EmptyState art={<IllCardsEmpty />}>还没有登记存储卡。</EmptyState>
                   ) : null}
                 </div>
               </section>
