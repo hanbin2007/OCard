@@ -1,10 +1,19 @@
-/** 全屏预览：左右切换、Esc 关闭（PRD §5.4 全屏对比）。 */
+/**
+ * 全屏预览：左右切换、Esc 关闭（PRD §5.4 全屏对比）。
+ *
+ * 预览打开期间键盘由这里**全权接管**(评审 3.2):你操作的就是你看见的
+ * 这张——P/数字键/D 作用于当前预览项,绝不落到网格里进预览前的旧选中。
+ * 底部动作条同时是快捷键提示:预览此前是唯一没有 hint 的操作场所。
+ */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { SortingAsset } from "../api/types";
+import type { SortingAsset, SortingCategory } from "../api/types";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import { animateOnce } from "../lib/motion";
+import { resolveShortcut } from "../lib/sorting";
 import { IconArrowLeft, IconChevronRight, IconClose } from "./Icon";
+import { JudgementBadges } from "./JudgementBadges";
+import { Badge, Kbd } from "./ui";
 
 /** 换图时的横向位移量：够读出方向，又不至于把整张图甩出视野 */
 const SWAP_SHIFT_PX = 18;
@@ -15,21 +24,42 @@ export function AssetLightbox({
   asset,
   index,
   total,
+  categories = [],
+  marked = false,
+  curated = false,
   onClose,
   onPrev,
   onNext,
+  onAssign,
+  onCurate,
+  onToggleDelete,
 }: {
   asset: SortingAsset;
   index: number;
   total: number;
+  /** 分类清单:动作条按钮与数字键映射都从这来;缺省不渲染动作条 */
+  categories?: SortingCategory[];
+  /** 当前项已标记待删 */
+  marked?: boolean;
+  /** 当前项本次会话里精选过 */
+  curated?: boolean;
   onClose: () => void;
   onPrev: () => void;
   onNext: () => void;
+  /** 把**当前预览项**移入分类(调用方负责自动前进) */
+  onAssign?: (categoryId: string) => void;
+  /** 把当前预览项复制进精选 */
+  onCurate?: () => void;
+  /** 切换当前预览项的待删标记 */
+  onToggleDelete?: () => void;
 }) {
   // thumb:// 取图可能 404：转占位而不是留一个碎图
   const [failed, setFailed] = useState(false);
+  /** 点击放大(评审 3.11 v1):在全尺寸解码接上之前,先给一个粗判焦的放大 */
+  const [zoomed, setZoomed] = useState(false);
   useEffect(() => {
     setFailed(false);
+    setZoomed(false);
   }, [asset.id]);
 
   const mediaRef = useRef<HTMLElement | null>(null);
@@ -83,12 +113,40 @@ export function AssetLightbox({
       if (e.key === "Escape") onClose();
       else if (e.key === "ArrowRight") goNext();
       else if (e.key === "ArrowLeft") goPrev();
-      else return;
+      else {
+        // 打标键(P/O/D/数字)作用于**眼前这张**(评审 3.2)
+        const action = resolveShortcut(
+          {
+            key: e.key,
+            shiftKey: e.shiftKey,
+            metaKey: e.metaKey,
+            ctrlKey: e.ctrlKey,
+          },
+          categories,
+        );
+        if (!action) return;
+        if (action.type === "assign" && onAssign) onAssign(action.categoryId);
+        else if (action.type === "other" && onAssign) {
+          const other = categories.find((c) => c.kind === "other");
+          if (other) onAssign(other.id);
+        } else if (action.type === "curate" && onCurate) onCurate();
+        else if (
+          (action.type === "markDelete" || action.type === "unmarkDelete") &&
+          onToggleDelete
+        ) {
+          onToggleDelete();
+        } else return;
+      }
       e.preventDefault();
+      e.stopPropagation();
     };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [onClose, goPrev, goNext]);
+    // capture 阶段接管:网格 wrap 可能仍持有焦点,不能让同一击键双处生效
+    document.addEventListener("keydown", onKey, { capture: true });
+    return () => document.removeEventListener("keydown", onKey, { capture: true });
+  }, [onClose, goPrev, goNext, categories, onAssign, onCurate, onToggleDelete]);
+
+  const customCategories = categories.filter((c) => c.kind === "custom");
+  const hasActions = Boolean(onAssign || onCurate || onToggleDelete);
 
   return (
     <div className="lightbox" data-testid="asset-lightbox" role="dialog" aria-modal="true"
@@ -118,6 +176,12 @@ export function AssetLightbox({
               : `检出人脸 ${asset.judgement.faces}`}
           </span>
         ) : null}
+        {/* 网格里有的状态,大图里必须也有(评审 D1) */}
+        <span className="lightbox__badges" data-testid="lightbox-badges">
+          <JudgementBadges judgement={asset.judgement} />
+          {curated ? <Badge tone="ok">已精选</Badge> : null}
+          {marked ? <Badge tone="danger">已标删</Badge> : null}
+        </span>
         <button
           type="button"
           className="btn btn--ghost btn--icon push-right"
@@ -149,10 +213,12 @@ export function AssetLightbox({
             }}
             /* 与网格里那一格共用过渡名：支持的内核上，两者是同一个实体在形变 */
             style={{ viewTransitionName: "ocard-preview" }}
-            className="lightbox__image"
+            className={`lightbox__image${zoomed ? " lightbox__image--zoomed" : ""}`}
             src={asset.thumbnail}
             alt={asset.fileName}
             data-testid="lightbox-image"
+            title={zoomed ? "点击还原" : "点击放大(缩略图预览,清晰度有限)"}
+            onClick={() => setZoomed((z) => !z)}
             onError={() => setFailed(true)}
           />
         ) : (
@@ -181,6 +247,64 @@ export function AssetLightbox({
           <IconChevronRight />
         </button>
       </div>
+
+      {hasActions ? (
+        /* 动作条兼快捷键提示(评审 D2):大图下即可完成全部选片决策,
+           不必退回网格找格子 */
+        <div className="lightbox__actions" data-testid="lightbox-actions">
+          {onAssign
+            ? customCategories.map((c) => (
+                <button
+                  key={c.id}
+                  type="button"
+                  className="btn btn--sm"
+                  data-testid="lightbox-assign"
+                  data-category={c.id}
+                  onClick={() => onAssign(c.id)}
+                >
+                  {c.hotkey ? <Kbd>{c.hotkey}</Kbd> : null}
+                  {c.name}
+                </button>
+              ))
+            : null}
+          {onCurate ? (
+            <button
+              type="button"
+              className="btn btn--sm"
+              data-testid="lightbox-curate"
+              title="复制一份进「精选/待修」,原件留在待分类"
+              onClick={onCurate}
+            >
+              <Kbd>P</Kbd>精选
+            </button>
+          ) : null}
+          {onAssign && categories.some((c) => c.kind === "other") ? (
+            <button
+              type="button"
+              className="btn btn--sm"
+              data-testid="lightbox-other"
+              onClick={() => {
+                const other = categories.find((c) => c.kind === "other");
+                if (other) onAssign(other.id);
+              }}
+            >
+              <Kbd>O</Kbd>其他
+            </button>
+          ) : null}
+          {onToggleDelete ? (
+            <button
+              type="button"
+              className={`btn btn--sm${marked ? "" : " btn--danger"}`}
+              data-testid="lightbox-toggle-delete"
+              onClick={onToggleDelete}
+            >
+              <Kbd>D</Kbd>
+              {marked ? "取消标删" : "标删"}
+            </button>
+          ) : null}
+          <span className="text-2xs dim push-right">操作后自动看下一张</span>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -225,6 +225,14 @@ export type CopyTaskState =
   | "done"
   | "failed";
 
+/** 任务级全量状态计数:不受文件明细分页影响的真值(评审 2.5) */
+export interface CopyStatusCounts {
+  pending: number;
+  copied: number;
+  verified: number;
+  failed: number;
+}
+
 export interface CopyTask {
   id: string;
   projectId: string;
@@ -252,6 +260,8 @@ export interface CopyTask {
   files: CopyFileItem[];
   /** 文件总数（files 被分页截断时仍然准确） */
   fileCount?: number;
+  /** 全量状态计数（不依赖已加载的明细页数） */
+  statusCounts?: CopyStatusCounts;
   totalBytes: number;
   copiedBytes: number;
   /** 实时速度，字节/秒 */
@@ -331,6 +341,8 @@ export interface CopyProgressEvent {
   changedDestinations: Array<
     Pick<CopyDestination, "id" | "state" | "writtenBytes" | "verifiedBytes" | "error">
   >;
+  /** 全量状态计数快照（可选;带上时覆盖任务上的旧值） */
+  statusCounts?: CopyStatusCounts;
 }
 
 /** 当前工作站身份（PRD §6.3） */
@@ -371,6 +383,10 @@ export interface NoticeDto {
   occurredAt: string;
   /** 后端在 30s 窗口内合并同 code 的次数；缺省视为 1 */
   repeats?: number;
+  /** 通知关联的拷卡任务(前端合成:拷卡终态通知点击直达任务) */
+  taskId?: string;
+  /** 通知关联的项目(跳转前先切到该项目) */
+  projectId?: string;
 }
 
 /**

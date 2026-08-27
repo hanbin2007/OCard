@@ -482,6 +482,14 @@
   background: var(--border-focus);
 }
 
+.progress--danger .progress__bar {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--danger) 45%, transparent),
+    var(--danger)
+  );
+}
+
 /* ---------- 渐变图表（charts.tsx） ---------- */
 
 /* 速度曲线：面积图容器。底边 1px 当基线轴，其余刻度一概不画 */
@@ -1497,6 +1505,45 @@
 
 .toast__body {
   min-width: 0;
+}
+
+/* 快捷键速查(? 呼出):双列分区,键位列等宽对齐 */
+.keyhelp {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--space-5);
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.keyhelp__heading {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  color: var(--text-secondary);
+  letter-spacing: 0.04em;
+}
+
+.keyhelp__row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: 2px 0;
+}
+
+.keyhelp__keys {
+  flex: 0 0 128px;
+}
+
+/* 高级设置折叠区(评审 6.5):低频诊断默认收起 */
+.settings-advanced > summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  user-select: none;
+}
+
+.settings-advanced[open] > summary {
+  margin-bottom: var(--space-3);
 }
 
 .settings-about {

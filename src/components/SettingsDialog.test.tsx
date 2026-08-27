@@ -431,15 +431,19 @@ describe("转码能力", () => {
     spy.mockRestore();
   });
 
-  it("导出诊断给出 JSON", async () => {
+  it("「复制诊断信息」一键进剪贴板并给出回执(评审 #10)", async () => {
     const user = await openSettings2();
     await user.click(screen.getByTestId("settings-diagnostics"));
 
-    const out = (await screen.findByTestId(
-      "settings-diagnostics-output",
-    )) as HTMLTextAreaElement;
-    expect(out.value).toContain("ffmpeg");
-    expect(out.value).toContain("probes");
+    // user-event 提供可读写的剪贴板 stub:验证真的复制进去了
+    await waitFor(async () => {
+      const text = await window.navigator.clipboard.readText();
+      expect(text).toContain("ffmpeg");
+      expect(text).toContain("probes");
+    });
+    expect(screen.getByTestId("settings-diagnostics").textContent).toContain(
+      "已复制",
+    );
   });
 });
 
@@ -451,7 +455,7 @@ describe("首跑引导", () => {
     expect(screen.queryAllByTestId("project-row")).toHaveLength(0);
   });
 
-  it("引导向导两步配完操作人与 NAS 根，完成后进入拷卡界面", async () => {
+  it("引导单屏配完操作人与 NAS 根(评审 6.3)，完成后进入拷卡界面", async () => {
     const user = userEvent.setup();
     render(
       <App
@@ -459,11 +463,8 @@ describe("首跑引导", () => {
       />,
     );
 
-    // 第 1 步:操作人
+    // 单屏两个字段:全貌一眼可见,不再拆两步(手填路径,浏览按钮在测试环境隐藏)
     await user.type(screen.getByTestId("onboarding-operator"), "张三");
-    await user.click(screen.getByTestId("onboarding-next"));
-
-    // 第 2 步:NAS 根目录(手填路径,浏览按钮在测试环境隐藏)
     await user.type(
       screen.getByTestId("onboarding-nas-root"),
       "/Volumes/DIT-NAS/Projects",
@@ -498,7 +499,6 @@ describe("首跑引导", () => {
 
     expect(await screen.findByTestId("first-run-guide")).toBeDefined();
     await user.type(screen.getByTestId("onboarding-operator"), "张三");
-    await user.click(screen.getByTestId("onboarding-next"));
     await user.type(
       screen.getByTestId("onboarding-nas-root"),
       "/Volumes/DIT-NAS/Projects",
@@ -518,11 +518,11 @@ describe("首跑引导", () => {
     );
   });
 
-  it("引导第 1 步操作人为空时报错并停在原步骤", async () => {
+  it("操作人为空时提交报错,引导留在原地", async () => {
     const user = userEvent.setup();
     render(<App preloaded={firstRun} />);
 
-    await user.click(screen.getByTestId("onboarding-next"));
+    await user.click(screen.getByTestId("onboarding-finish"));
     expect(screen.getByText(/请填写操作人/)).toBeDefined();
     expect(screen.getByTestId("onboarding-operator")).toBeDefined();
   });

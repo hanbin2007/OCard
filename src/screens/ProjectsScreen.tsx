@@ -34,7 +34,18 @@ export function ProjectsScreen({ onNewProject }: { onNewProject: () => void }) {
   const bridge = useWindowBridge();
   const notify = useNotify();
   const { projects, selectedProjectId } = state;
-  const selected = projects.find((p) => p.id === selectedProjectId) ?? null;
+
+  /**
+   * 浏览与打开分离(评审 5.4 × 欢迎窗口架构):点行/键盘只是「看一眼
+   * 这个项目的详情」,不动主窗口;「打开此项目」按钮才经窗口桥把项目
+   * 投递给主窗口。全局切换时浏览焦点跟上。
+   */
+  const [viewedId, setViewedId] = useState<string | null>(selectedProjectId);
+  useEffect(() => {
+    setViewedId(selectedProjectId);
+  }, [selectedProjectId]);
+  const viewingId = viewedId ?? selectedProjectId;
+  const selected = projects.find((p) => p.id === viewingId) ?? null;
   const [opening, setOpening] = useState(false);
 
   async function openInMain(projectId: string, name: string) {
@@ -42,6 +53,9 @@ export function ProjectsScreen({ onNewProject }: { onNewProject: () => void }) {
     setOpening(true);
     try {
       await bridge.openProject(projectId);
+      // 本窗口内也同步「当前项目」:黄标/浏览焦点即时跟上
+      // (Tauri 下欢迎窗口随打开动作关闭,这步无感;浏览器形态则必要)
+      dispatch({ type: "selectProject", projectId });
     } catch (err) {
       notify(
         "error",
@@ -53,26 +67,27 @@ export function ProjectsScreen({ onNewProject }: { onNewProject: () => void }) {
     }
   }
 
+
   /* 审计日志抽屉的开合是这一屏的局部视图状态，不进全局 store：
      换项目时必须自动收起——否则抽屉里显示的还是上一个项目的时间线。 */
   const [auditOpen, setAuditOpen] = useState(false);
   useEffect(() => {
     setAuditOpen(false);
-  }, [selectedProjectId]);
+  }, [viewingId]);
 
   const nav = useListNavigation({
     ids: projects.map((p) => p.id),
-    selectedId: selectedProjectId,
-    onSelect: (projectId) => dispatch({ type: "selectProject", projectId }),
+    selectedId: viewingId,
+    onSelect: (projectId) => setViewedId(projectId),
     idPrefix: "project",
   });
 
   useEffect(() => {
-    if (!selectedProjectId) return;
-    const row = document.getElementById(`project-${selectedProjectId}`);
+    if (!viewingId) return;
+    const row = document.getElementById(`project-${viewingId}`);
     // 老 WebView / jsdom 里可能没有这个方法，不能让它把渲染打断
     row?.scrollIntoView?.({ block: "nearest" });
-  }, [selectedProjectId]);
+  }, [viewingId]);
 
   return (
     <>
@@ -100,15 +115,31 @@ export function ProjectsScreen({ onNewProject }: { onNewProject: () => void }) {
                   <span>项目</span>
                   <span>工况</span>
                   <span>已拷卡</span>
-                  <span>分类进度</span>
+                  {/* 列头改「进度」(评审 5.8):A 项目在这列显示的是拷卡进度,
+                      「分类进度」的头会让人误读;口径由行内文字自述 */}
+                  <span>进度</span>
                   <span>备份</span>
-                  <span>最近事件</span>
+                  <span>最近活动</span>
                   <span>状态</span>
                   <span aria-hidden="true" />
                 </div>
 
                 {projects.length === 0 ? (
-                  <EmptyState art={<IllProjectsEmpty />}>还没有项目，先新建一个。</EmptyState>
+                  <EmptyState art={<IllProjectsEmpty />}>
+                    <div className="stack">
+                      <span>还没有项目，先新建一个。</span>
+                      <div>
+                        <button
+                          type="button"
+                          className="btn btn--primary btn--sm"
+                          data-testid="projects-empty-create"
+                          onClick={onNewProject}
+                        >
+                          新建项目
+                        </button>
+                      </div>
+                    </div>
+                  </EmptyState>
                 ) : (
                 <div {...nav.containerProps} aria-label="项目列表">
                   {projects.map((project) => (
@@ -183,8 +214,11 @@ export function ProjectsScreen({ onNewProject }: { onNewProject: () => void }) {
                         </span>
                       </span>
 
-                      <span className="projects__cell projects__cell--mono">
-                        {project.destinationCount} 处
+                      <span
+                        className="projects__cell projects__cell--mono"
+                        title={`拷卡时并行写 ${project.destinationCount} 个目的地`}
+                      >
+                        {project.destinationCount} 份
                       </span>
 
                       <span className="projects__cell projects__cell--mono">
@@ -198,7 +232,8 @@ export function ProjectsScreen({ onNewProject }: { onNewProject: () => void }) {
                       </span>
 
                       {/* 「当前操作项目」是全局状态,选中行的高亮太隐晦——
-                          每行给出显式动作,当前行给出显式黄标(UX 波) */}
+                          每行给出显式动作,当前行给出显式黄标(UX 波)。
+                          点行只浏览,按钮才切换(评审 5.4):两套线索指向同一心智 */}
                       <span className="projects__switch">
                         {project.id === selectedProjectId ? (
                           <span className="current-flag" data-testid="project-current-flag">
@@ -212,12 +247,15 @@ export function ProjectsScreen({ onNewProject }: { onNewProject: () => void }) {
                             /* listbox 走 roving tabindex,option 内不能再冒出
                                tab 停靠点;鼠标可点,键盘用行选中(等价操作) */
                             tabIndex={-1}
+                            disabled={opening}
                             onClick={(e) => {
                               e.stopPropagation();
-                              dispatch({ type: "selectProject", projectId: project.id });
+                              /* 双窗口下 selectProject 只动本窗口,必须经
+                                 窗口桥把项目投递给主窗口 */
+                              void openInMain(project.id, project.name);
                             }}
                           >
-                            切换到此项目
+                            在主窗口打开
                           </button>
                         )}
                       </span>
@@ -245,6 +283,26 @@ export function ProjectsScreen({ onNewProject }: { onNewProject: () => void }) {
                     <div className="card__head">
                       <span className="card__title">{selected.name}</span>
                       <div className="card__actions">
+                        {/* 拷卡是建项目后的第一件事、全周期最高频的动作:
+                            上浮到详情头部做 primary(评审 5.3),不再埋在
+                            目录树/交付状态之后要滚半屏才找得到 */}
+                        <button
+                          type="button"
+                          className="btn btn--primary btn--sm"
+                          data-testid="project-goto-copy"
+                          onClick={() => {
+                            // 看的是哪个项目,拷的就是哪个:先切当前再进屏
+                            if (selected.id !== selectedProjectId) {
+                              dispatch({
+                                type: "selectProject",
+                                projectId: selected.id,
+                              });
+                            }
+                            dispatch({ type: "navigate", route: "copy" });
+                          }}
+                        >
+                          进入拷卡任务
+                        </button>
                         {/* 全量业务事件（含他机）的入口，紧挨着「最近事件」那一行 */}
                         <button
                           type="button"

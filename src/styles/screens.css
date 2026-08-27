@@ -301,6 +301,11 @@
   align-items: center;
 }
 
+/* 非 NAS 目的地多一列「选盘…」快捷选择(评审 1.2) */
+.dest-row:has(> :nth-child(4)) {
+  grid-template-columns: 96px minmax(0, 1fr) 116px 32px;
+}
+
 /* ---- 拷卡仪表区：百分比与速度是这块屏的主角 ---- */
 
 .copy-hero {
@@ -328,6 +333,16 @@
   font-size: var(--text-md);
   font-weight: var(--weight-normal);
   color: var(--text-tertiary);
+}
+
+/* 校验阶段标注：大百分比的口径从「拷贝」切到「校验」时必须自我说明 */
+.copy-hero__phase {
+  margin-left: var(--space-3);
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  letter-spacing: 0;
+  color: var(--accent);
 }
 
 .copy-hero__vitals {
@@ -726,6 +741,17 @@
   color: var(--on-danger);
 }
 
+/* 已精选:常驻 ✓,与待删的 D 同一视觉体系;两者可同时在场,精选让位左移 */
+.asset__flag--curated {
+  background: var(--ok);
+  color: var(--on-danger); /* 深色前景规则与 danger 相同:浅底白字/深底黑字 */
+}
+
+.asset__flag--delete ~ .asset__flag--curated,
+.asset__flag--curated:has(~ .asset__flag--delete) {
+  right: calc(var(--space-2) + 22px);
+}
+
 .sorting__foot {
   display: flex;
   align-items: center;
@@ -830,10 +856,47 @@
   border: 1px dashed var(--border-strong);
 }
 
-/* 回收站 */
+/* 点击放大(v1 判焦辅助):只动 transform,不引发重排;stage 隐藏溢出 */
+.lightbox__image--zoomed {
+  transform: scale(2.4);
+  cursor: zoom-out;
+}
+
+.lightbox__image:not(.lightbox__image--empty) {
+  cursor: zoom-in;
+}
+
+.lightbox__stage {
+  overflow: hidden;
+}
+
+/* 顶栏状态徽标组:与文件名/元信息同一行,靠视觉分组读作「这张的状态」 */
+.lightbox__badges {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* 底部动作条:预览内直接打标(兼快捷键提示) */
+.lightbox__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+/* 新建项目:固定夹只读行(评审 D2),编号自解释 */
+.category-row--fixed {
+  opacity: 0.75;
+}
+
+/* 回收站(首列为勾选框:批量恢复,评审 4.2) */
 .trash__head,
 .trash__row {
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) 108px 80px 64px;
+  grid-template-columns: 28px minmax(0, 1fr) minmax(0, 1.4fr) 108px 80px 64px;
 }
 
 @media (max-width: 1180px) {

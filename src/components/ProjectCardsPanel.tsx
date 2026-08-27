@@ -81,9 +81,12 @@ export function ProjectCardsPanel({
         <span className="card__hint">
           {rosterIds.length > 0
             ? `${copied.size}/${rosterIds.length} 张已拷`
-            : "「已拷 x/y」的分母来自这份清单"}
+            : "列出本项目要用的卡,拷完一张记一张"}
         </span>
         <div className="card__actions">
+          {/* 「套用模板」是实现视角且行为是覆盖(评审 6.7):
+              高频诉求其实是「把登记卡都加进来」——改为并集,只增不删,
+              手工移出的卡不会被一键静默加回以外的方式覆盖丢失 */}
           <button
             type="button"
             className="btn btn--sm"
@@ -92,11 +95,13 @@ export function ProjectCardsPanel({
             title={
               cards.length === 0
                 ? "设备登记表里还没有卡,先去「设备登记」登记"
-                : "以设备登记表的全部卡为模板(替换当前清单)"
+                : "把设备登记表里的全部卡加入清单(只增不删)"
             }
-            onClick={() => void save(cards.map((c) => c.id))}
+            onClick={() =>
+              void save([...new Set([...rosterIds, ...cards.map((c) => c.id)])])
+            }
           >
-            套用登记表模板
+            添加全部登记卡
           </button>
         </div>
       </div>
@@ -124,7 +129,7 @@ export function ProjectCardsPanel({
             <p className="text-sm dim">
               {cards.length === 0
                 ? "设备登记表里还没有卡——先去「设备登记」把卡登记上,再回来配置本项目用卡。"
-                : "还没有配置本项目要用的卡。套用登记表模板一键填入,或在下方逐张添加;拷卡时实际用到的登记卡也会自动加进来。"}
+                : "列出本项目要用的卡,进度条按它统计。「添加全部登记卡」一键填入,或在下方逐张添加;拷卡时实际用到的登记卡也会自动加进来。"}
             </p>
           ) : (
             rosterIds.map((id) => {
@@ -153,26 +158,22 @@ export function ProjectCardsPanel({
 
           {roster !== null && addable.length > 0 ? (
             <div className="row-inline">
+              {/* 选中即添加(评审 6.7):选择本身就是意图,不再多点一次「添加」 */}
               <Select
                 ariaLabel="添加用卡"
                 testId="cards-add-select"
                 value={addId}
-                onChange={setAddId}
+                onChange={(next) => {
+                  setAddId(next);
+                  if (next) void save([...rosterIds, next]);
+                }}
+                disabled={busy}
                 placeholder="添加一张登记卡…"
                 options={addable.map((c) => ({
                   value: c.id,
                   label: c.label,
                 }))}
               />
-              <button
-                type="button"
-                className="btn btn--sm"
-                data-testid="cards-add"
-                disabled={busy || !addId}
-                onClick={() => void save([...rosterIds, addId])}
-              >
-                添加
-              </button>
             </div>
           ) : null}
         </div>

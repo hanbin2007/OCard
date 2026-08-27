@@ -43,6 +43,17 @@ export function SessionGuard() {
   // 引导/加载阶段没有会话可言；操作人都没配时轮不到会话守卫出场
   const armed = Boolean(workstation?.operator?.trim() && workstation?.nasRoot?.trim());
 
+  /**
+   * 拷卡进行中不算闲置(评审 2.4):拷一张 512G 卡轻松超过 15 分钟,
+   * 「守在旁边盯进度」是最正当的使用姿势。数据在动就是有人在干活——
+   * 落门只会把最关键的进度挡在 inert 后面。校验阶段同理。
+   * 用 ref 供判定定时器读取,避免任务状态变化反复重建定时器。
+   */
+  const copyActiveRef = useRef(false);
+  copyActiveRef.current = state.tasks.some(
+    (t) => t.state === "running" || t.state === "verifying",
+  );
+
   // 活动采集：捕获阶段挂在 window 上,任何交互都算“人还在”
   useEffect(() => {
     if (!armed) return;
@@ -74,6 +85,11 @@ export function SessionGuard() {
     if (!armed || phase === "ended") return;
     const timer = setInterval(() => {
       const now = Date.now();
+      // 拷卡/校验进行中:持续视为有人在场,闲置计时不断向前推
+      if (copyActiveRef.current) {
+        lastActivityRef.current = now;
+        return;
+      }
       if (phase === "active" && now - lastActivityRef.current >= IDLE_PROMPT_MS) {
         promptAtRef.current = now;
         setPhase("prompt");
@@ -83,6 +99,17 @@ export function SessionGuard() {
     }, IDLE_TICK_MS);
     return () => clearInterval(timer);
   }, [armed, phase]);
+
+  // 询问弹窗里的实时倒计时:从远处一瞥就知道还剩多久(评审 2.4 附带)
+  const [countdownMs, setCountdownMs] = useState(PROMPT_GRACE_MS);
+  useEffect(() => {
+    if (phase !== "prompt") return;
+    setCountdownMs(PROMPT_GRACE_MS);
+    const timer = setInterval(() => {
+      setCountdownMs(Math.max(0, PROMPT_GRACE_MS - (Date.now() - promptAtRef.current)));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [phase]);
 
   const resume = useCallback(() => {
     lastActivityRef.current = Date.now();
@@ -173,8 +200,12 @@ export function SessionGuard() {
             还在吗？
           </h2>
           <p className="dialog__message" id="session-idle-message">
-            已经 15 分钟没有操作了。继续会话请确认；5 分钟内无应答将结束当前会话，
-            之后需要重新确认操作员（后台的拷卡/转码作业不会中断）。
+            已经 15 分钟没有操作了。继续会话请确认；
+            <strong data-testid="session-idle-countdown">
+              {Math.floor(countdownMs / 60000)}:
+              {String(Math.floor((countdownMs % 60000) / 1000)).padStart(2, "0")}
+            </strong>{" "}
+            后将自动结束当前会话，之后需要重新确认操作员（后台的拷卡/转码作业不会中断）。
           </p>
           <div className="dialog__actions">
             <button

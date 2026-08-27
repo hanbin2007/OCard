@@ -12,6 +12,7 @@ import type { CopyTask, JobSnapshot, JobState } from "../api/types";
 import { isArchiveResult, isJobTerminal, isTranscodeJob } from "../api/types";
 import {
   formatBytes,
+  formatEta,
   formatPercent,
   formatSpeed,
   formatTimestamp,
@@ -20,11 +21,11 @@ import {
 import { TASK_STATE_LABEL, TASK_STATE_TONE } from "../lib/labels";
 import { withViewTransition } from "../lib/motion";
 import {
-  selectDeliveryWorking,
   useNotify,
   useStore,
   type RouteName,
 } from "../state/store";
+import { useWindowBridge } from "../state/windowBridge";
 import { IconTasks } from "./Icon";
 import { Badge, ProgressBar } from "./ui";
 
@@ -66,11 +67,11 @@ function isCopyActive(t: CopyTask): boolean {
 export function TaskCenter() {
   const { state, dispatch, refreshTask, reconcileJobs } = useStore();
   const notify = useNotify();
+  const bridge = useWindowBridge();
   const open = state.taskCenterOpen;
   /** 在途操作的行 id:按下即禁用并显示进行中回执(评审 P2) */
   const [busyId, setBusyId] = useState<string | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
-  const deliveryWorking = selectDeliveryWorking(state);
 
   const projectName = useCallback(
     (projectId: string) =>
@@ -160,13 +161,10 @@ export function TaskCenter() {
     .slice(0, HISTORY_CAP);
 
   /**
-   * 跳到任务所在的项目与屏。两道交付锁:
-   * - 当前项目在交付:与侧栏同一把锁,整体禁跳(行按钮已禁用,这里兜底);
-   * - 目标项目在交付:selectProject 之后侧栏立即上锁,若落在分类屏之外
-   *   用户会被困在错误页面——统一改道去分类屏(交付面板所在地)。
+   * 跳到任务所在的项目与屏。打包期间导航已放行(评审 4.3);
+   * 目标项目在交付时仍改道去「选片与交付」屏——交付面板在那里。
    */
   function jumpTo(projectId: string, route: RouteName, taskId?: string) {
-    if (deliveryWorking) return;
     const targetDelivering = state.jobs.some(
       (j) =>
         j.kind === "delivery" &&
@@ -227,7 +225,7 @@ export function TaskCenter() {
       notify(
         "warning",
         "copy-pause-failed",
-        `${task.state === "paused" ? "继续" : "挂起"}拷卡失败：${
+        `${task.state === "paused" ? "继续" : "暂停"}拷卡失败：${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -276,13 +274,8 @@ export function TaskCenter() {
                 <button
                   type="button"
                   className="task-item__main"
-                  disabled={deliveryWorking}
                   aria-label={`打开拷卡任务：${projectName(task.projectId)}`}
-                  title={
-                    deliveryWorking
-                      ? "交付打包进行中，完成后才能切换页面"
-                      : "打开拷卡任务"
-                  }
+                  title="打开拷卡任务"
                   onClick={() => jumpTo(task.projectId, "copy", task.id)}
                 >
                   <span className="task-item__title">
@@ -306,6 +299,13 @@ export function TaskCenter() {
                       ? ` · ${formatSpeed(task.speedBytesPerSec)}`
                       : ""}
                     {` · ${formatPercent(ratio(task.copiedBytes, task.totalBytes))}`}
+                    {/* 任务中心里最想知道的就是「还要多久」(评审 C3) */}
+                    {task.state === "running"
+                      ? ` · 剩 ${formatEta(
+                          task.totalBytes - task.copiedBytes,
+                          task.speedBytesPerSec,
+                        )}`
+                      : ""}
                   </span>
                 </button>
                 <button
@@ -314,7 +314,7 @@ export function TaskCenter() {
                   data-testid={
                     task.state === "paused" ? "task-resume" : "task-pause"
                   }
-                  aria-label={`${task.state === "paused" ? "继续" : "挂起"}拷卡：${projectName(task.projectId)}`}
+                  aria-label={`${task.state === "paused" ? "继续" : "暂停"}拷卡：${projectName(task.projectId)}`}
                   disabled={busyId === task.id}
                   onClick={() => void pauseOrResume(task)}
                 >
@@ -322,7 +322,7 @@ export function TaskCenter() {
                     ? "处理中…"
                     : task.state === "paused"
                       ? "继续"
-                      : "挂起"}
+                      : "暂停"}
                 </button>
               </div>
             ))}
@@ -353,13 +353,8 @@ export function TaskCenter() {
                 <button
                   type="button"
                   className="task-item__main"
-                  disabled={deliveryWorking}
                   aria-label={`打开${jobLabel(job)}：${projectName(job.projectId)}`}
-                  title={
-                    deliveryWorking
-                      ? "交付打包进行中，完成后才能切换页面"
-                      : "打开对应页面"
-                  }
+                  title="打开对应页面"
                   onClick={() => jumpTo(job.projectId, JOB_ROUTE[job.kind])}
                 >
                   <span className="task-item__title">
@@ -405,13 +400,8 @@ export function TaskCenter() {
                     <button
                       type="button"
                       className="task-item__main"
-                      disabled={deliveryWorking}
                       aria-label={`打开历史记录：${h.label}`}
-                      title={
-                        deliveryWorking
-                          ? "交付打包进行中，完成后才能切换页面"
-                          : "打开对应页面"
-                      }
+                      title="打开对应页面"
                       onClick={() => jumpTo(h.projectId, h.route, h.taskId)}
                     >
                       <span className="task-item__title">
@@ -438,6 +428,19 @@ export function TaskCenter() {
                     </button>
                   </div>
                 ))}
+                {/* 「翻旧账走审计日志」不能只是一句注释(评审 C2):给条路 */}
+                <button
+                  type="button"
+                  className="btn btn--ghost btn--sm"
+                  data-testid="task-history-audit"
+                  onClick={() => {
+                    closePanel();
+                    // 审计日志入口在项目管理窗口的项目详情里
+                    void bridge.openManager();
+                  }}
+                >
+                  查看完整记录（项目管理 → 审计日志）
+                </button>
               </>
             ) : null}
           </div>

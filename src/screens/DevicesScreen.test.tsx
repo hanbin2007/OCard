@@ -231,7 +231,7 @@ describe("插卡绑定登记(UX 波二)", () => {
     expect(screen.queryByRole("option", { name: /Macintosh HD/ })).toBeNull();
   });
 
-  it("已绑定指纹的卡在列表带「指纹」徽标,未绑定带「卷标」", () => {
+  it("已绑定的卡带「自动识别」徽标,未绑定带「仅按名称识别」(评审 E4)", () => {
     render(
       <App
         preloaded={{
@@ -244,7 +244,7 @@ describe("插卡绑定登记(UX 波二)", () => {
         }}
       />,
     );
-    expect(screen.getAllByText("指纹")).toHaveLength(1);
-    expect(screen.getAllByText("卷标").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("自动识别")).toHaveLength(1);
+    expect(screen.getAllByText("仅按名称识别").length).toBeGreaterThan(0);
   });
 });

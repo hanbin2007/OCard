@@ -35,6 +35,10 @@ export function DeliveryButton({
   /** 已被用户关掉的终态作业 id：关掉后不再自动弹回来 */
   const [dismissed, setDismissed] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
+  /** 转入后台的作业 id(评审 4.3):进度收进任务中心,完成时结果自动弹回 */
+  const [backgrounded, setBackgrounded] = useState<string | null>(null);
+  /** 打包前检查清单拉取中(评审 4.1) */
+  const [checking, setChecking] = useState(false);
 
   useEffect(() => {
     onWorkingChange?.(working);
@@ -106,15 +110,61 @@ export function DeliveryButton({
     }
   }
 
-  function requestConfirm() {
+  /**
+   * 打包前检查清单(评审 4.1):确认框必须回答「缺什么」——
+   * 待分类还剩多少没分、待修里有几个已出成品,都摆在眼前;
+   * 有 ⚠️ 仍可继续,但必须是看见之后的决定。文字墙拆成条目(评审 4.5)。
+   */
+  async function requestConfirm() {
+    if (checking) return;
+    setChecking(true);
+    let pendingLeft: number | null = null;
+    let todoWithDone: number | null = null;
+    try {
+      const [page, hints] = await Promise.all([
+        api.listPendingAssets(projectId, 0, 1),
+        api.curatedFlowHints(projectId),
+      ]);
+      pendingLeft = page.total;
+      todoWithDone = hints.length;
+    } catch {
+      // 检查项拿不到不拦打包:清单里如实标「未能核对」
+    } finally {
+      setChecking(false);
+    }
     setConfirm({
       title: "开始交付打包？",
-      message:
-        "将按拍摄时间把「各分类 + 精选/已修 + 其他」复制成半天一个包（待分类与待修不交付），" +
-        "不压缩、不改动分类夹里的原件，同时生成交付清单。" +
-        "已打包过的文件会跳过而不是覆盖。" +
-        "打包期间请勿在任何工作站进行分类操作。" +
-        "打包完成后，上传网盘与发送链接仍需人工完成。",
+      message: (
+        <div className="stack stack--sm" data-testid="delivery-checklist">
+          <span
+            className={pendingLeft === 0 ? "text-sm" : "text-sm text-warn"}
+            data-testid="delivery-check-pending"
+          >
+            {pendingLeft == null
+              ? "⚠️ 未能核对待分类剩余数量（NAS 读取失败）"
+              : pendingLeft === 0
+                ? "✓ 待分类已清空"
+                : `⚠️ 待分类还剩 ${pendingLeft} 张没分——它们不会进包`}
+          </span>
+          <span
+            className={todoWithDone ? "text-sm text-warn" : "text-sm"}
+            data-testid="delivery-check-flow"
+          >
+            {todoWithDone == null
+              ? "⚠️ 未能核对「待修 → 已修」流转"
+              : todoWithDone === 0
+                ? "✓ 待修没有遗留的已出成品原稿"
+                : `⚠️ ${todoWithDone} 个待修原稿已有成品,建议先清理`}
+          </span>
+          <span className="text-sm">
+            · 按拍摄时间把「各分类 + 精选/已修 + 其他」复制成半天一个包（待分类与待修不交付）
+          </span>
+          <span className="text-sm">· 不压缩、不改动分类夹里的原件，同时生成交付清单</span>
+          <span className="text-sm">· 已打包过的文件会跳过而不是覆盖，重跑安全</span>
+          <span className="text-sm">· 打包期间请勿在任何工作站进行分类操作</span>
+          <span className="text-sm">· 打包完成后，上传网盘与发送链接仍需人工完成</span>
+        </div>
+      ),
       confirmLabel: "开始打包",
       onConfirm: () => void start(),
     });
@@ -131,16 +181,33 @@ export function DeliveryButton({
         type="button"
         className="btn btn--sm"
         data-testid="delivery-open"
-        disabled={working}
-        onClick={requestConfirm}
+        disabled={working || checking}
+        onClick={() => void requestConfirm()}
       >
-        {working ? "打包中…" : "交付打包"}
+        {working ? "打包中…" : checking ? "核对中…" : "交付打包"}
       </button>
+
+      {/* 关掉的结果随时找得回来(评审 E3):交付路径不必去文件系统翻 */}
+      {terminal && dismissed === job?.id ? (
+        <button
+          type="button"
+          className="btn btn--ghost btn--sm"
+          data-testid="delivery-last-result"
+          onClick={() => setDismissed(null)}
+        >
+          上次打包结果
+        </button>
+      ) : null}
 
       <ConfirmDialog request={confirm} onCancel={() => setConfirm(null)} />
 
-      {working && job ? (
-        <DeliveryProgress job={job} cancelling={cancelling} onCancel={cancel} />
+      {working && job && backgrounded !== job.id ? (
+        <DeliveryProgress
+          job={job}
+          cancelling={cancelling}
+          onCancel={cancel}
+          onBackground={() => setBackgrounded(job.id)}
+        />
       ) : null}
 
       {showResult && job ? (
@@ -162,15 +229,18 @@ export function DeliveryButton({
   );
 }
 
-/** 进度视图：当前文件 + done/total + 进度条 + 取消 */
+/** 进度视图：当前文件 + done/total + 进度条 + 取消/转后台 */
 function DeliveryProgress({
   job,
   cancelling,
   onCancel,
+  onBackground,
 }: {
   job: DeliveryJob;
   cancelling: boolean;
   onCancel: () => void;
+  /** 收进任务中心继续跑(评审 4.3):几十分钟的复制不该占死全屏 */
+  onBackground: () => void;
 }) {
   return (
     <div className="overlay">
@@ -219,7 +289,18 @@ function DeliveryProgress({
             >
               {cancelling ? "正在取消…" : "取消打包"}
             </button>
+            <button
+              type="button"
+              className="btn btn--primary"
+              data-testid="delivery-background"
+              onClick={onBackground}
+            >
+              转入后台
+            </button>
           </div>
+          <p className="text-2xs dim">
+            转入后台后进度在顶栏「任务中心」里；打包完成会自动弹出结果。
+          </p>
         </div>
       </div>
     </div>

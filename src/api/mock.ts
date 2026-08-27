@@ -448,6 +448,13 @@ export const mockCopyTasks: CopyTask[] = [
   },
 ];
 
+// 全量状态计数(评审 2.5):真实后端在快照/进度事件里聚合,mock 从 files 现算
+for (const t of mockCopyTasks) {
+  const counts = { pending: 0, copied: 0, verified: 0, failed: 0 };
+  for (const f of t.files) counts[f.status] += 1;
+  t.statusCounts = counts;
+}
+
 /* ------------------------------------------------------------------ *
  * 分类工作台 mock
  * ------------------------------------------------------------------ */

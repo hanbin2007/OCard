@@ -37,5 +37,8 @@ export default defineConfig(async () => ({
     include: ["src/**/*.test.{ts,tsx}"],
     css: false,
     restoreMocks: true,
+    // 本地偏好(lib/prefs)会写 localStorage:用例之间必须隔离,
+    // 否则上一个用例记住的目的地/归档目录会预填进下一个用例的表单
+    setupFiles: ["src/testSetup.ts"],
   },
 }));

@@ -31,6 +31,12 @@ export interface VirtualGridProps<T> {
   className?: string;
   ariaLabel?: string;
   onColumnsChange?: (columns: number) => void;
+  /**
+   * 渲染窗口触到列表尾部时回调(评审 3.7 自动加载):
+   * 调用方据此续拉下一页,把「滚到底还要伸手点按钮」的断点抹掉。
+   * 同一批 items 只会触发一次;items 变化(加载进来了)后重新武装。
+   */
+  onEndReached?: () => void;
 }
 
 export function VirtualGrid<T>({
@@ -44,6 +50,7 @@ export function VirtualGrid<T>({
   className,
   ariaLabel,
   onColumnsChange,
+  onEndReached,
 }: VirtualGridProps<T>) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -88,6 +95,16 @@ export function VirtualGrid<T>({
   const startIndex = firstRow * columns;
   const endIndex = Math.min(items.length, lastRow * columns);
   const visible = items.slice(startIndex, endIndex);
+
+  // 渲染窗口触底 → 通知调用方续拉。按 items 引用武装一次,避免连环触发
+  const endNotifiedRef = useRef<T[] | null>(null);
+  useEffect(() => {
+    if (!onEndReached || items.length === 0) return;
+    if (endIndex < items.length) return;
+    if (endNotifiedRef.current === items) return;
+    endNotifiedRef.current = items;
+    onEndReached();
+  }, [endIndex, items, onEndReached]);
 
   /*
    * 键盘移动焦点后把它滚进可视区。

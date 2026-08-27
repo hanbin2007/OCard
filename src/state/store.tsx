@@ -16,6 +16,7 @@ import {
   type ReactNode,
 } from "react";
 import * as api from "../api";
+import { loadPref, savePref } from "../lib/prefs";
 import type {
   CameraReg,
   CopyDestination,
@@ -71,6 +72,9 @@ export interface NoticeEntry {
   lastRepeats: number;
   read: boolean;
   live: boolean;
+  /** 关联拷卡任务(拷卡终态通知):点击直达任务 */
+  taskId?: string;
+  projectId?: string;
 }
 
 export interface AppState {
@@ -143,6 +147,7 @@ export type AppAction =
   | { type: "noticeReceived"; notice: NoticeDto }
   | { type: "noticesReplayed"; notices: NoticeDto[] }
   | { type: "noticeAcknowledged"; id: string }
+  | { type: "noticesAllAcknowledged" }
   | { type: "noticeToastDismissed"; id: string }
   | { type: "noticeDismissed"; id: string }
   | { type: "noticesCleared" }
@@ -230,7 +235,38 @@ function applyProgress(task: CopyTask, event: CopyProgressEvent): CopyTask {
     finishedAt: task.finishedAt ?? (terminal ? event.occurredAt : undefined),
     files: mergeFiles(task.files, event.changedFiles),
     destinations: mergeDestinations(task.destinations, event.changedDestinations),
+    statusCounts: event.statusCounts ?? task.statusCounts,
   };
+}
+
+/**
+ * 拷卡终态必须全局出声(评审 2.1):完成/失败是全应用最重要的两个事件,
+ * 用户大概率不在拷卡屏。done 走 info toast(自动收进铃铛),
+ * failed 走 error(常驻、须确认)。通知带 taskId/projectId,点击直达任务。
+ */
+function terminalNotice(before: CopyTask, after: CopyTask): NoticeDto | null {
+  if (before.state === after.state) return null;
+  if (after.state === "done") {
+    return {
+      level: "info",
+      code: "copy-task-done",
+      message: `「${after.volumeName}」校验 100% 通过，本卡可格式化（请在相机内格式化）。`,
+      occurredAt: after.finishedAt ?? new Date().toISOString(),
+      taskId: after.id,
+      projectId: after.projectId,
+    };
+  }
+  if (after.state === "failed") {
+    return {
+      level: "error",
+      code: "copy-task-failed",
+      message: `「${after.volumeName}」拷卡失败。点击查看失败文件与原因，可一键重试全部失败文件。`,
+      occurredAt: after.finishedAt ?? new Date().toISOString(),
+      taskId: after.id,
+      projectId: after.projectId,
+    };
+  }
+  return null;
 }
 
 /**
@@ -353,6 +389,8 @@ function ingestNotice(
     lastRepeats: repeats ?? 1,
     read: false,
     live: options.live,
+    taskId: notice.taskId,
+    projectId: notice.projectId,
   };
   return {
     notices: [entry, ...bucket.notices],
@@ -483,14 +521,29 @@ export function reducer(state: AppState, action: AppAction): AppState {
         ),
       };
 
-    case "projectCreated":
-      // 不再切路由:创建发生在欢迎窗口的引导里,主窗口经「打开项目」投递进入
-      return {
+    case "projectCreated": {
+      // 不切路由:创建发生在欢迎窗口的引导里,主窗口经「打开项目」投递进入
+      const next = {
         ...state,
         projects: [action.project, ...state.projects],
         selectedProjectId: action.project.id,
         selectedTaskId: null,
       };
+      // 建完项目把人往下一步送(评审 5.3/G2):插卡引导会接手后续
+      return {
+        ...next,
+        ...ingestNotice(
+          next,
+          {
+            level: "info",
+            code: "project-created",
+            message: `项目「${action.project.name}」已创建。插入存储卡即可开始拷卡。`,
+            occurredAt: new Date().toISOString(),
+          },
+          { live: true },
+        ),
+      };
+    }
 
     case "cameraCreated":
       return { ...state, cameras: [...state.cameras, action.camera] };
@@ -534,12 +587,14 @@ export function reducer(state: AppState, action: AppAction): AppState {
           orphanProgress: { ...state.orphanProgress, [event.taskId]: event },
         };
       }
-      return {
+      const before = state.tasks.find((t) => t.id === event.taskId)!;
+      const after = applyProgress(before, event);
+      const next = {
         ...state,
-        tasks: state.tasks.map((task) =>
-          task.id === event.taskId ? applyProgress(task, event) : task,
-        ),
+        tasks: state.tasks.map((task) => (task.id === event.taskId ? after : task)),
       };
+      const notice = terminalNotice(before, after);
+      return notice ? { ...next, ...ingestNotice(next, notice, { live: true }) } : next;
     }
 
     case "taskSnapshot": {
@@ -551,13 +606,17 @@ export function reducer(state: AppState, action: AppAction): AppState {
       const exists = local !== undefined;
       const rest = { ...state.orphanProgress };
       delete rest[merged.id];
-      return {
+      const next = {
         ...state,
         tasks: exists
           ? state.tasks.map((t) => (t.id === merged.id ? merged : t))
           : [merged, ...state.tasks],
         orphanProgress: rest,
       };
+      // 事件丢失时终态可能由快照对账补上——同样要出声;
+      // 本地此前不存在的任务(重启恢复/他机任务)不算「刚刚结束」,不打扰
+      const notice = local ? terminalNotice(local, merged) : null;
+      return notice ? { ...next, ...ingestNotice(next, notice, { live: true }) } : next;
     }
 
     case "noticeReceived":
@@ -590,6 +649,14 @@ export function reducer(state: AppState, action: AppAction): AppState {
         notices: state.notices.map((n) =>
           n.id === action.id ? { ...n, read: true, live: false } : n,
         ),
+      };
+
+    case "noticesAllAcknowledged":
+      // 一次动作代表「我都看到了」(评审 6.8):一场 NAS 断连的 N 条 error
+      // 不该要求点 2N 下。零静默要求的是「看见」,不是逐条点击。
+      return {
+        ...state,
+        notices: state.notices.map((n) => ({ ...n, read: true, live: false })),
       };
 
     case "noticeToastDismissed":
@@ -694,15 +761,61 @@ export function StoreProvider({
   /** 测试可注入初始状态，跳过异步 bootstrap */
   preloaded?: Partial<AppState>;
 }) {
-  const [state, dispatch] = useReducer(reducer, {
-    ...initialState,
-    ...preloaded,
-    loading: preloaded ? false : initialState.loading,
-  });
+  const [state, dispatch] = useReducer(
+    reducer,
+    undefined,
+    // 重启回到原地(评审 5.7):路由与当前项目从本地偏好恢复——
+    // 更新安装必然重启,每次都重选项目/重新导航是纯重复劳动。
+    // 恢复的项目 id 若在新数据里不存在,bootstrapped 会按既有规则回退到首个。
+    // 测试注入 preloaded 时不读偏好,保持用例相互隔离。
+    () => {
+      const restored =
+        preloaded === undefined
+          ? loadPref<{ route?: RouteName; selectedProjectId?: string | null }>(
+              "ui",
+              {},
+            )
+          : {};
+      return {
+        ...initialState,
+        ...(restored.route && ROUTE_ORDER.includes(restored.route)
+          ? { route: restored.route }
+          : {}),
+        ...(restored.selectedProjectId
+          ? { selectedProjectId: restored.selectedProjectId }
+          : {}),
+        ...preloaded,
+        loading: preloaded ? false : initialState.loading,
+      };
+    },
+  );
 
   const skipBootstrap = preloaded !== undefined;
   const [reloadToken, setReloadToken] = useState(0);
   const reload = useCallback(() => setReloadToken((n) => n + 1), []);
+
+  // 路由/当前项目随用随存(评审 5.7);测试注入态不落盘
+  useEffect(() => {
+    if (skipBootstrap) return;
+    savePref("ui", {
+      route: state.route,
+      selectedProjectId: state.selectedProjectId,
+    });
+  }, [skipBootstrap, state.route, state.selectedProjectId]);
+
+  // DEV 专用:浏览器预览/截图脚本的状态注入句柄(生产构建整段剔除,不改行为)
+  const devStateRef = useRef(state);
+  devStateRef.current = state;
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    (window as unknown as Record<string, unknown>).__ocardDev = {
+      dispatch,
+      getState: () => devStateRef.current,
+    };
+    return () => {
+      delete (window as unknown as Record<string, unknown>).__ocardDev;
+    };
+  }, []);
 
   /**
    * 全局兜底网（零静默铁律）：任何漏掉 catch 的 Promise rejection 都不允许

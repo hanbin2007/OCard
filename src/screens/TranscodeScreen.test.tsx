@@ -193,14 +193,15 @@ describe("作业生命周期", () => {
     spy.mockRestore();
   });
 
-  it("#5 强制全转文案说真话：不承诺重转已有输出", async () => {
+  it("#5 全转勾选文案说人话且不承诺重转已有输出(评审 6.6)", async () => {
     render(<App preloaded={preloaded(projectA.id)} />);
     const label = (await screen.findByTestId("transcode-force-all")).closest(
       "label",
     ) as HTMLElement;
-    expect(label.textContent).toContain("忽略「高负载」判定");
+    // 「高负载判定」是引擎黑话:文案改说默认转哪些
+    expect(label.textContent).toContain("把所有视频都转代理");
+    expect(label.textContent).toContain("默认只转");
     expect(label.textContent).toContain("不会");
-    // 旧文案承诺「重转所有素材」，与后端行为不符
     expect(label.textContent).not.toContain("重转所有素材");
   });
 
@@ -424,7 +425,25 @@ describe("归档转码", () => {
     await user.type(screen.getByTestId("archive-dir"), "归档/2026");
     await user.click(screen.getByTestId("archive-start"));
 
-    expect(screen.getByTestId("archive-error").textContent).toContain("绝对路径");
+    // 错误就近显示在字段旁(评审 #4),不再是按钮下方的独立红字
+    const alerts = screen.getAllByRole("alert").map((el) => el.textContent ?? "");
+    expect(alerts.some((t) => t.includes("绝对路径"))).toBe(true);
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("归档目录选进项目文件夹内会被前端就地拦下(评审 #6)", async () => {
+    const user = await ready();
+    const spy = vi.spyOn(api, "startArchiveTranscode");
+
+    await user.type(
+      screen.getByTestId("archive-dir"),
+      `/Volumes/DIT-NAS/Projects/${projectA.folderName}/归档`,
+    );
+    await user.click(screen.getByTestId("archive-start"));
+
+    const alerts = screen.getAllByRole("alert").map((el) => el.textContent ?? "");
+    expect(alerts.some((t) => t.includes("项目文件夹内"))).toBe(true);
     expect(spy).not.toHaveBeenCalled();
     spy.mockRestore();
   });

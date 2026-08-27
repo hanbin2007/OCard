@@ -54,6 +54,34 @@ describe("闲置询问", () => {
     expect(screen.getByTestId("session-idle-dialog")).toBeDefined();
   });
 
+  it("拷卡/校验进行中不算闲置:盯进度不该被门挡住(评审 2.4)", async () => {
+    const { mockCopyTasks } = await import("../api/mock");
+    render(
+      <App
+        preloaded={{
+          ...preloaded,
+          tasks: [{ ...mockCopyTasks[0], state: "running" as const }],
+        }}
+      />,
+    );
+
+    // 远超闲置阈值也不弹:数据在动就是有人在干活
+    advance(IDLE_PROMPT_MS * 2 + IDLE_TICK_MS);
+    expect(screen.queryByTestId("session-idle-dialog")).toBeNull();
+  });
+
+  it("询问弹窗带实时倒计时", () => {
+    render(<App preloaded={preloaded} />);
+    advance(IDLE_PROMPT_MS + IDLE_TICK_MS);
+
+    const countdown = screen.getByTestId("session-idle-countdown");
+    expect(countdown.textContent).toBe("5:00");
+    advance(61_000);
+    expect(
+      screen.getByTestId("session-idle-countdown").textContent?.startsWith("3:"),
+    ).toBe(true);
+  });
+
   it("有操作就不会弹:活动把闲置计时推回去", () => {
     render(<App preloaded={preloaded} />);
 

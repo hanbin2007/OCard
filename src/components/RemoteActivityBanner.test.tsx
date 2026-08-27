@@ -226,9 +226,15 @@ describe("轮询与失败降级", () => {
 describe("同卷名警告", () => {
   async function reachConfirm(user: ReturnType<typeof userEvent.setup>) {
     await user.click(screen.getByRole("radio", { name: "选择源卷 SONY_A7M4" }));
+    // 标签系统(启动重构)取代自由备注
     await user.type(screen.getByLabelText("内容标签"), "上午田赛");
     await user.keyboard("{Enter}");
-    await user.type(screen.getByLabelText("第 2 个目的地路径"), "/backup/ocard");
+    // 该项目设置里有备份盘预设,异步落进第 2 行;手动添加会与之竞态,等预设即可
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText("第 2 个目的地路径") as HTMLInputElement).value,
+      ).not.toBe(""),
+    );
     await user.click(screen.getByRole("button", { name: "开始拷卡" }));
     await waitFor(() =>
       expect(screen.getByTestId("confirm-target-folder").textContent).not.toBe("解析中…"),

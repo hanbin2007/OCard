@@ -138,6 +138,31 @@ export function actionTargets(selection: Selection): string[] {
   return selection.cursor ? [selection.cursor] : [];
 }
 
+/**
+ * 分类/删除把条目移出网格后,光标应落在被移除块的**下一个**条目上
+ * (评审 3.1):「看一张→按一键→看下一张」的循环不能每次都断在
+ * 「光标归零、方向键从头找位置」上——这是 Photo Mechanic/Lightroom
+ * 选片流的标准模型。块尾没有下一个时退而落在前一个;全移光了返回 null。
+ */
+export function nextCursorAfterRemoval(
+  ids: string[],
+  removedIds: string[],
+): string | null {
+  const removed = new Set(removedIds);
+  let lastRemovedAt = -1;
+  for (let i = 0; i < ids.length; i += 1) {
+    if (removed.has(ids[i])) lastRemovedAt = i;
+  }
+  if (lastRemovedAt < 0) return null;
+  for (let i = lastRemovedAt + 1; i < ids.length; i += 1) {
+    if (!removed.has(ids[i])) return ids[i];
+  }
+  for (let i = lastRemovedAt - 1; i >= 0; i -= 1) {
+    if (!removed.has(ids[i])) return ids[i];
+  }
+  return null;
+}
+
 /* ------------------------------------------------------------------ *
  * 快捷键映射
  * ------------------------------------------------------------------ */
@@ -152,7 +177,11 @@ export type SortingAction =
   | { type: "toggle" }
   | { type: "selectAll" }
   | { type: "move"; key: string; extend: boolean }
-  | { type: "closePreview" };
+  | { type: "closePreview" }
+  /** 网格态 Esc:清空选区(评审 3.8;预览打开时 Esc 仍是关预览) */
+  | { type: "clearSelection" }
+  /** Shift+D:待删清单直接进入确认(评审 3.9,标完不必再摸鼠标) */
+  | { type: "confirmDelete" };
 
 export interface KeyEventLike {
   key: string;
@@ -201,7 +230,8 @@ export function resolveShortcut(
   }
   if (key === " ") return { type: "toggle" };
   if (key === "Enter") return { type: "preview" };
-  if (key === "Escape") return { type: "closePreview" };
+  // 网格态 Esc = 清空选区;预览态在上面已拦下作关预览
+  if (key === "Escape") return { type: "clearSelection" };
 
   if (/^[1-9]$/.test(key)) {
     const hotkey = Number(key);
@@ -217,7 +247,8 @@ export function resolveShortcut(
     case "o":
       return { type: "other" };
     case "d":
-      return { type: "markDelete" };
+      // Shift+D 提交待删清单;裸 D 由调用方做 toggle(全部已标→取消,否则标记)
+      return event.shiftKey ? { type: "confirmDelete" } : { type: "markDelete" };
     case "u":
       return { type: "unmarkDelete" };
     default:
@@ -444,6 +475,27 @@ export function resolveEntryIds<T extends { id: string }>(
   return [...new Set(out)];
 }
 
+/**
+ * 按「这些素材被移走后」计算将随之消失的条目 id:
+ * 单件条目 = 素材本身被移走;组条目 = 组内全部成员被移走(部分移走的组留在原地)。
+ * 与 nextCursorAfterRemoval 配对使用——光标前进要在条目 id 空间里算。
+ */
+export function removedEntryIds<T extends { id: string }>(
+  entries: Array<GridEntry<T>>,
+  removedAssetIds: string[],
+): string[] {
+  const removed = new Set(removedAssetIds);
+  const out: string[] = [];
+  for (const entry of entries) {
+    if (entry.kind === "group") {
+      if (entry.items.every((item) => removed.has(item.id))) out.push(entry.id);
+    } else if (removed.has(entry.asset.id)) {
+      out.push(entry.id);
+    }
+  }
+  return out;
+}
+
 /** 把网格条目摊平成显示顺序的素材列表——预览用的**唯一**下标空间 */
 export function flattenEntries<T extends { id: string }>(
   entries: Array<GridEntry<T>>,
@@ -462,4 +514,50 @@ export function filterBySuggestion<
 >(assets: T[], enabled: boolean): T[] {
   if (!enabled) return assets;
   return assets.filter((a) => !a.judgement || a.judgement.suggestedKeep);
+}
+
+/**
+ * 判定筛选组(评审 3.6):选片的两个批量动作是「这批全要」和「这批全不要」。
+ * 旧的单勾选只支持前一半——「AI 建议放弃的全标删」没有任何路径。
+ * keep 沿用旧口径(建议保留 + 未判定,漏判不该被藏起来);
+ * drop 是它的严格反集(有判定且不建议保留),两边拼起来恰好覆盖全量。
+ */
+export type JudgementFilter =
+  | "all"
+  | "keep"
+  | "drop"
+  | "blurry"
+  | "lowScore"
+  | "unjudged";
+
+export const JUDGEMENT_FILTER_LABEL: Record<JudgementFilter, string> = {
+  all: "全部",
+  keep: "建议保留（含未判定）",
+  drop: "建议放弃",
+  blurry: "糊片",
+  lowScore: "低分",
+  unjudged: "未判定",
+};
+
+export function filterByJudgement<
+  T extends {
+    judgement?: { suggestedKeep: boolean; blurry: boolean; score: number };
+  },
+>(assets: T[], filter: JudgementFilter, lowScoreAt: number): T[] {
+  switch (filter) {
+    case "keep":
+      return assets.filter((a) => !a.judgement || a.judgement.suggestedKeep);
+    case "drop":
+      return assets.filter((a) => a.judgement && !a.judgement.suggestedKeep);
+    case "blurry":
+      return assets.filter((a) => a.judgement?.blurry);
+    case "lowScore":
+      return assets.filter(
+        (a) => a.judgement !== undefined && a.judgement.score < lowScoreAt,
+      );
+    case "unjudged":
+      return assets.filter((a) => !a.judgement);
+    default:
+      return assets;
+  }
 }

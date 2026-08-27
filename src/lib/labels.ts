@@ -10,9 +10,13 @@ import type {
 } from "../api/types";
 import type { BadgeTone } from "../components/ui";
 
+/**
+ * 术语原则(评审 7.x):主文案说人话,规范编号做附注——
+ * 「视频项目/拍照项目」才是有区分度的信息,「工况 A/B」只为对照纸面规范保留。
+ */
 export const SCENARIO_LABEL: Record<Scenario, string> = {
-  A: "工况 A · 视频剪辑",
-  B: "工况 B · 纯拍照",
+  A: "视频项目（工况 A）",
+  B: "拍照项目（工况 B）",
 };
 
 export const SCENARIO_SHORT: Record<Scenario, string> = {
@@ -43,7 +47,8 @@ export const PROJECT_STATUS_TONE: Record<ProjectStatus, BadgeTone> = {
 
 export const COPY_FILE_STATUS_LABEL: Record<CopyFileStatus, string> = {
   pending: "待拷",
-  copied: "已拷",
+  // 中间态自解释(评审 #25):「已拷」看起来像完事了,其实还差校验
+  copied: "已拷·待校验",
   verified: "已校验",
   failed: "失败",
 };
@@ -59,7 +64,8 @@ export const TASK_STATE_LABEL: Record<CopyTaskState, string> = {
   confirming: "待确认",
   running: "拷贝中",
   verifying: "校验中",
-  paused: "已挂起",
+  // 「挂起」是操作系统术语,现场语言是「暂停」(评审 H1)
+  paused: "已暂停",
   done: "已完成",
   failed: "失败",
 };
@@ -74,9 +80,10 @@ export const TASK_STATE_TONE: Record<CopyTaskState, BadgeTone> = {
 };
 
 export const DESTINATION_KIND_LABEL: Record<DestinationKind, string> = {
-  nas: "NAS 主",
+  // 「NAS 主」语序生硬(评审 #24):对齐 PRD「NAS 主 + 本地/移动硬盘备」的语义
+  nas: "NAS 主备份",
   local: "本机",
-  external: "移动盘",
+  external: "移动硬盘",
 };
 
 export const DESTINATION_STATE_LABEL: Record<DestinationState, string> = {
@@ -87,13 +94,17 @@ export const DESTINATION_STATE_LABEL: Record<DestinationState, string> = {
   error: "出错",
 };
 
-/** 工况 A 用「转码/交付」衡量，工况 B 用「已分类/总数」衡量 */
+/**
+ * 进度列文字。工况 B 有真实分母(已分类/总数);工况 A 未配用卡清单时
+ * 只有素材量可说——如实说「已入库」,阶段状态由同行的状态徽标承载
+ * (评审 5.8:注释不许承诺实现没有的「转码/交付」口径)。
+ */
 export function progressLabel(
   scenario: Scenario,
   sorted: number,
   total: number,
 ): string {
   if (total === 0) return "尚无素材";
-  if (scenario === "A") return `${total} 个素材`;
+  if (scenario === "A") return `${total} 个素材已入库`;
   return `${sorted} / ${total} 已分类`;
 }

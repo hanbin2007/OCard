@@ -16,6 +16,7 @@ import { TopBar } from "../components/TopBar";
 import { IllTranscodeEmpty } from "../components/illustrations";
 import { Badge, EmptyState, Field, ProgressBar } from "../components/ui";
 import { isAbsoluteNasRoot } from "../lib/validation";
+import { loadPref, savePref } from "../lib/prefs";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import { selectLatestTranscodeJob, useStore } from "../state/store";
 import { useWindowBridge } from "../state/windowBridge";
@@ -44,8 +45,16 @@ export function TranscodeScreen() {
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
-  const [tier, setTier] = useState<ArchiveTier>("balanced");
-  const [archiveDir, setArchiveDir] = useState("");
+  /**
+   * 档位与归档目录持久化(评审 6.6):归档盘一用一个项目周期,
+   * 每次归档都重新点浏览选一遍目录是纯重复劳动。
+   */
+  const [tier, setTier] = useState<ArchiveTier>(() =>
+    loadPref<ArchiveTier>("transcode:tier", "balanced"),
+  );
+  const [archiveDir, setArchiveDir] = useState(() =>
+    loadPref<string>("transcode:archiveDir", ""),
+  );
   const [archiveError, setArchiveError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -87,6 +96,9 @@ export function TranscodeScreen() {
         outputDir: archiveDir.trim(),
       });
       dispatch({ type: "jobProgress", job: snapshot });
+      // 发起成功即记忆(评审 6.6):下次进屏自动预填同一块归档盘与档位
+      savePref("transcode:tier", tier);
+      savePref("transcode:archiveDir", archiveDir.trim());
     } catch (err) {
       // 提交后失败统一走 toast;archiveError 只承载提交前的路径校验
       const message = err instanceof Error ? err.message : String(err);
@@ -99,8 +111,20 @@ export function TranscodeScreen() {
   function requestArchive() {
     if (!project) return;
     if (!isAbsoluteNasRoot(archiveDir)) {
-      setArchiveError("请填写项目之外的绝对路径，如 /Volumes/ARCHIVE-2026");
+      setArchiveError("请填写绝对路径，如 /Volumes/ARCHIVE-2026");
       return;
+    }
+    // 前端就拦「选进项目目录里」(评审 #6):提示承诺过的约束不该等后端才报
+    const nasRoot = state.workstation?.nasRoot?.replace(/\/+$/, "");
+    if (nasRoot) {
+      const projectDir = `${nasRoot}/${project.folderName}`;
+      const normalized = archiveDir.trim().replace(/\/+$/, "");
+      if (normalized === projectDir || normalized.startsWith(`${projectDir}/`)) {
+        setArchiveError(
+          "归档目录不能在项目文件夹内——归档是独立副本，请选项目之外的目录",
+        );
+        return;
+      }
     }
     setConfirm({
       title: `按「${TIER_LABEL[tier]}」归档转码？`,
@@ -116,7 +140,7 @@ export function TranscodeScreen() {
   function requestRetranscode() {
     if (!project) return;
     setConfirm({
-      title: "强制重转全部代理？",
+      title: "删除已有代理并全部重转？",
       message:
         "这会先删除「4. 转码素材」下已有的代理文件，再重新转码——已删除的代理无法恢复。" +
         "原始素材不受影响。只有在代理文件确认有问题时才需要这么做。",
@@ -216,7 +240,7 @@ export function TranscodeScreen() {
               <div className="stack" data-testid="transcode-scenario-b">
                 <p className="text-sm" role="status">
                   代理转码只适用于工况 A（视频剪辑）项目。当前项目「{project.name}」是工况
-                  B（相片精修），素材整理走「分类工作台」。
+                  B（纯拍照），素材整理走「选片与交付」。
                 </p>
                 <div>
                   <button
@@ -283,26 +307,19 @@ export function TranscodeScreen() {
               </div>
               <div className="card__body">
                 <div className="stack stack--lg">
+                  {/* 「高负载判定」是引擎黑话(评审 6.6/#3):说人话——默认转哪些、
+                      勾了会怎样,一句讲清;两个「强制」术语拆开,不再并排打架 */}
                   <Checkbox
                     testId="transcode-force-all"
                     checked={forceAll}
                     disabled={working || ffmpegMissing}
                     onChange={setForceAll}
                   >
-                    强制全转（忽略「高负载」判定，把所有素材纳入；
-                    <strong>不会</strong>重转已经有代理的素材）
+                    把所有视频都转代理（默认只转 Log/高码率等剪辑时容易卡顿的素材；
+                    <strong>不会</strong>重转已经有代理的）
                   </Checkbox>
 
                   <div className="row-inline">
-                    <button
-                      type="button"
-                      className="btn"
-                      data-testid="transcode-retranscode"
-                      disabled={working || starting || ffmpegMissing}
-                      onClick={requestRetranscode}
-                    >
-                      强制重转
-                    </button>
                     <button
                       type="button"
                       className="btn btn--primary"
@@ -321,6 +338,18 @@ export function TranscodeScreen() {
                         ffmpeg {ffmpeg.info.version}
                       </span>
                     ) : null}
+                    {/* 破坏性低频操作降级为文字链接(评审 6.6/#2):
+                        不再与日常主操作同尺寸并排,误触少一个入口 */}
+                    <button
+                      type="button"
+                      className="btn btn--ghost btn--sm push-right"
+                      data-testid="transcode-retranscode"
+                      disabled={working || starting || ffmpegMissing}
+                      title="删除已有代理并全部重转——只在代理文件确认有问题时使用"
+                      onClick={requestRetranscode}
+                    >
+                      删除代理并重转…
+                    </button>
                   </div>
 
                 </div>
@@ -359,13 +388,23 @@ export function TranscodeScreen() {
                   <Field
                     label="归档输出目录"
                     htmlFor="archive-dir"
-                    hint="选择项目之外的目录——归档是独立副本，不放回项目里"
+                    hint={
+                      archiveDir
+                        ? "已沿用上次的归档目录，可直接开始或改选"
+                        : "选择项目之外的目录——归档是独立副本，不放回项目里"
+                    }
+                    /* 错误就近显示(评审 #4):不再让人从按钮往下扫红字 */
+                    error={archiveError ?? undefined}
                   >
                     <PathField
                       id="archive-dir"
                       testId="archive-dir"
                       value={archiveDir}
-                      onChange={setArchiveDir}
+                      invalid={Boolean(archiveError)}
+                      onChange={(next) => {
+                        setArchiveDir(next);
+                        setArchiveError(null);
+                      }}
                       placeholder="/Volumes/ARCHIVE-2026"
                       pickerTitle="选择归档输出目录"
                       disabled={working || ffmpegMissing}
@@ -383,16 +422,6 @@ export function TranscodeScreen() {
                       开始归档
                     </button>
                   </div>
-
-                  {archiveError ? (
-                    <span
-                      className="field__error"
-                      role="alert"
-                      data-testid="archive-error"
-                    >
-                      {archiveError}
-                    </span>
-                  ) : null}
                 </div>
               </div>
             </div>

@@ -40,9 +40,14 @@ async function addTag(user: ReturnType<typeof userEvent.setup>, name: string) {
   await user.keyboard("{Enter}");
 }
 
-async function fillDestinations(user: ReturnType<typeof userEvent.setup>) {
-  // 第 1 行是 NAS,路径由项目结构自动推导,不可填
-  await user.type(screen.getByLabelText("第 2 个目的地路径"), "/backup/ocard");
+async function fillDestinations(_user: ReturnType<typeof userEvent.setup>) {
+  // 默认只有 NAS 行(评审 1.1);该项目设置里有备份盘预设——预设是异步落地的,
+  // 手动再点「添加目的地」会与之竞态(先到则多出一行空行),这里等预设行即可
+  await waitFor(() =>
+    expect(
+      (screen.getByLabelText("第 2 个目的地路径") as HTMLInputElement).value,
+    ).not.toBe(""),
+  );
 }
 
 function targetPreview() {
@@ -57,7 +62,7 @@ describe("拷卡任务面板", () => {
     expect(await screen.findByText("C0001.MP4")).toBeDefined();
     expect(screen.getByText("8f2a1c04b7d9e355")).toBeDefined();
     expect(screen.getAllByText("已校验").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("已拷").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("已拷·待校验").length).toBeGreaterThan(0);
     expect(screen.getAllByText("待拷").length).toBeGreaterThan(0);
     expect(screen.getAllByText("失败").length).toBeGreaterThan(0);
   });
@@ -89,7 +94,7 @@ describe("拷卡任务面板", () => {
     expect(targetPreview()).toBe(`1. 待分类/${expectedSlotPrefix()}_SonyA7M4_A_LM`);
   });
 
-  it("NAS 行只读且不预填平台特有路径", () => {
+  it("默认只有 NAS 一行:不再预置会拦提交的空移动盘行(评审 1.1)", () => {
     render(<App preloaded={preloaded} />);
 
     const nasRow = screen.getByLabelText("第 1 个目的地路径") as HTMLInputElement;
@@ -97,12 +102,12 @@ describe("拷卡任务面板", () => {
     expect(nasRow.readOnly).toBe(true);
     expect(nasRow.placeholder).toContain("自动推导");
 
-    const localRow = screen.getByLabelText("第 2 个目的地路径") as HTMLInputElement;
-    expect(localRow.value).toBe("");
-    expect(localRow.readOnly).toBe(false);
+    expect(screen.queryByLabelText("第 2 个目的地路径")).toBeNull();
+    // 双备份用灰字引导,不用空行逼人处理
+    expect(screen.getByText(/建议再加一块本地\/移动盘/)).toBeDefined();
   });
 
-  it("自填目的地行留空时逐行标红，不进确认步骤", async () => {
+  it("手动加的目的地行留空时逐行标红，不进确认步骤", async () => {
     const user = userEvent.setup();
     render(<App preloaded={preloaded} />);
 
@@ -211,6 +216,8 @@ describe("autoProxy（工况 A）", () => {
 
     await user.click(screen.getByRole("radio", { name: "选择源卷 SONY_A7M4" }));
     await addTag(user, "发布会主机位");
+    // 该项目无预设备份盘:默认只有 NAS 行(评审 1.1),第二块盘显式添加
+    await user.click(screen.getByRole("button", { name: "添加目的地" }));
     await user.type(screen.getByLabelText("第 2 个目的地路径"), "/backup/ocard");
     await user.click(screen.getByRole("button", { name: "开始拷卡" }));
 
@@ -245,7 +252,7 @@ describe("#4 任务快照刷新失败", () => {
     await screen.findByText("C0001.MP4");
 
     // 挂起后会 refreshTask 对账，此处让它失败
-    await user.click(screen.getByRole("button", { name: "挂起" }));
+    await user.click(screen.getByRole("button", { name: "暂停" }));
 
     await user.click(screen.getByTestId("notice-bell"));
     await waitFor(() =>
@@ -416,7 +423,13 @@ describe("分页与进度事件互不打架", () => {
         return () => {};
       });
 
-    const runningTask = { ...mockCopyTasks[0], fileCount: TOTAL, files: [] };
+    // statusCounts 置空:这组测试盯的是「旧后端没有全量计数」的回退口径
+    const runningTask = {
+      ...mockCopyTasks[0],
+      fileCount: TOTAL,
+      files: [],
+      statusCounts: undefined,
+    };
     render(
       <App
         preloaded={{
@@ -512,7 +525,12 @@ describe("分页与进度事件互不打架", () => {
       .spyOn(api, "listCopyFiles")
       .mockResolvedValue({ items: page(0, 3).items.slice(0, 3), total: 3 });
 
-    const task = { ...mockCopyTasks[0], fileCount: 3, files: [] };
+    const task = {
+      ...mockCopyTasks[0],
+      fileCount: 3,
+      files: [],
+      statusCounts: undefined,
+    };
     render(
       <App preloaded={{ ...preloaded, tasks: [task], selectedTaskId: task.id }} />,
     );
@@ -520,6 +538,32 @@ describe("分页与进度事件互不打架", () => {
     await screen.findByText("IMG_0.NEF");
     expect(screen.getByTestId("copy-verified-stat").textContent).toBe("3/3");
     expect(screen.queryByTestId("copy-load-more-files")).toBeNull();
+
+    listSpy.mockRestore();
+  });
+
+  it("后端带全量计数时,未全载也显示真值总账(评审 2.5)", async () => {
+    const TOTAL = 500;
+    const listSpy = vi
+      .spyOn(api, "listCopyFiles")
+      .mockImplementation((_taskId, offset = 0, limit = 200) =>
+        Promise.resolve(page(offset, limit)),
+      );
+
+    const task = {
+      ...mockCopyTasks[0],
+      fileCount: TOTAL,
+      files: [],
+      statusCounts: { pending: 120, copied: 40, verified: 337, failed: 3 },
+    };
+    render(
+      <App preloaded={{ ...preloaded, tasks: [task], selectedTaskId: task.id }} />,
+    );
+
+    await screen.findByText("IMG_0.NEF");
+    // 只加载了第一页(200/500),总账仍然是全量真值,不再被分页挟持
+    expect(screen.getByTestId("copy-verified-stat").textContent).toBe("337/500");
+    expect(screen.getByText(/待拷 120 · 已拷 40 · 已校验 337 · 失败 3/)).toBeDefined();
 
     listSpy.mockRestore();
   });
@@ -591,7 +635,7 @@ describe("源卷过滤与刷新(UX 波)", () => {
     await user.click(screen.getByTestId("volumes-refresh"));
     await waitFor(() =>
       expect(
-        screen.getAllByText(/刷新卷列表失败/).length,
+        screen.getAllByText(/刷新卡列表失败/).length,
       ).toBeGreaterThan(0),
     );
     spy.mockRestore();

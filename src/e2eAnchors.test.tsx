@@ -126,7 +126,7 @@ describe("E2E 锚点", () => {
       "sorting-open-trash",
       "delivery-open",
       "sorting-analyze",
-      "sorting-suggestion-filter",
+      "sorting-judge-filter",
       "virtual-grid",
       "asset-cell",
     ]);
@@ -140,6 +140,7 @@ describe("E2E 锚点", () => {
 
   it("项目管理(欢迎窗口):列表行 + 打开入口 + 审计日志入口", () => {
     renderProjectsManager({ ...base, route: "copy" });
+    // 「新建项目」移出侧栏后,项目管理页头部按钮是 E2E 建项目的唯一入口
     expectAnchors(["project-row", "audit-open", "projects-new", "project-open"]);
     expect(screen.getAllByTestId("project-row")).toHaveLength(mockProjects.length);
   });
@@ -239,8 +240,7 @@ describe("E2E 锚点", () => {
     expectAnchors([
       "first-run-guide",
       "onboarding-operator",
-      "onboarding-next",
-      "settings-open",
+            "settings-open",
     ]);
   });
 });

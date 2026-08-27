@@ -50,6 +50,10 @@ export function SettingsDialog() {
   const [caps, setCaps] = useState<TranscodeCapabilities | null>(null);
   const [probing, setProbing] = useState(false);
   const [diagnostics, setDiagnostics] = useState<string | null>(null);
+  /** 「复制诊断信息」的回执:按过要看得出已进剪贴板(评审 #10) */
+  const [diagCopied, setDiagCopied] = useState(false);
+  /** 误点遮罩不丢输入(评审 #12):有未保存修改时给提示而不是直接关 */
+  const [dirtyHint, setDirtyHint] = useState(false);
 
   /**
    * 关闭走视图过渡：进场由 CSS 关键帧负责（缩放 + 淡入），退场在这里淡出，
@@ -151,13 +155,24 @@ export function SettingsDialog() {
     }
   }
 
-  async function exportDiagnostics() {
+  /** 「导出」得真的导出(评审 #10):一键进剪贴板;剪贴板不可用退回文本框 */
+  async function copyDiagnostics() {
+    setDiagCopied(false);
     try {
       const data = await api.transcodeDiagnostics();
-      setDiagnostics(JSON.stringify(data, null, 2));
+      const text = JSON.stringify(data, null, 2);
+      try {
+        await navigator.clipboard.writeText(text);
+        setDiagnostics(null);
+        setDiagCopied(true);
+        setTimeout(() => setDiagCopied(false), 3000);
+      } catch {
+        // 剪贴板被策略挡住:退回可全选复制的文本框
+        setDiagnostics(text);
+      }
     } catch (err) {
       setDiagnostics(
-        `导出失败：${err instanceof Error ? err.message : String(err)}`,
+        `读取诊断信息失败：${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
@@ -219,8 +234,22 @@ export function SettingsDialog() {
     }
   }
 
+  /** 未保存的修改:NAS 路径手输很长,误点遮罩丢一次很疼(评审 #12) */
+  const dirty =
+    operator !== (workstation?.operator ?? "") ||
+    nasRoot !== (workstation?.nasRoot ?? "");
+
   return (
-    <div className="overlay" onClick={close}>
+    <div
+      className="overlay"
+      onClick={() => {
+        if (dirty) {
+          setDirtyHint(true);
+          return;
+        }
+        close();
+      }}
+    >
       <div
         className="dialog"
         role="dialog"
@@ -234,6 +263,11 @@ export function SettingsDialog() {
         <p className="dialog__message">
           仅影响本机。操作人随审计日志留痕，NAS 根路径决定项目落在哪里。
         </p>
+        {dirtyHint && dirty ? (
+          <p className="text-xs text-warn" role="alert" data-testid="settings-dirty-hint">
+            有未保存的修改——先「保存」，或点「取消」放弃修改。
+          </p>
+        ) : null}
 
         <form
           className="stack stack--lg dialog__form"
@@ -277,6 +311,11 @@ export function SettingsDialog() {
             />
           </Field>
 
+          {/* 高频(换人)与一次性/排障配置分区(评审 6.5):
+              诊断与更新默认收起,换个操作人不必滚过一整屏技术信息 */}
+          <details className="settings-advanced" data-testid="settings-advanced">
+            <summary className="text-sm">高级 · 转码能力与更新</summary>
+
           <div className="settings-about" data-testid="settings-transcode">
             <div className="settings-about__head">
               <span className="field__label">转码能力</span>
@@ -300,6 +339,14 @@ export function SettingsDialog() {
 
             {caps?.status === "ready" && caps.report ? (
               <div className="stack stack--sm" data-testid="settings-caps">
+                {/* 一句人话结论(评审 #11):用户关心的是快不快,不是编码器 ID */}
+                <p className="text-sm" data-testid="settings-caps-summary">
+                  {Object.values(caps.report.winners).some(
+                    (enc) => !/^(libx26[45]|x26[45])/.test(enc),
+                  )
+                    ? "✓ 转码将使用硬件加速，速度较快。"
+                    : "仅软件编码可用，转码速度较慢。"}
+                </p>
                 <div className="list">
                   <div className="list__head caps__head">
                     <span>能力</span>
@@ -349,9 +396,9 @@ export function SettingsDialog() {
                 type="button"
                 className="btn btn--sm"
                 data-testid="settings-diagnostics"
-                onClick={exportDiagnostics}
+                onClick={() => void copyDiagnostics()}
               >
-                导出诊断
+                {diagCopied ? "已复制 ✓" : "复制诊断信息"}
               </button>
             </div>
 
@@ -423,6 +470,7 @@ export function SettingsDialog() {
               </span>
             ) : null}
           </div>
+          </details>
 
           <div className="dialog__actions">
             <button

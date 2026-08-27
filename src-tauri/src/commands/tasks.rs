@@ -97,8 +97,25 @@ impl TaskManager {
 pub fn summary_of(dto: &CopyTaskDto) -> CopyTaskDto {
     let mut t = dto.clone();
     t.file_count = Some(t.files.len());
+    t.status_counts = Some(status_counts(&t.files));
     t.files = Vec::new();
     t
+}
+
+/// 全量状态计数(UX 评审 2.5):快照/进度事件自带聚合真值,
+/// 前端不必翻完分页明细才看得到「已校验 x/y」总账。
+pub fn status_counts(files: &[CopyFileItemDto]) -> CopyStatusCountsDto {
+    let mut c = CopyStatusCountsDto::default();
+    for f in files {
+        match f.status {
+            "copied" => c.copied += 1,
+            "verified" => c.verified += 1,
+            "failed" => c.failed += 1,
+            // 未知状态按未完成计:总账宁可保守,不虚报完成
+            _ => c.pending += 1,
+        }
+    }
+    c
 }
 
 pub fn file_status_str(status: &copy::FileStatus) -> &'static str {
@@ -457,6 +474,7 @@ fn progress_event(snap: &mut CopyTaskDto, changed: Vec<CopyFileItemDto>) -> Copy
         state: snap.state,
         changed_files: changed,
         changed_destinations: Vec::new(),
+        status_counts: Some(status_counts(&snap.files)),
     }
 }
 
@@ -542,6 +560,7 @@ pub fn build_task(
         destinations: dest_dtos,
         files: file_dtos,
         file_count: Some(files.len()),
+        status_counts: None, // 快照对外发布时由 summary_of 现算
         total_bytes,
         copied_bytes: 0,
         speed_bytes_per_sec: 0,

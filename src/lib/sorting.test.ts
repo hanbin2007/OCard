@@ -450,3 +450,103 @@ describe("flattenEntries（预览的唯一下标空间）", () => {
     expect(flattenEntries(entries).map((a) => a.id)).toEqual(["a", "b", "c", "d"]);
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * UX 全面简化波(2026-08-27)新增行为
+ * ------------------------------------------------------------------ */
+
+import {
+  filterByJudgement,
+  nextCursorAfterRemoval,
+  removedEntryIds,
+} from "./sorting";
+
+describe("nextCursorAfterRemoval(评审 3.1:分类后光标自动前进)", () => {
+  const ids = ["a", "b", "c", "d", "e"];
+
+  it("落在被移除块的下一个条目上", () => {
+    expect(nextCursorAfterRemoval(ids, ["b"])).toBe("c");
+    expect(nextCursorAfterRemoval(ids, ["b", "c"])).toBe("d");
+  });
+
+  it("块在尾部时退而落在前一个", () => {
+    expect(nextCursorAfterRemoval(ids, ["e"])).toBe("d");
+    expect(nextCursorAfterRemoval(ids, ["d", "e"])).toBe("c");
+  });
+
+  it("全移光/没移任何已知条目时返回 null", () => {
+    expect(nextCursorAfterRemoval(ids, [...ids])).toBeNull();
+    expect(nextCursorAfterRemoval(ids, ["zz"])).toBeNull();
+  });
+
+  it("离散多选:跳过其余被移除项,落在最后一个块之后", () => {
+    expect(nextCursorAfterRemoval(ids, ["a", "c"])).toBe("d");
+  });
+});
+
+describe("removedEntryIds(组条目只有全员被移才消失)", () => {
+  it("单件与全员组都算移除;部分移走的组保留", () => {
+    const entries = buildGridEntries([
+      { id: "a" },
+      { id: "b", groupId: "g1" },
+      { id: "c", groupId: "g1" },
+      { id: "d", groupId: "g2" },
+      { id: "e", groupId: "g2" },
+    ]);
+    expect(removedEntryIds(entries, ["a", "b", "c", "d"])).toEqual([
+      "a",
+      `${GROUP_ID_PREFIX}g1`,
+    ]);
+  });
+});
+
+describe("filterByJudgement(评审 3.6:筛选组)", () => {
+  const assets = [
+    { id: "none" },
+    { id: "keep", judgement: { suggestedKeep: true, blurry: false, score: 80 } },
+    { id: "drop", judgement: { suggestedKeep: false, blurry: false, score: 60 } },
+    { id: "blur", judgement: { suggestedKeep: false, blurry: true, score: 10 } },
+  ];
+
+  it("keep 沿用旧口径:建议保留 + 未判定", () => {
+    expect(filterByJudgement(assets, "keep", 25).map((a) => a.id)).toEqual([
+      "none",
+      "keep",
+    ]);
+  });
+
+  it("drop 是 keep 的严格反集:有判定且不建议保留", () => {
+    expect(filterByJudgement(assets, "drop", 25).map((a) => a.id)).toEqual([
+      "drop",
+      "blur",
+    ]);
+  });
+
+  it("blurry / lowScore / unjudged 各取其类", () => {
+    expect(filterByJudgement(assets, "blurry", 25).map((a) => a.id)).toEqual(["blur"]);
+    expect(filterByJudgement(assets, "lowScore", 25).map((a) => a.id)).toEqual(["blur"]);
+    expect(filterByJudgement(assets, "unjudged", 25).map((a) => a.id)).toEqual(["none"]);
+    expect(filterByJudgement(assets, "all", 25)).toHaveLength(4);
+  });
+});
+
+describe("快捷键新增映射(评审 3.8/3.9)", () => {
+  it("网格态 Esc 是清空选区,不再是无事发生", () => {
+    expect(resolveShortcut({ key: "Escape" }, [])).toEqual({
+      type: "clearSelection",
+    });
+  });
+
+  it("预览态 Esc 仍是关预览", () => {
+    expect(resolveShortcut({ key: "Escape" }, [], { previewOpen: true })).toEqual({
+      type: "closePreview",
+    });
+  });
+
+  it("Shift+D 提交待删清单,裸 D 仍是标删", () => {
+    expect(resolveShortcut({ key: "D", shiftKey: true }, [])).toEqual({
+      type: "confirmDelete",
+    });
+    expect(resolveShortcut({ key: "d" }, [])).toEqual({ type: "markDelete" });
+  });
+});

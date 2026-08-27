@@ -89,26 +89,40 @@ describe("当前项目的显性指示(UX 波)", () => {
     );
   });
 
-  it("点「切换到此项目」把该行设为当前,黄标随之移动", () => {
+  it("点「在主窗口打开」把该行设为当前,黄标随之移动", async () => {
     renderProjectsManager(preloaded);
     const buttons = screen.getAllByTestId("project-switch");
     fireEvent.click(buttons[0]);
 
-    const rows = screen.getAllByRole("option");
-    const flaggedRow = rows.find((r) =>
-      r.querySelector('[data-testid="project-current-flag"]'),
-    );
-    expect(flaggedRow?.textContent).toContain(mockProjects[1].folderName);
+    // 打开动作经窗口桥异步完成,黄标随 selectProject 落地后移动
+    await waitFor(() => {
+      const rows = screen.getAllByRole("option");
+      const flaggedRow = rows.find((r) =>
+        r.querySelector('[data-testid="project-current-flag"]'),
+      );
+      expect(flaggedRow?.textContent).toContain(mockProjects[1].folderName);
+    });
   });
 
-  it("顶栏正中常驻当前项目名,点击打开项目管理(欢迎窗口)", () => {
+  it("顶栏正中常驻当前项目名,点击弹出原地切换下拉(评审 5.2)", () => {
     render(<App preloaded={{ ...preloaded, route: "devices" as const }} />);
     const chip = screen.getByTestId("current-project-chip");
     expect(chip.textContent).toContain(mockProjects[0].name);
 
     // 浏览器单窗口形态:打开项目管理 = 切到欢迎视图
     fireEvent.click(chip);
-    expect(screen.getByTestId("welcome-root")).toBeDefined();
+    // 原地切项目:不跳回列表,直接在下拉里选
+    expect(screen.getByTestId("project-switch-menu")).toBeDefined();
+    const items = screen.getAllByTestId("project-switch-item");
+    expect(items.length).toBe(mockProjects.length);
+
+    fireEvent.click(items[1]);
+    // 下拉收起,当前项目切换,人还留在设备屏
+    expect(screen.queryByTestId("project-switch-menu")).toBeNull();
+    expect(screen.getByTestId("current-project-chip").textContent).toContain(
+      mockProjects[1].name,
+    );
+    expect(screen.getByRole("button", { name: "登记相机" })).toBeDefined();
   });
 
   it("没有选中项目时顶栏指示为「未选择项目」", () => {
@@ -118,7 +132,7 @@ describe("当前项目的显性指示(UX 波)", () => {
     );
   });
 
-  it("交付打包进行中时黄标禁用:不能成为绕过导航锁的旁门", () => {
+  it("交付打包进行中黄标不再禁用(评审 4.3):导航放行,进度由 store 承载", () => {
     render(
       <App
         preloaded={{
@@ -141,8 +155,7 @@ describe("当前项目的显性指示(UX 波)", () => {
       />,
     );
     const chip = screen.getByTestId("current-project-chip") as HTMLButtonElement;
-    expect(chip.disabled).toBe(true);
-    expect(chip.title).toContain("交付打包进行中");
+    expect(chip.disabled).toBe(false);
   });
 });
 

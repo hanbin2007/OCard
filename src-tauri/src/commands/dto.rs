@@ -160,6 +160,16 @@ pub struct CopyDestinationDto {
     pub error: Option<String>,
 }
 
+/// 任务级全量状态计数:不受 list_copy_files 分页影响的真值(UX 评审 2.5)。
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopyStatusCountsDto {
+    pub pending: usize,
+    pub copied: usize,
+    pub verified: usize,
+    pub failed: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopyTaskDto {
@@ -178,6 +188,8 @@ pub struct CopyTaskDto {
     pub files: Vec<CopyFileItemDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_counts: Option<CopyStatusCountsDto>,
     pub total_bytes: u64,
     pub copied_bytes: u64,
     pub speed_bytes_per_sec: u64,
@@ -248,6 +260,8 @@ pub struct CopyProgressEventDto {
     pub state: &'static str,
     pub changed_files: Vec<CopyFileItemDto>,
     pub changed_destinations: Vec<CopyDestinationDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_counts: Option<CopyStatusCountsDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]
