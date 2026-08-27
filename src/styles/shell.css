@@ -473,16 +473,20 @@
   overflow-y: auto;
 }
 
-.shell[data-nav="forward"] .content {
+/* 屏间过渡动画只许落在滚动**内容**(.content__inner)上,绝不落在滚动
+   容器(.content)上:WebKit 里给滚动容器本身做 transform/opacity 动画
+   会把它踢出合成器异步滚动,退回主线程——滚动条与内容不同步、回弹消失
+   (macOS 实测:项目管理页没有这套动画所以正常,其余屏全部失同步)。 */
+.shell[data-nav="forward"] .content__inner {
   animation: screen-in-below var(--dur-spring-fast) var(--spring);
 }
 
-.shell[data-nav="back"] .content {
+.shell[data-nav="back"] .content__inner {
   animation: screen-in-above var(--dur-spring-fast) var(--spring);
 }
 
 /* 首屏 / 非导航引起的整屏替换（加载完成、首跑引导）只淡入，不给方向 */
-.shell[data-nav="none"] .content {
+.shell[data-nav="none"] .content__inner {
   animation: chrome-fade-in var(--dur-quick) var(--ease-out);
 }
 
