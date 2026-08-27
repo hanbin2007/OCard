@@ -40,10 +40,14 @@ async function addTag(user: ReturnType<typeof userEvent.setup>, name: string) {
   await user.keyboard("{Enter}");
 }
 
-async function fillDestinations(user: ReturnType<typeof userEvent.setup>) {
-  // 默认只有 NAS 行(评审 1.1):双备份由「添加目的地」显式加一行
-  await user.click(screen.getByRole("button", { name: "添加目的地" }));
-  await user.type(screen.getByLabelText("第 2 个目的地路径"), "/backup/ocard");
+async function fillDestinations(_user: ReturnType<typeof userEvent.setup>) {
+  // 默认只有 NAS 行(评审 1.1);该项目设置里有备份盘预设——预设是异步落地的,
+  // 手动再点「添加目的地」会与之竞态(先到则多出一行空行),这里等预设行即可
+  await waitFor(() =>
+    expect(
+      (screen.getByLabelText("第 2 个目的地路径") as HTMLInputElement).value,
+    ).not.toBe(""),
+  );
 }
 
 function targetPreview() {

@@ -302,10 +302,13 @@ export function CopyTaskScreen() {
         if (cancelled) return;
         setSettings(loaded);
         if (loaded.backupPaths.length > 0) {
-          setDests([
-            newDest("nas"),
-            ...loaded.backupPaths.map((p) => newDest("external", p)),
-          ]);
+          // 预设只填「还没动过」的表单:settings 是异步落地的,
+          // 用户已经添加/填写的目的地行(或按项目记忆恢复的行)不许被冲掉
+          setDests((prev) =>
+            prev.length === 1 && prev[0].kind === "nas" && prev[0].path === ""
+              ? [prev[0], ...loaded.backupPaths.map((p) => newDest("external", p))]
+              : prev,
+          );
         }
       } catch (err) {
         if (cancelled) return;
