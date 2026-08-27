@@ -274,7 +274,12 @@ describe("快捷拷卡引导", () => {
   it("会话门开启时浮层整体 inert:键盘也进不去(双路评审 P0)", async () => {
     vi.useFakeTimers();
     try {
-      render(<App preloaded={{ ...base, quickCopyQueue: ["vol-untitled-1"] }} />);
+      // 拷卡进行中会抑制闲置判定(评审 2.4),这里专门测门,任务清空
+      render(
+        <App
+          preloaded={{ ...base, tasks: [], quickCopyQueue: ["vol-untitled-1"] }}
+        />,
+      );
       // 15 分钟无操作 → 询问 → 再 5 分钟 → 会话结束,门弹出
       act(() => {
         vi.advanceTimersByTime(IDLE_PROMPT_MS + IDLE_TICK_MS);

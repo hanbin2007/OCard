@@ -12,27 +12,32 @@ import type {
 import { AssetLightbox } from "../components/AssetLightbox";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { DeliveryButton } from "../components/DeliveryPanel";
+import { JudgementBadges, LOW_SCORE_AT } from "../components/JudgementBadges";
 import { TopBar } from "../components/TopBar";
-import { Badge, EmptyState, Kbd, ProgressBar, PulseValue } from "../components/ui";
+import { Badge, Kbd, ProgressBar, PulseValue } from "../components/ui";
 import { VirtualGrid } from "../components/VirtualGrid";
-import { Checkbox } from "../components/controls";
+import { Select } from "../components/controls";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import { withViewTransition } from "../lib/motion";
 import {
   actionTargets,
   buildGridEntries,
   clickSelection,
-  filterBySuggestion,
+  filterByJudgement,
   flattenEntries,
   resolveEntryIds,
   emptySelection,
   initialPendingDelete,
+  JUDGEMENT_FILTER_LABEL,
   moveCursor,
+  nextCursorAfterRemoval,
   pendingDeleteReducer,
   pruneSelection,
+  removedEntryIds,
   resolveShortcut,
   selectAll,
   toggleSelection,
+  type JudgementFilter,
   type Selection,
 } from "../lib/sorting";
 import {
@@ -46,8 +51,9 @@ const PAGE_SIZE = 200;
 const INDEX_REFRESH_MIN_MS = 2000;
 /** 连续多少张缩略图加载失败就在屏内亮出横幅（后端另发 thumb-protocol-degraded 通知） */
 const THUMB_FAIL_BANNER_AT = 20;
-/** 后端 score 量纲是 0–100，低分阈值按百分制取 25 */
-export const LOW_SCORE_AT = 25;
+export { LOW_SCORE_AT };
+/** 批量移动的「撤销」窗口:超时自动收起(文件已在分类夹里,仍可手动找回) */
+const UNDO_WINDOW_MS = 10_000;
 
 /** 非照片类型的中性徽章文案；other = 后端明确的「其他类型」，不再伪装成视频 */
 const KIND_LABEL: Record<SortingAsset["kind"], string> = {
@@ -65,6 +71,7 @@ const COMMIT_PULSE_MS = 420;
 export function SortingScreen() {
   const { state, dispatch } = useStore();
   const project = state.projects.find((p) => p.id === state.selectedProjectId) ?? null;
+  const projectId = project?.id ?? null;
   /** 交付作业进行中（由 job 状态派生）：分类、删除链路、导航都要据此禁用 */
   const deliveryWorking = selectDeliveryWorking(state);
   const analyzeJob = project ? selectLatestAnalyzeJob(state, project.id) : null;
@@ -82,7 +89,10 @@ export function SortingScreen() {
   const [pageError, setPageError] = useState<string | null>(null);
   /** 连续加载失败的缩略图数：任一成功即归零 */
   const [thumbFailStreak, setThumbFailStreak] = useState(0);
-  const [suggestionOnly, setSuggestionOnly] = useState(false);
+  /** 判定筛选组(评审 3.6):「这批全要/全不要」都要有路径 */
+  const [judgeFilter, setJudgeFilter] = useState<JudgementFilter>("all");
+  /** 只看已标删(评审 3.9):删前复核不必满网格找红角标 */
+  const [markedOnly, setMarkedOnly] = useState(false);
   const [openGroup, setOpenGroup] = useState<string | null>(null);
   const [flowHints, setFlowHints] = useState<CuratedFlowHint[]>([]);
   const [flowHintsOpen, setFlowHintsOpen] = useState(false);
@@ -101,6 +111,22 @@ export function SortingScreen() {
     pendingDeleteReducer,
     initialPendingDelete,
   );
+  const markedSet = useMemo(
+    () => new Set(pendingDelete.marked),
+    [pendingDelete.marked],
+  );
+  /**
+   * 本次会话精选过的素材(评审 3.3):精选是复制语义,格子留在网格里,
+   * 没有常驻标识就记不住哪些按过 P。按项目存 localStorage,重启不丢;
+   * 这是视图层记忆,权威事实仍是「精选/待修」夹里的文件。
+   */
+  const [curatedIds, setCuratedIds] = useState<Set<string>>(new Set());
+  /** 批量移动的撤销窗口(评审 3.5):高速打标必然误击,分错类要有退路 */
+  const [lastMove, setLastMove] = useState<{
+    assetIds: string[];
+    categoryName: string;
+  } | null>(null);
+  const [undoing, setUndoing] = useState(false);
   /** 预览锚在 assetId 上，避免折叠/筛选后下标错位 */
   const [previewId, setPreviewId] = useState<string | null>(null);
   const [columns, setColumns] = useState(6);
@@ -140,13 +166,59 @@ export function SortingScreen() {
     assetsRef.current = assets;
   }, [assets]);
 
+  /** 光标前进要在「当前网格条目」空间里算,applyBulk 是稳定回调,经 ref 取最新 */
+  const entriesRef = useRef<typeof entries>([]);
+
+  // 精选标识按项目载入/落盘(评审 3.3)
+  useEffect(() => {
+    if (!projectId) {
+      setCuratedIds(new Set());
+      return;
+    }
+    try {
+      const raw = window.localStorage?.getItem(`ocard:curated:${projectId}`);
+      setCuratedIds(new Set(raw ? (JSON.parse(raw) as string[]) : []));
+    } catch {
+      // 私隐模式/清站点数据:没有记忆就从空开始,不影响分类本身
+      setCuratedIds(new Set());
+    }
+  }, [projectId]);
+
+  const rememberCurated = useCallback(
+    (ids: string[]) => {
+      setCuratedIds((prev) => {
+        const next = new Set(prev);
+        for (const id of ids) next.add(id);
+        if (projectId) {
+          try {
+            window.localStorage?.setItem(
+              `ocard:curated:${projectId}`,
+              JSON.stringify([...next].slice(-5000)),
+            );
+          } catch {
+            // 存不进去只丢记忆,不丢功能
+          }
+        }
+        return next;
+      });
+    },
+    [projectId],
+  );
+
+  // 撤销窗口超时自动收起
+  useEffect(() => {
+    if (!lastMove) return;
+    const timer = setTimeout(() => setLastMove(null), UNDO_WINDOW_MS);
+    return () => clearTimeout(timer);
+  }, [lastMove]);
+
   const onThumbError = useCallback(() => setThumbFailStreak((n) => n + 1), []);
   const onThumbLoad = useCallback(() => setThumbFailStreak(0), []);
 
-  const visibleAssets = useMemo(
-    () => filterBySuggestion(assets, suggestionOnly),
-    [assets, suggestionOnly],
-  );
+  const visibleAssets = useMemo(() => {
+    const byJudge = filterByJudgement(assets, judgeFilter, LOW_SCORE_AT);
+    return markedOnly ? byJudge.filter((a) => markedSet.has(a.id)) : byJudge;
+  }, [assets, judgeFilter, markedOnly, markedSet]);
   const entries = useMemo(
     () =>
       buildGridEntries(visibleAssets, (reason) =>
@@ -154,6 +226,7 @@ export function SortingScreen() {
       ),
     [visibleAssets],
   );
+  entriesRef.current = entries;
   /** 预览的唯一下标空间：网格显示顺序摊平后的素材列表 */
   const previewAssets = useMemo(() => flattenEntries(entries), [entries]);
   const openGroupItems = useMemo(() => {
@@ -169,11 +242,8 @@ export function SortingScreen() {
     : -1;
   /** 选区认的是「条目 id」——组条目用合成 id，等高行与选择模型都不受影响 */
   const assetIds = useMemo(() => entries.map((e) => e.id), [entries]);
-  const markedSet = useMemo(() => new Set(pendingDelete.marked), [pendingDelete.marked]);
   const selectedSet = useMemo(() => new Set(selection.selected), [selection.selected]);
   const cursorIndex = selection.cursor ? assetIds.indexOf(selection.cursor) : -1;
-
-  const projectId = project?.id ?? null;
 
   /* ---------------- 动效与导航连续性 ---------------- */
 
@@ -239,6 +309,9 @@ export function SortingScreen() {
     setPreviewId(null);
     setOpenGroup(null);
     setCommit(null);
+    setJudgeFilter("all");
+    setMarkedOnly(false);
+    setLastMove(null);
     dispatchDelete({ type: "clear" });
   }, [projectId]);
 
@@ -548,7 +621,22 @@ export function SortingScreen() {
               .join("；")}${result.failed.length > 3 ? " 等" : ""}`,
           );
         } else {
-          setSelection((prev) => pruneSelection(prev, result.succeeded));
+          /*
+           * 光标自动前进(评审 3.1):被移走的块的下一个条目接住焦点,
+           * 「按 1 → 自动站到下一张」的循环不再断在「光标归零」上。
+           * 选区清空:下一次打标默认只作用于光标格,与 PM/LR 的心智一致。
+           */
+          const ents = entriesRef.current;
+          const goneEntries = removedEntryIds(ents, result.succeeded);
+          const next = nextCursorAfterRemoval(
+            ents.map((e) => e.id),
+            goneEntries,
+          );
+          setSelection((prev) =>
+            next
+              ? { cursor: next, anchor: next, selected: [] }
+              : pruneSelection(prev, result.succeeded),
+          );
         }
       });
     },
@@ -574,21 +662,30 @@ export function SortingScreen() {
   /* ---------------- 动作 ---------------- */
 
   // runCurate 定义在下面，用 ref 打通引用（两者都是稳定回调）
-  const runCurateRef = useRef<() => Promise<void>>(async () => {});
+  const runCurateRef = useRef<(targetsOverride?: string[]) => Promise<void>>(
+    async () => {},
+  );
 
   const runAssign = useCallback(
-    async (categoryId: string) => {
-      const targets = resolveEntryIds(entries, actionTargets(selection));
+    async (categoryId: string, targetsOverride?: string[]) => {
+      // override 是预览/组浮层传来的**已解析** assetId(评审 3.2)
+      const targets =
+        targetsOverride ?? resolveEntryIds(entries, actionTargets(selection));
       if (!projectId || targets.length === 0 || busy || deliveryWorking) return;
       // 精选永远是复制语义，move 到 curated 会让素材卡在没有流程的位置
       if (categories.find((c) => c.id === categoryId)?.kind === "curated") {
-        await runCurateRef.current();
+        await runCurateRef.current(targetsOverride);
         return;
       }
       setBusy(true);
       try {
         const result = await api.moveAssets(projectId, targets, categoryId);
         applyBulk(result, "移动");
+        // 撤销窗口(评审 3.5):只对真正移走的部分开;移入待分类的撤销没有意义
+        const cat = categories.find((c) => c.id === categoryId);
+        if (result.succeeded.length > 0 && cat && cat.kind !== "inbox") {
+          setLastMove({ assetIds: result.succeeded, categoryName: cat.name });
+        }
         void refreshCategories();
       } catch (err) {
         notify(
@@ -613,45 +710,131 @@ export function SortingScreen() {
     ],
   );
 
-  const runCurate = useCallback(async () => {
-    const actedEntries = actionTargets(selection);
-    const targets = resolveEntryIds(entries, actedEntries);
-    if (!projectId || targets.length === 0 || busy || deliveryWorking) return;
-    setBusy(true);
+  /** 撤销上一次批量移动:反向 move 回「待分类」 */
+  const undoLastMove = useCallback(async () => {
+    const inbox = categories.find((c) => c.kind === "inbox");
+    if (!projectId || !lastMove || undoing || !inbox) return;
+    setUndoing(true);
     try {
-      const result = await api.curateAssets(projectId, targets);
-      // 精选是「复制一份进待修」，原件留在待分类，所以格子不会离开网格；
-      // 正因为不会离开，才必须在格子上给一次"收到了"的回弹（§13 causality）
-      if (result.succeeded.length > 0) pulseCommit(actedEntries);
+      const result = await api.moveAssets(projectId, lastMove.assetIds, inbox.id);
       if (result.failed.length > 0) {
         notify(
           "error",
-          "sorting-curate-failed",
-          `${result.failed.length} 个文件加入精选失败：${result.failed[0].message}`,
+          "sorting-undo-failed",
+          `${result.failed.length} 个文件撤销失败：${result.failed[0].message}`,
         );
       }
+      setLastMove(null);
+      await refreshLoadedAssets();
       void refreshCategories();
     } catch (err) {
       notify(
         "error",
-        "sorting-curate-failed",
-        `加入精选失败：${err instanceof Error ? err.message : String(err)}`,
+        "sorting-undo-failed",
+        `撤销失败：${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
-      setBusy(false);
+      setUndoing(false);
     }
   }, [
     projectId,
-    selection,
-    busy,
-    deliveryWorking,
-    entries,
+    lastMove,
+    undoing,
+    categories,
+    refreshLoadedAssets,
     refreshCategories,
     notify,
-    pulseCommit,
   ]);
 
+  const runCurate = useCallback(
+    async (targetsOverride?: string[]) => {
+      const actedEntries = targetsOverride ?? actionTargets(selection);
+      const targets = targetsOverride ?? resolveEntryIds(entries, actedEntries);
+      if (!projectId || targets.length === 0 || busy || deliveryWorking) return;
+      setBusy(true);
+      try {
+        const result = await api.curateAssets(projectId, targets);
+        // 精选是「复制一份进待修」，原件留在待分类，所以格子不会离开网格；
+        // 正因为不会离开，才必须在格子上给一次"收到了"的回弹（§13 causality）
+        if (result.succeeded.length > 0) {
+          pulseCommit(actedEntries);
+          // 常驻 ✓精选 角标(评审 3.3):动画播完之后仍然认得出哪些精选过
+          rememberCurated(result.succeeded);
+        }
+        if (result.failed.length > 0) {
+          notify(
+            "error",
+            "sorting-curate-failed",
+            `${result.failed.length} 个文件加入精选失败：${result.failed[0].message}`,
+          );
+        }
+        void refreshCategories();
+      } catch (err) {
+        notify(
+          "error",
+          "sorting-curate-failed",
+          `加入精选失败：${err instanceof Error ? err.message : String(err)}`,
+        );
+      } finally {
+        setBusy(false);
+      }
+    },
+    [
+      projectId,
+      selection,
+      busy,
+      deliveryWorking,
+      entries,
+      refreshCategories,
+      notify,
+      pulseCommit,
+      rememberCurated,
+    ],
+  );
+
   runCurateRef.current = runCurate;
+
+  /** D 是开关(评审 3.8):目标全部已标记 → 取消,否则标记 */
+  const toggleMark = useCallback(
+    (ids: string[]) => {
+      if (deliveryWorking || ids.length === 0) return;
+      const allMarked = ids.every((id) => markedSet.has(id));
+      dispatchDelete({ type: allMarked ? "unmark" : "mark", assetIds: ids });
+    },
+    [deliveryWorking, markedSet],
+  );
+
+  /* ---------------- 预览内打标(评审 3.2):作用于眼前这张,操作后自动前进 ---------------- */
+
+  const previewAsset = previewIndex >= 0 ? (previewAssets[previewIndex] ?? null) : null;
+
+  const previewAssign = useCallback(
+    (categoryId: string) => {
+      if (!previewAsset) return;
+      // 先站到下一张再移走当前张:大图不闪断,失败时素材还在、toast 会说话
+      const nextId =
+        previewAssets[previewIndex + 1]?.id ??
+        previewAssets[previewIndex - 1]?.id ??
+        null;
+      setPreviewId(nextId);
+      void runAssign(categoryId, [previewAsset.id]);
+    },
+    [previewAsset, previewAssets, previewIndex, runAssign],
+  );
+
+  const previewCurate = useCallback(() => {
+    if (!previewAsset) return;
+    void runCurate([previewAsset.id]);
+    const nextId = previewAssets[previewIndex + 1]?.id ?? null;
+    if (nextId) setPreviewId(nextId);
+  }, [previewAsset, previewAssets, previewIndex, runCurate]);
+
+  const previewToggleDelete = useCallback(() => {
+    if (!previewAsset) return;
+    toggleMark([previewAsset.id]);
+    const nextId = previewAssets[previewIndex + 1]?.id ?? null;
+    if (nextId) setPreviewId(nextId);
+  }, [previewAsset, previewAssets, previewIndex, toggleMark]);
 
   const commitDelete = useCallback(async () => {
     // 双保险：即使对话框以某种方式被触发，打包期间也绝不下发删除
@@ -697,10 +880,19 @@ export function SortingScreen() {
   function requestDeleteConfirm() {
     if (pendingDelete.marked.length === 0 || deliveryWorking) return;
     dispatchDelete({ type: "requestConfirm" });
+    // 确认前要能看见删的是**哪些**(评审 3.9),不是只有一个数字
+    const byId = new Map(assetsRef.current.map((a) => [a.id, a.fileName]));
+    const names = pendingDelete.marked
+      .slice(0, 8)
+      .map((id) => byId.get(id) ?? id.split("/").pop() ?? id);
+    const listing =
+      names.join("、") +
+      (pendingDelete.marked.length > 8
+        ? ` 等 ${pendingDelete.marked.length} 个`
+        : "");
     setConfirm({
       title: `把 ${pendingDelete.marked.length} 个文件移入回收站？`,
-      message:
-        "文件会移入项目内 .ocard/trash，可以随时恢复；此操作不会物理删除任何文件。",
+      message: `${listing}。文件会移入项目内 .ocard/trash，可以随时恢复；此操作不会物理删除任何文件。`,
       confirmLabel: "移入回收站",
       onConfirm: () => void commitDelete(),
     });
@@ -710,6 +902,9 @@ export function SortingScreen() {
 
   const handleKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLDivElement>) => {
+      // 预览打开时键盘由 Lightbox 全权接管(评审 3.2):这里不再处理,
+      // 否则同一击键会两处生效——网格里作用的还是进预览前的旧选中
+      if (previewId !== null) return;
       const action = resolveShortcut(
         {
           key: event.key,
@@ -718,25 +913,23 @@ export function SortingScreen() {
           ctrlKey: event.ctrlKey,
         },
         categories,
-        { previewOpen: previewId !== null },
       );
       if (!action) return;
       event.preventDefault();
 
       switch (action.type) {
         case "move": {
-          if (previewIndex >= 0) {
-            const delta = action.key === "ArrowRight" ? 1 : -1;
-            const next = Math.min(
-              previewAssets.length - 1,
-              Math.max(0, previewIndex + delta),
-            );
-            setPreviewId(previewAssets[next]?.id ?? null);
-            return;
-          }
           setSelection((prev) =>
             moveCursor(assetIds, prev, action.key, columns, action.extend),
           );
+          // 光标逼近已加载的尾部就续拉(评审 3.7):键盘流不必停下来点按钮
+          if (
+            cursorIndex >= assetIds.length - columns * 2 &&
+            assets.length < total &&
+            !loading
+          ) {
+            void loadMore();
+          }
           return;
         }
         case "toggle": {
@@ -748,8 +941,17 @@ export function SortingScreen() {
         case "selectAll":
           setSelection((prev) => selectAll(assetIds, prev));
           return;
+        case "clearSelection":
+          // Esc 清空选区(评审 3.8),光标留在原地
+          setSelection((prev) => ({ ...prev, anchor: prev.cursor, selected: [] }));
+          return;
         case "preview": {
-          // 光标可能停在折叠组上：预览打开组内第一张
+          // 光标停在折叠组上:Enter 展开组(评审 3.4),不再直接跳进第一张
+          const entry = entries.find((e) => e.id === selection.cursor);
+          if (entry?.kind === "group") {
+            openGroupOverlay(entry.groupId);
+            return;
+          }
           const targets = resolveEntryIds(entries, actionTargets(selection));
           if (targets.length > 0) openPreview(targets[0]);
           return;
@@ -770,11 +972,7 @@ export function SortingScreen() {
           return;
         case "markDelete":
           // 打包期间不许新增待删标记：后端 OpsMutex 也会拒，但 UI 要先行拦下并说明
-          if (deliveryWorking) return;
-          dispatchDelete({
-            type: "mark",
-            assetIds: resolveEntryIds(entries, actionTargets(selection)),
-          });
+          toggleMark(resolveEntryIds(entries, actionTargets(selection)));
           return;
         case "unmarkDelete":
           dispatchDelete({
@@ -782,14 +980,20 @@ export function SortingScreen() {
             assetIds: resolveEntryIds(entries, actionTargets(selection)),
           });
           return;
+        case "confirmDelete":
+          // Shift+D:标完直接进入确认,不必伸手摸鼠标(评审 3.9)
+          requestDeleteConfirm();
+          return;
       }
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       categories,
       previewId,
-      previewIndex,
-      previewAssets,
       assets.length,
+      total,
+      loading,
+      loadMore,
       assetIds,
       selection,
       columns,
@@ -798,8 +1002,10 @@ export function SortingScreen() {
       entries,
       runAssign,
       runCurate,
+      toggleMark,
       openPreview,
       closePreview,
+      openGroupOverlay,
     ],
   );
 
@@ -840,11 +1046,12 @@ export function SortingScreen() {
               className="btn btn--sm"
               data-testid="sorting-analyze"
               disabled={analyzing}
+              title="本地分析:连拍聚类、质量评分、人脸检测。只给建议角标,不会移动或删除任何文件"
               onClick={() => void startAnalysis()}
             >
               {analyzing
                 ? `分析中 ${analyzeJob?.done ?? 0}/${analyzeJob?.total ?? 0}`
-                : "分析"}
+                : "AI 选片分析"}
             </button>
             <DeliveryButton projectId={project.id} />
             <button
@@ -864,46 +1071,81 @@ export function SortingScreen() {
 
       <div className="content content--flush">
         <div className="sorting">
-          {/* 分类条：计数 + 数字键提示 */}
+          {/* 分类条：计数 + 数字键提示。chip 是「把选中素材移入」的动作,
+              不是筛选器(评审 3.10)——无选中目标时禁用并说明,而不是静默无事发生 */}
           <div className="sorting__bar" data-testid="sorting-categories">
-            {categories.map((category) => (
-              <button
-                key={category.id}
-                type="button"
-                className="chip"
-                data-testid="sorting-category"
-                data-category={category.id}
-                disabled={category.kind === "inbox" || busy || deliveryWorking}
-                /* 精选是「复制进精选/待修」，不是移动——点击路径必须与 P 键一致 */
-                onClick={() =>
-                  category.kind === "curated"
-                    ? void runCurate()
-                    : void runAssign(category.id)
-                }
-                title={
-                  category.kind === "custom"
-                    ? `按 ${category.hotkey} 分到「${category.name}」`
-                    : category.name
-                }
-              >
-                {category.hotkey ? <Kbd>{category.hotkey}</Kbd> : null}
-                {category.kind === "curated" ? <Kbd>P</Kbd> : null}
-                {category.kind === "other" ? <Kbd>O</Kbd> : null}
-                <span>{category.name}</span>
-                {/* 计数变化就是"这一下生效了"的因果反馈：分类完不用满屏找差别 */}
-                <PulseValue className="chip__count" value={category.count} />
-              </button>
-            ))}
+            {(() => {
+              const hasTargets = actionTargets(selection).length > 0;
+              return categories.map((category) => (
+                <button
+                  key={category.id}
+                  type="button"
+                  className="chip"
+                  data-testid="sorting-category"
+                  data-category={category.id}
+                  disabled={
+                    category.kind === "inbox" ||
+                    busy ||
+                    deliveryWorking ||
+                    !hasTargets
+                  }
+                  /* 精选是「复制进精选/待修」，不是移动——点击路径必须与 P 键一致 */
+                  onClick={() =>
+                    category.kind === "curated"
+                      ? void runCurate()
+                      : void runAssign(category.id)
+                  }
+                  title={
+                    category.kind === "inbox"
+                      ? category.name
+                      : !hasTargets
+                        ? "先在网格里选中素材，再点击移入该分类"
+                        : category.kind === "curated"
+                          ? "把选中素材复制一份进「精选/待修」，原件留在待分类（快捷键 P）"
+                          : category.kind === "other"
+                            ? `把选中素材移入「${category.name}」（快捷键 O）`
+                            : `把选中素材移入「${category.name}」（快捷键 ${category.hotkey}）`
+                  }
+                >
+                  {category.hotkey ? <Kbd>{category.hotkey}</Kbd> : null}
+                  {category.kind === "curated" ? <Kbd>P</Kbd> : null}
+                  {category.kind === "other" ? <Kbd>O</Kbd> : null}
+                  <span>{category.name}</span>
+                  {/* 计数变化就是"这一下生效了"的因果反馈：分类完不用满屏找差别 */}
+                  <PulseValue className="chip__count" value={category.count} />
+                </button>
+              ));
+            })()}
 
-            <Checkbox
-              className="push-right text-xs"
-              testId="sorting-suggestion-filter"
-              checked={suggestionOnly}
-              onChange={setSuggestionOnly}
-            >
-              只看建议保留
-            </Checkbox>
+            <span className="push-right row-inline text-xs">
+              <span className="dim">筛选</span>
+              <Select
+                ariaLabel="按 AI 判定筛选"
+                testId="sorting-judge-filter"
+                value={judgeFilter}
+                onChange={(next) => setJudgeFilter(next as JudgementFilter)}
+                options={(
+                  Object.keys(JUDGEMENT_FILTER_LABEL) as JudgementFilter[]
+                ).map((key) => ({
+                  value: key,
+                  label: JUDGEMENT_FILTER_LABEL[key],
+                }))}
+              />
+            </span>
           </div>
+
+          {/* 没跑过分析时,判定筛选形同虚设——把因果说破,别让人对着全量列表纳闷 */}
+          {judgeFilter !== "all" && !assets.some((a) => a.judgement) ? (
+            <div
+              className="sorting__indexing"
+              role="status"
+              data-testid="sorting-filter-hint"
+            >
+              <span className="text-xs">
+                还没有 AI 判定结果——先点右上角「AI 选片分析」，跑完才有「建议保留/放弃」可筛。
+              </span>
+            </div>
+          ) : null}
 
           {flowHints.length > 0 ? (
             <div className="sorting__indexing" data-testid="sorting-flow-hints">
@@ -1015,7 +1257,38 @@ export function SortingScreen() {
                 </button>
               </div>
             ) : assets.length === 0 && !loading ? (
-              <EmptyState>待分类里没有素材了。</EmptyState>
+              /* 清空不是死胡同(评审 3.12):此刻的下一步几乎必然是交付打包 */
+              <div className="sorting__error" data-testid="sorting-empty-cta">
+                <p className="text-sm">待分类已清空——都分完了。</p>
+                <p className="text-xs dim">
+                  下一步通常是交付打包;若有误删的,先去回收站找回。
+                </p>
+                <div className="row-inline">
+                  <DeliveryButton projectId={project.id} />
+                  <button
+                    type="button"
+                    className="btn btn--sm"
+                    onClick={() => dispatch({ type: "navigate", route: "trash" })}
+                  >
+                    查看回收站
+                  </button>
+                </div>
+              </div>
+            ) : visibleAssets.length === 0 && !loading ? (
+              /* 筛选下为空 ≠ 没素材:给一键回到全部,别让人以为素材丢了 */
+              <div className="sorting__error" data-testid="sorting-filter-empty">
+                <p className="text-sm">当前筛选条件下没有素材。</p>
+                <button
+                  type="button"
+                  className="btn btn--sm"
+                  onClick={() => {
+                    setJudgeFilter("all");
+                    setMarkedOnly(false);
+                  }}
+                >
+                  清除筛选
+                </button>
+              </div>
             ) : (
               <VirtualGrid
                 items={entries}
@@ -1026,6 +1299,13 @@ export function SortingScreen() {
                 ariaLabel="待分类素材网格"
                 scrollToIndex={cursorIndex}
                 onColumnsChange={setColumns}
+                /* 滚动触底自动续拉(评审 3.7):滚动流不必停下来点按钮;
+                   失败重试仍走底部显式按钮 */
+                onEndReached={
+                  assets.length < total && !pageError
+                    ? () => void loadMore()
+                    : undefined
+                }
                 keyOf={(entry) => entry.id}
                 renderItem={(entry, index) =>
                   entry.kind === "group" ? (
@@ -1044,6 +1324,9 @@ export function SortingScreen() {
                       committed={commit?.ids.has(entry.id) ? commit.phase : undefined}
                       markedCount={
                         entry.items.filter((i) => markedSet.has(i.id)).length
+                      }
+                      selectedCount={
+                        entry.items.filter((i) => selectedSet.has(i.id)).length
                       }
                       onSelect={(modifiers) =>
                         setSelection((prev) =>
@@ -1068,6 +1351,7 @@ export function SortingScreen() {
                       }
                       committed={commit?.ids.has(entry.id) ? commit.phase : undefined}
                       marked={markedSet.has(entry.id)}
+                      curated={curatedIds.has(entry.id)}
                       onSelect={(modifiers) =>
                         setSelection((prev) =>
                           clickSelection(assetIds, prev, entry.id, modifiers),
@@ -1092,21 +1376,57 @@ export function SortingScreen() {
                 <Kbd>→</Kbd> 移动
               </span>
               <span>
-                <Kbd>空格</Kbd> 选中 · <Kbd>Shift</Kbd>+方向 连选
+                <Kbd>空格</Kbd> 选中 · <Kbd>Shift</Kbd>+方向 连选 · <Kbd>⌘A</Kbd> 全选 ·{" "}
+                <Kbd>Esc</Kbd> 清选
               </span>
               <span>
                 <Kbd>1</Kbd>–<Kbd>9</Kbd> 分类 · <Kbd>P</Kbd> 精选 · <Kbd>O</Kbd> 其他 ·{" "}
-                <Kbd>D</Kbd> 标删
+                <Kbd>D</Kbd> 标删/取消 · <Kbd>Shift+D</Kbd> 提交
               </span>
               <span>
-                <Kbd>Enter</Kbd> 全屏
+                <Kbd>Enter</Kbd> 全屏/展开组
               </span>
               {selection.selected.length > 0 ? (
                 <span className="push-right" data-testid="sorting-selected-count">
                   已选 {resolveEntryIds(entries, selection.selected).length}
+                  {/* 隐形边界必须说破(评审 3.7):全选只覆盖已加载部分 */}
+                  {assets.length < total &&
+                  selection.selected.length >= entries.length
+                    ? `（尚有 ${total - assets.length} 张未加载）`
+                    : ""}
                 </span>
               ) : null}
             </div>
+
+            {/* 批量移动撤销窗口(评审 3.5):误击一个数字键,200 张也追得回来 */}
+            {lastMove ? (
+              <div
+                className="sorting__pending"
+                role="status"
+                data-testid="sorting-undo-bar"
+              >
+                <span className="text-sm">
+                  已把 {lastMove.assetIds.length} 张移入「{lastMove.categoryName}」
+                </span>
+                <button
+                  type="button"
+                  className="btn btn--sm push-right"
+                  data-testid="sorting-undo"
+                  disabled={undoing || busy}
+                  onClick={() => void undoLastMove()}
+                >
+                  {undoing ? "撤销中…" : "撤销"}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn--ghost btn--sm"
+                  aria-label="收起撤销提示"
+                  onClick={() => setLastMove(null)}
+                >
+                  收起
+                </button>
+              </div>
+            ) : null}
 
             {pageError ? (
               <span className="field__error" role="alert" data-testid="sorting-page-error">
@@ -1140,6 +1460,16 @@ export function SortingScreen() {
               <button
                 type="button"
                 className="btn btn--sm push-right"
+                data-testid="sorting-marked-only"
+                aria-pressed={markedOnly}
+                title="只显示已标删的素材,提交前逐张复核"
+                onClick={() => setMarkedOnly((v) => !v)}
+              >
+                {markedOnly ? "显示全部" : "只看已标删"}
+              </button>
+              <button
+                type="button"
+                className="btn btn--sm"
                 data-testid="sorting-unmark-all"
                 onClick={() => dispatchDelete({ type: "clear" })}
               >
@@ -1151,7 +1481,9 @@ export function SortingScreen() {
                 data-testid="sorting-confirm-delete"
                 disabled={deliveryWorking}
                 title={
-                  deliveryWorking ? "交付打包进行中，暂不能移入回收站" : undefined
+                  deliveryWorking
+                    ? "交付打包进行中，暂不能移入回收站"
+                    : "快捷键 Shift+D"
                 }
                 onClick={requestDeleteConfirm}
               >
@@ -1167,6 +1499,8 @@ export function SortingScreen() {
           items={openGroupItems}
           selectedSet={selectedSet}
           markedSet={markedSet}
+          curatedIds={curatedIds}
+          categories={categories}
           /* 关键：连选也在**组成员 id 空间**里做，
              展开层选中的裸素材 id 由 resolveEntryIds 兜住，不再被静默丢弃 */
           onSelect={(id, modifiers) =>
@@ -1179,7 +1513,9 @@ export function SortingScreen() {
               ),
             )
           }
-          onKeyDown={handleKeyDown}
+          onAssign={(ids, categoryId) => void runAssign(categoryId, ids)}
+          onCurate={(ids) => void runCurate(ids)}
+          onToggleDelete={toggleMark}
           onThumbError={onThumbError}
           onThumbLoad={onThumbLoad}
           onClose={closeGroupOverlay}
@@ -1191,6 +1527,9 @@ export function SortingScreen() {
           asset={previewAssets[previewIndex]}
           index={previewIndex}
           total={previewAssets.length}
+          categories={categories}
+          marked={markedSet.has(previewAssets[previewIndex].id)}
+          curated={curatedIds.has(previewAssets[previewIndex].id)}
           onClose={closePreview}
           onPrev={() =>
             setPreviewId(previewAssets[Math.max(0, previewIndex - 1)].id)
@@ -1202,6 +1541,9 @@ export function SortingScreen() {
               ].id,
             )
           }
+          onAssign={previewAssign}
+          onCurate={previewCurate}
+          onToggleDelete={previewToggleDelete}
         />
       ) : null}
 
@@ -1226,6 +1568,7 @@ function AssetCell({
   selected,
   focused,
   marked,
+  curated,
   previewAnchor,
   committed,
   onSelect,
@@ -1238,6 +1581,8 @@ function AssetCell({
   selected: boolean;
   focused: boolean;
   marked: boolean;
+  /** 本次会话精选过:常驻角标,动画播完仍认得出(评审 3.3) */
+  curated?: boolean;
   /** 该格是不是全屏预览的来源/去向：是就把过渡名挂上，做同一实体的形变 */
   previewAnchor: boolean;
   /** 刚被"精选"命中过：a / b 交替以便连续两次都能重新起播 */
@@ -1310,6 +1655,15 @@ function AssetCell({
 
       <JudgementBadges judgement={asset.judgement} />
 
+      {curated ? (
+        <span
+          className="asset__flag asset__flag--curated"
+          title="已精选(复制进精选/待修)"
+          data-testid="asset-curated-flag"
+        >
+          ✓
+        </span>
+      ) : null}
       {marked ? (
         <span className="asset__flag asset__flag--delete" title="已标记待删除">
           D
@@ -1328,36 +1682,7 @@ function AssetCell({
 }
 
 
-/** 判定角标：AI 只标注，不触发任何文件操作 */
-function JudgementBadges({ judgement }: { judgement?: SortingAsset["judgement"] }) {
-  if (!judgement) return null;
-  const faces = judgement.faces;
-  return (
-    <span className="asset__judge" data-testid="asset-judgement">
-      {judgement.suggestedKeep ? (
-        <Badge tone="ok">建议保留</Badge>
-      ) : null}
-      {/*
-        只有"确实检出了脸"才出角标。
-        faces == null 是**检测不可用**、0 是**确实没有脸**，两者都不出角标：
-        网格里一个中性角标承载不了这个区别，硬塞会把"不知道"说成"没有"。
-        需要区分时去全屏预览看逐项说明。
-      */}
-      {typeof faces === "number" && faces > 0 ? (
-        <Badge tone="neutral">
-          <span data-testid="judge-faces">{faces} 人</span>
-        </Badge>
-      ) : null}
-      {judgement.blurry ? <Badge tone="warn">糊</Badge> : null}
-      {judgement.overExposed ? <Badge tone="warn">过曝</Badge> : null}
-      {judgement.underExposed ? <Badge tone="warn">欠曝</Badge> : null}
-      {/* 分数只用区间表达，不显示数值 */}
-      {judgement.score < LOW_SCORE_AT ? (
-        <span className="dot judge-dot--low" title="低分" data-testid="judge-low" />
-      ) : null}
-    </span>
-  );
-}
+/* 判定角标已抽到 components/JudgementBadges.tsx:网格与全屏预览共用同一套呈现 */
 
 /** 连拍组：恰占一格，角标 ×N；展开走 overlay */
 function GroupCell({
@@ -1365,6 +1690,7 @@ function GroupCell({
   selected,
   focused,
   markedCount,
+  selectedCount = 0,
   previewAnchor,
   committed,
   onSelect,
@@ -1376,6 +1702,8 @@ function GroupCell({
   selected: boolean;
   focused: boolean;
   markedCount: number;
+  /** 组内已被单独选中的张数:展开层选完关掉后,格面也要看得出(评审 G1) */
+  selectedCount?: number;
   previewAnchor: boolean;
   committed?: "a" | "b";
   onSelect: (modifiers: { shift?: boolean; meta?: boolean }) => void;
@@ -1427,6 +1755,7 @@ function GroupCell({
         <span className="asset__name truncate">连拍组</span>
         <span className="asset__sub">
           <Badge tone="neutral">×{entry.items.length}</Badge>
+          {selectedCount > 0 ? <Badge tone="ok">已选 {selectedCount}</Badge> : null}
           {markedCount > 0 ? <Badge tone="danger">待删 {markedCount}</Badge> : null}
         </span>
       </div>
@@ -1449,13 +1778,26 @@ function GroupCell({
   );
 }
 
-/** 组内网格：选中语义与主网格一致（写的是同一个选区） */
+/** 展开层键盘上下移动一次跨几张(网格为 auto-fill,取常见列数的近似) */
+const GROUP_OVERLAY_ROW_STEP = 4;
+
+/**
+ * 组内网格：选中语义与主网格一致（写的是同一个选区）。
+ *
+ * 键盘流自洽(评审 3.4):浮层自己有光标,方向键在**组成员**里移动、
+ * Esc 关层、空格选中、打标键作用于组内选中(或光标项)——
+ * 不再把按键交给背后的主网格,那会让方向键动的是看不见的东西。
+ */
 function GroupOverlay({
   items,
   selectedSet,
   markedSet,
+  curatedIds,
+  categories,
   onSelect,
-  onKeyDown,
+  onAssign,
+  onCurate,
+  onToggleDelete,
   onThumbError,
   onThumbLoad,
   onClose,
@@ -1463,17 +1805,93 @@ function GroupOverlay({
   items: SortingAsset[];
   selectedSet: Set<string>;
   markedSet: Set<string>;
+  curatedIds: Set<string>;
+  categories: SortingCategory[];
   onSelect: (id: string, modifiers: { shift?: boolean; meta?: boolean }) => void;
-  onKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => void;
+  onAssign: (assetIds: string[], categoryId: string) => void;
+  onCurate: (assetIds: string[]) => void;
+  onToggleDelete: (assetIds: string[]) => void;
   onThumbError: () => void;
   onThumbLoad: () => void;
   onClose: () => void;
 }) {
   const boxRef = useRef<HTMLDivElement>(null);
+  const [cursorIdx, setCursorIdx] = useState(0);
   // 展开层是 overlay，按键不会冒泡回网格——这里自己接，并把焦点拿过来
   useEffect(() => {
     boxRef.current?.focus();
   }, []);
+
+  /** 打标目标:组内已选中的成员;都没选就用光标那张 */
+  const overlayTargets = useCallback(() => {
+    const selected = items.filter((i) => selectedSet.has(i.id)).map((i) => i.id);
+    if (selected.length > 0) return selected;
+    const at = items[cursorIdx];
+    return at ? [at.id] : [];
+  }, [items, selectedSet, cursorIdx]);
+
+  const handleOverlayKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const { key } = event;
+    const step =
+      key === "ArrowRight"
+        ? 1
+        : key === "ArrowLeft"
+          ? -1
+          : key === "ArrowDown"
+            ? GROUP_OVERLAY_ROW_STEP
+            : key === "ArrowUp"
+              ? -GROUP_OVERLAY_ROW_STEP
+              : null;
+    if (step !== null) {
+      event.preventDefault();
+      event.stopPropagation();
+      setCursorIdx((prev) => Math.min(items.length - 1, Math.max(0, prev + step)));
+      return;
+    }
+    if (key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+      return;
+    }
+    if (key === " ") {
+      event.preventDefault();
+      event.stopPropagation();
+      const at = items[cursorIdx];
+      if (at) onSelect(at.id, { meta: true });
+      return;
+    }
+    const action = resolveShortcut(
+      {
+        key,
+        shiftKey: event.shiftKey,
+        metaKey: event.metaKey,
+        ctrlKey: event.ctrlKey,
+      },
+      categories,
+    );
+    if (!action) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const targets = overlayTargets();
+    if (targets.length === 0) return;
+    if (action.type === "assign") onAssign(targets, action.categoryId);
+    else if (action.type === "other") {
+      const other = categories.find((c) => c.kind === "other");
+      if (other) onAssign(targets, other.id);
+    } else if (action.type === "curate") onCurate(targets);
+    else if (action.type === "markDelete" || action.type === "unmarkDelete") {
+      onToggleDelete(targets);
+    }
+  };
+
+  // 「一组保留 1-2 张、其余批量处理」(PRD §5.4)的一键版
+  const suggested = items.filter((i) => i.judgement?.suggestedKeep);
+  const keepRecommended = () => {
+    const keep = new Set(suggested.map((i) => i.id));
+    const rest = items.filter((i) => !keep.has(i.id)).map((i) => i.id);
+    if (rest.length > 0) onToggleDelete(rest);
+  };
 
   return (
     <div className="overlay" onClick={onClose}>
@@ -1485,15 +1903,53 @@ function GroupOverlay({
         data-testid="group-overlay"
         ref={boxRef}
         tabIndex={0}
-        onKeyDown={onKeyDown}
+        onKeyDown={handleOverlayKey}
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="dialog__title">连拍组（{items.length} 张）</h2>
         <p className="dialog__message">
-          组内可以单独选中并执行分类/精选/标删；AI 只给建议，不会替你动文件。
+          方向键移动、空格选中、P/数字键/D 直接打标；AI 只给建议，不会替你动文件。
         </p>
+        <div className="row-inline">
+          <button
+            type="button"
+            className="btn btn--sm"
+            data-testid="group-keep-recommended"
+            disabled={suggested.length === 0 || suggested.length === items.length}
+            title={
+              suggested.length === 0
+                ? "先运行 AI 选片分析,组内才有「建议保留」"
+                : `保留 ${suggested.length} 张建议项,其余 ${items.length - suggested.length} 张标删(仍需底部确认才移入回收站)`
+            }
+            onClick={keepRecommended}
+          >
+            保留推荐，其余标删
+          </button>
+          <button
+            type="button"
+            className="btn btn--sm"
+            data-testid="group-select-all"
+            onClick={() => {
+              for (const item of items) {
+                if (!selectedSet.has(item.id)) onSelect(item.id, { meta: true });
+              }
+            }}
+          >
+            全选
+          </button>
+          <button
+            type="button"
+            className="btn btn--sm"
+            data-testid="group-invert"
+            onClick={() => {
+              for (const item of items) onSelect(item.id, { meta: true });
+            }}
+          >
+            反选
+          </button>
+        </div>
         <div className="group-overlay__grid dialog__form">
-          {items.map((asset) => (
+          {items.map((asset, i) => (
             <div
               key={asset.id}
               role="gridcell"
@@ -1501,14 +1957,15 @@ function GroupOverlay({
               data-testid="group-item"
               data-asset={asset.id}
               className={`asset${selectedSet.has(asset.id) ? " asset--selected" : ""}${
-                markedSet.has(asset.id) ? " asset--marked" : ""
-              }`}
-              onClick={(e) =>
+                i === cursorIdx ? " asset--focused" : ""
+              }${markedSet.has(asset.id) ? " asset--marked" : ""}`}
+              onClick={(e) => {
+                setCursorIdx(i);
                 onSelect(asset.id, {
                   shift: e.shiftKey,
                   meta: e.metaKey || e.ctrlKey,
-                })
-              }
+                });
+              }}
             >
               <GroupThumb
                 asset={asset}
@@ -1517,6 +1974,19 @@ function GroupOverlay({
               />
               <span className="asset__name truncate">{asset.fileName}</span>
               <JudgementBadges judgement={asset.judgement} />
+              {curatedIds.has(asset.id) ? (
+                <span
+                  className="asset__flag asset__flag--curated"
+                  title="已精选(复制进精选/待修)"
+                >
+                  ✓
+                </span>
+              ) : null}
+              {markedSet.has(asset.id) ? (
+                <span className="asset__flag asset__flag--delete" title="已标记待删除">
+                  D
+                </span>
+              ) : null}
             </div>
           ))}
         </div>

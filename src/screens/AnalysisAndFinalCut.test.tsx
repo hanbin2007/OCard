@@ -98,7 +98,7 @@ describe("★ PRD 底线：AI 只标注，不动文件", () => {
       jobEmitters.forEach((emit) => emit(analyzeJob({ revision: 20 })));
     });
     await waitFor(() =>
-      expect(screen.getByTestId("sorting-analyze").textContent).toBe("分析"),
+      expect(screen.getByTestId("sorting-analyze").textContent).toBe("AI 选片分析"),
     );
 
     // 分析只产出标注，绝不触发任何文件操作
@@ -437,18 +437,34 @@ describe("#24 score 量纲是 0–100", () => {
   });
 });
 
-describe("按建议筛选", () => {
-  it("开启后只留建议保留与尚无判定的", async () => {
+describe("按判定筛选(筛选组)", () => {
+  it("「建议保留」只留建议保留与尚无判定的", async () => {
     const user = userEvent.setup();
     await renderSorting();
     const before = screen.getAllByTestId("asset-cell").length;
 
-    await user.click(screen.getByTestId("sorting-suggestion-filter"));
+    await user.click(screen.getByTestId("sorting-judge-filter"));
+    await user.click(screen.getByRole("option", { name: /建议保留/ }));
     await waitFor(() =>
       expect(screen.getAllByTestId("asset-cell").length).not.toBe(before),
     );
     // 明确判定为不保留的那些被过滤掉了
     expect(screen.queryAllByTestId("asset-group")).toHaveLength(0);
+  });
+
+  it("「建议放弃」是它的严格反集:批量弃片有了路径(评审 3.6)", async () => {
+    const user = userEvent.setup();
+    await renderSorting();
+
+    await user.click(screen.getByTestId("sorting-judge-filter"));
+    await user.click(screen.getByRole("option", { name: "建议放弃" }));
+    await waitFor(() => {
+      // mock 里有判定且 suggestedKeep=false 的:i=5、i=7 与连拍组的 4 张
+      const cells = screen.queryAllByTestId("asset-cell");
+      const groups = screen.queryAllByTestId("asset-group");
+      expect(cells.length + groups.length).toBeGreaterThan(0);
+      expect(cells.length).toBeLessThan(10);
+    });
   });
 });
 

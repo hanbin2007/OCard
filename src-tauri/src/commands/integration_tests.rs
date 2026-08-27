@@ -526,6 +526,7 @@ fn resume_rejects_tampered_manifest_through_real_handler() {
                 destinations: Vec::new(),
                 files: Vec::new(),
                 file_count: None,
+                status_counts: None,
                 total_bytes: 0,
                 copied_bytes: 0,
                 speed_bytes_per_sec: 0,

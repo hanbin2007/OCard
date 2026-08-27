@@ -478,6 +478,14 @@
   background: var(--border-focus);
 }
 
+.progress--danger .progress__bar {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--danger) 45%, transparent),
+    var(--danger)
+  );
+}
+
 /* ---------- 渐变图表（charts.tsx） ---------- */
 
 /* 速度曲线：面积图容器。底边 1px 当基线轴，其余刻度一概不画 */

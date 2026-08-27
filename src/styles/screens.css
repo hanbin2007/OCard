@@ -330,6 +330,16 @@
   color: var(--text-tertiary);
 }
 
+/* 校验阶段标注：大百分比的口径从「拷贝」切到「校验」时必须自我说明 */
+.copy-hero__phase {
+  margin-left: var(--space-3);
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  letter-spacing: 0;
+  color: var(--accent);
+}
+
 .copy-hero__vitals {
   display: flex;
   gap: var(--space-8);
@@ -726,6 +736,17 @@
   color: var(--on-danger);
 }
 
+/* 已精选:常驻 ✓,与待删的 D 同一视觉体系;两者可同时在场,精选让位左移 */
+.asset__flag--curated {
+  background: var(--ok);
+  color: var(--on-danger); /* 深色前景规则与 danger 相同:浅底白字/深底黑字 */
+}
+
+.asset__flag--delete ~ .asset__flag--curated,
+.asset__flag--curated:has(~ .asset__flag--delete) {
+  right: calc(var(--space-2) + 22px);
+}
+
 .sorting__foot {
   display: flex;
   align-items: center;
@@ -828,6 +849,38 @@
   width: 60%;
   aspect-ratio: 4 / 3;
   border: 1px dashed var(--border-strong);
+}
+
+/* 点击放大(v1 判焦辅助):只动 transform,不引发重排;stage 隐藏溢出 */
+.lightbox__image--zoomed {
+  transform: scale(2.4);
+  cursor: zoom-out;
+}
+
+.lightbox__image:not(.lightbox__image--empty) {
+  cursor: zoom-in;
+}
+
+.lightbox__stage {
+  overflow: hidden;
+}
+
+/* 顶栏状态徽标组:与文件名/元信息同一行,靠视觉分组读作「这张的状态」 */
+.lightbox__badges {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* 底部动作条:预览内直接打标(兼快捷键提示) */
+.lightbox__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--border);
+  background: var(--panel);
 }
 
 /* 回收站 */

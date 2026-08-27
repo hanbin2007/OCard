@@ -162,6 +162,51 @@ describe("reducer", () => {
     expect(next.tasks[0].note).toBe("n");
   });
 
+  it("终态跨越出声(评审 2.1):done 出 info、failed 出 error,且带任务引用", () => {
+    const seeded = { ...initialState, tasks: [runningTask] };
+
+    const done = reducer(seeded, {
+      type: "taskProgress",
+      event: progressEvent({ revision: 2, state: "done" }),
+    });
+    const doneNotice = done.notices.find((n) => n.code === "copy-task-done");
+    expect(doneNotice).toBeDefined();
+    expect(doneNotice?.level).toBe("info");
+    expect(doneNotice?.taskId).toBe(runningTask.id);
+    expect(doneNotice?.live).toBe(true);
+
+    const failed = reducer(seeded, {
+      type: "taskProgress",
+      event: progressEvent({ revision: 2, state: "failed" }),
+    });
+    const failNotice = failed.notices.find((n) => n.code === "copy-task-failed");
+    expect(failNotice?.level).toBe("error");
+    expect(failNotice?.projectId).toBe(runningTask.projectId);
+
+    // 终态之后的重复事件不再重复出声
+    const again = reducer(failed, {
+      type: "taskProgress",
+      event: progressEvent({ revision: 3, state: "failed" }),
+    });
+    expect(again.notices.filter((n) => n.code === "copy-task-failed").length).toBe(1);
+  });
+
+  it("快照对账补出的终态同样出声,但新任务快照不算", () => {
+    const seeded = { ...initialState, tasks: [runningTask] };
+    const viaSnapshot = reducer(seeded, {
+      type: "taskSnapshot",
+      task: { ...runningTask, state: "done" as const, progressRevision: 9 },
+    });
+    expect(viaSnapshot.notices.some((n) => n.code === "copy-task-done")).toBe(true);
+
+    // 本地原本没有的任务(重启恢复/他机)带着终态进来:不是「刚刚结束」,不打扰
+    const fresh = reducer(initialState, {
+      type: "taskSnapshot",
+      task: { ...runningTask, id: "t-other", state: "done" as const },
+    });
+    expect(fresh.notices.length).toBe(0);
+  });
+
   it("未知任务的进度事件不影响现有任务", () => {
     const next = reducer(initialState, {
       type: "taskProgress",

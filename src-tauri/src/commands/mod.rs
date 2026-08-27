@@ -1375,6 +1375,7 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
                 started_at: m.created_at.to_rfc3339(),
                 finished_at: None,
                 file_count: Some(files.len()),
+                status_counts: None, // 快照对外发布时由 summary_of 现算
                 files,
             };
             let handle = Arc::new(TaskHandle {

@@ -55,6 +55,31 @@ function newDest(kind: DestinationKind, path = ""): DestDraft {
   return { id: `dest-${destSeq}`, kind, path };
 }
 
+/**
+ * 校验阶段的速度估计(评审 2.2):后端只推 verifiedBytes,不推校验速度。
+ * 客户端按增量采样出字节/秒(EMA 平滑),供「校验中」的 ETA 使用。
+ * 渲染期突变 ref 是幂等的:verified 不增长就不更新,StrictMode 双渲染安全。
+ */
+function useVerifySpeed(taskId: string | null, verified: number, active: boolean): number {
+  const ref = useRef({ taskId: null as string | null, at: 0, verified: 0, speed: 0 });
+  if (ref.current.taskId !== taskId) {
+    ref.current = { taskId, at: Date.now(), verified, speed: 0 };
+  } else if (active && verified > ref.current.verified) {
+    const now = Date.now();
+    const dt = (now - ref.current.at) / 1000;
+    if (dt >= 0.5) {
+      const inst = (verified - ref.current.verified) / dt;
+      ref.current = {
+        taskId,
+        at: now,
+        verified,
+        speed: ref.current.speed > 0 ? ref.current.speed * 0.6 + inst * 0.4 : inst,
+      };
+    }
+  }
+  return active ? ref.current.speed : 0;
+}
+
 export function CopyTaskScreen() {
   const { state, dispatch, refreshTask } = useStore();
   const { volumes, cameras, tasks, projects, selectedProjectId, selectedTaskId } = state;
@@ -429,7 +454,7 @@ export function CopyTaskScreen() {
     }
   }
 
-  const fileSummary = useMemo(() => {
+  const loadedSummary = useMemo(() => {
     const counts = { pending: 0, copied: 0, verified: 0, failed: 0 };
     for (const f of files) counts[f.status] += 1;
     return counts;
@@ -437,8 +462,45 @@ export function CopyTaskScreen() {
 
   // 总数以后端为准（task.fileCount），列表接口的 total 兜底
   const totalFiles = task?.fileCount ?? fileTotal;
-  /** 明细是否已全部加载——没全载就不能给出全量「已校验」断言 */
+  /** 明细是否已全部加载 */
   const fullyLoaded = totalFiles > 0 && files.length >= totalFiles;
+  /**
+   * 全量状态计数(评审 2.5):任务快照/进度事件自带的聚合真值,
+   * 不受明细分页挟持——几千个文件不必点十几次「加载更多」才见总账。
+   * 旧后端没这个字段时,退回「已全部加载才敢断言」的旧口径。
+   */
+  const counts = task?.statusCounts ?? (fullyLoaded ? loadedSummary : null);
+  /** 「只看失败」过滤(评审 2.6):失败文件不该逐页翻着找 */
+  const [failedOnly, setFailedOnly] = useState(false);
+  const visibleFiles = failedOnly ? files.filter((f) => f.status === "failed") : files;
+  const failedTotal = counts?.failed ?? loadedSummary.failed;
+  /** 重试全部失败 = 续跑任务:引擎按 manifest 只补未校验文件 */
+  const [retryingAll, setRetryingAll] = useState(false);
+  const retryAllFailed = useCallback(async () => {
+    if (!task || retryingAll) return;
+    setRetryingAll(true);
+    try {
+      await api.resumeCopyTask(task.id);
+      await refreshTask(task.id);
+      await refreshLoadedFiles(task.id);
+    } catch (err) {
+      pushNotice(
+        "error",
+        "copy-retry-failed",
+        `重试失败文件未能发起：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setRetryingAll(false);
+    }
+  }, [task, retryingAll, refreshTask, refreshLoadedFiles, pushNotice]);
+
+  /** 校验阶段总进度(评审 2.2):所有目的地合计的已回读字节 */
+  const verifying = task?.state === "verifying";
+  const verifiedSum = task
+    ? task.destinations.reduce((sum, d) => sum + (d.verifiedBytes ?? 0), 0)
+    : 0;
+  const verifyTotal = task ? task.totalBytes * Math.max(1, task.destinations.length) : 0;
+  const verifySpeed = useVerifySpeed(task?.id ?? null, verifiedSum, Boolean(verifying));
 
   const volume = volumes.find((v) => v.id === volumeId) ?? null;
   // 同名卷提示：只警告不阻断——这是协作提示，不是锁
@@ -896,6 +958,41 @@ export function CopyTaskScreen() {
                     </div>
                   ) : null}
 
+                  {/* 失败必须与完成同等醒目(评审 2.1):写明规模与下一步,不让用户
+                      只面对一个红 Badge 猜原因 */}
+                  {task.state === "failed" ? (
+                    <div
+                      className="notice notice--danger"
+                      role="alert"
+                      data-testid="copy-failed-banner"
+                    >
+                      <strong>
+                        拷卡失败
+                        {failedTotal > 0 ? `：${failedTotal} 个文件未通过` : ""}。
+                      </strong>
+                      <span>
+                        {task.destinations.some((d) => d.error)
+                          ? "目的地报错（见下方「目的地」的红字原因）。"
+                          : "失败原因见下方文件明细的红字说明。"}
+                        排除故障后点「重试全部失败文件」，按 manifest 续拷，
+                        已校验的文件自动跳过、绝不覆盖。
+                      </span>
+                      <div>
+                        <button
+                          type="button"
+                          className="btn btn--primary btn--sm"
+                          data-testid="copy-retry-all"
+                          disabled={retryingAll}
+                          onClick={() => void retryAllFailed()}
+                        >
+                          {retryingAll
+                            ? "正在重试…"
+                            : `重试全部失败文件${failedTotal > 0 ? `（${failedTotal}）` : ""}`}
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+
                   <div className="card">
                     <div className="card__head">
                       <span className="card__title mono truncate" title={task.targetFolder}>
@@ -939,12 +1036,29 @@ export function CopyTaskScreen() {
                         <div className="copy-hero">
                           <div className="copy-hero__row">
                             <div className="copy-hero__percent">
-                              {Math.round(ratio(task.copiedBytes, task.totalBytes) * 100)}
+                              {/* 校验阶段大百分比切到校验进度(评审 2.2):
+                                  「拷贝 100% 但还没完」的十几分钟里,用户必须
+                                  看得到在推进什么、还要等多久 */}
+                              {verifying
+                                ? Math.round(ratio(verifiedSum, verifyTotal) * 100)
+                                : Math.round(
+                                    ratio(task.copiedBytes, task.totalBytes) * 100,
+                                  )}
                               <span className="copy-hero__unit">%</span>
+                              {verifying ? (
+                                <span
+                                  className="copy-hero__phase"
+                                  data-testid="copy-hero-phase"
+                                >
+                                  校验中
+                                </span>
+                              ) : null}
                             </div>
                             <div className="copy-hero__vitals">
                               <div className="copy-hero__vital">
-                                <span className="stat__label">速度</span>
+                                <span className="stat__label">
+                                  {verifying ? "校验速度" : "速度"}
+                                </span>
                                 <span className="copy-hero__vital-value copy-hero__vital-value--spark">
                                   {/* 迷你曲线嵌在速度数字左侧：读法就是「这个数的历史」，
                                       与下方总进度条隔着整块仪表区，不会混成一回事 */}
@@ -953,33 +1067,42 @@ export function CopyTaskScreen() {
                                     label="拷贝速度曲线"
                                     className="copy-hero__spark"
                                   />
-                                  {formatSpeed(task.speedBytesPerSec)}
+                                  {formatSpeed(
+                                    verifying ? verifySpeed : task.speedBytesPerSec,
+                                  )}
                                 </span>
                               </div>
                               <div className="copy-hero__vital">
                                 <span className="stat__label">预计剩余</span>
                                 <span className="copy-hero__vital-value">
-                                  {formatEta(
-                                    task.totalBytes - task.copiedBytes,
-                                    task.speedBytesPerSec,
-                                  )}
+                                  {verifying
+                                    ? formatEta(verifyTotal - verifiedSum, verifySpeed)
+                                    : formatEta(
+                                        task.totalBytes - task.copiedBytes,
+                                        task.speedBytesPerSec,
+                                      )}
                                 </span>
                               </div>
                             </div>
                           </div>
                           <div className="copy-hero__bar">
                             <ProgressBar
-                              value={task.copiedBytes}
-                              total={task.totalBytes}
+                              value={verifying ? verifiedSum : task.copiedBytes}
+                              total={verifying ? verifyTotal : task.totalBytes}
                               tone={task.state === "done" ? "ok" : "accent"}
-                              label="总进度"
-                              valueText={`${formatBytes(task.copiedBytes)} / ${formatBytes(task.totalBytes)}`}
+                              label={verifying ? "校验进度" : "总进度"}
+                              valueText={
+                                verifying
+                                  ? `已校验 ${formatBytes(verifiedSum)} / ${formatBytes(verifyTotal)}（全部目的地合计）`
+                                  : `${formatBytes(task.copiedBytes)} / ${formatBytes(task.totalBytes)}`
+                              }
                             />
                           </div>
                           <div className="row-inline text-xs dim">
                             <span className="mono">
-                              {formatBytes(task.copiedBytes)} /{" "}
-                              {formatBytes(task.totalBytes)}
+                              {verifying
+                                ? `已校验 ${formatBytes(verifiedSum)} / ${formatBytes(verifyTotal)}`
+                                : `${formatBytes(task.copiedBytes)} / ${formatBytes(task.totalBytes)}`}
                             </span>
                           </div>
                         </div>
@@ -987,11 +1110,11 @@ export function CopyTaskScreen() {
                         <div className="task-stats">
                           <div>
                             <div className="stat__label">
-                              {fullyLoaded ? "已校验" : "文件明细"}
+                              {counts ? "已校验" : "文件明细"}
                             </div>
                             <div className="stat__value" data-testid="copy-verified-stat">
-                              {fullyLoaded
-                                ? `${fileSummary.verified}/${totalFiles}`
+                              {counts
+                                ? `${counts.verified}/${totalFiles}`
                                 : `已加载 ${files.length}/${totalFiles}`}
                             </div>
                           </div>
@@ -1038,16 +1161,39 @@ export function CopyTaskScreen() {
                                 </span>
                                 <span className="dest-lane__stats">
                                   {DESTINATION_STATE_LABEL[dest.state]} ·{" "}
-                                  {formatBytes(dest.writtenBytes, 0)}
+                                  {dest.state === "verifying"
+                                    ? `已校验 ${formatBytes(dest.verifiedBytes ?? 0, 0)}`
+                                    : formatBytes(dest.writtenBytes, 0)}
                                 </span>
                               </div>
                               <ProgressBar
-                                value={dest.writtenBytes}
+                                value={
+                                  dest.state === "verifying"
+                                    ? (dest.verifiedBytes ?? 0)
+                                    : dest.writtenBytes
+                                }
                                 total={task.totalBytes}
-                                tone={dest.state === "done" ? "ok" : "accent"}
+                                tone={
+                                  dest.state === "done"
+                                    ? "ok"
+                                    : dest.state === "error"
+                                      ? "danger"
+                                      : "accent"
+                                }
                                 thin
                                 decorative
                               />
+                              {/* 出错原因就地可见(评审 2.3):后端给了 dest.error,
+                                  用户不该只看到一个红色「出错」猜是拔线还是坏盘 */}
+                              {dest.state === "error" && dest.error ? (
+                                <span
+                                  className="field__error"
+                                  role="alert"
+                                  data-testid="copy-dest-error"
+                                >
+                                  {dest.error}
+                                </span>
+                              ) : null}
                             </div>
                           ))}
                         </div>
@@ -1059,10 +1205,21 @@ export function CopyTaskScreen() {
                     <div className="section__head">
                       <h2 className="section__title">文件</h2>
                       <span className="card__hint">
-                        共 {totalFiles} 个（已加载 {files.length}）· 以下为已加载部分：待拷{" "}
-                        {fileSummary.pending} · 已拷 {fileSummary.copied} · 已校验{" "}
-                        {fileSummary.verified} · 失败 {fileSummary.failed}
+                        {counts
+                          ? /* 全量真值(评审 2.5):不再让总账被分页挟持 */
+                            `共 ${totalFiles} 个：待拷 ${counts.pending} · 已拷 ${counts.copied} · 已校验 ${counts.verified} · 失败 ${counts.failed}`
+                          : `共 ${totalFiles} 个（已加载 ${files.length}）· 以下为已加载部分：待拷 ${loadedSummary.pending} · 已拷 ${loadedSummary.copied} · 已校验 ${loadedSummary.verified} · 失败 ${loadedSummary.failed}`}
                       </span>
+                      {failedTotal > 0 ? (
+                        <Checkbox
+                          className="text-xs"
+                          testId="copy-failed-only"
+                          checked={failedOnly}
+                          onChange={setFailedOnly}
+                        >
+                          只看失败（{failedTotal}）
+                        </Checkbox>
+                      ) : null}
                     </div>
                     <div className="list">
                       <div className="files__scroll">
@@ -1073,7 +1230,7 @@ export function CopyTaskScreen() {
                           <span>状态</span>
                           <span />
                         </div>
-                        {files.map((f) => (
+                        {visibleFiles.map((f) => (
                           <div className="list__row files__row" key={f.id}>
                             <span className="files__name truncate" title={f.path}>
                               {f.name}
@@ -1107,8 +1264,14 @@ export function CopyTaskScreen() {
                             </span>
                           </div>
                         ))}
-                        {files.length === 0 && !filesLoading ? (
-                          <EmptyState>暂无文件明细。</EmptyState>
+                        {visibleFiles.length === 0 && !filesLoading ? (
+                          <EmptyState>
+                            {failedOnly
+                              ? files.length < totalFiles
+                                ? "已加载的部分没有失败文件；点下方「加载更多」继续找。"
+                                : "没有失败文件。"
+                              : "暂无文件明细。"}
+                          </EmptyState>
                         ) : null}
                       </div>
                     </div>

@@ -88,7 +88,7 @@ export function ProgressBar({
 }: {
   value: number;
   total: number;
-  tone?: "accent" | "ok" | "muted";
+  tone?: "accent" | "ok" | "muted" | "danger";
   thin?: boolean;
   label?: string;
   /** 读屏器播报的人话，如「3.2 GB / 7.1 GB，约 2 分」 */
@@ -98,7 +98,13 @@ export function ProgressBar({
 }) {
   const r = safeRatio(value, total);
   const toneClass =
-    tone === "ok" ? " progress--ok" : tone === "muted" ? " progress--muted" : "";
+    tone === "ok"
+      ? " progress--ok"
+      : tone === "muted"
+        ? " progress--muted"
+        : tone === "danger"
+          ? " progress--danger"
+          : "";
   const className = `progress${thin ? " progress--thin" : ""}${toneClass}`;
   /* 走 scaleX 而不是 width：width 每帧重排，拷卡屏几十条进度同时在动时是掉帧来源。
      CSS transition 天生从当前呈现值继续，进度事件密集改目标也不会跳帧。 */

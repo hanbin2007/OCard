@@ -75,6 +75,9 @@ export interface NoticeEntry {
   lastRepeats: number;
   read: boolean;
   live: boolean;
+  /** 关联拷卡任务(拷卡终态通知):点击直达任务 */
+  taskId?: string;
+  projectId?: string;
 }
 
 export interface AppState {
@@ -234,7 +237,38 @@ function applyProgress(task: CopyTask, event: CopyProgressEvent): CopyTask {
     finishedAt: task.finishedAt ?? (terminal ? event.occurredAt : undefined),
     files: mergeFiles(task.files, event.changedFiles),
     destinations: mergeDestinations(task.destinations, event.changedDestinations),
+    statusCounts: event.statusCounts ?? task.statusCounts,
   };
+}
+
+/**
+ * 拷卡终态必须全局出声(评审 2.1):完成/失败是全应用最重要的两个事件,
+ * 用户大概率不在拷卡屏。done 走 info toast(自动收进铃铛),
+ * failed 走 error(常驻、须确认)。通知带 taskId/projectId,点击直达任务。
+ */
+function terminalNotice(before: CopyTask, after: CopyTask): NoticeDto | null {
+  if (before.state === after.state) return null;
+  if (after.state === "done") {
+    return {
+      level: "info",
+      code: "copy-task-done",
+      message: `「${after.volumeName}」校验 100% 通过，本卡可格式化（请在相机内格式化）。`,
+      occurredAt: after.finishedAt ?? new Date().toISOString(),
+      taskId: after.id,
+      projectId: after.projectId,
+    };
+  }
+  if (after.state === "failed") {
+    return {
+      level: "error",
+      code: "copy-task-failed",
+      message: `「${after.volumeName}」拷卡失败。点击查看失败文件与原因，可一键重试全部失败文件。`,
+      occurredAt: after.finishedAt ?? new Date().toISOString(),
+      taskId: after.id,
+      projectId: after.projectId,
+    };
+  }
+  return null;
 }
 
 /**
@@ -357,6 +391,8 @@ function ingestNotice(
     lastRepeats: repeats ?? 1,
     read: false,
     live: options.live,
+    taskId: notice.taskId,
+    projectId: notice.projectId,
   };
   return {
     notices: [entry, ...bucket.notices],
@@ -538,12 +574,14 @@ export function reducer(state: AppState, action: AppAction): AppState {
           orphanProgress: { ...state.orphanProgress, [event.taskId]: event },
         };
       }
-      return {
+      const before = state.tasks.find((t) => t.id === event.taskId)!;
+      const after = applyProgress(before, event);
+      const next = {
         ...state,
-        tasks: state.tasks.map((task) =>
-          task.id === event.taskId ? applyProgress(task, event) : task,
-        ),
+        tasks: state.tasks.map((task) => (task.id === event.taskId ? after : task)),
       };
+      const notice = terminalNotice(before, after);
+      return notice ? { ...next, ...ingestNotice(next, notice, { live: true }) } : next;
     }
 
     case "taskSnapshot": {
@@ -555,13 +593,17 @@ export function reducer(state: AppState, action: AppAction): AppState {
       const exists = local !== undefined;
       const rest = { ...state.orphanProgress };
       delete rest[merged.id];
-      return {
+      const next = {
         ...state,
         tasks: exists
           ? state.tasks.map((t) => (t.id === merged.id ? merged : t))
           : [merged, ...state.tasks],
         orphanProgress: rest,
       };
+      // 事件丢失时终态可能由快照对账补上——同样要出声;
+      // 本地此前不存在的任务(重启恢复/他机任务)不算「刚刚结束」,不打扰
+      const notice = local ? terminalNotice(local, merged) : null;
+      return notice ? { ...next, ...ingestNotice(next, notice, { live: true }) } : next;
     }
 
     case "noticeReceived":
@@ -707,6 +749,20 @@ export function StoreProvider({
   const skipBootstrap = preloaded !== undefined;
   const [reloadToken, setReloadToken] = useState(0);
   const reload = useCallback(() => setReloadToken((n) => n + 1), []);
+
+  // DEV 专用:浏览器预览/截图脚本的状态注入句柄(生产构建整段剔除,不改行为)
+  const devStateRef = useRef(state);
+  devStateRef.current = state;
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    (window as unknown as Record<string, unknown>).__ocardDev = {
+      dispatch,
+      getState: () => devStateRef.current,
+    };
+    return () => {
+      delete (window as unknown as Record<string, unknown>).__ocardDev;
+    };
+  }, []);
 
   /**
    * 全局兜底网（零静默铁律）：任何漏掉 catch 的 Promise rejection 都不允许

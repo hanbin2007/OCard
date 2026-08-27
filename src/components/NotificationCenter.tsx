@@ -64,8 +64,11 @@ const NOTICE_TITLES: Record<string, string> = {
   "card-match-conflict": "卡片匹配存在冲突",
   "job-cancel-too-late": "取消未生效",
   "job-cancel-failed": "取消作业失败",
-  "copy-pause-failed": "拷卡挂起/继续失败",
+  "copy-pause-failed": "拷卡暂停/继续失败",
   "delivery-cancelled": "交付打包已取消",
+  // 拷卡终态(评审 2.1):全应用最重要的两个事件,必须在任何屏都能听见
+  "copy-task-done": "拷卡完成，本卡可格式化",
+  "copy-task-failed": "拷卡失败",
 };
 
 /** 未知 code 也要有体面的抬头，不能露出空白 */
@@ -79,12 +82,30 @@ function noticeTitle(entry: NoticeEntry): string {
   return NOTICE_TITLES[entry.code] ?? FALLBACK_TITLES[entry.level];
 }
 
+/** 通知带任务引用时的「查看任务」跳转:切项目→选任务→进拷卡屏 */
+function useGoToTask() {
+  const { state, dispatch } = useStore();
+  return useCallback(
+    (entry: NoticeEntry) => {
+      if (!entry.taskId) return;
+      if (entry.projectId && state.projects.some((p) => p.id === entry.projectId)) {
+        dispatch({ type: "selectProject", projectId: entry.projectId });
+      }
+      dispatch({ type: "selectTask", taskId: entry.taskId });
+      dispatch({ type: "navigate", route: "copy" });
+      dispatch({ type: "noticesPanelClosed" });
+    },
+    [state.projects, dispatch],
+  );
+}
+
 /* ------------------------------------------------------------------ *
  * 即时呈现区（Shell 级，一份）
  * ------------------------------------------------------------------ */
 
 function NoticeBanner({ entry }: { entry: NoticeEntry }) {
   const { dispatch } = useStore();
+  const goToTask = useGoToTask();
   const isError = entry.level === "error";
 
   useEffect(() => {
@@ -116,6 +137,20 @@ function NoticeBanner({ entry }: { entry: NoticeEntry }) {
           ) : null}
         </div>
         <p className="toast__message">{entry.message}</p>
+        {entry.taskId ? (
+          <button
+            type="button"
+            className="btn btn--sm"
+            data-testid="notice-toast-goto-task"
+            onClick={() => {
+              goToTask(entry);
+              // 跳过去之后 toast 使命完成:info 收起;error 保留待确认
+              if (!isError) dispatch({ type: "noticeToastDismissed", id: entry.id });
+            }}
+          >
+            查看任务
+          </button>
+        ) : null}
       </div>
       <button
         type="button"
@@ -156,6 +191,7 @@ export function NoticeToasts() {
 
 export function NoticeBell() {
   const { state, dispatch } = useStore();
+  const goToTask = useGoToTask();
   const { notices, noticesOpen } = state;
   const unread = notices.filter((n) => !n.read).length;
   // 只有尚未确认的 error 才让徽标转红
@@ -254,6 +290,16 @@ export function NoticeBell() {
                       </span>
                     </div>
                     <p className="notice-item__message">{entry.message}</p>
+                    {entry.taskId ? (
+                      <button
+                        type="button"
+                        className="btn btn--sm"
+                        data-testid="notice-goto-task"
+                        onClick={() => goToTask(entry)}
+                      >
+                        查看任务
+                      </button>
+                    ) : null}
                     <code className="notice-item__code">{entry.code}</code>
                   </div>
                   <div className="notice-item__actions">

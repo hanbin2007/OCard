@@ -414,7 +414,13 @@ describe("分页与进度事件互不打架", () => {
         return () => {};
       });
 
-    const runningTask = { ...mockCopyTasks[0], fileCount: TOTAL, files: [] };
+    // statusCounts 置空:这组测试盯的是「旧后端没有全量计数」的回退口径
+    const runningTask = {
+      ...mockCopyTasks[0],
+      fileCount: TOTAL,
+      files: [],
+      statusCounts: undefined,
+    };
     render(
       <App
         preloaded={{
@@ -510,7 +516,12 @@ describe("分页与进度事件互不打架", () => {
       .spyOn(api, "listCopyFiles")
       .mockResolvedValue({ items: page(0, 3).items.slice(0, 3), total: 3 });
 
-    const task = { ...mockCopyTasks[0], fileCount: 3, files: [] };
+    const task = {
+      ...mockCopyTasks[0],
+      fileCount: 3,
+      files: [],
+      statusCounts: undefined,
+    };
     render(
       <App preloaded={{ ...preloaded, tasks: [task], selectedTaskId: task.id }} />,
     );
@@ -518,6 +529,32 @@ describe("分页与进度事件互不打架", () => {
     await screen.findByText("IMG_0.NEF");
     expect(screen.getByTestId("copy-verified-stat").textContent).toBe("3/3");
     expect(screen.queryByTestId("copy-load-more-files")).toBeNull();
+
+    listSpy.mockRestore();
+  });
+
+  it("后端带全量计数时,未全载也显示真值总账(评审 2.5)", async () => {
+    const TOTAL = 500;
+    const listSpy = vi
+      .spyOn(api, "listCopyFiles")
+      .mockImplementation((_taskId, offset = 0, limit = 200) =>
+        Promise.resolve(page(offset, limit)),
+      );
+
+    const task = {
+      ...mockCopyTasks[0],
+      fileCount: TOTAL,
+      files: [],
+      statusCounts: { pending: 120, copied: 40, verified: 337, failed: 3 },
+    };
+    render(
+      <App preloaded={{ ...preloaded, tasks: [task], selectedTaskId: task.id }} />,
+    );
+
+    await screen.findByText("IMG_0.NEF");
+    // 只加载了第一页(200/500),总账仍然是全量真值,不再被分页挟持
+    expect(screen.getByTestId("copy-verified-stat").textContent).toBe("337/500");
+    expect(screen.getByText(/待拷 120 · 已拷 40 · 已校验 337 · 失败 3/)).toBeDefined();
 
     listSpy.mockRestore();
   });

@@ -126,7 +126,7 @@ describe("E2E 锚点", () => {
       "sorting-open-trash",
       "delivery-open",
       "sorting-analyze",
-      "sorting-suggestion-filter",
+      "sorting-judge-filter",
       "virtual-grid",
       "asset-cell",
     ]);
