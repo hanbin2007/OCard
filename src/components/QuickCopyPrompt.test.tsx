@@ -56,7 +56,7 @@ describe("快捷拷卡引导", () => {
     expect(screen.queryByTestId("quick-copy-prompt")).toBeNull();
   });
 
-  it("已登记卡不在当前项目清单:「加入清单并拷卡」原子追加后跳拷卡屏并预选卷与相机", async () => {
+  it("已登记卡不在当前项目清单:「去拷卡」立即导航,清单后台自动并入(评审 1.4)", async () => {
     const user = userEvent.setup();
     // mockResolvedValue 而非 call-through:真实 mock 实现会持久污染
     // 模块级 mockProjectCards,用例顺序一换就翻(评审 P2)
@@ -78,14 +78,11 @@ describe("快捷拷卡引导", () => {
     const prompt = screen.getByTestId("quick-copy-prompt");
     expect(prompt.textContent).toContain("检测到已登记卡「SD-03」");
 
-    const addBtn = screen.getByTestId("qc-add-and-copy") as HTMLButtonElement;
-    await waitFor(() => expect(addBtn.disabled).toBe(false));
-    await user.click(addBtn);
+    // 只有一个主按钮,不再有「加入清单并拷卡/不加入」二选一
+    expect(screen.queryByTestId("qc-add-and-copy")).toBeNull();
+    await user.click(screen.getByTestId("qc-copy"));
 
-    await waitFor(() =>
-      expect(addSpy).toHaveBeenCalledWith(mockProjects[1].id, "card-sd-03"),
-    );
-    // 落在拷卡屏:卷已预选,相机按匹配卡带出
+    // 落在拷卡屏:卷已预选,相机按匹配卡带出;清单在后台补记
     await waitFor(() => {
       const selected = screen
         .getAllByTestId("copy-volume-option")
@@ -96,6 +93,9 @@ describe("快捷拷卡引导", () => {
       "A7M4",
     );
     expect(screen.queryByTestId("quick-copy-prompt")).toBeNull();
+    await waitFor(() =>
+      expect(addSpy).toHaveBeenCalledWith(mockProjects[1].id, "card-sd-03"),
+    );
   });
 
   it("已登记卡已在清单:不再问加入,「去拷卡」为主操作", async () => {
@@ -119,7 +119,7 @@ describe("快捷拷卡引导", () => {
     });
   });
 
-  it("清单读取失败:警告可见、加入禁用,仍可直接去拷卡,可重试", async () => {
+  it("清单读取失败:警告可见但「去拷卡」不被阻塞,可重试(评审 1.4/A2)", async () => {
     const user = userEvent.setup();
     // 持续失败(项目屏的用卡面板也会调它,Once 会被先消费掉)
     const listSpy = vi
@@ -129,12 +129,10 @@ describe("快捷拷卡引导", () => {
 
     await waitFor(() =>
       expect(screen.getByTestId("quick-copy-prompt").textContent).toContain(
-        "用卡清单读取失败",
+        "用卡清单暂时读取不到",
       ),
     );
-    expect(
-      (screen.getByTestId("qc-add-and-copy") as HTMLButtonElement).disabled,
-    ).toBe(true);
+    // 主按钮永远是「去拷卡」且可点:重试的是清单读取,不是拷卡
     expect((screen.getByTestId("qc-copy") as HTMLButtonElement).disabled).toBe(
       false,
     );
@@ -262,13 +260,13 @@ describe("快捷拷卡引导", () => {
     await user.click(screen.getAllByRole("option")[0]);
     await user.click(screen.getByRole("button", { name: "登记存储卡" }));
 
-    // 引导续接:浮层以已登记身份回来
+    // 引导续接:浮层以已登记身份回来,主按钮是唯一的「去拷卡」
     await waitFor(() =>
       expect(screen.getByTestId("quick-copy-prompt").textContent).toContain(
         "检测到已登记卡「NO NAME」",
       ),
     );
-    expect(screen.getByTestId("qc-add-and-copy")).toBeDefined();
+    expect(screen.getByTestId("qc-copy")).toBeDefined();
   });
 
   it("会话门开启时浮层整体 inert:键盘也进不去(双路评审 P0)", async () => {
@@ -322,16 +320,9 @@ describe("快捷拷卡引导", () => {
     expect(screen.getByTestId("qc-rematch")).toBeDefined();
   });
 
-  it("加入在途时「直接拷卡」同样禁用,不允许并行两条路", async () => {
+  it("清单加入失败只出 warning,不拦已经发生的导航(评审 1.4)", async () => {
     const user = userEvent.setup();
-    let release: () => void = () => {};
-    vi.spyOn(api, "addProjectCard").mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          release = () =>
-            resolve({ cardIds: ["card-sd-03"], copiedCardIds: [] });
-        }),
-    );
+    vi.spyOn(api, "addProjectCard").mockRejectedValue(new Error("NAS 抖动"));
     render(
       <App
         preloaded={{
@@ -341,12 +332,15 @@ describe("快捷拷卡引导", () => {
         }}
       />,
     );
-    const addBtn = screen.getByTestId("qc-add-and-copy") as HTMLButtonElement;
-    await waitFor(() => expect(addBtn.disabled).toBe(false));
-    await user.click(addBtn);
-    expect((screen.getByTestId("qc-copy") as HTMLButtonElement).disabled).toBe(
-      true,
+    await user.click(screen.getByTestId("qc-copy"));
+    // 人已经在拷卡屏
+    await waitFor(() =>
+      expect(screen.getAllByTestId("copy-volume-option").length).toBeGreaterThan(0),
     );
-    release();
+    // 失败以 warning 出声:不影响拷卡,拷完还有自动并入兜底
+    await waitFor(() => {
+      const toast = screen.queryByTestId("notice-toast-warning");
+      expect(toast?.getAttribute("data-code")).toBe("project-cards-save-failed");
+    });
   });
 });

@@ -38,7 +38,8 @@ async function waitForInferredPrefix() {
 }
 
 async function fillDestinations(user: ReturnType<typeof userEvent.setup>) {
-  // 第 1 行是 NAS,路径由项目结构自动推导,不可填
+  // 默认只有 NAS 行(评审 1.1):双备份由「添加目的地」显式加一行
+  await user.click(screen.getByRole("button", { name: "添加目的地" }));
   await user.type(screen.getByLabelText("第 2 个目的地路径"), "/backup/ocard");
 }
 
@@ -87,7 +88,7 @@ describe("拷卡任务面板", () => {
     expect(targetPreview()).toBe(`1. 待分类/${expectedSlot}_SonyA7M4_A_LM`);
   });
 
-  it("NAS 行只读且不预填平台特有路径", () => {
+  it("默认只有 NAS 一行:不再预置会拦提交的空移动盘行(评审 1.1)", () => {
     render(<App preloaded={preloaded} />);
 
     const nasRow = screen.getByLabelText("第 1 个目的地路径") as HTMLInputElement;
@@ -95,19 +96,20 @@ describe("拷卡任务面板", () => {
     expect(nasRow.readOnly).toBe(true);
     expect(nasRow.placeholder).toContain("自动推导");
 
-    const localRow = screen.getByLabelText("第 2 个目的地路径") as HTMLInputElement;
-    expect(localRow.value).toBe("");
-    expect(localRow.readOnly).toBe(false);
+    expect(screen.queryByLabelText("第 2 个目的地路径")).toBeNull();
+    // 双备份用灰字引导,不用空行逼人处理
+    expect(screen.getByText(/建议再加一块本地\/移动盘/)).toBeDefined();
   });
 
-  it("自填目的地行留空时逐行标红，不进确认步骤", async () => {
+  it("手动加的目的地行留空时逐行标红，不进确认步骤", async () => {
     const user = userEvent.setup();
     render(<App preloaded={preloaded} />);
 
     await user.click(screen.getByRole("radio", { name: "选择源卷 SONY_A7M4" }));
     await waitForInferredPrefix();
     await user.type(screen.getByLabelText("内容备注"), "上午田赛");
-    // 第 2 行(移动盘)留空就提交
+    // 加了第 2 行(移动盘)但留空就提交
+    await user.click(screen.getByRole("button", { name: "添加目的地" }));
     await user.click(screen.getByRole("button", { name: "开始拷卡" }));
 
     const alerts = screen.getAllByRole("alert").map((el) => el.textContent);
@@ -208,7 +210,7 @@ describe("autoProxy（工况 A）", () => {
       expect((screen.getByLabelText(/目标夹/) as HTMLInputElement).value).not.toBe(""),
     );
     await user.type(screen.getByLabelText("内容备注"), "发布会主机位");
-    await user.type(screen.getByLabelText("第 2 个目的地路径"), "/backup/ocard");
+    await fillDestinations(user);
     await user.click(screen.getByRole("button", { name: "开始拷卡" }));
 
     // 双确认屏要如实显示这项

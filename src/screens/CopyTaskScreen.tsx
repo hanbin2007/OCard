@@ -33,6 +33,7 @@ import {
   TASK_STATE_TONE,
 } from "../lib/labels";
 import { buildCopyTargetPath, copyTargetParent } from "../lib/naming";
+import { loadPref, savePref } from "../lib/prefs";
 import { validateStartCopy } from "../lib/validation";
 import {
   remoteActivityForVolume,
@@ -137,11 +138,10 @@ export function CopyTaskScreen() {
   const [prefixInferred, setPrefixInferred] = useState(false);
   // 人工改过前缀后就不再被探查结果覆盖
   const prefixEditedRef = useRef(false);
+  // 默认只留 NAS(评审 1.1):此前预置的空「移动盘」行会拦提交,
+  // 等于给每一次拷卡强加一步「删行或填路径」。双备份用「添加目的地」引导。
   // 不预填任何平台特有路径：/Volumes/… 在 Windows/Linux 上首屏即是错的
-  const [dests, setDests] = useState<DestDraft[]>(() => [
-    newDest("nas"),
-    newDest("external"),
-  ]);
+  const [dests, setDests] = useState<DestDraft[]>(() => [newDest("nas")]);
   const [submitted, setSubmitted] = useState(false);
   /** 工况 A：拷完自动派发代理转码作业（PRD §5.6） */
   const [autoProxy, setAutoProxy] = useState(false);
@@ -242,6 +242,25 @@ export function CopyTaskScreen() {
     setTargetPrefix("");
     setPrefixInferred(false);
     prefixEditedRef.current = false;
+    /*
+     * 目的地/备注/自动转代理按项目记忆(评审 1.2/1.3/1.6):
+     * 备份盘一整个项目周期不变,备注在同项目连拷时高度相似——
+     * 预填上次的值,连拷第二张起只需要选卷。
+     */
+    const saved = projectKey
+      ? loadPref<{
+          dests?: Array<{ kind: DestinationKind; path: string }>;
+          note?: string;
+          autoProxy?: boolean;
+        }>(`copy:${projectKey}`, {})
+      : {};
+    setDests(
+      saved.dests && saved.dests.length > 0
+        ? saved.dests.map((d) => newDest(d.kind, d.path))
+        : [newDest("nas")],
+    );
+    setNote(saved.note ?? "");
+    setAutoProxy(saved.autoProxy ?? false);
   }, [projectKey]);
 
   // 选中源卷后探查素材时间戳，据此推断时段前缀（PRD §5.3：从素材时间戳推断，可改）
@@ -398,7 +417,14 @@ export function CopyTaskScreen() {
       dispatch({ type: "taskStarted", task: started });
       // 与后端对账一次，别只信 start 的返回值
       void refreshTask(started.id);
-      setNote("");
+      // 成功即记忆(评审 1.2/1.3):目的地/备注/转代理预填给下一张卡。
+      // 备注**保留**在表单里(不再清空),连拷时改几个字就能提交;
+      // 完全不同的内容聚焦时全选一键覆盖。
+      savePref(`copy:${project.id}`, {
+        dests: dests.map(({ kind, path }) => ({ kind, path })),
+        note,
+        autoProxy,
+      });
       setSubmitted(false);
       setConfirming(false);
       setPreview(null);
@@ -427,11 +453,10 @@ export function CopyTaskScreen() {
     await submitStart(false);
   }
 
-  /** 进入第二步前，先问后端「实际会写到哪」，确认屏只展示真值 */
-  async function requestConfirm() {
-    setSubmitted(true);
-    if (!validation.valid || !project) return;
-    setConfirming(true);
+  /** 落盘预览拉取:独立出来供确认屏内「重试解析」复用(评审 1.6)——
+      NAS 偶发失败时不必退回第一步重走整表 */
+  async function fetchPreview() {
+    if (!project) return;
     setPreview(null);
     setPreviewFailed(false);
     try {
@@ -452,6 +477,27 @@ export function CopyTaskScreen() {
         `无法解析实际落盘路径：${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  /** 进入第二步前，先问后端「实际会写到哪」，确认屏只展示真值 */
+  async function requestConfirm() {
+    setSubmitted(true);
+    if (!validation.valid || !project) return;
+    setConfirming(true);
+    await fetchPreview();
+  }
+
+  /** 拷完一张接着拷下一张(评审 1.6):清源卷,保留相机/备注/目的地 */
+  function startNextCard() {
+    setVolumeId("");
+    setTargetPrefix("");
+    setPrefixInferred(false);
+    prefixEditedRef.current = false;
+    setConfirming(false);
+    setSubmitted(false);
+    setPreview(null);
+    setPreviewFailed(false);
+    void refreshVolumes();
   }
 
   const loadedSummary = useMemo(() => {
@@ -592,7 +638,15 @@ export function CopyTaskScreen() {
                           <span className="dl__val" data-testid="confirm-destinations">
                             {previewFailed ? (
                               <span className="text-warn" role="alert">
-                                落盘路径解析失败(详见右下角提示),请返回修改后重试
+                                落盘路径解析失败(详见右下角提示)。表单没改的话不必退回,{" "}
+                                <button
+                                  type="button"
+                                  className="btn btn--sm"
+                                  data-testid="copy-preview-retry"
+                                  onClick={() => void fetchPreview()}
+                                >
+                                  重试解析
+                                </button>
                               </span>
                             ) : preview ? (
                               preview.destinations.map((d) => (
@@ -716,6 +770,11 @@ export function CopyTaskScreen() {
                                     {formatBytes(v.capacityBytes, 0)}
                                   </span>
                                 </span>
+                                {/* 他机同卷冲突前置到选择时刻(评审 F2):
+                                    不该填完整张表进确认屏才被告知 */}
+                                {remoteActivityForVolume(remoteActivities, v.name) ? (
+                                  <Badge tone="warn">他机在拷</Badge>
+                                ) : null}
                                 {v.isSystem ? (
                                   <Badge tone="warn">系统盘</Badge>
                                 ) : matched ? (
@@ -810,7 +869,11 @@ export function CopyTaskScreen() {
                       <Field
                         label="内容备注"
                         htmlFor="copy-note"
-                        hint="规范要求「适当记录」，将写入 manifest 与审计日志"
+                        hint={
+                          note
+                            ? "已保留上一张的备注——点进去全选,改几个字或直接覆盖"
+                            : "规范要求「适当记录」，将写入 manifest 与审计日志"
+                        }
                         error={submitted ? validation.errors.note : undefined}
                       >
                         <textarea
@@ -820,6 +883,9 @@ export function CopyTaskScreen() {
                           value={note}
                           placeholder="如：上午田赛，含 4×100 决赛全程"
                           onChange={(e) => setNote(e.currentTarget.value)}
+                          /* 预填的备注聚焦即全选(评审 1.3):连拷改字省事,
+                             想换内容直接打字覆盖 */
+                          onFocus={(e) => e.currentTarget.select()}
                         />
                       </Field>
 
@@ -880,6 +946,32 @@ export function CopyTaskScreen() {
                                   );
                                 }}
                               />
+                              {dest.kind !== "nas" ? (
+                                /* 备份盘就在已挂载卷里(评审 1.2):选卷即得根路径,
+                                   不必进文件系统翻。源卷与系统盘不在候选之列。 */
+                                <Select
+                                  ariaLabel={`第 ${index + 1} 个目的地从已挂载卷选择`}
+                                  value=""
+                                  placeholder="选盘…"
+                                  onChange={(mount) => {
+                                    if (!mount) return;
+                                    setDests((prev) =>
+                                      prev.map((d) =>
+                                        d.id === dest.id ? { ...d, path: mount } : d,
+                                      ),
+                                    );
+                                  }}
+                                  options={volumes
+                                    .filter((v) => !v.isSystem && v.id !== volumeId)
+                                    .map((v) => ({
+                                      value: v.mountPath,
+                                      label: `${v.name}（剩 ${formatBytes(
+                                        v.capacityBytes - v.usedBytes,
+                                        0,
+                                      )}）`,
+                                    }))}
+                                />
+                              ) : null}
                               <button
                                 type="button"
                                 className="btn btn--ghost btn--icon"
@@ -900,14 +992,23 @@ export function CopyTaskScreen() {
                             ) : null}
                             </div>
                           ))}
-                          <button
-                            type="button"
-                            className="btn btn--sm"
-                            onClick={() => setDests((prev) => [...prev, newDest("local")])}
-                          >
-                            <IconPlus />
-                            添加目的地
-                          </button>
+                          <div className="row-inline">
+                            <button
+                              type="button"
+                              className="btn btn--sm"
+                              onClick={() =>
+                                setDests((prev) => [...prev, newDest("external")])
+                              }
+                            >
+                              <IconPlus />
+                              添加目的地
+                            </button>
+                            {dests.length < 2 ? (
+                              <span className="text-xs dim">
+                                建议再加一块本地/移动盘做第二份备份
+                              </span>
+                            ) : null}
+                          </div>
                           {submitted && validation.errors.destinations ? (
                             <span className="field__error" role="alert">
                               {validation.errors.destinations}
@@ -955,6 +1056,16 @@ export function CopyTaskScreen() {
                       <span>
                         请在相机内格式化——OCard 不代为格式化，以防误操作。
                       </span>
+                      <div>
+                        <button
+                          type="button"
+                          className="btn btn--sm"
+                          data-testid="copy-next-card"
+                          onClick={startNextCard}
+                        >
+                          拷下一张卡
+                        </button>
+                      </div>
                     </div>
                   ) : null}
 

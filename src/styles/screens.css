@@ -301,6 +301,11 @@
   align-items: center;
 }
 
+/* 非 NAS 目的地多一列「选盘…」快捷选择(评审 1.2) */
+.dest-row:has(> :nth-child(4)) {
+  grid-template-columns: 96px minmax(0, 1fr) 116px 32px;
+}
+
 /* ---- 拷卡仪表区：百分比与速度是这块屏的主角 ---- */
 
 .copy-hero {

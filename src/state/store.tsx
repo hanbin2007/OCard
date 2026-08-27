@@ -16,6 +16,7 @@ import {
   type ReactNode,
 } from "react";
 import * as api from "../api";
+import { loadPref, savePref } from "../lib/prefs";
 import type {
   CameraReg,
   CopyDestination,
@@ -740,15 +741,47 @@ export function StoreProvider({
   /** 测试可注入初始状态，跳过异步 bootstrap */
   preloaded?: Partial<AppState>;
 }) {
-  const [state, dispatch] = useReducer(reducer, {
-    ...initialState,
-    ...preloaded,
-    loading: preloaded ? false : initialState.loading,
-  });
+  const [state, dispatch] = useReducer(
+    reducer,
+    undefined,
+    // 重启回到原地(评审 5.7):路由与当前项目从本地偏好恢复——
+    // 更新安装必然重启,每次都重选项目/重新导航是纯重复劳动。
+    // 恢复的项目 id 若在新数据里不存在,bootstrapped 会按既有规则回退到首个。
+    // 测试注入 preloaded 时不读偏好,保持用例相互隔离。
+    () => {
+      const restored =
+        preloaded === undefined
+          ? loadPref<{ route?: RouteName; selectedProjectId?: string | null }>(
+              "ui",
+              {},
+            )
+          : {};
+      return {
+        ...initialState,
+        ...(restored.route && ROUTE_ORDER.includes(restored.route)
+          ? { route: restored.route }
+          : {}),
+        ...(restored.selectedProjectId
+          ? { selectedProjectId: restored.selectedProjectId }
+          : {}),
+        ...preloaded,
+        loading: preloaded ? false : initialState.loading,
+      };
+    },
+  );
 
   const skipBootstrap = preloaded !== undefined;
   const [reloadToken, setReloadToken] = useState(0);
   const reload = useCallback(() => setReloadToken((n) => n + 1), []);
+
+  // 路由/当前项目随用随存(评审 5.7);测试注入态不落盘
+  useEffect(() => {
+    if (skipBootstrap) return;
+    savePref("ui", {
+      route: state.route,
+      selectedProjectId: state.selectedProjectId,
+    });
+  }, [skipBootstrap, state.route, state.selectedProjectId]);
 
   // DEV 专用:浏览器预览/截图脚本的状态注入句柄(生产构建整段剔除,不改行为)
   const devStateRef = useRef(state);
