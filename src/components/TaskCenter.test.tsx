@@ -48,7 +48,7 @@ const doneJob: JobSnapshot = {
 };
 
 const preloaded = {
-  route: "projects" as const,
+  route: "copy" as const,
   workstation: mockWorkstation,
   projects: mockProjects,
   cameras: mockCameras,

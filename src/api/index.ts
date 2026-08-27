@@ -33,6 +33,7 @@ import {
   mockTrash,
   mockProjects,
   mockProjectCards,
+  mockProjectSettings,
   mockStorageCards,
   mockVolumes,
   mockWorkstation,
@@ -77,6 +78,7 @@ import type {
   NewStorageCardInput,
   Project,
   ProjectCards,
+  ProjectSettings,
   Scenario,
   StartCopyInput,
   StorageCard,
@@ -88,6 +90,7 @@ import type {
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getVersion } from "@tauri-apps/api/app";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -160,6 +163,94 @@ export function setWorkstationInfo(
     nasRoot: nasRoot.trim(),
   });
   return reply({ ...mockWorkstation });
+}
+
+/* ------------------------------------------------------------------ *
+ * 窗口编排（欢迎/项目管理窗口 ↔ 主窗口）
+ *
+ * Tauri 下是真正的多窗口：启动先见 `welcome` 窗口，主窗口隐藏待命；
+ * 打开项目由 Rust 负责「显示主窗口 + 投递项目 + 销毁欢迎窗」。
+ * 浏览器/测试环境只有一个窗口，这些函数退化为 no-op，由
+ * `state/windowBridge` 在同一窗口内切视图。
+ * ------------------------------------------------------------------ */
+
+/** 是否运行在 Tauri 里（窗口桥接层据此选择真多窗口或单窗口内切视图） */
+export function isTauri(): boolean {
+  return IS_TAURI;
+}
+
+/** 当前运行在哪个窗口。浏览器环境恒为 "main"（单窗口内切视图）。 */
+export function windowRole(): "main" | "welcome" {
+  if (!IS_TAURI) return "main";
+  return getCurrentWebviewWindow().label === "welcome" ? "welcome" : "main";
+}
+
+/**
+ * 在主窗口中打开项目（欢迎窗口调用）：
+ * Rust 记录本机最近打开、显示并聚焦主窗口、把 projectId 投递过去，
+ * 最后销毁欢迎窗口。
+ */
+export function openProjectInMain(projectId: string): Promise<void> {
+  if (IS_TAURI) return ipc("open_project_window", { projectId });
+  // 浏览器退化路径由 windowBridge 承接；这里只记最近打开
+  return recordRecentProjectMock(projectId);
+}
+
+/** 打开欢迎/项目管理窗口（主窗口侧栏调用；不存在则重建） */
+export function openManagerWindow(): Promise<void> {
+  if (IS_TAURI) return ipc("open_manager_window");
+  return Promise.resolve();
+}
+
+/**
+ * 主窗口启动时取一次「待打开项目」：主窗口可能是被 open_project_window
+ * 现场重建的，事件早于监听注册就会丢——pending 由 Rust 暂存、这里消费。
+ */
+export function takePendingOpenProject(): Promise<string | null> {
+  if (IS_TAURI) return ipc("take_pending_open_project");
+  return Promise.resolve(null);
+}
+
+/** 订阅「打开项目」投递（app://open-project，欢迎窗口 → 主窗口） */
+export function subscribeOpenProject(
+  onOpen: (projectId: string) => void,
+  onError?: (error: unknown) => void,
+): () => void {
+  if (!IS_TAURI) return () => {};
+  let disposed = false;
+  let unlisten: (() => void) | null = null;
+  listen<{ projectId: string }>("app://open-project", (e) => {
+    if (!disposed) onOpen(e.payload.projectId);
+  })
+    .then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    })
+    .catch((err) => {
+      if (!disposed) onError?.(err);
+    });
+  return () => {
+    disposed = true;
+    unlisten?.();
+  };
+}
+
+/** mock 环境的最近打开记录（就地更新，欢迎视图立即可见） */
+function recordRecentProjectMock(projectId: string): Promise<void> {
+  const project = mockProjects.find((p) => p.id === projectId);
+  if (project) {
+    mockWorkstation.recentProjects = [
+      {
+        id: project.id,
+        name: project.name,
+        folderName: project.folderName,
+        scenario: project.scenario,
+        lastOpenedAt: new Date().toISOString(),
+      },
+      ...mockWorkstation.recentProjects.filter((r) => r.id !== projectId),
+    ].slice(0, 10);
+  }
+  return reply(undefined);
 }
 
 /* ------------------------------------------------------------------ *
@@ -253,6 +344,30 @@ export function setProjectCards(
   };
   mockProjectCards[projectId] = next;
   return reply({ ...next });
+}
+
+/**
+ * 项目级设置：内容标签库 + 备份目的地预设。
+ * 存于 `<项目>/.ocard/settings.json`——数据跟着项目走，
+ * 任何工作站打开同一项目看到同一套标签与预设。
+ */
+export function getProjectSettings(projectId: string): Promise<ProjectSettings> {
+  if (IS_TAURI) return ipc("get_project_settings", { projectId });
+  return reply(
+    structuredClone(
+      mockProjectSettings[projectId] ?? { tags: [], backupPaths: [] },
+    ),
+  );
+}
+
+/** 整体保存项目设置（末写胜出；标签库变更频度低，可接受） */
+export function saveProjectSettings(
+  projectId: string,
+  settings: ProjectSettings,
+): Promise<ProjectSettings> {
+  if (IS_TAURI) return ipc("save_project_settings", { projectId, settings });
+  mockProjectSettings[projectId] = structuredClone(settings);
+  return reply(structuredClone(settings));
 }
 
 /* ------------------------------------------------------------------ *
@@ -353,6 +468,7 @@ export function startCopyTask(input: StartCopyInput): Promise<CopyTask> {
     cameraCode: camera?.code ?? "",
     targetFolder: buildCopyTargetFolder(prefix, camera?.code ?? ""),
     note: input.note,
+    tags: [...input.tags],
     destinations: input.destinations.map((d, i) => ({
       id: nextId(`d${i}`),
       kind: d.kind,

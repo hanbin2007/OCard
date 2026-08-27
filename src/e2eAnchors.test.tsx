@@ -7,6 +7,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 import App from "./App";
+import { renderProjectsManager, renderWelcome } from "./testUtils";
 import {
   mockCameras,
   mockCopyTasks,
@@ -39,10 +40,9 @@ function expectAnchors(ids: string[]) {
 
 describe("E2E 锚点", () => {
   it("侧栏导航项 + 设置入口 + 通知铃铛", () => {
-    render(<App preloaded={{ ...base, route: "projects" }} />);
+    render(<App preloaded={{ ...base, route: "copy" }} />);
     expectAnchors([
-      "nav-projects",
-      "nav-new-project",
+      "nav-manager",
       "nav-devices",
       "nav-copy",
       "nav-sorting",
@@ -74,7 +74,7 @@ describe("E2E 锚点", () => {
     };
     render(
       <App
-        preloaded={{ ...base, route: "projects", jobs: [runningJob, doneJob] }}
+        preloaded={{ ...base, route: "copy", jobs: [runningJob, doneJob] }}
       />,
     );
     expectAnchors(["task-center-toggle", "task-active-count"]);
@@ -94,7 +94,7 @@ describe("E2E 锚点", () => {
       <App
         preloaded={{
           ...base,
-          route: "projects",
+          route: "copy",
           quickCopyQueue: ["vol-untitled-3"],
         }}
       />,
@@ -106,7 +106,7 @@ describe("E2E 锚点", () => {
       <App
         preloaded={{
           ...base,
-          route: "projects",
+          route: "copy",
           quickCopyQueue: ["vol-untitled-1"],
         }}
       />,
@@ -138,15 +138,26 @@ describe("E2E 锚点", () => {
     expectAnchors(["trash-row", "trash-restore", "trash-empty", "trash-back"]);
   });
 
-  it("项目列表行 + 详情面板的审计日志入口", () => {
-    render(<App preloaded={{ ...base, route: "projects" }} />);
-    expectAnchors(["project-row", "audit-open"]);
+  it("项目管理(欢迎窗口):列表行 + 打开入口 + 审计日志入口", () => {
+    renderProjectsManager({ ...base, route: "copy" });
+    expectAnchors(["project-row", "audit-open", "projects-new", "project-open"]);
     expect(screen.getAllByTestId("project-row")).toHaveLength(mockProjects.length);
+  });
+
+  it("欢迎页锚点(新建项目 + 最近项目 + 所有项目)", () => {
+    renderWelcome({ ...base, route: "copy" });
+    expectAnchors([
+      "welcome-root",
+      "welcome-home",
+      "welcome-new-project",
+      "welcome-browse-all",
+      "welcome-recent",
+    ]);
   });
 
   it("审计日志抽屉锚点", async () => {
     const user = userEvent.setup();
-    render(<App preloaded={{ ...base, route: "projects" }} />);
+    renderProjectsManager({ ...base, route: "copy" });
     await user.click(screen.getByTestId("audit-open"));
     await screen.findByTestId("audit-list");
     expectAnchors([
@@ -162,20 +173,24 @@ describe("E2E 锚点", () => {
 
   it("设置对话框字段", async () => {
     const user = userEvent.setup();
-    render(<App preloaded={{ ...base, route: "projects" }} />);
+    render(<App preloaded={{ ...base, route: "copy" }} />);
     await user.click(screen.getByTestId("settings-open"));
     expectAnchors(["settings-operator", "settings-nas-root", "settings-save"]);
   });
 
-  it("新建项目向导", () => {
-    render(<App preloaded={{ ...base, route: "new-project" }} />);
+  it("新项目引导(欢迎窗口):第一步锚点与步进按钮", async () => {
+    const user = userEvent.setup();
+    renderWelcome({ ...base, route: "copy" });
+    await user.click(screen.getByTestId("welcome-new-project"));
     expectAnchors([
+      "new-project-wizard",
       "np-date",
       "np-name",
       "np-scenario-a",
       "np-scenario-b",
       "np-category-input",
-      "np-submit",
+      "npw-next",
+      "npw-back",
     ]);
   });
 
@@ -198,7 +213,8 @@ describe("E2E 锚点", () => {
       "copy-volume-select",
       "copy-volume-option",
       "copy-camera-select",
-      "copy-note",
+      "copy-tags",
+      "copy-prefix-date",
       "copy-start",
       "copy-target-preview",
       "volumes-refresh",
@@ -215,8 +231,8 @@ describe("E2E 锚点", () => {
       <App
         preloaded={{
           ...base,
-          route: "projects",
-          workstation: { machineId: "WS-NEW", operator: "", nasRoot: "" },
+          route: "copy",
+          workstation: { machineId: "WS-NEW", operator: "", nasRoot: "", recentProjects: [] },
         }}
       />,
     );

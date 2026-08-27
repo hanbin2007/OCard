@@ -12,6 +12,7 @@ pub mod tasks;
 pub mod thumb_proto;
 pub mod transcode_cmds;
 pub mod updater;
+pub mod windows_cmds;
 
 use crate::core::{catalog, config, copy, journal, manifest, project, registry, volumes};
 use chrono::{Local, NaiveDate, TimeZone, Utc};
@@ -50,7 +51,10 @@ fn load_config<R: tauri::Runtime>(
     cfg
 }
 
-fn nas_root<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) -> CmdResult<PathBuf> {
+pub(crate) fn nas_root<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+) -> CmdResult<PathBuf> {
     load_config(app, state)
         .nas_root
         .ok_or_else(|| "尚未配置 NAS 根路径,请先在设置中配置".to_string())
@@ -126,7 +130,7 @@ fn project_dto(
     }
 }
 
-fn find_project(nas: &Path, project_id: &str) -> CmdResult<catalog::ProjectStats> {
+pub(crate) fn find_project(nas: &Path, project_id: &str) -> CmdResult<catalog::ProjectStats> {
     let mut stats = catalog::scan_cached(nas)
         .map_err(err)?
         .projects
@@ -167,6 +171,17 @@ pub fn get_workstation_info<R: tauri::Runtime>(
             .nas_root
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
+        recent_projects: cfg
+            .recent_projects
+            .into_iter()
+            .map(|r| RecentProjectDto {
+                id: r.id,
+                name: r.name,
+                folder_name: r.folder_name,
+                scenario: r.scenario,
+                last_opened_at: r.last_opened_at,
+            })
+            .collect(),
     }
 }
 
@@ -177,16 +192,44 @@ pub fn set_workstation_info<R: tauri::Runtime>(
     operator: String,
     nas_root: String,
 ) -> CmdResult<WorkstationInfoDto> {
-    let cfg = config::WorkstationConfig {
-        operator,
-        nas_root: if nas_root.trim().is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(nas_root.trim()))
-        },
+    // 改操作人/NAS 根不清空本机最近打开记录:先读旧配置保留 recents
+    let (mut cfg, _) = config::load_checked(&state.config_dir);
+    cfg.operator = operator;
+    cfg.nas_root = if nas_root.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(nas_root.trim()))
     };
     config::save(&state.config_dir, &cfg).map_err(err)?;
     Ok(get_workstation_info(app, state))
+}
+
+// ---------- 项目级设置(标签库 + 备份目的地预设) ----------
+
+#[tauri::command]
+pub fn get_project_settings<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<AppState>,
+    project_id: String,
+) -> CmdResult<project::ProjectSettings> {
+    let nas = nas_root(&app, &state)?;
+    let stats = find_project(&nas, &project_id)?;
+    project::load_settings(&stats.root)
+        .map_err(|e| format!("读取项目设置失败(标签库/备份预设可能不可用): {e}"))
+}
+
+#[tauri::command]
+pub fn save_project_settings<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<AppState>,
+    project_id: String,
+    settings: project::ProjectSettings,
+) -> CmdResult<project::ProjectSettings> {
+    let nas = nas_root(&app, &state)?;
+    let stats = find_project(&nas, &project_id)?;
+    project::save_settings(&stats.root, &settings).map_err(err)?;
+    // 回读落盘结果:调用方拿到的就是共享文件里的真值
+    project::load_settings(&stats.root).map_err(err)
 }
 
 // ---------- 项目 ----------
@@ -981,6 +1024,7 @@ pub fn start_copy_task<R: tauri::Runtime>(
         .unwrap_or_else(|| input.volume_id.clone());
     let op = operator(&app, &state);
     let mut m = manifest::CopyManifest::new("", &volume_name, &camera.code, &op, &input.note);
+    m.tags = input.tags.clone();
     let (dto, dest_targets) = tasks::build_task(
         &input,
         &stats.root,
@@ -1067,6 +1111,7 @@ pub fn start_copy_task<R: tauri::Runtime>(
                 "camera": camera.code,
                 "volume": volume_name,
                 "note": input.note,
+                "tags": input.tags,
                 "targetFolder": dto.target_folder,
             }),
         ),
@@ -1345,6 +1390,7 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
                 camera_id: String::new(),
                 camera_code: m.camera_code.clone(),
                 note: m.note.clone(),
+                tags: m.tags.clone(),
                 target_folder: m
                     .target_rel
                     .rsplit('/')

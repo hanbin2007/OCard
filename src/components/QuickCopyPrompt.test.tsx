@@ -25,7 +25,7 @@ afterEach(() => {
 });
 
 const base = {
-  route: "projects" as const,
+  route: "copy" as const,
   workstation: mockWorkstation,
   projects: mockProjects,
   cameras: mockCameras,
@@ -165,8 +165,9 @@ describe("快捷拷卡引导", () => {
       "需要先选择当前操作项目",
     );
     await user.click(screen.getByTestId("qc-goto-projects"));
-    // 浮层不消失:选完项目后同一张卡继续引导
-    expect(screen.getByTestId("quick-copy-prompt")).toBeDefined();
+    // 浏览器单窗口形态:打开项目管理 = 切到欢迎视图(Tauri 下为独立窗口,
+    // 主窗口与浮层原地保留)
+    expect(screen.getByTestId("welcome-root")).toBeDefined();
   });
 
   it("「忽略」关闭本次提示", async () => {
@@ -245,6 +246,9 @@ describe("快捷拷卡引导", () => {
       <App
         preloaded={{
           ...base,
+          // 从设备屏出发:拷卡屏进屏会自动刷新卷列表,上面的 listVolumes mock
+          // 会被提前消费成「已匹配」,测不到「未登记 → 去登记」这条链
+          route: "devices" as const,
           selectedProjectId: mockProjects[1].id,
           quickCopyQueue: ["vol-untitled-3"],
         }}

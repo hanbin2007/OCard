@@ -5,6 +5,7 @@ import { $, expect } from "@wdio/globals";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, readdirSync } from "node:fs";
 import path from "node:path";
+import { createProjectViaWizard, openAllProjects } from "../lib/windows.mjs";
 
 const nasRoot = process.env.OCARD_E2E_NAS_ROOT;
 // 与 transcode spec 同源:用将被打包的那个 sidecar 生成素材(系统 ffmpeg 不算数)
@@ -21,15 +22,8 @@ const itemFor = (fileName) =>
   $(`//div[@data-testid="final-cut-item"][.//span[@title="${fileName}"]]`);
 
 describe("OCard M3 成片命名校验冒烟", () => {
-  it("新建工况A项目并注入成片(合规/名实不符/命名不合规)", async () => {
-    await $('[data-testid="nav-new-project"]').click();
-    await $('[data-testid="np-name"]').waitForExist();
-    await $('[data-testid="np-name"]').setValue("E2E成片");
-    await $('[data-testid="np-scenario-a"]').click();
-    await $('[data-testid="np-submit"]').click();
-    await $('[data-testid="project-row"] span[title="E2E成片"]').waitForExist({
-      timeout: 20000,
-    });
+  it("引导新建工况A项目并注入成片(合规/名实不符/命名不合规)", async () => {
+    await createProjectViaWizard("E2E成片", "a");
 
     const dir = path.join(projectRoot(), "6. 成片");
     const good = path.join(dir, "20260825_晚会_1080P_预览_V1.mp4");
@@ -47,6 +41,8 @@ describe("OCard M3 成片命名校验冒烟", () => {
   });
 
   it("成片校验面板:合规放行、假4K标红、坏名给人话理由", async () => {
+    // 成片校验面板在项目管理窗口的详情区:从主窗口侧栏打开「所有项目」
+    await openAllProjects();
     const row = $('[data-testid="project-row"] span[title="E2E成片"]');
     await row.waitForClickable({ timeout: 15000 });
     await row.click();

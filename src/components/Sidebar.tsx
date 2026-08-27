@@ -3,6 +3,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ROUTE_ORDER, selectDeliveryWorking, useStore } from "../state/store";
 import type { RouteName } from "../state/store";
+import { useWindowBridge } from "../state/windowBridge";
 import { THEME_LABELS, useTheme } from "../state/theme";
 import { formatCompactDate } from "../lib/format";
 import { PulseValue } from "./ui";
@@ -21,10 +22,8 @@ import {
 
 /** 只描述"长什么样"；顺序由 ROUTE_ORDER 单点决定，与屏间过渡方向永远一致 */
 const NAV_ITEMS: Record<RouteName, { label: string; icon: typeof IconProjects }> = {
-  projects: { label: "项目", icon: IconProjects },
-  "new-project": { label: "新建项目", icon: IconPlus },
-  devices: { label: "设备登记", icon: IconCamera },
   copy: { label: "拷卡任务", icon: IconCard },
+  devices: { label: "设备登记", icon: IconCamera },
   sorting: { label: "分类工作台", icon: IconGrid },
   transcode: { label: "代理转码", icon: IconFilm },
   trash: { label: "回收站", icon: IconTrash },
@@ -111,6 +110,7 @@ function ThemeSwitch() {
 
 export function Sidebar() {
   const { state, dispatch } = useStore();
+  const bridge = useWindowBridge();
   const deliveryWorking = selectDeliveryWorking(state);
   const selectedProject = state.projects.find(
     (p) => p.id === state.selectedProjectId,
@@ -118,7 +118,6 @@ export function Sidebar() {
   // 代理转码是工况 A 概念，工况 B 项目下不给入口
   const transcodeAvailable = selectedProject?.scenario === "A";
   const counts: Partial<Record<RouteName, number>> = {
-    projects: state.projects.length,
     devices: state.cameras.length,
     copy: state.tasks.filter((t) => t.state === "running").length,
   };
@@ -143,6 +142,27 @@ export function Sidebar() {
       </div>
 
       <div className="sidebar__scroll">
+        {/* 项目管理/新建项目整体搬进了独立窗口:这里保留原「新建项目」的
+            位置作为它的入口(启动重构) */}
+        <div className="sidebar__section">
+          <button
+            type="button"
+            data-testid="nav-manager"
+            className="nav-item"
+            disabled={deliveryWorking}
+            title={
+              deliveryWorking
+                ? "交付打包进行中，完成后才能打开项目管理"
+                : "打开项目管理窗口(新建/切换项目)"
+            }
+            onClick={() => void bridge.openManager()}
+          >
+            <IconProjects className="nav-item__icon" />
+            <span>项目管理</span>
+            <IconPlus className="nav-item__count" size={13} />
+          </button>
+        </div>
+
         <nav className="sidebar__section sidebar__nav" aria-label="主导航">
           {rail ? (
             <span
@@ -198,7 +218,9 @@ export function Sidebar() {
         </nav>
 
         <div className="sidebar__section">
-          <div className="sidebar__label">最近项目</div>
+          {/* 「最近项目」语义已归欢迎窗口(本机最近打开);这里是当前 NAS
+              项目间的快速切换,不换窗口不换页面 */}
+          <div className="sidebar__label">快速切换</div>
           <div className="sidebar__projects">
             {state.projects.slice(0, 5).map((project) => (
               <button

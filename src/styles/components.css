@@ -269,6 +269,10 @@
   gap: var(--space-4);
 }
 
+.form-grid--3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 .form-grid--2 {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -2050,4 +2054,166 @@
   font-weight: var(--weight-medium);
   color: var(--text-tertiary);
   letter-spacing: 0.04em;
+}
+
+/* ================================================================
+ * 内容标签(Notion 式)与标签选择器
+ * ================================================================ */
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 100%;
+  padding: 1px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--tag-gray-bg);
+  color: var(--tag-gray-fg);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.tag__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tag__remove {
+  margin-right: -3px;
+  border: 0;
+  padding: 0 3px;
+  background: none;
+  color: inherit;
+  opacity: 0.6;
+  font-size: var(--text-sm);
+  line-height: 1;
+  cursor: pointer;
+}
+.tag__remove:hover {
+  opacity: 1;
+}
+
+.tag--gray { background: var(--tag-gray-bg); color: var(--tag-gray-fg); }
+.tag--blue { background: var(--tag-blue-bg); color: var(--tag-blue-fg); }
+.tag--green { background: var(--tag-green-bg); color: var(--tag-green-fg); }
+.tag--yellow { background: var(--tag-yellow-bg); color: var(--tag-yellow-fg); }
+.tag--orange { background: var(--tag-orange-bg); color: var(--tag-orange-fg); }
+.tag--red { background: var(--tag-red-bg); color: var(--tag-red-fg); }
+.tag--purple { background: var(--tag-purple-bg); color: var(--tag-purple-fg); }
+.tag--pink { background: var(--tag-pink-bg); color: var(--tag-pink-fg); }
+.tag--teal { background: var(--tag-teal-bg); color: var(--tag-teal-fg); }
+.tag--brown { background: var(--tag-brown-bg); color: var(--tag-brown-fg); }
+
+/* 任务详情等只读处的标签行 */
+.tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.tag-picker {
+  position: relative;
+}
+.tag-picker__box {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 34px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--field);
+  cursor: text;
+  transition: border-color var(--transition);
+}
+.tag-picker__box:focus-within {
+  border-color: var(--border-focus);
+}
+.tag-picker--invalid .tag-picker__box {
+  border-color: var(--danger);
+}
+.tag-picker--disabled .tag-picker__box {
+  opacity: 0.6;
+  pointer-events: none;
+}
+.tag-picker__input {
+  flex: 1;
+  min-width: 120px;
+  border: 0;
+  background: none;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-sm);
+  outline: none;
+  padding: 2px 0;
+}
+.tag-picker__menu {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel);
+  box-shadow: var(--shadow-overlay);
+}
+.tag-picker__option {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+.tag-picker__option--active,
+.tag-picker__option:hover {
+  background: var(--hover);
+}
+.tag-picker__create-label {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+/* 拷卡前缀选择器:日期 + 时段(工况 B)组合,不再手敲文本 */
+.prefix-picker {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.prefix-picker__date {
+  flex: 0 0 auto;
+}
+.seg {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  gap: 2px;
+}
+.seg__btn {
+  border: 0;
+  padding: 4px 12px;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+.seg__btn[aria-pressed="true"] {
+  background: var(--panel);
+  color: var(--text-primary);
+  font-weight: var(--weight-medium);
+  outline: 1px solid var(--border-strong);
 }

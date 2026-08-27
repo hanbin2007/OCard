@@ -148,9 +148,43 @@ export function inferTimeSlot(isoTimestamp: string): string {
   if (Number.isNaN(d.getTime())) return "";
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
-  const hour = d.getHours();
-  let slot = "上午";
-  if (hour >= 18) slot = "晚上";
-  else if (hour >= 12) slot = "下午";
-  return `${mm}${dd}${slot}`;
+  return `${mm}${dd}${slotForHour(d.getHours())}`;
+}
+
+/** 工况 B 的时段选项（顺序即界面分段控件顺序） */
+export const TIME_SLOTS = ["上午", "下午", "晚上"] as const;
+export type TimeSlot = (typeof TIME_SLOTS)[number];
+
+function slotForHour(hour: number): TimeSlot {
+  if (hour >= 18) return "晚上";
+  if (hour >= 12) return "下午";
+  return "上午";
+}
+
+/** 本机当前时刻对应的时段（拷卡表单的默认值来源） */
+export function currentTimeSlot(now: Date = new Date()): TimeSlot {
+  return slotForHour(now.getHours());
+}
+
+/** 本机今天的 `YYYYMMDD`（拷卡前缀默认值来源，不再探查卡内素材时间） */
+export function todayCompactDate(now: Date = new Date()): string {
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const dd = String(now.getDate()).padStart(2, "0");
+  return `${now.getFullYear()}${mm}${dd}`;
+}
+
+/**
+ * 由「日期 + 时段」组合拷卡前缀（前端唯一的前缀来源，用户不再手敲文本）：
+ * - 工况 A：`YYYYMMDD`（时段不参与）
+ * - 工况 B：`MMDD时段`，如 `0824上午`
+ * 非法日期返回空串，交由表单校验拦截。
+ */
+export function buildCopyPrefix(
+  scenario: "A" | "B",
+  compactDate: string,
+  slot: TimeSlot,
+): string {
+  if (!isValidCompactDate(compactDate)) return "";
+  if (scenario === "A") return compactDate;
+  return `${compactDate.slice(4)}${slot}`;
 }

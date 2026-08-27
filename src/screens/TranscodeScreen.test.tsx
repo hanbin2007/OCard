@@ -90,7 +90,8 @@ describe("入口约束", () => {
     expect(await screen.findByTestId("transcode-scenario-b")).toBeDefined();
     expect(screen.queryByTestId("transcode-start")).toBeNull();
     await user.click(screen.getByTestId("transcode-goto-projects"));
-    expect(await screen.findAllByTestId("project-row")).not.toHaveLength(0);
+    // 浏览器单窗口形态:打开项目管理 = 切到欢迎视图(Tauri 下为独立窗口)
+    expect(await screen.findByTestId("welcome-root")).toBeDefined();
   });
 
   it("未选项目时进转码屏给出空态与去路,而不是一句死话", async () => {
@@ -569,7 +570,7 @@ describe("转码不锁其他屏（与交付不同）", () => {
     await screen.findByTestId("transcode-progress");
 
     // 转码只动「4. 转码素材」，不影响其他屏的数据安全
-    expect((screen.getByTestId("nav-projects") as HTMLButtonElement).disabled).toBe(
+    expect((screen.getByTestId("nav-manager") as HTMLButtonElement).disabled).toBe(
       false,
     );
     expect((screen.getByTestId("nav-sorting") as HTMLButtonElement).disabled).toBe(

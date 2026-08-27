@@ -5,6 +5,7 @@ import { IconSettings } from "./Icon";
 import { NoticeBell } from "./NotificationCenter";
 import { TaskCenter } from "./TaskCenter";
 import { selectDeliveryWorking, useStore } from "../state/store";
+import { useWindowBridge } from "../state/windowBridge";
 
 /**
  * 当前操作项目的常驻指示（UX 波）：拷卡/分类/转码全都作用在「当前项目」上，
@@ -12,7 +13,8 @@ import { selectDeliveryWorking, useStore } from "../state/store";
  * 现在钉在顶栏正中——黄底加粗,超长跑马灯,点击回项目列表。
  */
 function CurrentProjectChip() {
-  const { state, dispatch } = useStore();
+  const { state } = useStore();
+  const bridge = useWindowBridge();
   const project =
     state.projects.find((p) => p.id === state.selectedProjectId) ?? null;
   // 首跑引导阶段没有「当前项目」概念,不显示(设置没配完,项目都还进不去)
@@ -63,9 +65,9 @@ function CurrentProjectChip() {
       title={
         deliveryWorking
           ? "交付打包进行中，完成后才能切换页面"
-          : `当前操作项目：${project.name}（点击回项目列表）`
+          : `当前操作项目：${project.name}（点击打开项目管理）`
       }
-      onClick={() => dispatch({ type: "navigate", route: "projects" })}
+      onClick={() => void bridge.openManager()}
     >
       <span className="topbar__project-label">当前</span>
       <span className="topbar__project-clip" ref={clipRef}>

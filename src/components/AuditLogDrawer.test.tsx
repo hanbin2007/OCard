@@ -11,14 +11,13 @@
 import {
   cleanup,
   fireEvent,
-  render,
   screen,
   waitFor,
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import App from "../App";
+import { renderProjectsManager } from "../testUtils";
 import * as api from "../api";
 import { mockAuditLog, mockProjects, mockWorkstation } from "../api/mock";
 import { toAuditRows } from "../lib/audit";
@@ -30,7 +29,7 @@ afterEach(() => {
 });
 
 const preloaded = {
-  route: "projects" as const,
+  route: "copy" as const,
   workstation: mockWorkstation,
   projects: mockProjects,
   cameras: [],
@@ -46,7 +45,7 @@ type AuditReply = Awaited<ReturnType<typeof api.listAuditLog>>;
 /** 打开抽屉并等首屏落地（列表 / 空态 / 错误任一） */
 async function openDrawer() {
   const user = userEvent.setup();
-  render(<App preloaded={preloaded} />);
+  renderProjectsManager(preloaded);
   await user.click(screen.getByTestId("audit-open"));
   await screen.findByTestId("audit-log-drawer");
   await waitFor(() => expect(screen.queryByTestId("audit-loading")).toBeNull());
@@ -77,7 +76,7 @@ function groupChip(group: string): HTMLElement {
 
 describe("审计日志入口", () => {
   it("项目详情面板有入口，未打开时抽屉不存在", () => {
-    render(<App preloaded={preloaded} />);
+    renderProjectsManager(preloaded);
     const entry = screen.getByTestId("audit-open");
     expect(entry.textContent).toBe("审计日志");
     expect(entry.getAttribute("aria-haspopup")).toBe("dialog");
@@ -344,7 +343,7 @@ describe("过滤", () => {
 describe("加载与失败", () => {
   it("取数期间给出加载态", async () => {
     const user = userEvent.setup();
-    render(<App preloaded={preloaded} />);
+    renderProjectsManager(preloaded);
     await user.click(screen.getByTestId("audit-open"));
     expect(screen.getByTestId("audit-loading").getAttribute("role")).toBe("status");
     await waitFor(() => expect(screen.queryByTestId("audit-loading")).toBeNull());

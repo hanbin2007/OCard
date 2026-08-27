@@ -155,7 +155,7 @@ describe("validateStartCopy", () => {
   const base = {
     volumeId: "vol-1",
     cameraId: "cam-1",
-    note: "上午田赛",
+    tags: ["田赛"],
     targetPrefix: "0824上午",
     destinations: [
       { kind: "local" as const, path: "/Volumes/NAS" },
@@ -167,10 +167,10 @@ describe("validateStartCopy", () => {
     expect(validateStartCopy(base).valid).toBe(true);
   });
 
-  it("备注为空被拦下（规范要求适当记录）", () => {
-    const result = validateStartCopy({ ...base, note: "   " });
+  it("没有内容标签被拦下（规范要求适当记录）", () => {
+    const result = validateStartCopy({ ...base, tags: ["   "] });
     expect(result.valid).toBe(false);
-    expect(result.errors.note).toContain("必填");
+    expect(result.errors.tags).toContain("标签");
   });
 
   it("一个目的地都没有时被拦下", () => {

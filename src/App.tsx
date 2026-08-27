@@ -1,3 +1,4 @@
+import * as api from "./api";
 import { NoticeToasts } from "./components/NotificationCenter";
 import { OnboardingWizard } from "./components/OnboardingWizard";
 import { QuickCopyPrompt } from "./components/QuickCopyPrompt";
@@ -7,15 +8,15 @@ import { Sidebar } from "./components/Sidebar";
 import { TopBar } from "./components/TopBar";
 import { CopyTaskScreen } from "./screens/CopyTaskScreen";
 import { DevicesScreen } from "./screens/DevicesScreen";
-import { NewProjectScreen } from "./screens/NewProjectScreen";
-import { ProjectsScreen } from "./screens/ProjectsScreen";
 import { SortingScreen } from "./screens/SortingScreen";
 import { TranscodeScreen } from "./screens/TranscodeScreen";
 import { TrashScreen } from "./screens/TrashScreen";
-import { useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ROUTE_ORDER, StoreProvider, useStore, type AppState } from "./state/store";
 import type { RouteName } from "./state/store";
 import { ThemeProvider } from "./state/theme";
+import { WindowBridgeProvider } from "./state/windowBridge";
+import { WelcomeRoot } from "./welcome/WelcomeRoot";
 
 /**
  * 屏间过渡的方向。
@@ -115,22 +116,53 @@ function Routes() {
   }
 
   switch (state.route) {
-    case "new-project":
-      return <NewProjectScreen />;
     case "devices":
       return <DevicesScreen />;
-    case "copy":
-      return <CopyTaskScreen />;
     case "sorting":
       return <SortingScreen />;
     case "trash":
       return <TrashScreen />;
     case "transcode":
       return <TranscodeScreen />;
-    case "projects":
+    case "copy":
     default:
-      return <ProjectsScreen />;
+      // 主窗口默认落在拷卡界面(启动重构):项目已在欢迎窗口选定
+      return <CopyTaskScreen />;
   }
+}
+
+/**
+ * 主窗口的「打开项目」接收端(仅 Tauri):
+ * 欢迎窗口经 Rust 投递 projectId——事件通道接「已在跑」的主窗口,
+ * 暂存通道接「被现场重建、事件早于监听注册」的主窗口(启动先消费一次)。
+ * 收到后选中项目、切到拷卡屏,并整站 reload:项目/相机/卡可能刚在
+ * 欢迎窗口里创建,本窗口的快照还不知道它们。
+ */
+function OpenProjectListener() {
+  const { dispatch, reload } = useStore();
+  useEffect(() => {
+    let disposed = false;
+    const handle = (projectId: string) => {
+      if (disposed) return;
+      dispatch({ type: "selectProject", projectId });
+      dispatch({ type: "navigate", route: "copy" });
+      reload();
+    };
+    void api
+      .takePendingOpenProject()
+      .then((projectId) => {
+        if (projectId) handle(projectId);
+      })
+      .catch(() => {
+        // 暂存拿不到还有事件通道;事件也丢时用户会再点一次,不弹错
+      });
+    const unsubscribe = api.subscribeOpenProject(handle);
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, [dispatch, reload]);
+  return null;
 }
 
 export function Shell() {
@@ -159,11 +191,55 @@ export function Shell() {
   );
 }
 
+/**
+ * 浏览器/测试环境的单窗口形态:没有 Tauri 多窗口,欢迎页与主界面
+ * 在同一窗口内切换。传了 preloaded(测试注入)直接进主界面。
+ */
+function BrowserApp({ preloaded }: { preloaded?: Partial<AppState> }) {
+  const { dispatch } = useStore();
+  const [view, setView] = useState<"welcome" | "shell">(
+    preloaded ? "shell" : "welcome",
+  );
+  return (
+    <WindowBridgeProvider
+      role={view === "welcome" ? "welcome" : "main"}
+      onBrowserOpenProject={(projectId) => {
+        dispatch({ type: "selectProject", projectId });
+        dispatch({ type: "navigate", route: "copy" });
+        setView("shell");
+      }}
+      onBrowserOpenManager={() => setView("welcome")}
+    >
+      {view === "welcome" ? <WelcomeRoot /> : <Shell />}
+    </WindowBridgeProvider>
+  );
+}
+
 export default function App({ preloaded }: { preloaded?: Partial<AppState> }) {
+  // 每个窗口一个 React 实例,角色终生不变:按角色分叉不违反 hooks 规则
+  if (api.isTauri()) {
+    const role = api.windowRole();
+    return (
+      <ThemeProvider>
+        <StoreProvider preloaded={preloaded}>
+          <WindowBridgeProvider role={role}>
+            {role === "welcome" ? (
+              <WelcomeRoot />
+            ) : (
+              <>
+                <OpenProjectListener />
+                <Shell />
+              </>
+            )}
+          </WindowBridgeProvider>
+        </StoreProvider>
+      </ThemeProvider>
+    );
+  }
   return (
     <ThemeProvider>
       <StoreProvider preloaded={preloaded}>
-        <Shell />
+        <BrowserApp preloaded={preloaded} />
       </StoreProvider>
     </ThemeProvider>
   );

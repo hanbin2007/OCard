@@ -3,23 +3,23 @@
 import { $, expect } from "@wdio/globals";
 import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
+import { createProjectViaWizard, switchToWindowWith } from "../lib/windows.mjs";
 
 const nasRoot = process.env.OCARD_E2E_NAS_ROOT;
 
 describe("OCard M1 冒烟", () => {
-  it("应用启动并渲染导航,预置配置已生效(无首跑引导)", async () => {
-    await $('[data-testid="nav-projects"]').waitForExist({ timeout: 30000 });
+  it("启动进入欢迎窗口,预置配置已生效(无首跑引导)", async () => {
+    await switchToWindowWith('[data-testid="welcome-home"]', 30000);
     expect(await $('[data-testid="first-run-guide"]').isExisting()).toBe(false);
+    // Xcode 式欢迎页:新建项目入口 + 最近项目区
+    expect(await $('[data-testid="welcome-new-project"]').isExisting()).toBe(true);
+    expect(await $('[data-testid="welcome-recents"]').isExisting()).toBe(true);
   });
 
-  it("新建工况A项目,NAS 上按规范建夹", async () => {
-    await $('[data-testid="nav-new-project"]').click();
-    await $('[data-testid="np-name"]').waitForExist();
-    await $('[data-testid="np-name"]').setValue("E2E冒烟");
-    await $('[data-testid="np-scenario-a"]').click();
-    await $('[data-testid="np-submit"]').click();
-
-    await $('[data-testid="project-row"]').waitForExist({ timeout: 20000 });
+  it("引导新建工况A项目,NAS 上按规范建夹,主窗口默认落在拷卡屏", async () => {
+    await createProjectViaWizard("E2E冒烟", "a");
+    // 主窗口默认显示拷卡界面
+    await $('[data-testid="copy-start"]').waitForExist({ timeout: 20000 });
 
     const dirs = readdirSync(nasRoot).filter((d) => d.includes("E2E冒烟"));
     expect(dirs.length).toBe(1);

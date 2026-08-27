@@ -6,6 +6,7 @@ import type {
   CopyFileItem,
   CopyTaskPreview,
   DestinationKind,
+  ProjectSettings,
   StartCopyInput,
   NoticeLevel,
 } from "../api/types";
@@ -15,6 +16,7 @@ import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog"
 import { IconPlus, IconRetry, IconTrash } from "../components/Icon";
 import { PathField } from "../components/PathField";
 import { RemoteActivityBanner } from "../components/RemoteActivityBanner";
+import { TagChip, TagPicker } from "../components/TagPicker";
 import { TopBar } from "../components/TopBar";
 import { IllCopyEmpty, IllCopyFlow } from "../components/illustrations";
 import { Badge, EmptyState, Field, ProgressBar } from "../components/ui";
@@ -33,13 +35,31 @@ import {
   TASK_STATE_LABEL,
   TASK_STATE_TONE,
 } from "../lib/labels";
-import { buildCopyTargetPath, copyTargetParent } from "../lib/naming";
+import {
+  buildCopyPrefix,
+  buildCopyTargetPath,
+  copyTargetParent,
+  currentTimeSlot,
+  todayCompactDate,
+  TIME_SLOTS,
+  type TimeSlot,
+} from "../lib/naming";
+import { colorOfTag, joinTagsAsNote, nextTagColor } from "../lib/tags";
 import { validateStartCopy } from "../lib/validation";
 import {
   remoteActivityForVolume,
   useRemoteActivity,
 } from "../hooks/useRemoteActivity";
 import { useStore } from "../state/store";
+import { useWindowBridge } from "../state/windowBridge";
+
+/** `YYYYMMDD` ↔ date input 的 `YYYY-MM-DD` */
+function compactToIso(compact: string): string {
+  return `${compact.slice(0, 4)}-${compact.slice(4, 6)}-${compact.slice(6, 8)}`;
+}
+function isoToCompact(iso: string): string {
+  return iso.replace(/-/g, "");
+}
 
 interface DestDraft {
   id: string;
@@ -58,6 +78,7 @@ function newDest(kind: DestinationKind, path = ""): DestDraft {
 
 export function CopyTaskScreen() {
   const { state, dispatch, refreshTask } = useStore();
+  const bridge = useWindowBridge();
   const { volumes, cameras, tasks, projects, selectedProjectId, selectedTaskId } = state;
 
   // 不做 `?? projects[0]` 兜底：没选项目就不该猜一个往里拷
@@ -101,18 +122,22 @@ export function CopyTaskScreen() {
     setPreview(null);
     setPreviewFailed(false);
     setSubmitted(false);
-    setTargetPrefix("");
-    setPrefixInferred(false);
-    prefixEditedRef.current = false;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.copyDraft]);
   const [volumesRefreshing, setVolumesRefreshing] = useState(false);
   const [cameraId, setCameraId] = useState("");
-  const [note, setNote] = useState("");
-  const [targetPrefix, setTargetPrefix] = useState("");
-  const [prefixInferred, setPrefixInferred] = useState(false);
-  // 人工改过前缀后就不再被探查结果覆盖
-  const prefixEditedRef = useRef(false);
+  /**
+   * 内容标签(替代自由文本备注):标签库随项目存 settings.json,
+   * 现场新建的标签当场写回库,其他工作站打开同一项目即可复用。
+   */
+  const [tags, setTags] = useState<string[]>([]);
+  const [settings, setSettings] = useState<ProjectSettings | null>(null);
+  /**
+   * 目标夹前缀不再手敲、也不再探查卡内素材时间:
+   * 日期选择器默认本机今天,工况 B 另有上午/下午/晚上时段切换。
+   */
+  const [prefixIso, setPrefixIso] = useState(() => compactToIso(todayCompactDate()));
+  const [slot, setSlot] = useState<TimeSlot>(() => currentTimeSlot());
   // 不预填任何平台特有路径：/Volumes/… 在 Windows/Linux 上首屏即是错的
   const [dests, setDests] = useState<DestDraft[]>(() => [
     newDest("nas"),
@@ -190,16 +215,19 @@ export function CopyTaskScreen() {
   const hiddenSystemCount = volumes.length - visibleVolumes.length;
 
   const camera = cameras.find((c) => c.id === cameraId) ?? null;
+  const targetPrefix = project
+    ? buildCopyPrefix(project.scenario, isoToCompact(prefixIso), slot)
+    : "";
   const validation = useMemo(
     () =>
       validateStartCopy({
         volumeId,
         cameraId,
-        note,
+        tags,
         targetPrefix,
         destinations: dests.map(({ kind, path }) => ({ kind, path })),
       }),
-    [volumeId, cameraId, note, targetPrefix, dests],
+    [volumeId, cameraId, tags, targetPrefix, dests],
   );
 
   const targetPath =
@@ -215,42 +243,64 @@ export function CopyTaskScreen() {
     setPreview(null);
     setPreviewFailed(false);
     setSubmitted(false);
-    setTargetPrefix("");
-    setPrefixInferred(false);
-    prefixEditedRef.current = false;
+    setTags([]);
+    setSettings(null);
+    // 前缀回到「本机今天 + 当前时段」——按本机日期自动填,不探查卡内素材
+    setPrefixIso(compactToIso(todayCompactDate()));
+    setSlot(currentTimeSlot());
   }, [projectKey]);
 
-  // 选中源卷后探查素材时间戳，据此推断时段前缀（PRD §5.3：从素材时间戳推断，可改）
+  // 项目设置(标签库 + 备份盘预设)随项目加载;预设盘预填进目的地行
   useEffect(() => {
-    if (!volumeId || !project || prefixEditedRef.current) return;
+    if (!projectKey) return;
     let cancelled = false;
-    // 换卡先清上一张卡的推断结果:上一张成功、这一张失败时,
-    // 旧时段前缀留着会把新卡拷进旧时段目录(codex 评审 P1)
-    setTargetPrefix("");
-    setPrefixInferred(false);
     void (async () => {
       try {
-        const inspection = await api.inspectVolume(volumeId);
-        if (cancelled || prefixEditedRef.current) return;
-        // 工况 A 用项目拍摄日期，工况 B 用卡内素材推断出的时段
-        setTargetPrefix(
-          project.scenario === "A" ? project.date : inspection.suggestedPrefix,
-        );
-        setPrefixInferred(true);
+        const loaded = await api.getProjectSettings(projectKey);
+        if (cancelled) return;
+        setSettings(loaded);
+        if (loaded.backupPaths.length > 0) {
+          setDests([
+            newDest("nas"),
+            ...loaded.backupPaths.map((p) => newDest("external", p)),
+          ]);
+        }
       } catch (err) {
         if (cancelled) return;
-        // 探查失败以前是静默的：前缀悄悄没推出来,用户不知道为什么是空的
+        // 标签库读不到必须出声:否则用户只看到一个永远为空的标签选择器
+        setSettings({ tags: [], backupPaths: [] });
         pushNotice(
           "warning",
-          "volume-inspect-failed",
-          `读取卡内素材时间失败，时段前缀请手动填写：${err instanceof Error ? err.message : String(err)}`,
+          "project-settings-load-failed",
+          `读取项目标签库失败：${err instanceof Error ? err.message : String(err)}。仍可现场新建标签。`,
         );
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [volumeId, project, pushNotice]);
+  }, [projectKey, pushNotice]);
+
+  /** 现场新建标签:先进库(本地即时可用),再写回项目 settings(零静默) */
+  const createTag = useCallback(
+    (name: string) => {
+      const current = settings ?? { tags: [], backupPaths: [] };
+      const next: ProjectSettings = {
+        ...current,
+        tags: [...current.tags, { name, color: nextTagColor(current.tags) }],
+      };
+      setSettings(next);
+      if (!projectKey) return;
+      void api.saveProjectSettings(projectKey, next).catch((err) => {
+        pushNotice(
+          "warning",
+          "project-settings-save-failed",
+          `标签「${name}」写入项目失败(本次拷卡仍会带上它)：${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    },
+    [settings, projectKey, pushNotice],
+  );
 
 
   /** 进度事件驱动的重拉节流：拷贝中每 ~200ms 一条事件，不能每条都打一次 IPC */
@@ -363,7 +413,9 @@ export function CopyTaskScreen() {
         projectId: project.id,
         volumeId,
         cameraId,
-        note,
+        // note 是标签拼串的兼容形态:manifest 与审计日志保持人可读
+        note: joinTagsAsNote(tags),
+        tags,
         targetPrefix,
         destinations: dests.map(({ kind, path }) => ({ kind, path })),
         // 仅工况 A 有代理转码概念，工况 B 不传这个标志
@@ -374,7 +426,7 @@ export function CopyTaskScreen() {
       dispatch({ type: "taskStarted", task: started });
       // 与后端对账一次，别只信 start 的返回值
       void refreshTask(started.id);
-      setNote("");
+      setTags([]);
       setSubmitted(false);
       setConfirming(false);
       setPreview(null);
@@ -415,7 +467,8 @@ export function CopyTaskScreen() {
         projectId: project.id,
         volumeId,
         cameraId,
-        note,
+        note: joinTagsAsNote(tags),
+        tags,
         targetPrefix,
         destinations: dests.map(({ kind, path }) => ({ kind, path })),
       });
@@ -484,7 +537,7 @@ export function CopyTaskScreen() {
                         <button
                           type="button"
                           className="btn"
-                          onClick={() => dispatch({ type: "navigate", route: "projects" })}
+                          onClick={() => void bridge.openManager()}
                         >
                           去选择项目
                         </button>
@@ -527,8 +580,18 @@ export function CopyTaskScreen() {
                           </span>
                         </div>
                         <div className="dl__row">
-                          <span className="dl__key">备注</span>
-                          <span className="dl__val">{note}</span>
+                          <span className="dl__key">内容标签</span>
+                          <span className="dl__val">
+                            <span className="tag-row" data-testid="confirm-tags">
+                              {tags.map((name) => (
+                                <TagChip
+                                  key={name}
+                                  name={name}
+                                  color={colorOfTag(settings?.tags ?? [], name)}
+                                />
+                              ))}
+                            </span>
+                          </span>
                         </div>
                         {project.scenario === "A" ? (
                           <div className="dl__row">
@@ -725,27 +788,42 @@ export function CopyTaskScreen() {
                           project.scenario === "A" ? "目标夹日期" : "目标夹时段"
                         }
                         htmlFor="copy-prefix"
-                        hint={
-                          prefixInferred
-                            ? "由卡内素材时间戳推断得出，可改"
-                            : `落在「${copyTargetParent(project.scenario)}」下`
-                        }
+                        hint={`默认本机今天,落在「${copyTargetParent(project.scenario)}」下`}
                         error={submitted ? validation.errors.targetPrefix : undefined}
                       >
-                        <input
-                          id="copy-prefix"
-                          className="input input--mono"
-                          type="text"
-                          value={targetPrefix}
-                          placeholder={
-                            project.scenario === "A" ? "20260824" : "0824上午"
-                          }
-                          onChange={(e) => {
-                            prefixEditedRef.current = true;
-                            setPrefixInferred(false);
-                            setTargetPrefix(e.currentTarget.value);
-                          }}
-                        />
+                        <div className="prefix-picker">
+                          <input
+                            id="copy-prefix"
+                            data-testid="copy-prefix-date"
+                            className="input input--mono prefix-picker__date"
+                            type="date"
+                            value={prefixIso}
+                            onChange={(e) => setPrefixIso(e.currentTarget.value)}
+                          />
+                          {project.scenario === "B" ? (
+                            <div
+                              className="seg"
+                              role="group"
+                              aria-label="时段"
+                              data-testid="copy-prefix-slot"
+                            >
+                              {TIME_SLOTS.map((value) => (
+                                <button
+                                  key={value}
+                                  type="button"
+                                  className="seg__btn"
+                                  aria-pressed={slot === value}
+                                  onClick={() => setSlot(value)}
+                                >
+                                  {value}
+                                </button>
+                              ))}
+                            </div>
+                          ) : null}
+                          <span className="text-xs dim mono" data-testid="copy-prefix-value">
+                            {targetPrefix || "—"}
+                          </span>
+                        </div>
                       </Field>
 
                       <div className="code-preview">
@@ -759,18 +837,19 @@ export function CopyTaskScreen() {
                       </div>
 
                       <Field
-                        label="内容备注"
-                        htmlFor="copy-note"
-                        hint="规范要求「适当记录」，将写入 manifest 与审计日志"
-                        error={submitted ? validation.errors.note : undefined}
+                        label="内容标签"
+                        htmlFor="copy-tags"
+                        hint="规范要求「适当记录」；标签随项目走，各工作站共用一套"
+                        error={submitted ? validation.errors.tags : undefined}
                       >
-                        <textarea
-                          id="copy-note"
-                          data-testid="copy-note"
-                          className="textarea"
-                          value={note}
-                          placeholder="如：上午田赛，含 4×100 决赛全程"
-                          onChange={(e) => setNote(e.currentTarget.value)}
+                        <TagPicker
+                          id="copy-tags"
+                          testId="copy-tags"
+                          value={tags}
+                          onChange={setTags}
+                          library={settings?.tags ?? []}
+                          onCreateTag={createTag}
+                          invalid={Boolean(submitted && validation.errors.tags)}
                         />
                       </Field>
 
@@ -1022,8 +1101,23 @@ export function CopyTaskScreen() {
                             <span className="dl__val mono">{task.cameraCode}</span>
                           </div>
                           <div className="dl__row">
-                            <span className="dl__key">内容备注</span>
-                            <span className="dl__val">{task.note}</span>
+                            <span className="dl__key">内容标签</span>
+                            <span className="dl__val">
+                              {task.tags.length > 0 ? (
+                                <span className="tag-row">
+                                  {task.tags.map((name) => (
+                                    <TagChip
+                                      key={name}
+                                      name={name}
+                                      color={colorOfTag(settings?.tags ?? [], name)}
+                                    />
+                                  ))}
+                                </span>
+                              ) : (
+                                /* 旧任务(标签系统之前发起的)只有自由文本备注 */
+                                task.note || "—"
+                              )}
+                            </span>
                           </div>
                           <div className="dl__row">
                             <span className="dl__key">操作人</span>
