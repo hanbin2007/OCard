@@ -42,7 +42,7 @@ fn ensure_main_window<R: tauri::Runtime>(app: &AppHandle<R>) -> CmdResult<tauri:
 }
 
 /// 在主窗口中打开项目(欢迎窗口调用)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_project_window<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -102,7 +102,7 @@ pub fn open_project_window<R: tauri::Runtime>(
 }
 
 /// 打开欢迎/项目管理窗口(主窗口侧栏调用;已存在则聚焦,不存在则重建)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_manager_window<R: tauri::Runtime>(app: AppHandle<R>) -> CmdResult<()> {
     if let Some(w) = app.get_webview_window("welcome") {
         let _ = w.show();
@@ -120,7 +120,7 @@ pub fn open_manager_window<R: tauri::Runtime>(app: AppHandle<R>) -> CmdResult<()
 }
 
 /// 主窗口启动时消费一次「待打开项目」(取后即清)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn take_pending_open_project(pending: State<PendingOpenProject>) -> CmdResult<Option<String>> {
     Ok(pending.0.lock().map_err(|_| "内部状态锁中毒")?.take())
 }

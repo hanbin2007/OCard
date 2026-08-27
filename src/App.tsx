@@ -92,9 +92,7 @@ function Routes() {
         <TopBar title="OCard" />
         <div className="content">
           <div className="content__inner">
-            <p className="text-sm dim" role="status">
-              正在读取 NAS 项目状态…
-            </p>
+            <LoadingWithWatchdog />
           </div>
         </div>
       </>
@@ -164,6 +162,32 @@ function OpenProjectListener() {
     };
   }, [dispatch, reload]);
   return null;
+}
+
+/**
+ * 启动加载态 + 看门狗:NAS 半死(挂载点在、IO 挂起)时 statfs 可以卡上
+ * 几分钟,不能让人对着一行灰字干等(Arch 实机:同事以为软件死了)。
+ * 超过 10s 就把可能的原因和自救路径说出来。命令已全部移出主线程执行,
+ * UI 本身保持响应。
+ */
+function LoadingWithWatchdog() {
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    const t = window.setTimeout(() => setSlow(true), 10_000);
+    return () => window.clearTimeout(t);
+  }, []);
+  return (
+    <div className="stack" role="status">
+      <p className="text-sm dim">正在读取 NAS 项目状态…</p>
+      {slow ? (
+        <p className="text-xs text-warn" data-testid="loading-slow-hint">
+          NAS 响应很慢或没有响应。常见原因:网络断开但挂载点还在
+          (系统级 IO 挂起,可能要等数分钟才超时)。可检查 NAS
+          连接与挂载状态;恢复后本页会自动继续。
+        </p>
+      ) : null}
+    </div>
+  );
 }
 
 export function Shell() {

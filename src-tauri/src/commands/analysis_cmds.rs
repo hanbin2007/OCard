@@ -59,7 +59,7 @@ pub fn verify_models_on_startup<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 }
 
 /// 发起分析作业(工况 B「待分类」全量;幂等:指纹命中即缓存)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn start_analysis<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<super::AppState>,

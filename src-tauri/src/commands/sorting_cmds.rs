@@ -456,7 +456,7 @@ fn asset_dto(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_pending_assets<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -625,7 +625,7 @@ fn cached_features(
     (feats, skipped, read_err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_categories<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -700,7 +700,7 @@ fn audit_bulk<R: tauri::Runtime>(
     );
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn move_assets<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -739,7 +739,7 @@ pub fn move_assets<R: tauri::Runtime>(
     Ok(res)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn curate_assets<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -762,7 +762,7 @@ pub fn curate_assets<R: tauri::Runtime>(
     Ok(res)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn trash_assets<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -806,7 +806,7 @@ pub fn trash_assets<R: tauri::Runtime>(
     Ok(res)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_trash<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -850,7 +850,7 @@ pub fn list_trash<R: tauri::Runtime>(
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn restore_from_trash<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -892,7 +892,7 @@ pub struct EmptyTrashResultDto {
     pub failed: usize,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn empty_trash<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -940,7 +940,7 @@ pub fn empty_trash<R: tauri::Runtime>(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn indexing_status<R: tauri::Runtime>(
     app: AppHandle<R>,
     project_id: String,
@@ -984,7 +984,7 @@ pub struct DeliverySummaryDto {
 
 /// 执行交付打包(PRD §5.7):半天分包、复制不动原件、清单落盘;
 /// 上传与发链接人工完成(既定边界)。重跑安全(零覆盖,已打包项报失败)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn start_delivery<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -1129,13 +1129,13 @@ pub fn start_delivery<R: tauri::Runtime>(
     Ok(body_handle.snapshot())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_jobs<R: tauri::Runtime>(app: AppHandle<R>) -> Vec<crate::core::jobs::JobSnapshot> {
     app.state::<std::sync::Arc<crate::core::jobs::JobManager>>()
         .snapshots()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_job<R: tauri::Runtime>(
     app: AppHandle<R>,
     job_id: String,
@@ -1145,7 +1145,7 @@ pub fn get_job<R: tauri::Runtime>(
         .map(|h| h.snapshot())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cancel_job<R: tauri::Runtime>(
     app: AppHandle<R>,
     job_id: String,
@@ -1213,7 +1213,7 @@ pub struct AuditEventDto {
 }
 
 /// 项目全量审计日志(最新在前)。读取降级(坏行/坏文件)零静默上浮为 warning。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_audit_log<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -1247,7 +1247,7 @@ pub fn list_audit_log<R: tauri::Runtime>(
     Ok(out)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_remote_activity<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,

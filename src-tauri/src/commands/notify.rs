@@ -79,7 +79,7 @@ pub fn emit_notice<R: tauri::Runtime>(
 }
 
 /// 回放积压通知(前端启动订阅就绪后调用一次补账)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_notices(state: tauri::State<super::AppState>) -> Vec<NoticeDto> {
     state.notices.lock().unwrap().clone()
 }

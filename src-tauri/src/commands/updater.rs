@@ -106,14 +106,14 @@ async fn do_check_and_download<R: tauri::Runtime>(app: &AppHandle<R>, manual: bo
 }
 
 /// 手动检查更新(设置界面「检查更新」按钮)。
-#[tauri::command]
+#[tauri::command(async)]
 pub async fn check_for_update<R: tauri::Runtime>(app: AppHandle<R>) -> Result<String, String> {
     Ok(check_and_download(&app, true).await)
 }
 
 /// 用户主动安装已下载的更新。有运行中拷卡任务时拒绝(安装会退出进程);
 /// 与检查/下载共用同一串行闸(codex 五轮:安装可与下载并发)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn install_update<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: tauri::State<AppState>,

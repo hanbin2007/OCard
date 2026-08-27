@@ -42,7 +42,7 @@ pub struct FinalCutReportDto {
     pub warnings: Vec<String>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn check_final_cuts<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<super::AppState>,
@@ -150,7 +150,7 @@ pub struct CuratedFlowHintDto {
 
 /// 「待修→已修」流转提示:已修夹出现与待修**同主名**(忽略扩展名)的成品时,
 /// 提示删除待修原稿(PRD §5.4;只提示,不动文件)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn curated_flow_hints<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<super::AppState>,
@@ -249,7 +249,7 @@ fn delivery_status_path(root: &std::path::Path) -> PathBuf {
     root.join(project::STATE_DIR).join("delivery-status.json")
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_delivery_status<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<super::AppState>,
@@ -267,7 +267,7 @@ pub fn get_delivery_status<R: tauri::Runtime>(
 }
 
 /// 勾选状态:原子替换,last-write-wins(声明语义——这是人工勾选,不是账本)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_delivery_status<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<super::AppState>,

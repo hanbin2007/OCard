@@ -1,5 +1,12 @@
 //! Tauri 命令层:实现 `src/api/index.ts` 里标注的全部 invoke 契约。
 //! 错误统一映射为字符串消息(前端 toast 展示)。
+//!
+//! ## 命令一律 `#[tauri::command(async)]`
+//! Tauri v2 的同步命令跑在**主线程**:任何 NAS/磁盘 IO(statfs 在半死的
+//! SMB/NFS 挂载上会无限期阻塞)都会把整个 UI 冻成「未响应」,GTK 主循环
+//! 饿死后 WebKit 合成状态错乱还可能直接 SEGV(Arch 实机 coredump)。
+//! `(async)` 让同步签名的命令在独立任务上执行,主线程只做 UI。
+//! 新增命令必须沿用 `(async)`,除非确有主线程需求并写明原因。
 
 pub mod analysis_cmds;
 pub mod dto;
@@ -155,7 +162,7 @@ pub(crate) fn find_project(nas: &Path, project_id: &str) -> CmdResult<catalog::P
 
 // ---------- 工作站 ----------
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_workstation_info<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -185,7 +192,7 @@ pub fn get_workstation_info<R: tauri::Runtime>(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_workstation_info<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -206,7 +213,7 @@ pub fn set_workstation_info<R: tauri::Runtime>(
 
 // ---------- 项目级设置(标签库 + 备份目的地预设) ----------
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_project_settings<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -218,7 +225,7 @@ pub fn get_project_settings<R: tauri::Runtime>(
         .map_err(|e| format!("读取项目设置失败(标签库/备份预设可能不可用): {e}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_project_settings<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -254,7 +261,7 @@ fn notice_catalog_warnings<R: tauri::Runtime>(app: &AppHandle<R>, warnings: &[St
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_projects<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -290,7 +297,7 @@ pub fn list_projects<R: tauri::Runtime>(
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_project<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -301,7 +308,7 @@ pub fn get_project<R: tauri::Runtime>(
         .find(|p| p.id == project_id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_project<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -328,7 +335,7 @@ pub fn create_project<R: tauri::Runtime>(
     Ok(project_dto(&stats, Some(&[]), false))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn preview_folder_tree(
     scenario: project::Scenario,
     categories: Vec<String>,
@@ -370,7 +377,7 @@ pub fn preview_folder_tree(
 
 // ---------- 登记表 ----------
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_cameras<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -380,7 +387,7 @@ pub fn list_cameras<R: tauri::Runtime>(
     Ok(load.registry.cameras)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_camera<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -398,7 +405,7 @@ pub fn create_camera<R: tauri::Runtime>(
     .map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_camera<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -413,7 +420,7 @@ pub fn delete_camera<R: tauri::Runtime>(
     .map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_storage_cards<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -502,7 +509,7 @@ pub(crate) fn match_card(
     (label_hit.map(|c| c.id.clone()), None)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_storage_card<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -584,7 +591,7 @@ pub fn create_storage_card<R: tauri::Runtime>(
     .map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_storage_card<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -632,7 +639,7 @@ fn project_cards_dto(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_project_cards<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -644,7 +651,7 @@ pub fn list_project_cards<R: tauri::Runtime>(
     Ok(project_cards_dto(&stats, &cards))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_project_cards<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -708,7 +715,7 @@ pub fn set_project_cards<R: tauri::Runtime>(
 /// 原子追加一张卡到项目用卡清单(快捷拷卡引导)。
 /// 与 set_project_cards 的整表覆盖不同:写可交换的增量事件,
 /// 两台工作站同时各加一张卡不会互相覆盖(评审 P0)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_project_card<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -753,7 +760,7 @@ pub fn add_project_card<R: tauri::Runtime>(
 
 // ---------- 卷 ----------
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_volumes<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -816,7 +823,7 @@ pub fn list_volumes<R: tauri::Runtime>(
         .collect()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn inspect_volume(volume_id: String) -> CmdResult<VolumeInspectionDto> {
     let root = PathBuf::from(&volume_id);
     let files = copy::scan_source(&root).map_err(err)?;
@@ -867,12 +874,12 @@ pub fn inspect_volume(volume_id: String) -> CmdResult<VolumeInspectionDto> {
 
 // ---------- 拷卡任务 ----------
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_copy_tasks(state: State<AppState>, project_id: Option<String>) -> Vec<CopyTaskDto> {
     state.tasks.snapshots(project_id.as_deref())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_copy_task(state: State<AppState>, task_id: String) -> Option<CopyTaskDto> {
     state
         .tasks
@@ -880,7 +887,7 @@ pub fn get_copy_task(state: State<AppState>, task_id: String) -> Option<CopyTask
         .map(|h| tasks::summary_of(&h.snapshot.lock().unwrap()))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_copy_files(
     state: State<AppState>,
     task_id: String,
@@ -945,7 +952,7 @@ fn check_existing_target(dest_targets: &[PathBuf], confirmed: bool) -> CmdResult
 }
 
 /// 解析一次拷卡任务的真实落盘目标(不落任何盘)。供前端双确认屏展示真值(评审 H6/P1-6)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn preview_copy_task<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -979,7 +986,7 @@ pub fn preview_copy_task<R: tauri::Runtime>(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn start_copy_task<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -1149,7 +1156,7 @@ pub fn start_copy_task<R: tauri::Runtime>(
     Ok(dto)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pause_copy_task(state: State<AppState>, task_id: String) -> CmdResult<()> {
     let handle = state
         .tasks
@@ -1159,7 +1166,7 @@ pub fn pause_copy_task(state: State<AppState>, task_id: String) -> CmdResult<()>
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn resume_copy_task<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,
@@ -1441,7 +1448,7 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
 }
 
 /// 单文件重试:失败文件在 manifest 中未验证,重跑任务即只补拷这些文件。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn retry_copy_file<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<AppState>,

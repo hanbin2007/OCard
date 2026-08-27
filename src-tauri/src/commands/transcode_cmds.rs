@@ -19,7 +19,7 @@ pub enum FfmpegStatusDto {
 }
 
 /// sidecar 状态(设置页「能力」区;缺失时前端显示禁用态与原因)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn ffmpeg_status() -> FfmpegStatusDto {
     match ffmpeg::detect() {
         Ok(info) => FfmpegStatusDto::Ready { info },
@@ -68,7 +68,7 @@ fn probe_state_dto() -> CapabilityStateDto {
 /// 硬编能力探测:首次(或 refresh=true)在后台线程跑真探针(每个 ≤12s,串行),
 /// 前端轮询本命令直到 ready/failed。缓存驻内存;换驱动/外接 GPU 后用刷新按钮
 /// 重探(缓存键不含驱动标识,属声明边界——探测本身就是权威)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn transcode_capabilities<R: tauri::Runtime>(
     app: AppHandle<R>,
     refresh: Option<bool>,
@@ -119,7 +119,7 @@ pub fn transcode_capabilities<R: tauri::Runtime>(
 
 /// 诊断导出(计划可选建议):版本/探测明细/最近状态 + 最近运行日志尾
 /// (32KB,v0.3.1),不含任何素材路径。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn transcode_diagnostics<R: tauri::Runtime>(app: AppHandle<R>) -> serde_json::Value {
     use tauri::Manager as _;
     let recent_log = app
@@ -452,7 +452,7 @@ fn capabilities_blocking() -> Result<ff::CapabilityReport, String> {
 
 /// 发起代理转码作业(工况 A)。幂等:输出已存在=already-transcoded skip;
 /// 绝不覆盖(覆盖只属于将来的「强制重转」显式入口)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn start_proxy_transcode<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<super::AppState>,
@@ -1133,7 +1133,7 @@ pub struct ArchiveResultDto {
 }
 
 /// 发起归档转码作业(HEVC 三档;默认不动原件;零覆盖 + skip 幂等)。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn start_archive_transcode<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<super::AppState>,
