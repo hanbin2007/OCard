@@ -2701,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "ocard"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "hex",
