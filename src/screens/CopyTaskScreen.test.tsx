@@ -40,12 +40,14 @@ async function addTag(user: ReturnType<typeof userEvent.setup>, name: string) {
   await user.keyboard("{Enter}");
 }
 
-async function fillDestinations(user: ReturnType<typeof userEvent.setup>) {
-  // 校运会项目带预设备份盘:先等异步预填落地(确定性——CI/本地时序不同,
-  // 先点「添加目的地」会和预填赛跑),再改写成测试路径
-  const second = await screen.findByLabelText("第 2 个目的地路径");
-  await user.clear(second);
-  await user.type(second, "/backup/ocard");
+async function fillDestinations(_user: ReturnType<typeof userEvent.setup>) {
+  // 默认只有 NAS 行(评审 1.1);该项目设置里有备份盘预设——预设是异步落地的,
+  // 手动再点「添加目的地」会与之竞态(先到则多出一行空行),这里等预设行即可
+  await waitFor(() =>
+    expect(
+      (screen.getByLabelText("第 2 个目的地路径") as HTMLInputElement).value,
+    ).not.toBe(""),
+  );
 }
 
 function targetPreview() {

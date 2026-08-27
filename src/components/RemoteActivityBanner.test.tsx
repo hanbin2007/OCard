@@ -229,10 +229,12 @@ describe("同卷名警告", () => {
     // 标签系统(启动重构)取代自由备注
     await user.type(screen.getByLabelText("内容标签"), "上午田赛");
     await user.keyboard("{Enter}");
-    // 该项目带预设备份盘:等异步预填落地再改写(确定性,防与预填赛跑)
-    const second = await screen.findByLabelText("第 2 个目的地路径");
-    await user.clear(second);
-    await user.type(second, "/backup/ocard");
+    // 该项目设置里有备份盘预设,异步落进第 2 行;手动添加会与之竞态,等预设即可
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText("第 2 个目的地路径") as HTMLInputElement).value,
+      ).not.toBe(""),
+    );
     await user.click(screen.getByRole("button", { name: "开始拷卡" }));
     await waitFor(() =>
       expect(screen.getByTestId("confirm-target-folder").textContent).not.toBe("解析中…"),
