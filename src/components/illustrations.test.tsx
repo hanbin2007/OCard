@@ -65,7 +65,14 @@ describe("空态插画", () => {
 
 describe("拷贝流向图", () => {
   it("是信息图：带描述性 aria-label，目的地名称进入标签", () => {
-    const { container } = render(<IllCopyFlow destinations={["NAS 主", "移动盘"]} />);
+    const { container } = render(
+      <IllCopyFlow
+        destinations={[
+          { label: "NAS 主", kind: "nas" },
+          { label: "移动盘", kind: "external" },
+        ]}
+      />,
+    );
     const svg = container.querySelector("svg");
     expect(svg?.getAttribute("role")).toBe("img");
     expect(svg?.getAttribute("aria-label")).toContain("NAS 主");
@@ -73,8 +80,31 @@ describe("拷贝流向图", () => {
     expect(svg?.getAttribute("aria-label")).toContain("双端校验");
   });
 
-  it("目的地缺省时用通用文案补位", () => {
+  it("确认页不许虚构：几个目的地画几路、几个对勾（评审 P1）", () => {
+    for (const n of [1, 2, 3]) {
+      const { container } = render(
+        <IllCopyFlow
+          destinations={Array.from({ length: n }, (_, i) => ({
+            label: `目的地${i + 1}`,
+            kind: "external" as const,
+          }))}
+        />,
+      );
+      expect(container.querySelectorAll('[data-testid="copy-flow-dest"]')).toHaveLength(n);
+    }
+  });
+
+  it("不做「只读挂载」承诺——后端登记指纹可能写卡（评审 P2）", () => {
+    const { container } = render(
+      <IllCopyFlow destinations={[{ label: "NAS 主", kind: "nas" }]} />,
+    );
+    expect(container.textContent).not.toContain("只读");
+    expect(container.querySelector("svg")?.getAttribute("aria-label")).not.toContain("只读");
+  });
+
+  it("目的地缺省时用单路通用文案补位", () => {
     const { container } = render(<IllCopyFlow />);
-    expect(container.querySelector("svg")?.getAttribute("aria-label")).toContain("目的地 A");
+    expect(container.querySelector("svg")?.getAttribute("aria-label")).toContain("目的地");
+    expect(container.querySelectorAll('[data-testid="copy-flow-dest"]')).toHaveLength(1);
   });
 });

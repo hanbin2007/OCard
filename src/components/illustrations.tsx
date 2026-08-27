@@ -443,48 +443,56 @@ export function IllTrashEmpty() {
   );
 }
 
+export interface CopyFlowDestination {
+  label: string;
+  /** 决定画机架（nas）还是便携盘（其余）；缺省画便携盘 */
+  kind?: "nas" | "local" | "external";
+}
+
 interface CopyFlowProps {
-  /** 目的地名称（取前两个）；不足两个时用通用文案补位 */
-  destinations?: string[];
+  /** 真实落盘目的地：几路画几路，几个对勾就是几路校验（评审 P1：不许虚构备份） */
+  destinations?: CopyFlowDestination[];
 }
 
 /**
  * 拷贝流向辅助图（双确认页专用，静态）。
  * 全套素材里唯一允许上色的一张：强调色画数据流向，状态绿画校验对勾，
  * 金触点保留材质色——它的职责是讲清「源读一次、多目的地、双端校验」。
+ * 确认页是安全关口，图上每一笔都得是真的：目的地按传入清单逐一渲染；
+ * 源卡不标「只读」——后端登记指纹时可能往卡上写 .ocard-volume-id。
  */
 export function IllCopyFlow({ destinations }: CopyFlowProps) {
   const id = useIllId();
-  const [destA, destB] = [
-    destinations?.[0] ?? "目的地 A",
-    destinations?.[1] ?? "目的地 B",
-  ];
+  const dests: CopyFlowDestination[] =
+    destinations && destinations.length > 0 ? destinations : [{ label: "目的地" }];
+  const rowH = 64;
+  const height = Math.max(150, dests.length * rowH + 22);
+  const cy = height / 2;
+  const rowsTop = (height - dests.length * rowH) / 2;
+  const destCy = (i: number) => rowsTop + i * rowH + rowH / 2;
   return (
     <svg
       className="copy-flow__svg"
-      viewBox="0 0 348 186"
+      viewBox={`0 0 348 ${height}`}
       role="img"
-      aria-label={`拷贝流向：源卡只读挂载，源读一次边拷边校，并行写入 ${destA} 与 ${destB}，每个文件双端校验`}
+      aria-label={`拷贝流向：源卡经工作站源读一次、边拷边校，并行写入 ${dests
+        .map((d) => d.label)
+        .join("、")}，每个文件双端校验`}
     >
       <GradientDefs id={id} use={["metal", "plastic", "dark", "gold", "sheen"]} />
-      <DropShadow id={id} cx={27} cy={104} rx={22} />
-      <DropShadow id={id} cx={126} cy={116} rx={40} />
-      <DropShadow id={id} cx={244} cy={64} rx={38} />
-      <DropShadow id={id} cx={240} cy={158} rx={30} />
+      <DropShadow id={id} cx={27} cy={cy + 27} rx={22} />
+      <DropShadow id={id} cx={126} cy={cy + 41} rx={40} />
       {/* 源卡 */}
-      <g transform="translate(8,60)">
+      <g transform={`translate(8,${cy - 18})`}>
         <SdCard id={id} label="源卡" contacts="gold" />
-        <text className="illu-t" x="-2" y="48">
-          只读挂载
-        </text>
       </g>
       {/* 源读一次 */}
       <g stroke="var(--accent)" fill="none" strokeWidth="1.5" strokeLinecap="round">
-        <line x1="50" y1="78" x2="82" y2="78" strokeDasharray="3 3" />
-        <path d="M78 73 l6 5 -6 5" />
+        <line x1="50" y1={cy} x2="82" y2={cy} strokeDasharray="3 3" />
+        <path d={`M78 ${cy - 5} l6 5 -6 5`} />
       </g>
       {/* 工作站 */}
-      <g transform="translate(88,52)">
+      <g transform={`translate(88,${cy - 23})`}>
         <rect className="illu-ln" x="0" y="0" width="76" height="46" rx="5" fill={`url(#${id("dark")})`} />
         <rect x="4" y="4" width="68" height="34" rx="2.5" fill="var(--ill-slot)" stroke="none" />
         <text className="illu-t-inv" x="22" y="19" style={{ fontSize: "7px" }}>
@@ -499,42 +507,53 @@ export function IllCopyFlow({ destinations }: CopyFlowProps) {
           源读一次 · 边拷边校
         </text>
       </g>
-      {/* 分叉到两个目的地 */}
-      <g stroke="var(--accent)" fill="none" strokeWidth="1.5" strokeLinecap="round">
-        <path d="M170 68 q22 -14 44 -20" strokeDasharray="3 3" />
-        <path d="M209 43 l7 3.5 -5.5 5.5" />
-        <path d="M170 88 q22 20 44 32" strokeDasharray="3 3" />
-        <path d="M208 123 l7.5 0.5 -3.5 -7" />
-      </g>
-      {/* 目的地 1：NAS（两个盘位 + 状态灯） */}
-      <g transform="translate(208,14)">
-        <rect className="illu-ln" x="0" y="0" width="72" height="42" rx="4" fill={`url(#${id("metal")})`} />
-        <rect x="0" y="0" width="72" height="8" rx="4" fill={`url(#${id("sheen")})`} stroke="none" opacity="0.5" />
-        <rect className="illu-ln-soft" x="6" y="7" width="54" height="11" rx="2" fill={`url(#${id("dark")})`} />
-        <rect className="illu-ln-soft" x="6" y="24" width="54" height="11" rx="2" fill={`url(#${id("dark")})`} />
-        <circle cx="65" cy="12.5" r="1.8" fill="var(--ok)" />
-        <circle cx="65" cy="29.5" r="1.8" fill="var(--ok)" />
-        <text className="illu-t" x="4" y="52">
-          {destA}
-        </text>
-      </g>
-      <g transform="translate(296,26)" stroke="var(--ok)" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <circle cx="10" cy="10" r="9.5" fill="var(--panel)" />
-        <path d="M5.5 10 l3.5 3.5 6 -6.5" />
-      </g>
-      {/* 目的地 2：移动盘 */}
-      <g transform="translate(212,128)">
-        <rect className="illu-ln" x="0" y="0" width="56" height="27" rx="6" fill={`url(#${id("dark")})`} />
-        <rect x="0" y="0" width="56" height="7" rx="6" fill={`url(#${id("sheen")})`} stroke="none" opacity="0.25" />
-        <line x1="9" y1="6" x2="9" y2="21" stroke="var(--ill-dark-side)" strokeWidth="1.4" />
-        <text className="illu-t-inv" x="15" y="17">
-          {destB}
-        </text>
-      </g>
-      <g transform="translate(280,132)" stroke="var(--ok)" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <circle cx="10" cy="10" r="9.5" fill="var(--panel)" />
-        <path d="M5.5 10 l3.5 3.5 6 -6.5" />
-      </g>
+      {/* 目的地：几路画几路，每路一个校验对勾 */}
+      {dests.map((dest, i) => {
+        const y = destCy(i);
+        const isNas = dest.kind === "nas";
+        return (
+          <g key={`${dest.label}-${i}`} data-testid="copy-flow-dest">
+            <DropShadow id={id} cx={242} cy={y + (isNas ? 28 : 17)} rx={isNas ? 38 : 30} />
+            <g stroke="var(--accent)" fill="none" strokeWidth="1.5" strokeLinecap="round">
+              <path d={`M170 ${cy} Q 186 ${y} 200 ${y}`} strokeDasharray="3 3" />
+              <path d={`M198 ${y - 4.5} L206 ${y} L198 ${y + 4.5}`} />
+            </g>
+            {isNas ? (
+              <g transform={`translate(210,${y - 26})`}>
+                <rect className="illu-ln" x="0" y="0" width="72" height="42" rx="4" fill={`url(#${id("metal")})`} />
+                <rect x="0" y="0" width="72" height="8" rx="4" fill={`url(#${id("sheen")})`} stroke="none" opacity="0.5" />
+                <rect className="illu-ln-soft" x="6" y="7" width="54" height="11" rx="2" fill={`url(#${id("dark")})`} />
+                <rect className="illu-ln-soft" x="6" y="24" width="54" height="11" rx="2" fill={`url(#${id("dark")})`} />
+                <circle cx="65" cy="12.5" r="1.8" fill="var(--ok)" />
+                <circle cx="65" cy="29.5" r="1.8" fill="var(--ok)" />
+                <text className="illu-t" x="4" y="52">
+                  {dest.label}
+                </text>
+              </g>
+            ) : (
+              <g transform={`translate(210,${y - 13.5})`}>
+                <rect className="illu-ln" x="0" y="0" width="56" height="27" rx="6" fill={`url(#${id("dark")})`} />
+                <rect x="0" y="0" width="56" height="7" rx="6" fill={`url(#${id("sheen")})`} stroke="none" opacity="0.25" />
+                <line x1="9" y1="6" x2="9" y2="21" stroke="var(--ill-dark-side)" strokeWidth="1.4" />
+                <text className="illu-t-inv" x="15" y="17">
+                  {dest.label}
+                </text>
+              </g>
+            )}
+            <g
+              transform={`translate(294,${y - 10})`}
+              stroke="var(--ok)"
+              fill="none"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <circle cx="10" cy="10" r="9.5" fill="var(--panel)" />
+              <path d="M5.5 10 l3.5 3.5 6 -6.5" />
+            </g>
+          </g>
+        );
+      })}
     </svg>
   );
 }
