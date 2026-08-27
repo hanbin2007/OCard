@@ -168,6 +168,12 @@ export function CopyTaskScreen() {
   // 等于给每一次拷卡强加一步「删行或填路径」。双备份用「添加目的地」引导。
   // 不预填任何平台特有路径：/Volumes/… 在 Windows/Linux 上首屏即是错的
   const [dests, setDests] = useState<DestDraft[]>(() => [newDest("nas")]);
+  /**
+   * 目的地是否仍是「无人动过」的初始态:settings 预设的异步预填只允许
+   * 落在 pristine 状态上——用户(或本地记忆)已经写过的目的地,预设晚到
+   * 一步就整表覆盖是真数据丢失(合并评审:CI/本地时序不同当场翻车)。
+   */
+  const destsPristineRef = useRef(true);
   const [submitted, setSubmitted] = useState(false);
   /** 工况 A：拷完自动派发代理转码作业（PRD §5.6） */
   const [autoProxy, setAutoProxy] = useState(false);
@@ -284,9 +290,11 @@ export function CopyTaskScreen() {
           autoProxy?: boolean;
         }>(`copy:${projectKey}`, {})
       : {};
+    const hasSavedDests = Boolean(saved.dests && saved.dests.length > 0);
+    destsPristineRef.current = !hasSavedDests;
     setDests(
-      saved.dests && saved.dests.length > 0
-        ? saved.dests.map((d) => newDest(d.kind, d.path))
+      hasSavedDests
+        ? saved.dests!.map((d) => newDest(d.kind, d.path))
         : [newDest("nas")],
     );
     setAutoProxy(saved.autoProxy ?? false);
@@ -301,7 +309,10 @@ export function CopyTaskScreen() {
         const loaded = await api.getProjectSettings(projectKey);
         if (cancelled) return;
         setSettings(loaded);
-        if (loaded.backupPaths.length > 0) {
+        // 只在无人动过时预填:用户/本地记忆已写过的目的地不许被晚到的
+        // 预设整表覆盖(数据丢失级竞态)
+        if (loaded.backupPaths.length > 0 && destsPristineRef.current) {
+          destsPristineRef.current = false;
           setDests([
             newDest("nas"),
             ...loaded.backupPaths.map((p) => newDest("external", p)),
@@ -323,23 +334,39 @@ export function CopyTaskScreen() {
     };
   }, [projectKey, pushNotice]);
 
-  /** 现场新建标签:先进库(本地即时可用),再写回项目 settings(零静默) */
+  /**
+   * 现场新建标签:先进库(本地即时可用),再写回项目 settings(零静默)。
+   * 回写必须以**后端最新** settings 为基底合并——settings 还没载入时
+   * 直接拿空壳保存,会把共享的备份盘预设整表清空(数据丢失级竞态,
+   * 合并评审实证:一个用例建了标签,后续用例的预设全没了)。
+   */
   const createTag = useCallback(
     (name: string) => {
-      const current = settings ?? { tags: [], backupPaths: [] };
-      const next: ProjectSettings = {
-        ...current,
-        tags: [...current.tags, { name, color: nextTagColor(current.tags) }],
-      };
-      setSettings(next);
-      if (!projectKey) return;
-      void api.saveProjectSettings(projectKey, next).catch((err) => {
-        pushNotice(
-          "warning",
-          "project-settings-save-failed",
-          `标签「${name}」写入项目失败(本次拷卡仍会带上它)：${err instanceof Error ? err.message : String(err)}`,
-        );
+      const local = settings ?? { tags: [], backupPaths: [] };
+      setSettings({
+        ...local,
+        tags: [...local.tags, { name, color: nextTagColor(local.tags) }],
       });
+      if (!projectKey) return;
+      void (async () => {
+        try {
+          const base = settings ?? (await api.getProjectSettings(projectKey));
+          const next: ProjectSettings = base.tags.some((t) => t.name === name)
+            ? base
+            : {
+                ...base,
+                tags: [...base.tags, { name, color: nextTagColor(base.tags) }],
+              };
+          await api.saveProjectSettings(projectKey, next);
+          setSettings(next);
+        } catch (err) {
+          pushNotice(
+            "warning",
+            "project-settings-save-failed",
+            `标签「${name}」写入项目失败(本次拷卡仍会带上它)：${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      })();
     },
     [settings, projectKey, pushNotice],
   );
@@ -991,6 +1018,7 @@ export function CopyTaskScreen() {
                                 value={dest.kind}
                                 onChange={(next) => {
                                   const kind = next as DestinationKind;
+                                  destsPristineRef.current = false;
                                   setDests((prev) =>
                                     prev.map((d) =>
                                       d.id === dest.id ? { ...d, kind } : d,
@@ -1020,6 +1048,7 @@ export function CopyTaskScreen() {
                                 }
                                 pickerTitle={`选择第 ${index + 1} 个目的地文件夹`}
                                 onChange={(path) => {
+                                  destsPristineRef.current = false;
                                   setDests((prev) =>
                                     prev.map((d) =>
                                       d.id === dest.id ? { ...d, path } : d,
@@ -1036,6 +1065,7 @@ export function CopyTaskScreen() {
                                   placeholder="选盘…"
                                   onChange={(mount) => {
                                     if (!mount) return;
+                                    destsPristineRef.current = false;
                                     setDests((prev) =>
                                       prev.map((d) =>
                                         d.id === dest.id ? { ...d, path: mount } : d,
@@ -1057,9 +1087,10 @@ export function CopyTaskScreen() {
                                 type="button"
                                 className="btn btn--ghost btn--icon"
                                 aria-label={`删除第 ${index + 1} 个目的地`}
-                                onClick={() =>
-                                  setDests((prev) => prev.filter((d) => d.id !== dest.id))
-                                }
+                                onClick={() => {
+                                  destsPristineRef.current = false;
+                                  setDests((prev) => prev.filter((d) => d.id !== dest.id));
+                                }}
                               >
                                 <IconTrash />
                               </button>
@@ -1077,9 +1108,10 @@ export function CopyTaskScreen() {
                             <button
                               type="button"
                               className="btn btn--sm"
-                              onClick={() =>
-                                setDests((prev) => [...prev, newDest("external")])
-                              }
+                              onClick={() => {
+                                destsPristineRef.current = false;
+                                setDests((prev) => [...prev, newDest("external")]);
+                              }}
                             >
                               <IconPlus />
                               添加目的地

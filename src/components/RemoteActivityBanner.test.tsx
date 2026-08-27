@@ -226,12 +226,13 @@ describe("轮询与失败降级", () => {
 describe("同卷名警告", () => {
   async function reachConfirm(user: ReturnType<typeof userEvent.setup>) {
     await user.click(screen.getByRole("radio", { name: "选择源卷 SONY_A7M4" }));
-    // 标签系统(启动重构)取代自由备注;默认只有 NAS 行(评审 1.1),
-    // 第二块盘显式添加
+    // 标签系统(启动重构)取代自由备注
     await user.type(screen.getByLabelText("内容标签"), "上午田赛");
     await user.keyboard("{Enter}");
-    await user.click(screen.getByRole("button", { name: "添加目的地" }));
-    await user.type(screen.getByLabelText("第 2 个目的地路径"), "/backup/ocard");
+    // 该项目带预设备份盘:等异步预填落地再改写(确定性,防与预填赛跑)
+    const second = await screen.findByLabelText("第 2 个目的地路径");
+    await user.clear(second);
+    await user.type(second, "/backup/ocard");
     await user.click(screen.getByRole("button", { name: "开始拷卡" }));
     await waitFor(() =>
       expect(screen.getByTestId("confirm-target-folder").textContent).not.toBe("解析中…"),

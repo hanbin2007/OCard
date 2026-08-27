@@ -41,9 +41,11 @@ async function addTag(user: ReturnType<typeof userEvent.setup>, name: string) {
 }
 
 async function fillDestinations(user: ReturnType<typeof userEvent.setup>) {
-  // 默认只有 NAS 行(评审 1.1):双备份由「添加目的地」显式加一行
-  await user.click(screen.getByRole("button", { name: "添加目的地" }));
-  await user.type(screen.getByLabelText("第 2 个目的地路径"), "/backup/ocard");
+  // 校运会项目带预设备份盘:先等异步预填落地(确定性——CI/本地时序不同,
+  // 先点「添加目的地」会和预填赛跑),再改写成测试路径
+  const second = await screen.findByLabelText("第 2 个目的地路径");
+  await user.clear(second);
+  await user.type(second, "/backup/ocard");
 }
 
 function targetPreview() {
