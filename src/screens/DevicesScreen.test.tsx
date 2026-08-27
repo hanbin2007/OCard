@@ -13,6 +13,7 @@ const preloaded = {
     machineId: "WS-TEST",
     operator: "测试员",
     nasRoot: "/Volumes/DIT-NAS/Projects",
+    recentProjects: [],
   },
   projects: [],
   cameras: [],

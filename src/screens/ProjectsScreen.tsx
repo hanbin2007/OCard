@@ -1,4 +1,8 @@
-/** 屏 1：项目列表（列表 + 详情，↑/↓ 键盘导航）。 */
+/**
+ * 项目管理（列表 + 详情，↑/↓ 键盘导航）。
+ * 启动重构后不再是主窗口路由：整体运行在欢迎/项目管理窗口里,
+ * 「打开项目」经窗口桥接切到主窗口。
+ */
 
 import { useEffect, useState } from "react";
 import { AuditLogDrawer } from "../components/AuditLogDrawer";
@@ -21,12 +25,32 @@ import {
   SCENARIO_SHORT,
   progressLabel,
 } from "../lib/labels";
-import { useStore } from "../state/store";
+import { useNotify, useStore } from "../state/store";
+import { useWindowBridge } from "../state/windowBridge";
 
-export function ProjectsScreen() {
+export function ProjectsScreen({ onNewProject }: { onNewProject: () => void }) {
   const { state, dispatch } = useStore();
+  const bridge = useWindowBridge();
+  const notify = useNotify();
   const { projects, selectedProjectId } = state;
   const selected = projects.find((p) => p.id === selectedProjectId) ?? null;
+  const [opening, setOpening] = useState(false);
+
+  async function openInMain(projectId: string, name: string) {
+    if (opening) return;
+    setOpening(true);
+    try {
+      await bridge.openProject(projectId);
+    } catch (err) {
+      notify(
+        "error",
+        "open-project-failed",
+        `打开「${name}」失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setOpening(false);
+    }
+  }
 
   /* 审计日志抽屉的开合是这一屏的局部视图状态，不进全局 store：
      换项目时必须自动收起——否则抽屉里显示的还是上一个项目的时间线。 */
@@ -58,7 +82,8 @@ export function ProjectsScreen() {
           <button
             type="button"
             className="btn btn--primary btn--pill"
-            onClick={() => dispatch({ type: "navigate", route: "new-project" })}
+            data-testid="projects-new"
+            onClick={onNewProject}
           >
             新建项目
           </button>
@@ -379,10 +404,12 @@ export function ProjectsScreen() {
 
                   <button
                     type="button"
-                    className="btn"
-                    onClick={() => dispatch({ type: "navigate", route: "copy" })}
+                    className="btn btn--primary"
+                    data-testid="project-open"
+                    disabled={opening}
+                    onClick={() => void openInMain(selected.id, selected.name)}
                   >
-                    进入拷卡任务
+                    {opening ? "打开中…" : "打开此项目"}
                   </button>
                 </>
               ) : (

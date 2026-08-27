@@ -152,6 +152,49 @@ pub fn load_meta(project_root: &Path) -> Result<ProjectMeta> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
+const SETTINGS_FILE: &str = "settings.json";
+
+/// 项目内容标签(Notion 式):色名限调色板(前端 `lib/tags.ts`),不存色值。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectTag {
+    pub name: String,
+    pub color: String,
+}
+
+/// 项目级设置(标签库 + 备份目的地预设),存 `<项目>/.ocard/settings.json`。
+/// 与 project.json 一样随项目走 NAS,多工作站共享;整体保存、末写胜出
+/// (标签库/预设变更频度低,不为它上 journal 折叠)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSettings {
+    #[serde(default)]
+    pub tags: Vec<ProjectTag>,
+    #[serde(default)]
+    pub backup_paths: Vec<String>,
+}
+
+/// 读项目设置。文件不存在 = 尚未配置,给默认空设置;损坏/不可读要报错,
+/// 由命令层转成可见通知(零静默)。
+pub fn load_settings(project_root: &Path) -> Result<ProjectSettings> {
+    let path = project_root.join(STATE_DIR).join(SETTINGS_FILE);
+    super::paths::assert_within(project_root, &path).map_err(super::CoreError::Invalid)?;
+    match fs::read(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ProjectSettings::default()),
+        Err(e) => Err(e.into()),
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+    }
+}
+
+pub fn save_settings(project_root: &Path, settings: &ProjectSettings) -> Result<()> {
+    let dir = project_root.join(STATE_DIR);
+    let path = dir.join(SETTINGS_FILE);
+    super::paths::assert_within(project_root, &path).map_err(super::CoreError::Invalid)?;
+    fs::create_dir_all(&dir)?;
+    fs::write(path, serde_json::to_vec_pretty(settings)?)?;
+    Ok(())
+}
+
 /// 拷卡素材落地的根:工况 A 是「2. 原始素材」,工况 B 是「1. 待分类」。
 pub fn raw_material_dir(project_root: &Path, scenario: Scenario) -> PathBuf {
     match scenario {

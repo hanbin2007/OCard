@@ -537,6 +537,7 @@ pub fn build_task(
         camera_id: input.camera_id.clone(),
         camera_code: camera_code.to_string(),
         note: input.note.clone(),
+        tags: input.tags.clone(),
         target_folder,
         destinations: dest_dtos,
         files: file_dtos,

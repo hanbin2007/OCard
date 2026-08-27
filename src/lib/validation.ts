@@ -215,7 +215,7 @@ export function validateWorkstation(input: {
 export interface StartCopyErrors {
   volumeId?: string;
   cameraId?: string;
-  note?: string;
+  tags?: string;
   targetPrefix?: string;
   destinations?: string;
   /** 逐行错误，key 为目的地下标（标红该行） */
@@ -225,7 +225,8 @@ export interface StartCopyErrors {
 export function validateStartCopy(input: {
   volumeId: string;
   cameraId: string;
-  note: string;
+  /** 内容标签（替代自由文本备注） */
+  tags: string[];
   targetPrefix: string;
   /**
    * kind 必须带上：kind = "nas" 的路径由项目结构自动推导、用户不填，
@@ -237,7 +238,8 @@ export function validateStartCopy(input: {
 
   if (!input.volumeId) errors.volumeId = "请选择源卷";
   if (!input.cameraId) errors.cameraId = "请选择该卡对应的相机";
-  if (!input.note.trim()) errors.note = "内容备注必填（规范要求「适当记录」）";
+  if (input.tags.filter((t) => t.trim()).length === 0)
+    errors.tags = "至少加一个内容标签（规范要求「适当记录」）";
 
   const prefix = input.targetPrefix.trim();
   if (!prefix) {

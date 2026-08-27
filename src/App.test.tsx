@@ -41,13 +41,19 @@ describe("进度监听（常驻单一 listener）", () => {
         return () => {};
       });
 
-    render(<App preloaded={{ route: "projects", workstation: mockWorkstation }} />);
+    render(<App preloaded={{ route: "copy", workstation: mockWorkstation }} />);
 
     // 现在经通知中心呈现：error 走 role="alert" 且不会自动消失
-    const alert = await screen.findByRole("alert");
+    // (拷卡屏的「尚未选择项目」也是 alert,按 data-code 找通知那条)
+    const alert = await waitFor(() => {
+      const found = screen
+        .getAllByRole("alert")
+        .find((el) => el.getAttribute("data-code") === "progress-listen-failed");
+      expect(found).toBeDefined();
+      return found!;
+    });
     expect(alert.textContent).toContain("进度监听未能建立");
     expect(alert.textContent).toContain("event channel closed");
-    expect(alert.getAttribute("data-code")).toBe("progress-listen-failed");
     expect(screen.getByTestId("notice-unread").textContent).toBe("1");
     spy.mockRestore();
   });
@@ -236,7 +242,7 @@ describe("进度监听（常驻单一 listener）", () => {
     const spy = vi.spyOn(api, "subscribeCopyProgress").mockReturnValue(dispose);
 
     const view = render(
-      <App preloaded={{ route: "projects", workstation: mockWorkstation }} />,
+      <App preloaded={{ route: "copy", workstation: mockWorkstation }} />,
     );
     view.unmount();
 
@@ -247,7 +253,7 @@ describe("进度监听（常驻单一 listener）", () => {
 
 describe("应用外壳", () => {
   it("有唯一的 main 地标与侧栏导航", () => {
-    render(<App preloaded={{ route: "projects", projects: mockProjects }} />);
+    render(<App preloaded={{ route: "copy", projects: mockProjects }} />);
     expect(screen.getAllByRole("main")).toHaveLength(1);
     expect(screen.getByRole("navigation", { name: "主导航" })).toBeDefined();
   });
@@ -284,7 +290,7 @@ describe("应用外壳", () => {
     render(
       <App
         preloaded={{
-          route: "projects",
+          route: "copy",
           workstation: mockWorkstation,
           projects: mockProjects,
         }}
@@ -294,8 +300,9 @@ describe("应用外壳", () => {
     await user.click(screen.getByRole("button", { name: /设备登记/ }));
     expect(screen.getByRole("button", { name: "登记相机" })).toBeDefined();
 
-    await user.click(screen.getByRole("button", { name: /新建项目/ }));
-    expect(screen.getByText("将创建")).toBeDefined();
+    // 「项目管理」不再是主窗口路由:点它切到欢迎/项目管理视图(浏览器形态)
+    await user.click(screen.getByTestId("nav-manager"));
+    expect(screen.getByTestId("welcome-root")).toBeDefined();
   });
 });
 
@@ -308,17 +315,18 @@ describe("导航方向", () => {
   const shell = () => document.querySelector(".shell") as HTMLElement;
 
   it("侧栏的排列顺序就是 ROUTE_ORDER，两处不会各说各话", () => {
-    render(<App preloaded={{ route: "projects", workstation: mockWorkstation }} />);
+    render(<App preloaded={{ route: "copy", workstation: mockWorkstation }} />);
     const rendered = screen
       .getAllByRole("button")
       .map((el) => el.getAttribute("data-testid"))
-      .filter((id): id is string => !!id && id.startsWith("nav-"))
+      // nav-manager 是打开项目管理窗口的入口,不是路由项
+      .filter((id): id is string => !!id && id.startsWith("nav-") && id !== "nav-manager")
       .map((id) => id.slice("nav-".length));
     expect(rendered).toEqual(ROUTE_ORDER);
   });
 
   it("首屏不带方向：不是导航引起的整屏替换不该做方向性位移", () => {
-    render(<App preloaded={{ route: "projects", workstation: mockWorkstation }} />);
+    render(<App preloaded={{ route: "copy", workstation: mockWorkstation }} />);
     expect(shell().getAttribute("data-nav")).toBe("none");
   });
 
@@ -327,19 +335,19 @@ describe("导航方向", () => {
     render(
       <App
         preloaded={{
-          route: "projects",
+          route: "copy",
           workstation: mockWorkstation,
           projects: mockProjects,
         }}
       />,
     );
 
-    // projects(0) → devices(2)
-    await user.click(screen.getByTestId("nav-devices"));
+    // copy(0) → sorting(2)
+    await user.click(screen.getByTestId("nav-sorting"));
     await waitFor(() => expect(shell().getAttribute("data-nav")).toBe("forward"));
 
-    // devices(2) → new-project(1)
-    await user.click(screen.getByTestId("nav-new-project"));
+    // sorting(2) → devices(1)
+    await user.click(screen.getByTestId("nav-devices"));
     await waitFor(() => expect(shell().getAttribute("data-nav")).toBe("back"));
   });
 });

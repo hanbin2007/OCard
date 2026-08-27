@@ -3,12 +3,13 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api";
 import App from "../App";
+import { renderProjectsManager } from "../testUtils";
 import { mockProjects, mockStorageCards, mockWorkstation } from "../api/mock";
 
 afterEach(cleanup);
 
 const preloaded = {
-  route: "projects" as const,
+  route: "copy" as const,
   workstation: mockWorkstation,
   projects: mockProjects,
   cameras: [],
@@ -24,7 +25,7 @@ function selectedRow() {
 
 describe("项目列表", () => {
   it("每个项目一行，显示项目夹名与工况", () => {
-    render(<App preloaded={preloaded} />);
+    renderProjectsManager(preloaded);
     const rows = screen.getAllByRole("option");
     expect(rows).toHaveLength(mockProjects.length);
     expect(rows[0].textContent).toContain("20260824_校运会");
@@ -32,7 +33,7 @@ describe("项目列表", () => {
   });
 
   it("↓ 键把选中项移到下一行，↑ 键移回", () => {
-    render(<App preloaded={preloaded} />);
+    renderProjectsManager(preloaded);
     const list = screen.getByRole("listbox", { name: "项目列表" });
 
     fireEvent.keyDown(list, { key: "ArrowDown" });
@@ -43,7 +44,7 @@ describe("项目列表", () => {
   });
 
   it("End 跳到最后一行，Home 跳回第一行", () => {
-    render(<App preloaded={preloaded} />);
+    renderProjectsManager(preloaded);
     const list = screen.getByRole("listbox", { name: "项目列表" });
 
     fireEvent.keyDown(list, { key: "End" });
@@ -55,7 +56,7 @@ describe("项目列表", () => {
   });
 
   it("详情区跟随选中项，展示该工况的目录结构", () => {
-    render(<App preloaded={preloaded} />);
+    renderProjectsManager(preloaded);
     const detail = screen.getByLabelText("项目详情");
 
     // 工况 B 项目：显示待分类
@@ -71,7 +72,7 @@ describe("项目列表", () => {
   });
 
   it("点击一行即选中它", () => {
-    render(<App preloaded={preloaded} />);
+    renderProjectsManager(preloaded);
     const rows = screen.getAllByRole("option");
     fireEvent.click(rows[2]);
     expect(rows[2].getAttribute("aria-selected")).toBe("true");
@@ -81,7 +82,7 @@ describe("项目列表", () => {
 
 describe("当前项目的显性指示(UX 波)", () => {
   it("当前行显示「当前项目」黄标,其余行显示「切换到此项目」按钮", () => {
-    render(<App preloaded={preloaded} />);
+    renderProjectsManager(preloaded);
     expect(screen.getByTestId("project-current-flag")).toBeDefined();
     expect(screen.getAllByTestId("project-switch")).toHaveLength(
       mockProjects.length - 1,
@@ -89,7 +90,7 @@ describe("当前项目的显性指示(UX 波)", () => {
   });
 
   it("点「切换到此项目」把该行设为当前,黄标随之移动", () => {
-    render(<App preloaded={preloaded} />);
+    renderProjectsManager(preloaded);
     const buttons = screen.getAllByTestId("project-switch");
     fireEvent.click(buttons[0]);
 
@@ -100,13 +101,14 @@ describe("当前项目的显性指示(UX 波)", () => {
     expect(flaggedRow?.textContent).toContain(mockProjects[1].folderName);
   });
 
-  it("顶栏正中常驻当前项目名,点击回项目列表", () => {
+  it("顶栏正中常驻当前项目名,点击打开项目管理(欢迎窗口)", () => {
     render(<App preloaded={{ ...preloaded, route: "devices" as const }} />);
     const chip = screen.getByTestId("current-project-chip");
     expect(chip.textContent).toContain(mockProjects[0].name);
 
+    // 浏览器单窗口形态:打开项目管理 = 切到欢迎视图
     fireEvent.click(chip);
-    expect(screen.getByRole("listbox", { name: "项目列表" })).toBeDefined();
+    expect(screen.getByTestId("welcome-root")).toBeDefined();
   });
 
   it("没有选中项目时顶栏指示为「未选择项目」", () => {
@@ -146,7 +148,7 @@ describe("当前项目的显性指示(UX 波)", () => {
 
 describe("已拷卡语义(UX 波三:分母=项目用卡清单)", () => {
   it("配了用卡清单的项目显示 x/y 张;未配置的回退按次数并明说", () => {
-    render(<App preloaded={preloaded} />);
+    renderProjectsManager(preloaded);
     // 校运会:清单 6 张、已拷 5 → 5/6 张(分母是真实清单,不是任务数)
     expect(screen.getAllByText(/5\/6 张/).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/有未完成任务/).length).toBeGreaterThan(0);
@@ -163,11 +165,7 @@ describe("已拷卡语义(UX 波三:分母=项目用卡清单)", () => {
       .mockImplementation((_, ids) =>
         Promise.resolve({ cardIds: ids, copiedCardIds: [] }),
       );
-    render(
-      <App
-        preloaded={{ ...preloaded, cards: mockStorageCards }}
-      />,
-    );
+    renderProjectsManager({ ...preloaded, cards: mockStorageCards });
 
     // 校运会清单 6 张,全部显示
     const rows = await screen.findAllByTestId("project-card-row");

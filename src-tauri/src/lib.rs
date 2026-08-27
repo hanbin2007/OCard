@@ -13,6 +13,11 @@ macro_rules! ocard_invoke_handler {
         tauri::generate_handler![
             $crate::commands::get_workstation_info,
             $crate::commands::set_workstation_info,
+            $crate::commands::get_project_settings,
+            $crate::commands::save_project_settings,
+            $crate::commands::windows_cmds::open_project_window,
+            $crate::commands::windows_cmds::open_manager_window,
+            $crate::commands::windows_cmds::take_pending_open_project,
             $crate::commands::list_projects,
             $crate::commands::get_project,
             $crate::commands::create_project,
@@ -144,6 +149,7 @@ pub fn run() {
             let machine_id = core::machine::machine_id(&config_dir)
                 .map_err(|e| format!("初始化机器 ID 失败: {e}"))?;
             app.manage(commands::updater::PendingUpdate::default());
+            app.manage(commands::windows_cmds::PendingOpenProject::default());
             app.manage(commands::sorting_cmds::IndexManager::default());
             app.manage(std::sync::Arc::new(core::jobs::JobManager::default()));
             app.manage(AppState {
@@ -337,6 +343,21 @@ pub fn run() {
             });
         })
         .on_window_event(|window, event| {
+            // 多窗口生命周期:欢迎窗与主窗任一还可见,应用就继续活着;
+            // 最后一个可见窗口销毁 = 应用退出(隐藏的主窗不能把进程吊着)。
+            if let tauri::WindowEvent::Destroyed = event {
+                use tauri::Manager as _;
+                let app = window.app_handle();
+                let any_visible = app
+                    .webview_windows()
+                    .iter()
+                    .filter(|(label, _)| label.as_str() != window.label())
+                    .any(|(_, w)| w.is_visible().unwrap_or(false));
+                if !any_visible {
+                    app.exit(0);
+                }
+                return;
+            }
             // D2/评审 #18:有活跃后台作业时关窗先拦 + 可见提示;
             // 15 秒内再次关闭 = 确认强退:取消全部作业、杀 ffmpeg 子进程后放行
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -344,6 +365,16 @@ pub fn run() {
                 use tauri::Manager as _;
                 static LAST_ATTEMPT: AtomicU64 = AtomicU64::new(0);
                 let app = window.app_handle();
+                // 关的不是最后一个可见窗口(如主窗还开着时关掉项目管理窗):
+                // 应用继续运行,作业不中断,直接放行
+                let others_visible = app
+                    .webview_windows()
+                    .iter()
+                    .filter(|(label, _)| label.as_str() != window.label())
+                    .any(|(_, w)| w.is_visible().unwrap_or(false));
+                if others_visible {
+                    return;
+                }
                 let jobs_active = app
                     .try_state::<std::sync::Arc<core::jobs::JobManager>>()
                     .map(|j| j.any_active())

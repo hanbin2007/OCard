@@ -400,7 +400,7 @@ describe("作业进行中的互斥（M2 收口行为必须保持）", () => {
 
   it("侧栏导航与回收站入口都被锁住", async () => {
     await enterWorking();
-    const nav = screen.getByTestId("nav-projects") as HTMLButtonElement;
+    const nav = screen.getByTestId("nav-manager") as HTMLButtonElement;
     expect(nav.disabled).toBe(true);
     expect(nav.title).toContain("交付打包进行中");
     expect(
@@ -421,7 +421,7 @@ describe("作业进行中的互斥（M2 收口行为必须保持）", () => {
       expect(screen.queryByTestId("sorting-delivery-lock")).toBeNull(),
     );
     expect(
-      (screen.getByTestId("nav-projects") as HTMLButtonElement).disabled,
+      (screen.getByTestId("nav-manager") as HTMLButtonElement).disabled,
     ).toBe(false);
   });
 });

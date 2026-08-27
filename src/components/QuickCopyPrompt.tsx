@@ -16,6 +16,7 @@ import * as api from "../api";
 import type { Project, StorageCard, Volume } from "../api/types";
 import { formatBytes } from "../lib/format";
 import { selectDeliveryWorking, useNotify, useStore } from "../state/store";
+import { useWindowBridge } from "../state/windowBridge";
 import { IconCard, IconClose } from "./Icon";
 
 type RosterState =
@@ -43,6 +44,7 @@ export function QuickCopyPrompt() {
 
 function PromptBody({ volume }: { volume: Volume }) {
   const { state, dispatch } = useStore();
+  const bridge = useWindowBridge();
   const notify = useNotify();
   const deliveryWorking = selectDeliveryWorking(state);
 
@@ -270,7 +272,7 @@ function PromptBody({ volume }: { volume: Volume }) {
               data-testid="qc-goto-projects"
               disabled={deliveryWorking}
               title={lockTitle}
-              onClick={() => dispatch({ type: "navigate", route: "projects" })}
+              onClick={() => void bridge.openManager()}
             >
               去选择项目
             </button>

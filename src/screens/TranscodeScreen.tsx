@@ -17,6 +17,7 @@ import { Badge, EmptyState, Field, ProgressBar } from "../components/ui";
 import { isAbsoluteNasRoot } from "../lib/validation";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import { selectLatestTranscodeJob, useStore } from "../state/store";
+import { useWindowBridge } from "../state/windowBridge";
 
 const TIER_LABEL: Record<ArchiveTier, string> = {
   quality: "高质量",
@@ -32,6 +33,7 @@ const TIER_HINT: Record<ArchiveTier, string> = {
 
 export function TranscodeScreen() {
   const { state, dispatch, reconcileJobs } = useStore();
+  const bridge = useWindowBridge();
   const project = state.projects.find((p) => p.id === state.selectedProjectId) ?? null;
   const job = project ? selectLatestTranscodeJob(state, project.id) : null;
   const working = job !== null && (job.state === "queued" || job.state === "running");
@@ -190,12 +192,7 @@ export function TranscodeScreen() {
                     type="button"
                     className="btn btn--primary"
                     data-testid="transcode-goto-projects"
-                    onClick={() =>
-                      dispatch({
-                        type: "navigate",
-                        route: state.projects.length === 0 ? "new-project" : "projects",
-                      })
-                    }
+                    onClick={() => void bridge.openManager()}
                   >
                     {state.projects.length === 0 ? "去新建项目" : "去选择项目"}
                   </button>
@@ -225,7 +222,7 @@ export function TranscodeScreen() {
                     type="button"
                     className="btn btn--primary"
                     data-testid="transcode-goto-projects"
-                    onClick={() => dispatch({ type: "navigate", route: "projects" })}
+                    onClick={() => void bridge.openManager()}
                   >
                     切换到其他项目
                   </button>

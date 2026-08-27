@@ -5,6 +5,7 @@ import { $, browser, expect } from "@wdio/globals";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
+import { createProjectViaWizard } from "../lib/windows.mjs";
 
 const nasRoot = process.env.OCARD_E2E_NAS_ROOT;
 // CI 为 linux x86_64;沿 fetch-ffmpeg.sh 的落位
@@ -24,15 +25,8 @@ async function confirmDangerDialogIfAny() {
 }
 
 describe("OCard M3 转码冒烟", () => {
-  it("新建工况A项目并注入 ProRes 合成素材", async () => {
-    await $('[data-testid="nav-new-project"]').click();
-    await $('[data-testid="np-name"]').waitForExist();
-    await $('[data-testid="np-name"]').setValue("E2E转码");
-    await $('[data-testid="np-scenario-a"]').click();
-    await $('[data-testid="np-submit"]').click();
-    await $('[data-testid="project-row"] span[title="E2E转码"]').waitForExist({
-      timeout: 20000,
-    });
+  it("引导新建工况A项目并注入 ProRes 合成素材", async () => {
+    await createProjectViaWizard("E2E转码", "a");
 
     const camDir = path.join(projectRoot(), "2. 原始素材", "0824_A7M4_A_ZS");
     mkdirSync(camDir, { recursive: true });
@@ -47,9 +41,7 @@ describe("OCard M3 转码冒烟", () => {
   });
 
   it("代理转码作业:UI 发起,代理真实落盘", async () => {
-    const row = $('[data-testid="project-row"] span[title="E2E转码"]');
-    await row.waitForClickable({ timeout: 15000 });
-    await row.click();
+    // 项目已在向导完成时选中,直接进转码屏
     await $('[data-testid="nav-transcode"]').click();
     await $('[data-testid="transcode-start"]').waitForClickable({ timeout: 30000 });
     await $('[data-testid="transcode-start"]').click();

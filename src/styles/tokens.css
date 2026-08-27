@@ -286,3 +286,78 @@
 
   color-scheme: dark;
 }
+
+/* ----------------------------------------------------------------
+ * 内容标签调色板(Notion 式)。色名与 `lib/tags.ts` TAG_COLORS 一一对应;
+ * 项目数据只存色名,亮/暗两套渲染在这里给值。
+ * ---------------------------------------------------------------- */
+:root {
+  --tag-gray-bg: #e7e7e5;
+  --tag-gray-fg: #52514e;
+  --tag-blue-bg: #d9e6f8;
+  --tag-blue-fg: #2b5797;
+  --tag-green-bg: #dcecdc;
+  --tag-green-fg: #2f6b3c;
+  --tag-yellow-bg: #f6eeca;
+  --tag-yellow-fg: #6d5717;
+  --tag-orange-bg: #f8e3cf;
+  --tag-orange-fg: #8f4d17;
+  --tag-red-bg: #f8d9d6;
+  --tag-red-fg: #a03430;
+  --tag-purple-bg: #e9def6;
+  --tag-purple-fg: #6b3fa0;
+  --tag-pink-bg: #f7dcea;
+  --tag-pink-fg: #a03c72;
+  --tag-teal-bg: #d5ecea;
+  --tag-teal-fg: #1f665f;
+  --tag-brown-bg: #eadfd4;
+  --tag-brown-fg: #6e4f34;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --tag-gray-bg: #3a3a3a;
+    --tag-gray-fg: #d4d4d2;
+    --tag-blue-bg: #274664;
+    --tag-blue-fg: #a8c7ee;
+    --tag-green-bg: #2b4a33;
+    --tag-green-fg: #a9d3b2;
+    --tag-yellow-bg: #4d4020;
+    --tag-yellow-fg: #e0c877;
+    --tag-orange-bg: #55361c;
+    --tag-orange-fg: #ecb582;
+    --tag-red-bg: #572e2b;
+    --tag-red-fg: #f0a09a;
+    --tag-purple-bg: #433059;
+    --tag-purple-fg: #cdb3f0;
+    --tag-pink-bg: #542e42;
+    --tag-pink-fg: #edaacd;
+    --tag-teal-bg: #1f4a47;
+    --tag-teal-fg: #94d3cd;
+    --tag-brown-bg: #473528;
+    --tag-brown-fg: #d3b394;
+  }
+}
+
+:root[data-theme="dark"] {
+  --tag-gray-bg: #3a3a3a;
+  --tag-gray-fg: #d4d4d2;
+  --tag-blue-bg: #274664;
+  --tag-blue-fg: #a8c7ee;
+  --tag-green-bg: #2b4a33;
+  --tag-green-fg: #a9d3b2;
+  --tag-yellow-bg: #4d4020;
+  --tag-yellow-fg: #e0c877;
+  --tag-orange-bg: #55361c;
+  --tag-orange-fg: #ecb582;
+  --tag-red-bg: #572e2b;
+  --tag-red-fg: #f0a09a;
+  --tag-purple-bg: #433059;
+  --tag-purple-fg: #cdb3f0;
+  --tag-pink-bg: #542e42;
+  --tag-pink-fg: #edaacd;
+  --tag-teal-bg: #1f4a47;
+  --tag-teal-fg: #94d3cd;
+  --tag-brown-bg: #473528;
+  --tag-brown-fg: #d3b394;
+}
