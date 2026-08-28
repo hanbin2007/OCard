@@ -284,6 +284,12 @@
   min-width: 0;
 }
 
+/* 子视图的「返回」并进顶栏:与新建/铃铛/设置同一排、同一视觉层级 */
+.topbar__back {
+  flex: none;
+  margin-right: var(--space-1);
+}
+
 /* 标题栏是"框"，不跟着内容一起位移：只做交叉淡入，
    否则整块 chrome 一起跳会削弱"内容换了、框没换"的层级关系。 */
 .topbar__title,
@@ -519,6 +525,12 @@
 .content--flush .content__inner {
   max-width: none;
   padding: 0;
+}
+
+/* flush 屏(选片工作台)内部是自己滚的虚拟网格:外层必须**不滚**,
+   否则两层都能滚 = 滚动条与内容对不上(一屏一个滚动容器) */
+.content--flush {
+  overflow: hidden;
 }
 
 /* 列表 + 详情 双栏 */

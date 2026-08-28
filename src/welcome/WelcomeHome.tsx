@@ -138,12 +138,18 @@ export function WelcomeHome({
               disabled={openingId !== null}
               onClick={() => void openProject(recent.id, recent.name)}
             >
+              {/* 徽标只放工况字母:36px 方块塞不下「B 拍照」,必然折行成
+                  「B 拍 / 照」(用户点名)。全称降到副行,信息一个字不少。 */}
               <span className="welcome-recent__badge" aria-hidden="true">
-                {SCENARIO_SHORT[recent.scenario]}
+                {recent.scenario}
               </span>
               <span className="welcome-recent__meta">
                 <span className="welcome-recent__name">{recent.name}</span>
-                <span className="welcome-recent__folder">{recent.folderName}</span>
+                <span className="welcome-recent__folder">
+                  <span>{SCENARIO_SHORT[recent.scenario]}</span>
+                  <span aria-hidden="true"> · </span>
+                  <span className="truncate">{recent.folderName}</span>
+                </span>
               </span>
               <span className="welcome-recent__time">
                 {openingId === recent.id

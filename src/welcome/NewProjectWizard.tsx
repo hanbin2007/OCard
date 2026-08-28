@@ -15,7 +15,7 @@ import { useMemo, useRef, useState } from "react";
 import * as api from "../api";
 import type { ProjectTag, Scenario } from "../api/types";
 import { FolderTreeView } from "../components/FolderTreeView";
-import { IconPlus, IconTrash } from "../components/Icon";
+import { IconCheck, IconChevronRight, IconPlus, IconTrash } from "../components/Icon";
 import { Checkbox, Select } from "../components/controls";
 import { PathField } from "../components/PathField";
 import { TagChip } from "../components/TagPicker";
@@ -79,6 +79,8 @@ export function NewProjectWizard({ onExit }: { onExit: () => void }) {
   const notify = useNotify();
 
   const [step, setStep] = useState<StepKey>("info");
+  /** 步骤切换方向:进入动画从行进方向进来(空间一致性),回退反向 */
+  const [stepDir, setStepDir] = useState<"fwd" | "back">("fwd");
 
   // ---- 第 1 步:项目信息 ----
   const [isoDate, setIsoDate] = useState(todayIso);
@@ -146,6 +148,9 @@ export function NewProjectWizard({ onExit }: { onExit: () => void }) {
   const stepIndex = STEPS.findIndex((s) => s.key === step);
 
   function goTo(next: StepKey) {
+    setStepDir(
+      STEPS.findIndex((x) => x.key === next) >= stepIndex ? "fwd" : "back",
+    );
     if (next === "tags" && !tagsSeededRef.current) {
       tagsSeededRef.current = true;
       if (scenario === "B") {
@@ -326,11 +331,21 @@ export function NewProjectWizard({ onExit }: { onExit: () => void }) {
             aria-current={s.key === step ? "step" : undefined}
             data-done={i < stepIndex || undefined}
           >
-            <span className="npw__step-index">{i + 1}</span>
+            {i > 0 ? (
+              <span className="npw__step-arrow" aria-hidden="true">
+                <IconChevronRight size={12} />
+              </span>
+            ) : null}
+            <span className="npw__step-index">
+              {i < stepIndex ? <IconCheck size={11} /> : i + 1}
+            </span>
             {s.label}
           </li>
         ))}
       </ol>
+
+      {/* key 换步即重挂:进入动画随方向进来;滚动容器在外层,面板动画安全 */}
+      <div className="npw__panel" key={step} data-dir={stepDir}>
 
       {step === "info" ? (
         <div className="wizard">
@@ -888,6 +903,7 @@ export function NewProjectWizard({ onExit }: { onExit: () => void }) {
           </div>
         </div>
       ) : null}
+      </div>
 
       <div className="npw__actions">
         <button type="button" className="btn btn--ghost" onClick={onExit}>

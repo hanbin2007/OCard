@@ -483,9 +483,13 @@
   color: var(--danger);
 }
 
+/* 文件明细**不再**是独立滚动区(实测定位:嵌套滚动容器让鼠标位置决定
+   滚的是内层还是外层,而用户眼睛盯的是主区右缘那根条——内层滚时它纹丝
+   不动,内层到底后才突然接管,读作「滚动条和内容不同步、还会跳」。
+   一屏之内只允许一个滚动容器,列表整体展开,由 .content 统一滚。) */
 .files__scroll {
-  max-height: 420px;
-  overflow-y: auto;
+  max-height: none;
+  overflow: visible;
 }
 
 .files__scroll .list__head {

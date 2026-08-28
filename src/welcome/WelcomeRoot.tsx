@@ -88,22 +88,19 @@ export function WelcomeRoot() {
       </div>
     );
   } else if (view === "manager") {
+    // 项目管理(原主窗口「项目」屏)整体搬进本窗口。
+    // 「返回」并入 ProjectsScreen 的顶栏(与新建/铃铛/设置同排同层级);
+    // body 用 flush 变体:自己不滚,让屏内 .content 滚——顶栏因此钉住
     body = (
       <div className="welcome-sub">
-        <div className="welcome-sub__bar">
-          <button
-            type="button"
-            className="btn btn--ghost btn--sm"
-            data-testid="welcome-back"
-            onClick={() => setView("home")}
-          >
-            <IconArrowLeft size={14} />
-            返回
-          </button>
-        </div>
-        {/* 项目管理(原主窗口「项目」屏)整体搬进本窗口 */}
-        <div className="welcome-sub__body" style={{ padding: 0 }}>
-          <ProjectsScreen onNewProject={() => setView("wizard")} />
+        <div
+          className="welcome-sub__body welcome-sub__body--flush"
+          data-view="manager"
+        >
+          <ProjectsScreen
+            onNewProject={() => setView("wizard")}
+            onBack={() => setView("home")}
+          />
         </div>
       </div>
     );

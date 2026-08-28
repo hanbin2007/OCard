@@ -12,6 +12,7 @@ import {
   FinalCutPanel,
 } from "../components/FinalCutPanel";
 import { FolderTreeView } from "../components/FolderTreeView";
+import { IconArrowLeft } from "../components/Icon";
 import { TopBar } from "../components/TopBar";
 import { ProgressRing } from "../components/charts";
 import { IllProjectsEmpty } from "../components/illustrations";
@@ -29,7 +30,14 @@ import {
 import { useNotify, useStore } from "../state/store";
 import { useWindowBridge } from "../state/windowBridge";
 
-export function ProjectsScreen({ onNewProject }: { onNewProject: () => void }) {
+export function ProjectsScreen({
+  onNewProject,
+  onBack,
+}: {
+  onNewProject: () => void;
+  /** 欢迎窗口子视图的「返回」:并入顶栏,与其余动作同排同层级 */
+  onBack?: () => void;
+}) {
   const { state, dispatch } = useStore();
   const bridge = useWindowBridge();
   const notify = useNotify();
@@ -94,6 +102,19 @@ export function ProjectsScreen({ onNewProject }: { onNewProject: () => void }) {
       <TopBar
         title="项目"
         subtitle={state.workstation?.nasRoot}
+        leading={
+          onBack ? (
+            <button
+              type="button"
+              className="btn btn--ghost btn--sm topbar__back"
+              data-testid="welcome-back"
+              onClick={onBack}
+            >
+              <IconArrowLeft size={14} />
+              返回
+            </button>
+          ) : undefined
+        }
         actions={
           <button
             type="button"

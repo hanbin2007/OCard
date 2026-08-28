@@ -163,12 +163,15 @@ export function TopBar({
   subtitle,
   subtitleMono = false,
   actions,
+  leading,
 }: {
   title: string;
   subtitle?: ReactNode;
   /** 仅路径/编码等技术信息用等宽字体，普通说明文案不要 mono */
   subtitleMono?: boolean;
   actions?: ReactNode;
+  /** 标题前的前置动作(如子视图的「返回」):与右侧动作同一排、同一层级 */
+  leading?: ReactNode;
 }) {
   const { dispatch } = useStore();
 
@@ -177,6 +180,7 @@ export function TopBar({
       {/* 三列网格:左标题簇 | 中当前项目 | 右动作。三块各占独立轨道,
           结构上杜绝重叠——绝对定位居中在长标题/长路径下必然压到别人 */}
       <div className="topbar__lead">
+        {leading}
         <h1 className="topbar__title">{title}</h1>
         {subtitle ? (
           <span className={`topbar__sub${subtitleMono ? " mono" : ""}`}>{subtitle}</span>

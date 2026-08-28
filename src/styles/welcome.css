@@ -165,8 +165,12 @@
   border-radius: var(--radius-md);
   background: var(--accent-soft);
   color: var(--accent);
-  font-size: var(--text-sm);
+  /* 单字母:大一号、紧 tracking,方块里读起来才像标记而非正文 */
+  font-size: var(--text-base);
   font-weight: var(--weight-semibold);
+  letter-spacing: -0.01em;
+  /* 兜底:任何情况下都不许在方块里折行 */
+  white-space: nowrap;
 }
 .welcome-recent__meta {
   min-width: 0;
@@ -181,6 +185,12 @@
   font-weight: var(--weight-medium);
 }
 .welcome-recent__folder {
+  display: flex;
+  align-items: baseline;
+  gap: 0;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -226,6 +236,16 @@
   padding: var(--space-2) var(--space-6) var(--space-6);
 }
 
+/* 项目管理视图:整屏(含顶栏)自带布局,外层**不滚**——
+   外层滚会把顶栏一起卷走(用户点名:导航头没锁定),
+   而且与屏内 .content 形成嵌套滚动,滚动条与内容对不上 */
+.welcome-sub__body--flush {
+  overflow: hidden;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 /* 首跑设置居中态 */
 .welcome-onboarding {
   flex: 1;
@@ -241,46 +261,112 @@
   max-width: 860px;
   margin: 0 auto;
 }
+/* 进度指示是一条**路径**,不是一排标签:用箭头串起来,读作
+   「从哪来、在哪、往哪去」。胶囊 chips 每颗都像可点的独立控件,
+   既不表达顺序也在骗点击(用户点名不要)。 */
 .npw__steps {
   display: flex;
-  gap: var(--space-2);
+  align-items: center;
+  gap: 0;
   margin: 0 0 var(--space-5);
   padding: 0;
   list-style: none;
   flex-wrap: wrap;
+  font-size: var(--text-xs);
+  /* 小字反而要正 tracking 才易读 */
+  letter-spacing: 0.01em;
 }
 .npw__step {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
-  padding: 4px 10px;
-  border-radius: var(--radius-pill);
-  border: 1px solid var(--border);
+  gap: var(--space-2);
+  padding: 2px 0;
   color: var(--text-tertiary);
-  font-size: var(--text-xs);
   white-space: nowrap;
+  /* 状态变化走同一条曲线,不同步骤间闪烁 */
+  transition:
+    color var(--dur-quick) var(--ease-out),
+    opacity var(--dur-quick) var(--ease-out);
+}
+.npw__step-arrow {
+  display: inline-flex;
+  align-items: center;
+  margin: 0 var(--space-2);
+  color: var(--text-quaternary, var(--text-tertiary));
+  opacity: 0.55;
 }
 .npw__step[aria-current="step"] {
-  border-color: var(--accent);
-  color: var(--accent);
+  color: var(--text-primary);
   font-weight: var(--weight-medium);
 }
 .npw__step[data-done] {
   color: var(--text-secondary);
-  border-color: var(--border-strong);
 }
 .npw__step-index {
   display: inline-grid;
   place-items: center;
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
-  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
   font-size: var(--text-2xs);
+  font-variant-numeric: tabular-nums;
+  /* 序号盘的状态切换有实体感:颜色与描边一起走 */
+  transition:
+    background-color var(--dur-quick) var(--ease-out),
+    border-color var(--dur-quick) var(--ease-out),
+    color var(--dur-quick) var(--ease-out);
+}
+.npw__step[data-done] .npw__step-index {
+  border-color: var(--ok, var(--accent));
+  color: var(--ok, var(--accent));
 }
 .npw__step[aria-current="step"] .npw__step-index {
   background: var(--accent);
+  border-color: var(--accent);
   color: var(--on-accent);
+  /* 当前步轻微外扩,是「你在这」的空间提示 */
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* 步骤面板:换步即重挂(key),按行进方向进场——
+   空间一致性(往下一步走,新面板从右侧来;上一步则从左侧回)。
+   位移只有 10px:桌面工具要的是「知道往哪走了」,不是搬家式大位移。
+   动画落在面板上,外层 .welcome-sub__body 才是滚动容器,不受影响。 */
+.npw__panel {
+  animation: npw-step-in var(--dur-spring-fast) var(--spring);
+}
+.npw__panel[data-dir="back"] {
+  animation-name: npw-step-in-back;
+}
+
+@keyframes npw-step-in {
+  from {
+    opacity: 0;
+    transform: translate3d(10px, 0, 0);
+  }
+}
+
+@keyframes npw-step-in-back {
+  from {
+    opacity: 0;
+    transform: translate3d(-10px, 0, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* 减少动效 ≠ 没有反馈:位移换成纯淡入,不做前庭刺激 */
+  .npw__panel,
+  .npw__panel[data-dir="back"] {
+    animation: npw-step-fade var(--dur-quick) var(--ease-out);
+  }
+  @keyframes npw-step-fade {
+    from {
+      opacity: 0;
+    }
+  }
 }
 .npw__actions {
   display: flex;
