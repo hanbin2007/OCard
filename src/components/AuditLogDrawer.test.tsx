@@ -584,24 +584,43 @@ describe("键盘可达", () => {
     expect(screen.queryByTestId("audit-log-drawer")).toBeNull();
   });
 
+  /*
+   * 下面三条一律走 user.keyboard（派发到 document.activeElement；没被
+   * preventDefault 时 user-event 会真的把焦点移到下一个可聚焦元素）。
+   * 从前它们用 fireEvent.keyDown(某元素, …)——那样等于自己指定事件目标，
+   * 整条焦点链被绕过去，圈定坏掉了测试也照样绿。
+   */
   it("Tab 焦点圈首尾相接，不会跑回身后被遮住的表", async () => {
-    await openDrawer();
+    const user = await openDrawer();
     const close = screen.getByTestId("audit-close");
     const abnormal = screen.getByTestId("audit-filter-abnormal");
 
     expect(document.activeElement).toBe(close);
-    fireEvent.keyDown(close, { key: "Tab", shiftKey: true });
+    await user.keyboard("{Shift>}{Tab}{/Shift}");
     expect(document.activeElement).toBe(abnormal);
 
-    fireEvent.keyDown(abnormal, { key: "Tab" });
+    await user.keyboard("{Tab}");
     expect(document.activeElement).toBe(close);
   });
 
   it("焦点在抽屉外时按 Tab 会被拽回抽屉里", async () => {
-    await openDrawer();
+    const user = await openDrawer();
     const outside = screen.getByTestId("audit-open");
     outside.focus();
-    fireEvent.keyDown(outside, { key: "Tab" });
+    expect(document.activeElement).toBe(outside);
+
+    await user.keyboard("{Tab}");
+    expect(screen.getByTestId("audit-log-drawer").contains(document.activeElement)).toBe(
+      true,
+    );
     expect(document.activeElement).toBe(screen.getByTestId("audit-close"));
+  });
+
+  it("Esc 走真实焦点链也能关，并把焦点还给入口按钮", async () => {
+    const user = await openDrawer();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByTestId("audit-log-drawer")).toBeNull();
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(screen.getByTestId("audit-open"));
   });
 });

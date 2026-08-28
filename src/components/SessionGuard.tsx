@@ -13,6 +13,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../api";
+import { useModalFocus } from "../lib/focusTrap";
 import { OPERATOR_NAME_MAX } from "../lib/validation";
 import { useNotify, useStore } from "../state/store";
 import { ConfirmDialog, type ConfirmRequest } from "./ConfirmDialog";
@@ -125,16 +126,65 @@ export function SessionGuard() {
    * 挡鼠标挡不住键盘,必须一并 inert(双路评审 P0:门开着 Tab+Enter
    * 就能以上一位操作人身份写 NAS)。
    */
+  const gateUp = phase !== "active";
   useEffect(() => {
-    if (phase === "active") return;
+    if (!gateUp) return;
+    /*
+     * 焦点还原为什么写在这里、而不是交给浮层的 useModalFocus：
+     * 置 inert 的那一刻浏览器会把 inert 子树里的焦点**踢掉**（落到 body），
+     * 而 inert 还在期间任何 focus() 都是空操作。所以"记住是谁"必须在置 inert
+     * 之前、"还回去"必须在撤 inert 之后，两头都得由这个 effect 自己夹住。
+     * 少了这一步：会话恢复后焦点停在 body，方向键 / Esc / 快捷键全部没反应，
+     * 而屏上没有任何迹象说明为什么（本项目的老账：「按键按了没反应」）。
+     */
+    const before = document.activeElement;
     const blocked = document.querySelectorAll<HTMLElement>(
       ".shell > .sidebar, .shell > .main, .shell > .quick-copy",
     );
     for (const el of blocked) el.setAttribute("inert", "");
     return () => {
       for (const el of blocked) el.removeAttribute("inert");
+      if (
+        before instanceof HTMLElement &&
+        before !== document.body &&
+        document.contains(before)
+      ) {
+        before.focus();
+      }
     };
-  }, [phase]);
+  }, [gateUp]);
+
+  /*
+   * 闲置询问与会话门都是**真**模态：Tab 必须圈在里面。
+   *
+   * inert 挡住了侧栏 / 主区 / 快捷拷卡，但 `.shell` 下还挂着设置对话框与
+   * toast——它们不在 inert 名单里，没有圈定时 Tab 照样能走过去。而且
+   * `aria-modal="true"` 已经写在这两层上了，不圈定就是在说谎。
+   *
+   * **故意不接 Esc**：这两层没有"取消"这条出路。闲置询问要么继续要么结束，
+   * 会话门必须确认操作人才能过——审计归属不允许被一下 Esc 绕过去。
+   *
+   * 声明在上面那条 inert effect **之后**：effect 按声明序跑，撤 inert 与
+   * 焦点还原必须先于本 hook 的 cleanup 发生。
+   */
+  const promptRef = useRef<HTMLDivElement>(null);
+  const continueRef = useRef<HTMLButtonElement>(null);
+  const gateRef = useRef<HTMLDivElement>(null);
+  const gateLastRef = useRef<HTMLButtonElement>(null);
+  const gateOperatorRef = useRef<HTMLInputElement>(null);
+  const lastOperator = workstation?.operator?.trim() ?? "";
+
+  useModalFocus({
+    ref: promptRef,
+    active: armed && phase === "prompt",
+    initialFocus: continueRef,
+  });
+  useModalFocus({
+    ref: gateRef,
+    active: armed && phase === "ended",
+    // 有上一位操作人就把焦点押在「继续上一位」上，否则押在换人输入框上
+    initialFocus: lastOperator ? gateLastRef : gateOperatorRef,
+  });
 
   async function startAs(operator: string) {
     const name = operator.trim();
@@ -195,6 +245,8 @@ export function SessionGuard() {
           aria-modal="true"
           aria-labelledby="session-idle-title"
           aria-describedby="session-idle-message"
+          ref={promptRef}
+          tabIndex={-1}
         >
           <h2 className="dialog__title" id="session-idle-title">
             还在吗？
@@ -220,7 +272,9 @@ export function SessionGuard() {
               type="button"
               data-testid="session-continue"
               className="btn btn--primary"
-              autoFocus
+              /* 取焦统一交给 useModalFocus：原生 autoFocus 在提交阶段就把焦点
+                 搬走了，会赶在 hook 记住「触发者是谁」之前 */
+              ref={continueRef}
               onClick={resume}
             >
               继续会话
@@ -241,6 +295,8 @@ export function SessionGuard() {
             role="dialog"
             aria-modal="true"
             aria-labelledby="session-gate-title"
+            ref={gateRef}
+            tabIndex={-1}
           >
             <h2 className="dialog__title" id="session-gate-title">
               会话已结束，谁在操作？
@@ -253,7 +309,7 @@ export function SessionGuard() {
                 type="button"
                 data-testid="session-gate-last"
                 className="btn session-gate__last"
-                autoFocus
+                ref={gateLastRef}
                 onClick={() =>
                   setConfirm({
                     title: `仍由「${last}」操作？`,
@@ -287,7 +343,7 @@ export function SessionGuard() {
                   data-testid="session-gate-operator"
                   className={`input${gateError ? " input--invalid" : ""}`}
                   type="text"
-                  autoFocus={!last}
+                  ref={gateOperatorRef}
                   value={newOperator}
                   placeholder="如：李四"
                   onChange={(e) => {

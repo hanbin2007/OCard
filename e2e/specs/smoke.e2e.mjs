@@ -469,10 +469,13 @@ describe("OCard M1 冒烟", () => {
       expect(Math.abs(r.moved - r.scrolled)).toBeLessThan(4);
     }
 
-    expect(
-      measured >= 1 ? [] : skipped,
-      "两屏都没能真正测量到侧栏位移——这条不变式等于没执行(见上面的 skip 原因)",
-    ).toEqual([]);
+    // 同上:wdio 的 expect 只收一个参数,说明只能走 throw
+    if (measured < 1) {
+      throw new Error(
+        "两屏都没能真正测量到侧栏位移——这条不变式等于没执行。skip 原因:" +
+          skipped.join(" / "),
+      );
+    }
   });
 
   /**
@@ -523,32 +526,47 @@ describe("OCard M1 冒烟", () => {
 
     const scan = await browser.execute(LAYER_SCAN);
 
+    /* 说明为什么这里用 `throw` 而不是 `expect(值, 说明)`:
+       wdio 的 expect 是 expect-webdriverio(jest 系),**只收一个参数**,
+       多传一个会当场抛 `Expect takes at most one argument` ——
+       断言还没跑,用例就先炸了,报错还与真正的病灶毫无关系。
+       vitest 支持两参,所以这个写法在单测里是对的、搬到 E2E 就错。
+       CI 实测踩过一次(33183973260)。 */
+    const fail = (msg) => {
+      throw new Error(msg);
+    };
+
     // 先钉住扫描器自己没瞎:读不到的样式表、扫到 0 条规则、扫到 0 族,
     // 这三种情况都会让下面的比对「恰好全绿」。
-    expect(scan.blocked, "有样式表读不到 cssRules,扫描面不完整").toEqual([]);
-    expect(
-      scan.ruleCount,
-      `只扫到 ${scan.ruleCount} 条样式规则 / ${scan.classCount} 个类名 —— 扫描器本身失效了`,
-    ).toBeGreaterThan(300);
+    if (scan.blocked.length) {
+      fail(`有样式表读不到 cssRules,扫描面不完整:[${scan.blocked.join(",")}]`);
+    }
+    if (scan.ruleCount <= 300) {
+      fail(
+        `只扫到 ${scan.ruleCount} 条样式规则 / ${scan.classCount} 个类名 —— 扫描器本身失效了`,
+      );
+    }
     const found = scan.layers;
-    expect(found.length, "一族全屏层都没扫到 = 扫描判据本身失效").toBeGreaterThanOrEqual(1);
+    if (found.length < 1) fail("一族全屏层都没扫到 = 扫描判据本身失效");
 
     const covered = new Set(LAYER_RECIPES.map((r) => r.covers));
     const missing = found.filter((n) => !covered.has(n) && !(n in LAYER_SCAN_EXEMPT));
-    expect(
-      missing,
-      `这几族全屏层在 CSS 里存在,却没有任何 recipe 跑过它们:[${missing.join(",")}]。\n` +
-        "请给它写一份配方(注意形状要贴合它自己的结构,别照抄一个会误红的)," +
-        "或者加进 LAYER_SCAN_EXEMPT 并写明为什么它不需要探针。\n" +
-        `当前扫到:[${found.join(",")}];当前覆盖:[${[...covered].join(",")}]`,
-    ).toEqual([]);
+    if (missing.length) {
+      fail(
+        `这几族全屏层在 CSS 里存在,却没有任何 recipe 跑过它们:[${missing.join(",")}]。\n` +
+          "请给它写一份配方(注意形状要贴合它自己的结构,别照抄一个会误红的)," +
+          "或者加进 LAYER_SCAN_EXEMPT 并写明为什么它不需要探针。\n" +
+          `当前扫到:[${found.join(",")}];当前覆盖:[${[...covered].join(",")}]`,
+      );
+    }
 
     const stale = [...covered].filter((n) => !found.includes(n));
-    expect(
-      stale,
-      `这几份 recipe 的 covers 在 CSS 里已经不是全屏层了:[${stale.join(",")}]。\n` +
-        "要么是类名改了、要么是这一族不再 fixed 铺满——配方已经在空跑,请更新。",
-    ).toEqual([]);
+    if (stale.length) {
+      fail(
+        `这几份 recipe 的 covers 在 CSS 里已经不是全屏层了:[${stale.join(",")}]。\n` +
+          "要么是类名改了、要么是这一族不再 fixed 铺满——配方已经在空跑,请更新。",
+      );
+    }
   });
 
   it("浮层不变式:铺满视口、行不被撑大、溢出由内部滚动容器真正承担", async () => {

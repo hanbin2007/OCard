@@ -20,7 +20,6 @@ import {
   selectAll,
   shouldYieldShortcut,
   toggleSelection,
-  trapTabFocus,
   type PendingDeleteState,
 } from "./sorting";
 
@@ -756,55 +755,5 @@ describe("快捷键让路 shouldYieldShortcut", () => {
     expect(shouldYieldShortcut(el('<div role="gridcell"></div>'), "Enter")).toBe(false);
     expect(shouldYieldShortcut(el("<div></div>"), " ")).toBe(false);
     expect(shouldYieldShortcut(null, "Enter")).toBe(false);
-  });
-});
-
-describe("焦点圈定 trapTabFocus", () => {
-  function layer(): { box: HTMLElement; buttons: HTMLButtonElement[] } {
-    const box = document.createElement("div");
-    box.tabIndex = -1;
-    box.innerHTML = "<button>a</button><button>b</button><button>c</button>";
-    document.body.appendChild(box);
-    return {
-      box,
-      buttons: Array.from(box.querySelectorAll("button")),
-    };
-  }
-
-  it("末项按 Tab 回到首项,首项 Shift+Tab 回到末项——焦点出不去这一层", () => {
-    const { box, buttons } = layer();
-    buttons[2].focus();
-    expect(trapTabFocus(box, { key: "Tab" })).toBe(true);
-    expect(document.activeElement).toBe(buttons[0]);
-
-    buttons[0].focus();
-    expect(trapTabFocus(box, { key: "Tab", shiftKey: true })).toBe(true);
-    expect(document.activeElement).toBe(buttons[2]);
-    box.remove();
-  });
-
-  it("中间位置原样交给浏览器原生 Tab 顺序", () => {
-    const { box, buttons } = layer();
-    buttons[1].focus();
-    expect(trapTabFocus(box, { key: "Tab" })).toBe(false);
-    box.remove();
-  });
-
-  it("焦点在层外(例如刚从背后那层跑过来)时收回层内首项", () => {
-    const { box, buttons } = layer();
-    const outside = document.createElement("button");
-    document.body.appendChild(outside);
-    outside.focus();
-    expect(trapTabFocus(box, { key: "Tab" })).toBe(true);
-    expect(document.activeElement).toBe(buttons[0]);
-    outside.remove();
-    box.remove();
-  });
-
-  it("非 Tab 键一律不接管", () => {
-    const { box } = layer();
-    expect(trapTabFocus(box, { key: "Escape" })).toBe(false);
-    expect(trapTabFocus(null, { key: "Tab" })).toBe(false);
-    box.remove();
   });
 });

@@ -14,7 +14,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import { trapTabFocus } from "../lib/sorting";
+import { trapTabFocus, useModalFocus } from "../lib/focusTrap";
 import { Kbd } from "./ui";
 
 const SECTIONS: Array<{ title: string; rows: Array<[string, string]> }> = [
@@ -118,10 +118,21 @@ export function KeyboardHelp() {
     return () => window.removeEventListener("keydown", onKey, { capture: true });
   }, [open]);
 
-  // 打开即把焦点收进来,Tab 才有可圈定的起点(否则第一下 Tab 就跑到层背后)
-  useEffect(() => {
-    if (open) dialogRef.current?.focus();
-  }, [open]);
+  /*
+   * 开屏取焦 + 关闭还原。
+   *
+   * 取焦：不收进来的话第一下 Tab 就跑到层背后（本层是 `?` 从任意屏呼出的,
+   * 背后随便是什么）。取焦目标显式指向层本身而不是「关闭」按钮——本层是
+   * 只读文档,一进来就把焦点押在唯一那个按钮上会误导人以为要按它。
+   *
+   * 还原：从前关掉速查表后焦点跟着卸载的层一起没了、落到 body,回到网格
+   * 方向键与 Esc 全部没反应——「按了没反应」的老账。触发者是按 `?` 那一刻
+   * 持有焦点的元素（网格 / 大图 / 组层）,还回去即可。
+   *
+   * Esc 与 Tab 仍由上面那条 window 捕获监听负责(本层要抢在大图的 document
+   * 捕获之前),所以这里不传 onEscape。
+   */
+  useModalFocus({ ref: dialogRef, active: open, initialFocus: dialogRef });
 
   if (!open) return null;
 

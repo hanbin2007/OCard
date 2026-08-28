@@ -1310,6 +1310,28 @@ describe("B9 帮助层压在最上层，并且真的拿得到按键", () => {
     expect(screen.queryByTestId("asset-lightbox")).not.toBeNull();
   });
 
+  it("★ 关掉速查表后焦点还给按 ? 之前那一层，不掉进 body", async () => {
+    const user = userEvent.setup();
+    await renderSorting();
+
+    const wrap = grid();
+    wrap.focus();
+    expect(document.activeElement).toBe(wrap);
+
+    fireEvent.keyDown(document, { key: "?" });
+    await screen.findByTestId("keyboard-help");
+    expect(document.activeElement).not.toBe(wrap);
+
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByTestId("keyboard-help")).toBeNull());
+    /*
+     * 从前速查表一关，焦点跟着卸载的层掉进 body：回到网格后方向键、Esc、
+     * 数字键全部没反应，还得先用鼠标点一下网格——「按了没反应」的老账。
+     */
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(wrap);
+  });
+
   it("★ 大图开屏就把焦点收进来，Tab 圈在层内，跑不到背后的网格上", async () => {
     const user = userEvent.setup();
     await renderSorting();

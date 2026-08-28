@@ -4,6 +4,7 @@
  */
 
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api";
 import App from "../App";
@@ -266,5 +267,126 @@ describe("未配置时不设防", () => {
     );
     advance(IDLE_PROMPT_MS * 2);
     expect(screen.queryByTestId("session-idle-dialog")).toBeNull();
+  });
+});
+
+/**
+ * 会话门与闲置询问都写着 `aria-modal="true"`，所以 Tab 必须真的圈在里面。
+ *
+ * inert 只挡住了侧栏 / 主区 / 快捷拷卡；`.shell` 下的设置对话框、toast 不在
+ * 名单里，光靠 inert 挡不住键盘。而且门上还能再开一层确认框（`--elevated`
+ * z=90 压在门 z=80 之上），此时**只有最上面那一层**该收键。
+ *
+ * 一律走 `user.keyboard(...)`（派发到 `document.activeElement`）并直接断言
+ * `document.activeElement`：用 `fireEvent.keyDown(某元素, …)` 会绕过焦点链。
+ */
+describe("会话门：焦点圈定与嵌套", () => {
+  /**
+   * 到门前用假时钟（闲置阈值是 15 分钟，等不起），到门后立刻换回真时钟：
+   * user-event 内部有自己的等待，跟假时钟凑在一起会互相卡死。门已经立起来了，
+   * 后面的判定不再依赖时钟。
+   */
+  function toGate() {
+    render(<App preloaded={preloaded} />);
+    advance(IDLE_PROMPT_MS + IDLE_TICK_MS);
+    advance(PROMPT_GRACE_MS + IDLE_TICK_MS);
+    const gate = screen.getByTestId("session-gate");
+    vi.useRealTimers();
+    return { gate, user: userEvent.setup() };
+  }
+
+  it("闲置询问开屏把焦点收进「继续会话」", () => {
+    render(<App preloaded={preloaded} />);
+    advance(IDLE_PROMPT_MS + IDLE_TICK_MS);
+    expect(document.activeElement).toBe(screen.getByTestId("session-continue"));
+  });
+
+  it("门开屏把焦点收进「继续上一位」", () => {
+    render(<App preloaded={preloaded} />);
+    advance(IDLE_PROMPT_MS + IDLE_TICK_MS);
+    advance(PROMPT_GRACE_MS + IDLE_TICK_MS);
+    expect(document.activeElement).toBe(screen.getByTestId("session-gate-last"));
+  });
+
+  it("末项 Tab 回到首项、首项 Shift+Tab 回到末项：焦点出不去这道门", async () => {
+    const { user } = toGate();
+    const first = screen.getByTestId("session-gate-last");
+    const last = screen.getByTestId("session-gate-start");
+
+    last.focus();
+    await user.keyboard("{Tab}");
+    expect(document.activeElement).toBe(first);
+
+    await user.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(document.activeElement).toBe(last);
+  });
+
+  it("焦点被挪到门外时，下一次 Tab 把它拽回门里", async () => {
+    const { gate, user } = toGate();
+    // 顶栏齿轮在 .main 里（已被 inert），但 jsdom 不模拟 inert 的失焦语义，
+    // 恰好可以用它扮演「焦点跑到层外」这一幕
+    const outside = screen.getByTestId("settings-open");
+    outside.focus();
+    expect(document.activeElement).toBe(outside);
+
+    await user.keyboard("{Tab}");
+    expect(gate.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(screen.getByTestId("session-gate-last"));
+  });
+
+  it("嵌套：门上开确认框后只有确认框收键，Tab 不会被门扯回去", async () => {
+    const { user } = toGate();
+    await user.click(screen.getByTestId("session-gate-last"));
+
+    const confirm = await screen.findByRole("alertdialog");
+    const cancel = screen.getByRole("button", { name: "取消" });
+    const ok = screen.getByRole("button", { name: /确认是/ });
+    // 归属性确认一律以「取消」为默认动作
+    expect(document.activeElement).toBe(cancel);
+
+    /*
+     * 判别点：从确认框首项按 Tab，正确结果是走到确认框末项。
+     * 门要是也在收键（少了栈顶判定），它会先把焦点扯回 session-gate-last，
+     * 确认框再把它捞回首项——结果停在「取消」上，永远走不到「确认」。
+     */
+    await user.keyboard("{Tab}");
+    expect(confirm.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(ok);
+
+    await user.keyboard("{Tab}");
+    expect(document.activeElement).toBe(cancel);
+  });
+
+  it("嵌套：Esc 只关最上面的确认框，门原地不动，焦点还给开框的那个按钮", async () => {
+    const { user } = toGate();
+    await user.click(screen.getByTestId("session-gate-last"));
+    await screen.findByRole("alertdialog");
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.getByTestId("session-gate")).toBeDefined();
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(screen.getByTestId("session-gate-last"));
+  });
+
+  it("确认沿用上一位后会话恢复，焦点回到进门前那个控件而不是 body", async () => {
+    render(<App preloaded={preloaded} />);
+    // 进门前先把焦点放在一个门外、门收起后仍然存在的控件上
+    const gear = screen.getByTestId("settings-open");
+    gear.focus();
+
+    advance(IDLE_PROMPT_MS + IDLE_TICK_MS);
+    advance(PROMPT_GRACE_MS + IDLE_TICK_MS);
+    screen.getByTestId("session-gate");
+    vi.useRealTimers();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByTestId("session-gate-last"));
+    await screen.findByRole("alertdialog");
+    await user.click(screen.getByRole("button", { name: /确认是/ }));
+
+    expect(screen.queryByTestId("session-gate")).toBeNull();
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(gear);
   });
 });

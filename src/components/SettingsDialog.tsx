@@ -12,6 +12,7 @@ import type {
   UpdateCheckResult,
 } from "../api/types";
 import * as api from "../api";
+import { useModalFocus } from "../lib/focusTrap";
 import { withViewTransition } from "../lib/motion";
 import { validateWorkstation } from "../lib/validation";
 import { useNotify, useStore } from "../state/store";
@@ -39,6 +40,7 @@ export function SettingsDialog() {
   const [submitted, setSubmitted] = useState(false);
   const [busy, setBusy] = useState(false);
   const operatorRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
 
   const [version, setVersion] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
@@ -64,6 +66,28 @@ export function SettingsDialog() {
     () => withViewTransition(() => dispatch({ type: "settingsClosed" })),
     [dispatch],
   );
+
+  /**
+   * 真模态：Esc 关闭、Tab 圈在框内、开屏焦点落「操作人」、关闭还原到齿轮按钮。
+   *
+   * 圈定这一步此前是缺的：设置框开着时 Tab 会一路走到底下的侧栏与主区，
+   * 焦点停在被遮罩盖住、看不见的按钮上，回车照样把它执行掉。
+   * 本框还挂在 `.shell` 下、不在会话门 inert 的范围里，没有圈定时它就是
+   * 一条绕过会话门的键盘旁路。
+   *
+   * Esc 与遮罩点击在这里**故意不同**：遮罩点击有 dirty 拦截（NAS 路径手输
+   * 很长，误点一下丢掉很疼），Esc 是明确的「我要关」，照旧直接关。
+   *
+   * 必须声明在下面那条"重置表单"之前：effect 按声明序跑，本 hook 要在任何
+   * 别的 effect 把焦点搬走**之前**把触发者（顶栏齿轮）记下来，否则关闭时
+   * 还原的目标会是本框里那个正在被卸载的输入框，焦点照样掉进 body。
+   */
+  useModalFocus({
+    ref: dialogRef,
+    active: settingsOpen,
+    onEscape: close,
+    initialFocus: operatorRef,
+  });
 
   // 每次打开都以当前配置为准重置表单
   useEffect(() => {
@@ -193,15 +217,6 @@ export function SettingsDialog() {
     }
   }
 
-  useEffect(() => {
-    if (!settingsOpen) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close();
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [settingsOpen, close]);
-
   if (!settingsOpen) return null;
 
   // 已下载待安装：本次检查返回 ready，或后端此前推过 update-ready 通知
@@ -255,6 +270,8 @@ export function SettingsDialog() {
         role="dialog"
         aria-modal="true"
         aria-labelledby="settings-title"
+        ref={dialogRef}
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="dialog__title" id="settings-title">

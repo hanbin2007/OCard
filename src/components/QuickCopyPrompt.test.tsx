@@ -347,3 +347,38 @@ describe("快捷拷卡引导", () => {
     });
   });
 });
+
+/**
+ * 快捷拷卡引导是**非模态**浮层：卡插上了就在角落里说一声，人手上那件事
+ * 不该被打断。所以它既不圈定焦点、也不开屏抢焦点——但正因为如此，它绝不能
+ * 声称自己是模态。`aria-modal="true"` 配上一个不圈定的层，对读屏用户就是
+ * 一句谎话（读屏会当背景全被遮蔽，实际 Tab 照样走得出去）。
+ */
+describe("快捷拷卡引导：非模态浮层的分寸", () => {
+  it("不声称 aria-modal,也不用 dialog 语义——它本来就不圈定焦点", () => {
+    render(<App preloaded={{ ...base, quickCopyQueue: ["vol-untitled-3"] }} />);
+    const prompt = screen.getByTestId("quick-copy-prompt");
+
+    expect(prompt.getAttribute("aria-modal")).toBeNull();
+    expect(prompt.getAttribute("role")).toBe("region");
+    expect(prompt.querySelector('[aria-modal="true"]')).toBeNull();
+  });
+
+  it("不抢焦点,Tab 也走得出去:键盘不被一个非模态层拦住", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={{ ...base, quickCopyQueue: ["vol-untitled-3"] }} />);
+    const prompt = screen.getByTestId("quick-copy-prompt");
+
+    // 浮层在,但焦点没有被它抢走——人手上那件事不被打断
+    expect(prompt.contains(document.activeElement)).toBe(false);
+
+    // 焦点放进浮层末项后按 Tab,应当照常走出去(这里**不该**有圈定)
+    const items = Array.from(
+      prompt.querySelectorAll<HTMLElement>("button:not([disabled])"),
+    );
+    expect(items.length).toBeGreaterThan(0);
+    items[items.length - 1].focus();
+    await user.keyboard("{Tab}");
+    expect(prompt.contains(document.activeElement)).toBe(false);
+  });
+});

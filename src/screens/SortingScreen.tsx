@@ -50,12 +50,12 @@ import {
   selectAll,
   shouldYieldShortcut,
   toggleSelection,
-  trapTabFocus,
   type ActionOutcome,
   type JudgementFilter,
   type Selection,
   type SortingActionKind,
 } from "../lib/sorting";
+import { trapTabFocus } from "../lib/focusTrap";
 import {
   selectDeliveryWorking,
   selectLatestAnalyzeJob,

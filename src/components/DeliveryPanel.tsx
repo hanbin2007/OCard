@@ -5,7 +5,8 @@
  * 失败清单在界面内直接可见——不能只丢进铃铛让人自己去翻。
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useModalFocus } from "../lib/focusTrap";
 import { withViewTransition } from "../lib/motion";
 import * as api from "../api";
 import { isJobTerminal } from "../api/types";
@@ -242,6 +243,15 @@ function DeliveryProgress({
   /** 收进任务中心继续跑(评审 4.3):几十分钟的复制不该占死全屏 */
   onBackground: () => void;
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  /**
+   * 真模态：Tab 圈在框内、开屏取焦、关闭还原到触发者。
+   *
+   * **故意不接 Esc**：本层没有"关掉"这个语义——离开的路只有「取消打包」
+   * 与「转入后台」两条，各自有明确后果。Esc 悄悄关掉一个还在复制的作业面板，
+   * 用户会以为自己把作业取消了。不接就不接，绝不假装接管。
+   */
+  useModalFocus({ ref: dialogRef, active: true });
   return (
     <div className="overlay">
       <div
@@ -250,6 +260,8 @@ function DeliveryProgress({
         aria-modal="true"
         aria-label="交付打包进行中"
         data-testid="delivery-progress"
+        ref={dialogRef}
+        tabIndex={-1}
       >
         <h2 className="dialog__title">正在交付打包</h2>
         <p className="dialog__message">
@@ -319,6 +331,17 @@ function DeliveryResult({
   const notify = useNotify();
   const summary: DeliverySummary | null = job?.result ?? null;
   const cancelled = job?.state === "cancelled";
+  const dialogRef = useRef<HTMLDivElement>(null);
+  /**
+   * 真模态：Esc / 遮罩点击关闭、Tab 圈在框内、开屏取焦、关闭还原到触发者。
+   *
+   * 下面三个分支（已取消 / 失败 / 完成）互斥，同一次挂载只会渲染其中一个，
+   * 所以共用一个 ref 就够——`job` 到这里已是终态，分支不会中途改变。
+   *
+   * 结果面板可能是后台作业跑完自己弹出来的，那一刻的"触发者"就是用户当时
+   * 正在操作的控件；关闭后把焦点还回去，人才能接着刚才那步继续。
+   */
+  useModalFocus({ ref: dialogRef, active: true, onEscape: onClose });
 
   // 取消是终态且 result 为空：按快照计数如实说明已完成量
   if (cancelled) {
@@ -330,6 +353,8 @@ function DeliveryResult({
           aria-modal="true"
           aria-label="交付打包已取消"
           data-testid="delivery-result"
+          ref={dialogRef}
+          tabIndex={-1}
           onClick={(e) => e.stopPropagation()}
         >
           <h2 className="dialog__title">交付打包已取消</h2>
@@ -371,6 +396,8 @@ function DeliveryResult({
           aria-modal="true"
           aria-label="交付打包失败"
           data-testid="delivery-result"
+          ref={dialogRef}
+          tabIndex={-1}
           onClick={(e) => e.stopPropagation()}
         >
           <h2 className="dialog__title">交付打包失败</h2>
@@ -415,6 +442,8 @@ function DeliveryResult({
         aria-modal="true"
         aria-label="交付打包结果"
         data-testid="delivery-result"
+        ref={dialogRef}
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="dialog__title">交付打包完成</h2>

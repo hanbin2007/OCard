@@ -24,14 +24,11 @@ import {
   type AuditGroupFilter,
   type AuditRow,
 } from "../lib/audit";
+import { useModalFocus } from "../lib/focusTrap";
 import { withViewTransition } from "../lib/motion";
 import { useStore } from "../state/store";
 import { IconClose } from "./Icon";
 import { Badge, EmptyState } from "./ui";
-
-/** 抽屉里可获得焦点的元素——焦点圈按这个集合首尾相接 */
-const FOCUSABLE =
-  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 function AuditItem({ row, remote }: { row: AuditRow; remote: boolean }) {
   return (
@@ -159,57 +156,23 @@ export function AuditLogDrawer({
     };
   }, [projectId, reloadToken]);
 
-  /** 打开时焦点进抽屉，关闭时还给触发它的按钮——键盘用户不会掉回页首 */
-  useEffect(() => {
-    const previous = document.activeElement;
-    closeRef.current?.focus();
-    return () => {
-      if (previous instanceof HTMLElement && document.contains(previous)) {
-        previous.focus();
-      }
-    };
-  }, []);
-
   /**
-   * Esc 关闭 + Tab 焦点圈。
+   * 真模态：Esc 关闭、Tab 圈在抽屉内、开屏焦点落关闭按钮、关闭还原到入口按钮。
+   *
+   * 这三件事从前是本文件自己手写的一份（连可聚焦选择器都单独抄了一遍）。
+   * 现在改用 `lib/focusTrap` 的共用实现——同一套规矩只留一份，别的浮层补
+   * 圈定时不必再抄第四遍，也不会出现"某一层的 Tab 顺序跟别层不一样"。
    *
    * 焦点圈是模态的题中之义：抽屉打开时 Tab 不该跑回身后那张已经被遮住的表——
-   * 用户会以为焦点丢了。这里按首尾相接处理，Shift+Tab 反向同理。
+   * 用户会以为焦点丢了。关闭还原同理：焦点跟着卸载的抽屉掉进 body 之后，
+   * 键盘流整条断掉且屏上没有任何迹象。
    */
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        close();
-        return;
-      }
-      if (event.key !== "Tab") return;
-      const panel = panelRef.current;
-      if (!panel) return;
-
-      const focusables = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE));
-      if (focusables.length === 0) {
-        event.preventDefault();
-        return;
-      }
-      const first = focusables[0];
-      const last = focusables[focusables.length - 1];
-      const active = document.activeElement;
-      const inside = active instanceof Node && panel.contains(active);
-
-      if (event.shiftKey) {
-        if (!inside || active === first) {
-          event.preventDefault();
-          last.focus();
-        }
-      } else if (!inside || active === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [close]);
+  useModalFocus({
+    ref: panelRef,
+    active: true,
+    onEscape: close,
+    initialFocus: closeRef,
+  });
 
   const counts = useMemo(() => auditGroupCounts(rows, abnormalOnly), [rows, abnormalOnly]);
   /* 快捷过滤的计数按**当前分组**算：chip 上的数字就是点下去会剩几条，
@@ -230,6 +193,7 @@ export function AuditLogDrawer({
       <aside
         className="drawer"
         ref={panelRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-labelledby="audit-log-title"

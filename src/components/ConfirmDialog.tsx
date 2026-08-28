@@ -4,7 +4,8 @@
  * 默认动作永远是不删。
  */
 
-import { useCallback, useEffect, useRef, type ReactNode } from "react";
+import { useCallback, useRef, type ReactNode } from "react";
+import { useModalFocus } from "../lib/focusTrap";
 import { withViewTransition } from "../lib/motion";
 
 export interface ConfirmRequest {
@@ -34,6 +35,7 @@ export function ConfirmDialog({
   onCancel: () => void;
 }) {
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
 
   /**
    * 关闭走视图过渡：进场由 CSS 关键帧（缩放 + 淡入）负责，退场由这里淡出。
@@ -43,15 +45,25 @@ export function ConfirmDialog({
    */
   const close = useCallback(() => withViewTransition(onCancel), [onCancel]);
 
-  useEffect(() => {
-    if (!request) return;
-    cancelRef.current?.focus();
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close();
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [request, close]);
+  /**
+   * 真模态：Esc 取消、Tab 圈在框内、开屏焦点落「取消」、关闭还原到触发者。
+   *
+   * 少了圈定的实测后果：确认框开着时 Tab 会走到遮罩背后的控件上——被聚焦
+   * 却看不见的按钮按回车照样执行，而 `aria-modal="true"` 一直在**说**这里
+   * 是模态。破坏性动作的二次确认尤其不能有这种旁路。
+   *
+   * 取焦显式指向「取消」（而不是层内第一个可聚焦元素）：message 是 ReactNode，
+   * 调用方塞进清单式内容时里面可能出现链接/按钮，默认动作永远得是不删。
+   *
+   * 嵌套：本框常常开在别的浮层之上（会话门 z=80 → `--elevated` z=90）。
+   * 栈顶判定保证此刻只有本框收键，下面那层不会来抢焦点。
+   */
+  useModalFocus({
+    ref: dialogRef,
+    active: request !== null,
+    onEscape: close,
+    initialFocus: cancelRef,
+  });
 
   if (!request) return null;
 
@@ -66,6 +78,8 @@ export function ConfirmDialog({
         aria-modal="true"
         aria-labelledby="confirm-title"
         aria-describedby="confirm-message"
+        ref={dialogRef}
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="dialog__title" id="confirm-title">

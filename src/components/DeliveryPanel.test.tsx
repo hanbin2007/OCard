@@ -497,3 +497,104 @@ describe("DeliverySummary 类型未变（E2E 结果块语义）", () => {
     expect(screen.getByTestId("delivery-headline")).toBeDefined();
   });
 });
+
+/**
+ * 交付路径上的三个浮层都写着 `aria-modal="true"`，所以 Tab 必须真的圈在里面：
+ * 打包前的确认框、打包中的进度面板、打包完的结果面板。
+ *
+ * 一律走 `user.keyboard(...)`（派发到 `document.activeElement`；没被
+ * `preventDefault` 时 user-event 会真的把焦点移到下一个可聚焦元素）并直接断言
+ * `document.activeElement`——`fireEvent.keyDown(某元素, …)` 会绕过整条焦点链。
+ */
+describe("交付浮层：焦点圈定", () => {
+  function focusables(root: HTMLElement): HTMLElement[] {
+    return Array.from(
+      root.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+  }
+
+  it("确认框：开屏焦点落「取消」，Tab 圈在框内", async () => {
+    const user = await openWorkbench();
+    await user.click(screen.getByTestId("delivery-open"));
+    const dialog = await screen.findByRole("alertdialog");
+
+    // 默认动作永远是不动手：焦点押在「取消」上
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "取消" }),
+    );
+
+    const items = focusables(dialog);
+    items[items.length - 1].focus();
+    await user.keyboard("{Tab}");
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(items[0]);
+
+    await user.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(document.activeElement).toBe(items[items.length - 1]);
+  });
+
+  it("确认框：Esc 关闭后焦点还给「交付打包」按钮，不掉进 body", async () => {
+    const user = await openWorkbench();
+    const trigger = screen.getByTestId("delivery-open");
+    await user.click(trigger);
+    await screen.findByRole("alertdialog");
+
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("进度面板：开屏取焦，Tab 圈在面板内（背后的选片网格碰不到）", async () => {
+    const { user } = await startWith(
+      deliveryJob({ state: "running", done: 3, total: 769, result: undefined }),
+    );
+    const panel = await screen.findByTestId("delivery-progress");
+
+    const items = focusables(panel);
+    expect(items.length).toBeGreaterThan(1);
+    expect(document.activeElement).toBe(items[0]);
+
+    items[items.length - 1].focus();
+    await user.keyboard("{Tab}");
+    expect(panel.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(items[0]);
+
+    await user.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(document.activeElement).toBe(items[items.length - 1]);
+  });
+
+  it("进度面板：焦点被挪到面板外时，下一次 Tab 把它拽回来", async () => {
+    const { user } = await startWith(
+      deliveryJob({ state: "running", done: 3, total: 769, result: undefined }),
+    );
+    const panel = await screen.findByTestId("delivery-progress");
+
+    const outside = screen.getByTestId("settings-open");
+    outside.focus();
+    expect(document.activeElement).toBe(outside);
+
+    await user.keyboard("{Tab}");
+    expect(panel.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(focusables(panel)[0]);
+  });
+
+  it("结果面板：Tab 圈在面板内，Esc 关闭后焦点回到「交付打包」按钮", async () => {
+    const { user } = await startWith(deliveryJob());
+    const result = await screen.findByTestId("delivery-result");
+
+    const items = focusables(result);
+    expect(items.length).toBeGreaterThan(1);
+    items[items.length - 1].focus();
+    await user.keyboard("{Tab}");
+    expect(result.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(items[0]);
+
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByTestId("delivery-result")).toBeNull());
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(screen.getByTestId("delivery-open"));
+  });
+});

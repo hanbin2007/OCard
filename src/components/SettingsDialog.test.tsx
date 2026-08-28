@@ -532,3 +532,79 @@ describe("首跑引导", () => {
     expect(screen.getByTestId("settings-open")).toBeDefined();
   });
 });
+
+/**
+ * 设置对话框是**真**模态：`aria-modal="true"` 写在那儿，Tab 就必须圈在里面。
+ *
+ * 一律走 `user.keyboard("{Tab}")`（派发到 `document.activeElement`；没被
+ * `preventDefault` 时 user-event 会真的把焦点移到下一个可聚焦元素）并直接断言
+ * `document.activeElement`——`fireEvent.keyDown(某元素, …)` 会绕过整条焦点链，
+ * 本项目的焦点 bug 当初就是这么逃过测试的。
+ */
+describe("工作站设置：焦点圈定", () => {
+  /** 打开设置框并等异步探测落定（ffmpeg / 能力矩阵 / 版本号会改动可聚焦集合） */
+  async function openSettings() {
+    const user = userEvent.setup();
+    render(<App preloaded={configured} />);
+    await user.click(screen.getByTestId("settings-open"));
+    const dialog = screen.getByRole("dialog", { name: "工作站设置" });
+    await screen.findByTestId("settings-save");
+    return { user, dialog };
+  }
+
+  function focusables(dialog: HTMLElement): HTMLElement[] {
+    return Array.from(
+      dialog.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+  }
+
+  it("开屏焦点落在「操作人」输入框上", async () => {
+    await openSettings();
+    expect(document.activeElement).toBe(screen.getByTestId("settings-operator"));
+  });
+
+  it("末项按 Tab 回到首项：焦点跑不到遮罩背后的侧栏与主区", async () => {
+    const { user, dialog } = await openSettings();
+    const items = focusables(dialog);
+    expect(items.length).toBeGreaterThan(1);
+
+    items[items.length - 1].focus();
+    await user.keyboard("{Tab}");
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(items[0]);
+  });
+
+  it("首项按 Shift+Tab 回到末项", async () => {
+    const { user, dialog } = await openSettings();
+    const items = focusables(dialog);
+
+    items[0].focus();
+    await user.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(items[items.length - 1]);
+  });
+
+  it("焦点被挪到层外（顶栏齿轮）时，下一次 Tab 把它拽回框内", async () => {
+    const { user, dialog } = await openSettings();
+    const gear = screen.getByTestId("settings-open");
+    gear.focus();
+    expect(document.activeElement).toBe(gear);
+
+    await user.keyboard("{Tab}");
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(focusables(dialog)[0]);
+  });
+
+  it("Esc 关闭后焦点还给齿轮按钮，不掉进 body", async () => {
+    const { user } = await openSettings();
+    await user.keyboard("{Escape}");
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "工作站设置" })).toBeNull(),
+    );
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(screen.getByTestId("settings-open"));
+  });
+});
