@@ -20,7 +20,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { renderProjectsManager } from "../testUtils";
 import * as api from "../api";
 import { mockAuditLog, mockProjects, mockWorkstation } from "../api/mock";
-import { toAuditRows } from "../lib/audit";
+import { SCAN_POLICY_VERSION, toAuditRows } from "../lib/audit";
 import { formatTimestamp } from "../lib/format";
 
 afterEach(() => {
@@ -208,7 +208,11 @@ describe("事件列表", () => {
  * 对账的 DIT 据此去相机里格式化,卡上没备份的素材就没了。
  */
 describe("★ 部分拷贝在日志里的呈现", () => {
-  /** 后端 `COPY_COMPLETED` 的真实载荷形状（src-tauri/src/commands/tasks.rs） */
+  /**
+   * 后端 `COPY_COMPLETED` 的真实载荷形状（src-tauri/src/commands/tasks.rs）。
+   * `scanPolicyVersion` 是真载荷的一部分，缺了会同时踩中「旧扫描口径」标注，
+   * 把这一组要测的「范围」串成两件事（口径那一轴另见下一个 describe）。
+   */
   function completed(ts: string, sourceFolders: string[]) {
     return {
       ts,
@@ -221,6 +225,7 @@ describe("★ 部分拷贝在日志里的呈现", () => {
         allVerified: true,
         bytesCopied: 42 * 1024 ** 3,
         sourceFolders,
+        scanPolicyVersion: SCAN_POLICY_VERSION,
       },
     };
   }
@@ -278,6 +283,80 @@ describe("★ 部分拷贝在日志里的呈现", () => {
     const detail = within(items()[0]).getByTestId("audit-detail");
     expect(detail.textContent).toContain("卷根");
     expect(detail.textContent).not.toContain("（）");
+  });
+});
+
+/**
+ * ★ 升级前跑完的那批任务必须被标出来。
+ *
+ * 旧口径（以点开头一律跳过）下跑完的整卷任务，当时漏掉了卡上合法的点开头素材，
+ * 却报了 100% 完成 +「本卡可格式化」。`rebuild_tasks` 只重建未完成的清单，
+ * 那批任务不进 `list_copy_tasks`，续传告警也够不到——这份日志是它们唯一留下
+ * 痕迹的地方。不标，升级后那一行就还是一条无标注的绿色完成。
+ */
+describe("★ 旧扫描口径在日志里的标注", () => {
+  function done(ts: string, extra: Record<string, unknown>) {
+    return {
+      ts,
+      machine: mockWorkstation.machineId,
+      operator: mockWorkstation.operator,
+      kind: "copy_completed",
+      data: {
+        taskId: "t-1",
+        allVerified: true,
+        bytesCopied: 42 * 1024 ** 3,
+        ...extra,
+      },
+    };
+  }
+
+  async function openWithBoth() {
+    vi.spyOn(api, "listAuditLog").mockResolvedValue([
+      // 升级前跑完的:清单里根本没有 scanPolicyVersion
+      done("2026-08-24T11:00:00+08:00", {}),
+      done("2026-08-24T10:00:00+08:00", { scanPolicyVersion: SCAN_POLICY_VERSION }),
+    ] as unknown as AuditReply);
+    await openDrawer();
+    const [legacy, fresh] = items();
+    return { legacy, fresh };
+  }
+
+  it("★ 两行不能逐字相同，颜色也不能同为绿", async () => {
+    const { legacy, fresh } = await openWithBoth();
+    const detailOf = (el: HTMLElement) =>
+      within(el).getByTestId("audit-detail").textContent;
+
+    expect(detailOf(legacy)).not.toBe(detailOf(fresh));
+    expect(legacy.getAttribute("data-tone")).toBe("warn");
+    expect(fresh.getAttribute("data-tone")).toBe("ok");
+  });
+
+  it("旧口径写明当时跳过了什么、写明校验与「可格式化」不覆盖它们", async () => {
+    const { legacy } = await openWithBoth();
+    const detail = within(legacy).getByTestId("audit-detail");
+    // 一行放不下的部分挂在 title 上，不算丢
+    const full = detail.getAttribute("title") ?? "";
+    expect(full).toContain("旧口径 v0");
+    expect(full).toContain("「.」开头");
+    expect(full).toContain("可格式化");
+    // 诚实:不替用户断言这张卡一定漏了东西
+    expect(full).toContain("判断不了");
+    // 颜色不是信息:灰度/色觉障碍/截图转发之后只剩文字,抬头也要说清
+    expect(legacy.textContent).toContain("拷卡完成（旧扫描口径）");
+    expect(legacy.querySelector(".badge--warn")).not.toBeNull();
+    expect(legacy.querySelector(".badge--ok")).toBeNull();
+  });
+
+  it("升级后跑的那条不被误伤，仍是绿色的「拷卡完成」", async () => {
+    const { fresh } = await openWithBoth();
+    expect(fresh.textContent).toContain("拷卡完成");
+    expect(fresh.textContent).not.toContain("旧扫描口径");
+    expect(fresh.querySelector(".badge--ok")).not.toBeNull();
+  });
+
+  it("旧口径不是失败，不该被「只看失败与取消」捞进来", async () => {
+    const { legacy } = await openWithBoth();
+    expect(legacy.getAttribute("data-abnormal")).toBeNull();
   });
 });
 

@@ -7,6 +7,7 @@
  */
 
 import { cleanup, createEvent, fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SortingAsset, SortingCategory } from "../api/types";
 import {
@@ -455,6 +456,103 @@ describe("画廊模式：死键（评审 D1）", () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * B1：Enter / 空格落在本组件自己的按钮上时，归按钮
+ *
+ * 上一轮把 `shouldYieldShortcut` 铺到了网格 / 画廊 wrap / 组层 / 大图四处，
+ * **唯独漏了 GalleryView 自己这一份**。父层的让路挡不住本组件挂在子树上的
+ * bubble 处理器，于是四层里修了三层等于没修。
+ * 这一组用例刻意 `.focus()` + `user.keyboard(...)`（派发到 activeElement），
+ * 不用 `fireEvent.keyDown(根节点, …)` —— 后者绕过焦点链，正是这个 bug
+ * 逃过上一轮所有用例的原因。
+ * ------------------------------------------------------------------ */
+
+describe("画廊模式：不劫持已聚焦按钮的 Enter / 空格（评审 B1）", () => {
+  it("★ Tab 到分类按钮按回车：执行的是分类，不是弹出全屏大图", async () => {
+    const user = userEvent.setup();
+    const { handlers } = renderGallery();
+
+    const assign = screen.getByTestId("gallery-assign") as HTMLButtonElement;
+    assign.focus();
+    expect(document.activeElement).toBe(assign);
+
+    await user.keyboard("{Enter}");
+
+    // 旧行为：Enter 被判成 preview → onOpenFullscreen + preventDefault +
+    // stopPropagation，按钮**完全不执行**，反而弹出一张全屏大图
+    expect(handlers.onAssign).toHaveBeenCalledWith("cat-boss");
+    expect(handlers.onOpenFullscreen).not.toHaveBeenCalled();
+  });
+
+  it("★ 空格落在「标删」按钮上同样归按钮", async () => {
+    const user = userEvent.setup();
+    const { handlers } = renderGallery();
+
+    const del = screen.getByTestId("gallery-toggle-delete") as HTMLButtonElement;
+    del.focus();
+    await user.keyboard(" ");
+
+    expect(handlers.onToggleDelete).toHaveBeenCalledTimes(1);
+    expect(handlers.onOpenFullscreen).not.toHaveBeenCalled();
+  });
+
+  it("★ 回执上的「知道了」按回车真的关掉它，而不是开全屏", async () => {
+    const user = userEvent.setup();
+    const { handlers } = renderGallery();
+
+    press("x"); // 先造一条回执出来
+    const dismiss = screen.getByTestId("gallery-notice-dismiss") as HTMLButtonElement;
+    dismiss.focus();
+    await user.keyboard("{Enter}");
+
+    expect(screen.queryByTestId("gallery-notice")).toBeNull();
+    expect(handlers.onOpenFullscreen).not.toHaveBeenCalled();
+  });
+
+  it("只让 Enter / 空格：焦点在按钮上按 D 仍然是打标键，键盘流不整条停摆", async () => {
+    const user = userEvent.setup();
+    const { handlers } = renderGallery();
+
+    (screen.getByTestId("gallery-assign") as HTMLButtonElement).focus();
+    await user.keyboard("d");
+
+    expect(handlers.onToggleDelete).toHaveBeenCalledTimes(1);
+  });
+
+  // 输入类目标（INPUT / TEXTAREA / **SELECT** / contentEditable）让路的是所有键，
+  // 这条口径由 lib/sorting.test.ts 的 shouldYieldShortcut 用例锁死；
+  // 本组件只需保证走的是同一个函数，不再自带一份漏了 SELECT 的判定。
+});
+
+/* ------------------------------------------------------------------ *
+ * B2：把根节点交出去，上层才交接得了键盘焦点
+ * ------------------------------------------------------------------ */
+
+describe("画廊模式：根节点交给上层（评审 B2）", () => {
+  it("★ rootNodeRef 拿到的就是能收键盘的那个节点，focus 之后方向键立刻可用", () => {
+    const rootNodeRef: { current: HTMLDivElement | null } = { current: null };
+    const { handlers } = renderGallery({ cursorId: ASSETS[0].id, rootNodeRef });
+
+    expect(rootNodeRef.current).toBe(screen.getByTestId("gallery-view"));
+
+    // 模拟上层在浮层收起后把焦点交回来
+    (document.activeElement as HTMLElement | null)?.blur();
+    rootNodeRef.current?.focus();
+    expect(document.activeElement).toBe(screen.getByTestId("gallery-view"));
+
+    fireEvent.keyDown(document.activeElement as HTMLElement, { key: "ArrowRight" });
+    expect(handlers.onCursorChange).toHaveBeenCalledWith(ASSETS[1].id);
+  });
+
+  it("卸载时把 ref 置空，不给上层留野指针", () => {
+    const rootNodeRef: { current: HTMLDivElement | null } = { current: null };
+    const { unmount } = renderGallery({ rootNodeRef });
+    expect(rootNodeRef.current).not.toBeNull();
+    unmount();
+    expect(rootNodeRef.current).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * D2：分页边界不许说谎，也不许静默停住
  * ------------------------------------------------------------------ */
 
@@ -550,6 +648,98 @@ describe("画廊模式：分页边界（评审 D2）", () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * D1：筛选态下总数是**不可知**的，不许拿全库 total 冒充
+ * ------------------------------------------------------------------ */
+
+describe("画廊模式：筛选态的总数口径（评审 D1）", () => {
+  it("★ 位置栏只说命中数与未加载数，绝不写「共 M 张」", () => {
+    renderGallery({ unloadedCount: 1040 });
+    const text = screen.getByTestId("gallery-position").textContent ?? "";
+
+    expect(text).toContain("第 1 张");
+    expect(text).toContain("当前筛选已命中 3 张");
+    expect(text).toContain("1040 张未加载");
+    expect(text).toContain("能命中多少未知");
+    // 「共 N 张」在筛选态下一律是谎话：命中总数根本没人知道
+    expect(text).not.toContain("共 ");
+  });
+
+  it("★ 翻到末尾不许说「已经是最后一张」——后面还有没检查过的素材", () => {
+    const onEndReached = vi.fn<() => void>();
+    renderGallery({ cursorId: ASSETS[2].id, unloadedCount: 1040, onEndReached });
+
+    press("ArrowRight");
+
+    expect(onEndReached).toHaveBeenCalledTimes(1);
+    const notice = screen.getByTestId("gallery-notice").textContent ?? "";
+    expect(notice).not.toContain("已经是最后一张");
+    expect(notice).toContain("库里还有 1040 张未加载");
+    expect(notice).toContain("能命中多少未知");
+    expect(notice).toContain("已请求继续加载");
+  });
+
+  it("筛选态但已经全部加载完（unloadedCount=0）：命中数就是准数，照常说「共 N 张」", () => {
+    renderGallery({ unloadedCount: 0 });
+    expect(screen.getByTestId("gallery-position").textContent).toContain("共 3 张");
+    expect(screen.queryByTestId("gallery-strip-more")).toBeNull();
+  });
+
+  it("胶片条的 aria-label 也改口，不把库存说成筛选结果", () => {
+    renderGallery({ unloadedCount: 1040 });
+    expect(screen.getByTestId("gallery-strip").getAttribute("aria-label")).toBe(
+      "胶片条，当前筛选已命中 3 张，库里还有 1040 张未加载",
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * D2：虚拟化 listbox 的集合位置语义
+ * ------------------------------------------------------------------ */
+
+describe("画廊模式：虚拟化 option 的集合位置（评审 D2）", () => {
+  const MANY_D2 = Array.from({ length: 1000 }, (_, i) =>
+    makeAsset(`待分类/N${String(i).padStart(4, "0")}.CR3`),
+  );
+
+  it("★ 每一格自报 aria-posinset：读屏不许按当前挂载的二十几个节点数序号", () => {
+    renderGallery({ assets: MANY_D2, cursorId: MANY_D2[900].id });
+
+    const options = screen.getAllByRole("option");
+    // 窗口化之后 DOM 里只有二十几格,序号却必须是它在**整个集合**里的位置
+    expect(options.length).toBeLessThanOrEqual(40);
+    for (const option of options) {
+      const at = Number(option.getAttribute("data-index"));
+      expect(option.getAttribute("aria-posinset")).toBe(String(at + 1));
+    }
+    const active = document.getElementById(
+      screen.getByTestId("gallery-strip").getAttribute("aria-activedescendant") as string,
+    );
+    expect(active?.getAttribute("aria-posinset")).toBe("901");
+  });
+
+  it("★ aria-setsize 报的是集合总数，而不是当前挂载的格数", () => {
+    renderGallery({ assets: MANY_D2, cursorId: MANY_D2[0].id });
+    for (const option of screen.getAllByRole("option")) {
+      expect(option.getAttribute("aria-setsize")).toBe("1000");
+    }
+  });
+
+  it("分页未拉完时 setsize 用**同口径的库存总数**，不是已加载数", () => {
+    renderGallery({ total: 1240 });
+    for (const option of screen.getAllByRole("option")) {
+      expect(option.getAttribute("aria-setsize")).toBe("1240");
+    }
+  });
+
+  it("★ 总数不可知（筛选 + 还有未加载）时报 -1，这是 WAI-ARIA 的未知总量口径", () => {
+    renderGallery({ unloadedCount: 1040 });
+    for (const option of screen.getAllByRole("option")) {
+      expect(option.getAttribute("aria-setsize")).toBe("-1");
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * D3：胶片条窗口化与 memo
  * ------------------------------------------------------------------ */
 
@@ -632,6 +822,7 @@ describe("画廊模式：胶片条窗口化（评审 D3）", () => {
       selected: false,
       marked: false,
       curated: false,
+      setSize: 3,
       registerShot,
       onPick: vi.fn<(id: string, index: number) => void>(),
       onThumbError: vi.fn<() => void>(),

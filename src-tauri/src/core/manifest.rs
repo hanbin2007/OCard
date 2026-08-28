@@ -47,6 +47,22 @@ fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// 当前的**扫描策略版本**(源卷上「什么算素材」的口径版本)。
+///
+/// - `0`(清单里缺字段)= **旧口径**:以点开头的条目一律跳过。这一版会漏拷卡上
+///   合法的点开头素材(`.clip.mov`、被误设隐藏属性的素材、用户自建的隐藏素材夹),
+///   而整卷任务照样报 100% 与「本卡可格式化」——**漏拷却报成功**。
+/// - `1` = 当前口径:只排除 `core::copy` 里明确列举的系统项(废纸篓、索引、
+///   NAS 记账目录、本工具自己的临时名),其余点开头的条目照拷。
+///
+/// 口径**再变**就必须递增,并同步更新 `commands::policy_upgrade_caveat` 的措辞:
+/// 这个数字是续传告警区分「策略升级」与「卡上真的变了」的唯一证据。
+pub const SCAN_POLICY_VERSION: u32 = 1;
+
 impl PlannedFile {
     /// 由引擎计划项生成持久化项:源与目标相同(整卷)时不落 `source_rel`,
     /// 让整卷任务的 manifest 与改造前保持同样的字节形态。
@@ -125,6 +141,20 @@ pub struct CopyManifest {
     /// 源卡身份指纹(卡根 .ocard-volume-id);写保护卡为 None,退化为卷名匹配。
     #[serde(default)]
     pub source_uid: Option<String>,
+    /// 锁定这份清单时用的**扫描策略版本**(见 [`SCAN_POLICY_VERSION`])。
+    ///
+    /// R13 C6:老清单没有这个字段,反序列化为 `0` = **旧口径**(「以点开头一律
+    /// 跳过」)。它是唯一能把「点开头的条目这次才出现」的两种原因分开的证据:
+    /// 策略升级 vs 卡上真的新增了文件。没有它,续传告警只能靠形状猜,而猜错的
+    /// 那一半会让用户放过一次真实的源卷变更(说错原因比不说更糟)。
+    ///
+    /// 更要紧的是**升级前就已经 `completed: true`** 的整卷任务:它当时按旧口径
+    /// 漏拷了点开头的素材、却报了 100% 与「本卡可格式化」。`rebuild_tasks` 只重建
+    /// 未完成的清单,两条续传告警都够不到它——那一行「绿色」是旧口径留下的假绿。
+    /// 版本号落在清单里并经 `CopyTaskDto.scan_policy_version` 暴露给前端,
+    /// 界面才有可能把这类记录标注出来。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub scan_policy_version: u32,
     pub created_at: DateTime<Utc>,
     pub completed: bool,
     /// 拷完自动转代理意图(M3 T1.5;intent ID 即 manifest id)。
@@ -163,6 +193,8 @@ impl CopyManifest {
             hidden_skipped: 0,
             hidden_samples: Vec::new(),
             source_uid: None,
+            // 新清单一律记下当前口径:事后才分得清「点开头的条目为什么这次才出现」
+            scan_policy_version: SCAN_POLICY_VERSION,
             created_at: Utc::now(),
             completed: false,
             auto_proxy: false,

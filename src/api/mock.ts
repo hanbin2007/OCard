@@ -459,8 +459,18 @@ export function mockSourceFolders(_volumeId: string): SourceFolder[] {
  * 与后端同一套规则：扁平化后同名的那一组，从最深一级目录名起逐级向上
  * 追加前缀，直到组内唯一（最短可区分前缀）；不冲突的名字一个字都不改。
  * `folders` 为空 = 整卷，整卷保留原层级、不会撞名，故改名清单恒为空。
+ *
+ * `_confirmInstanceId` 收下但**故意不用**——这是契约的一部分，不是漏实现：
+ * 它在真后端那里只决定「哪个计划快照占哪个槽」，对**返回的计划本身**必须零影响。
+ * 一旦让它参与 `planDigest`，同一张卡、同一份勾选就会因为换了个确认屏而算出
+ * 不同的令牌，开拷时被判成「计划变了」——那是凭空造出来的 `PLAN_CHANGED`。
+ * 参数留在签名里是为了让 mock 与真 IPC 的形状一致，浏览器/测试路径不会漏传。
  */
-export function mockSourcePlan(_volumeId: string, folders: string[]): SourcePlan {
+export function mockSourcePlan(
+  _volumeId: string,
+  folders: string[],
+  _confirmInstanceId?: string,
+): SourcePlan {
   if (folders.length === 0) {
     const all = MOCK_SOURCE_TREE.flatMap((e) => e.files);
     return {
@@ -1024,6 +1034,8 @@ export const mockAuditLog: AuditEventDto[] = [
       totalBytes: 118 * GB,
       durationSec: 2241,
       verified: true,
+      // 新口径下跑的：这一行才是一条可以照单全收的绿色完成
+      scanPolicyVersion: 1,
     },
   },
   {
@@ -1037,6 +1049,7 @@ export const mockAuditLog: AuditEventDto[] = [
       fileCount: 962,
       totalBytes: 118 * GB,
       destinations: 2,
+      scanPolicyVersion: 1,
     },
   },
   {
@@ -1050,6 +1063,9 @@ export const mockAuditLog: AuditEventDto[] = [
       totalBytes: 411.6 * GB,
       durationSec: 2804,
       verified: true,
+      // 刻意**不带** scanPolicyVersion:这就是升级前跑完的那批任务的形状。
+      // 界面必须把它标成「旧扫描口径」——当时点开头的条目一律被跳过,
+      // 而它照样报了完成。开发期在浏览器里就该看得见这个标注长什么样。
     },
   },
   {
@@ -1074,6 +1090,7 @@ export const mockAuditLog: AuditEventDto[] = [
       fileCount: 1284,
       totalBytes: 412 * GB,
       destinations: 2,
+      // 与上面那条 09:58 的完成同属升级前的一次任务:同样刻意不带版本号
     },
   },
 ];

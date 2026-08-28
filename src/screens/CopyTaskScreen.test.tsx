@@ -1276,6 +1276,142 @@ describe("★ E1 双确认屏绑定不可变草稿", () => {
   }, 20000);
 });
 
+/**
+ * ★ 确认页实例 id（`confirmInstanceId`，契约 2026-08-28）。
+ *
+ * 后端只留最近 16 份计划快照，按这个 id **替换**同一屏确认页的旧计划。
+ * 快照是 `PLAN_CHANGED` 报文说得出「多了哪几个文件」「勾选差在哪」的唯一来源，
+ * 被挤掉就只剩泛化原因——而「说错原因比不说更糟」这条是后端整轮工作的前提。
+ *
+ * 所以这一组盯两件事：**每次核算都带上它**，且它的生命周期跟着「用户还站不站
+ * 在同一屏确认页上」走，而不是跟着核算次数走。
+ */
+describe("★ 确认页实例 id（confirmInstanceId）", () => {
+  async function enterConfirm(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(screen.getByRole("radio", { name: "选择源卷 NIKON_Z9" }));
+    await addTag(user, "下午径赛");
+    await fillDestinations(user);
+    await user.click(screen.getByRole("button", { name: "开始拷卡" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("confirm-target-folder").textContent).not.toBe(
+        "解析中…",
+      ),
+    );
+  }
+
+  /** 每次 planSourceSelection 调用报上去的那个 id（第三个实参） */
+  function reportedIds(spy: { mock: { calls: readonly unknown[][] } }) {
+    return spy.mock.calls.map((call) => call[2] as string | undefined);
+  }
+
+  it("★ 每次核算都带上一个非空 id，且它不混进 startCopyTask 的提交体", async () => {
+    const user = userEvent.setup();
+    const planSpy = vi.spyOn(api, "planSourceSelection");
+    const startSpy = vi.spyOn(api, "startCopyTask");
+
+    render(<App preloaded={preloaded} />);
+    await enterConfirm(user);
+    await confirmReady();
+
+    expect(planSpy).toHaveBeenCalled();
+    for (const id of reportedIds(planSpy)) {
+      // 不传也能用,但后端会退化成「按时间淘汰」,PLAN_CHANGED 只剩泛化原因
+      expect(typeof id).toBe("string");
+      expect(id).toBeTruthy();
+    }
+
+    await user.click(screen.getByTestId("copy-confirm-start"));
+    await waitFor(() => expect(startSpy).toHaveBeenCalled());
+    // 它只是后端计划快照的一把钥匙:不参与令牌、不进 manifest、不进提交体
+    expect(startSpy.mock.calls[0][0]).not.toHaveProperty("confirmInstanceId");
+  }, 20000);
+
+  it("★ 屏内「重试核算」复用同一个 id：同一屏确认页不该占掉第二个快照槽", async () => {
+    const user = userEvent.setup();
+    const planSpy = vi
+      .spyOn(api, "planSourceSelection")
+      .mockRejectedValueOnce(new Error("卡上目录读不动"));
+
+    render(<App preloaded={preloaded} />);
+    await enterConfirm(user);
+    await screen.findByTestId("copy-plan-error");
+
+    await user.click(screen.getByTestId("copy-plan-retry"));
+    await waitFor(() => expect(planSpy.mock.calls.length).toBeGreaterThanOrEqual(2));
+
+    const ids = reportedIds(planSpy);
+    expect(ids[0]).toBeTruthy();
+    expect(new Set(ids).size, `多占了槽：${JSON.stringify(ids)}`).toBe(1);
+  }, 20000);
+
+  /**
+   * ★ 生命周期判据：`PLAN_CHANGED` 之后 requestId 会换发（作废在飞的旧响应），
+   * 但用户**根本没离开这一屏确认页**，instance id 必须原样保留。
+   *
+   * 换新 id 的后果是把一份刚被判定不成立、已经死掉的快照留在 16 格缓存里等 TTL，
+   * 还可能顺手挤掉别的确认屏正在用的活快照——让**那一屏**将来的 PLAN_CHANGED
+   * 只说得出泛化原因。这正是这个参数存在的理由。
+   */
+  it("★ PLAN_CHANGED 重新核算时 id 不变：用户还站在同一屏确认页上", async () => {
+    const user = userEvent.setup();
+    const planSpy = vi.spyOn(api, "planSourceSelection");
+    const startSpy = vi
+      .spyOn(api, "startCopyTask")
+      .mockRejectedValue(
+        new Error("PLAN_CHANGED: 卡上的内容在你确认之后发生了变化,请重新核对"),
+      );
+
+    render(<App preloaded={preloaded} />);
+    await enterConfirm(user);
+    await confirmReady();
+    const before = planSpy.mock.calls.length;
+
+    await user.click(screen.getByTestId("copy-confirm-start"));
+    await screen.findByTestId("copy-plan-changed");
+    // 退回确认屏必然要重新核算一次,让用户看到的是新真值
+    await waitFor(() => expect(planSpy.mock.calls.length).toBeGreaterThan(before));
+
+    const ids = reportedIds(planSpy);
+    expect(ids.length).toBeGreaterThanOrEqual(2);
+    // 「都没传」也会让下面那条 Set 断言过关,所以先钉死「确实报了 id」
+    expect(ids.every((id) => typeof id === "string" && id.length > 0)).toBe(true);
+    expect(new Set(ids).size, `换了 id：${JSON.stringify(ids)}`).toBe(1);
+    expect(startSpy).toHaveBeenCalledTimes(1);
+  }, 20000);
+
+  it("★ 「返回修改」再进来是另一屏确认页：必须换一个 id", async () => {
+    const user = userEvent.setup();
+    const planSpy = vi.spyOn(api, "planSourceSelection");
+
+    render(<App preloaded={preloaded} />);
+    await enterConfirm(user);
+    await confirmReady();
+
+    await user.click(screen.getByRole("button", { name: "返回修改" }));
+    await user.click(screen.getByRole("button", { name: "开始拷卡" }));
+    await waitFor(() => expect(planSpy.mock.calls.length).toBeGreaterThanOrEqual(2));
+
+    const ids = reportedIds(planSpy);
+    expect(ids[0]).toBeTruthy();
+    expect(ids[ids.length - 1]).toBeTruthy();
+    expect(ids[ids.length - 1]).not.toBe(ids[0]);
+  }, 20000);
+
+  it("mock 守同一条契约：id 不参与 planDigest，换一屏不会凭空造出 PLAN_CHANGED", async () => {
+    // 一旦让 id 参与令牌,同一张卡、同一份勾选就会因为换了个确认屏而算出不同的
+    // 令牌,开拷时被判成「计划变了」——那是无中生有的 PLAN_CHANGED
+    const folders = ["DCIM/100MSDCF"];
+    const a = await api.planSourceSelection("vol-untitled-2", folders, "confirm-A");
+    const b = await api.planSourceSelection("vol-untitled-2", folders, "confirm-B");
+    const none = await api.planSourceSelection("vol-untitled-2", folders);
+
+    expect(a.planDigest).toBeTruthy();
+    expect(b.planDigest).toBe(a.planDigest);
+    expect(none.planDigest).toBe(a.planDigest);
+    expect(b.fileCount).toBe(a.fileCount);
+  });
+});
+
 describe("★ E2 文件夹扫描结果按卷归属", () => {
   /** 两张卡给两份完全不同的目录清单，谁的结果串台一眼可辨 */
   const Z9_FOLDERS = [

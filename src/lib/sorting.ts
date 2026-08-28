@@ -294,6 +294,17 @@ export const initialPendingDelete: PendingDeleteState = {
 export type PendingDeleteAction =
   | { type: "mark"; assetIds: string[] }
   | { type: "unmark"; assetIds: string[] }
+  /**
+   * 这些素材**已经离开待分类夹**（被分类移走 / 已进回收站）。
+   *
+   * 与 `unmark` 的差别不是语义修饰，而是两件不同的事：`unmark` 是「用户改主意」，
+   * 提交进行中理应挡下；`prune` 是「文件已经不在那儿了」，任何时候都必须生效。
+   * 漏掉它的后果是实测过的：按 D 标删 A、再按 1 把 A 分类走，A 仍挂在
+   * 「已标记 N 个待删除」上——「只看已标删」筛出来是空的，Shift+D 提交时
+   * `trashAssets` 对 A 必然失败，而失败项按设计**永久留在清单里**，
+   * 用户除了「取消标记」清空全部之外无法单独摘掉它。
+   */
+  | { type: "prune"; assetIds: string[] }
   | { type: "clear" }
   | { type: "requestConfirm" }
   | { type: "cancelConfirm" }
@@ -332,6 +343,28 @@ export function pendingDeleteReducer(
       const marked = state.marked.filter((id) => !gone.has(id));
       return {
         phase: marked.length > 0 ? "marked" : "idle",
+        marked,
+        failed: state.failed.filter((f) => !gone.has(f.assetId)),
+      };
+    }
+
+    case "prune": {
+      /*
+       * 不受 working 态阻挡（这是它与 unmark 的**唯一**理由）。
+       * phase 也不在这里从 working / confirming 掉下来：提交还在飞、
+       * 或确认框还开着，收尾归 commitFinished / cancelConfirm 管，
+       * 半路改 phase 会让「只有确认过才能下发」这条不变量出现缺口。
+       */
+      const gone = new Set(action.assetIds);
+      const hit =
+        state.marked.some((id) => gone.has(id)) ||
+        state.failed.some((f) => gone.has(f.assetId));
+      // 没命中就返回原对象：绝大多数批量操作与待删清单无关，别白白推一次渲染
+      if (!hit) return state;
+      const marked = state.marked.filter((id) => !gone.has(id));
+      const settled = state.phase === "working" || state.phase === "confirming";
+      return {
+        phase: settled ? state.phase : marked.length > 0 ? "marked" : "idle",
         marked,
         failed: state.failed.filter((f) => !gone.has(f.assetId)),
       };

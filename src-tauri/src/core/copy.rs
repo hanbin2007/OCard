@@ -115,13 +115,23 @@ const SYSTEM_SAMPLE_CAP: usize = 5;
 /// 的信号——**漏拷却报成功**是这个工具最不能接受的失败形态。可见告警只能缓解,
 /// 不能替代拷对。所以只排除下面这些「确定不是素材」的东西,其余点开头的条目照拷。
 ///
-/// 每一项都写成 [`target_name_key`] 归一后的形态(NFC + 全小写):exFAT/APFS 上
-/// `.ds_store` 与 `.DS_Store` 是同一个文件,比对必须大小写不敏感,不能按字节比。
-/// `system_item_names_are_already_normalized` 这个测试守住这条不变式——写了个
-/// 大写条目却永不命中,是最难发现的一类失效。
+/// 每一项都写成 [`target_name_key`] 归一后的形态(Unicode 规范等价 + 大小写折叠):
+/// exFAT/APFS 上 `.ds_store` 与 `.DS_Store` 是同一个文件,比对必须大小写不敏感,
+/// 不能按字节比。`system_item_names_are_already_normalized` 这个测试守住这条
+/// 不变式——写了个大写条目却永不命中,是最难发现的一类失效。
+///
+/// **加条目的门槛(方向性)**:这张表加错的方向是**漏拷**,所以门槛是「确定不是
+/// 素材」**且**「现实中真的会出现在扫描范围里」。据此复核后**没有**加入
+/// `LOST.DIR`(Android fsck 恢复目录)与 `FOUND.000`/`*.CHK`(chkdsk 恢复片段)
+/// ——它们里面可能就是恢复出来的素材片段,多拷不是漏拷。
 const SYSTEM_ITEM_NAMES: &[&str] = &[
     // ---- macOS 在卷上留下的系统目录/文件:全是操作系统自己的记账,没有素材 ----
-    ".trashes",                // `.Trashes`:卷级废纸篓,里面是用户**已经删掉**的东西
+    ".trashes", // `.Trashes`:卷级废纸篓,里面是用户**已经删掉**的东西
+    // `$topdir/.Trash/$uid`:freedesktop.org Trash Specification 给可移动盘定义的
+    // **共享**回收站(与按 uid 分的 `.Trash-$uid` 并列,是规范里的另一半)。漏掉它
+    // 的后果不是多拷:已删除的素材连同 `.trashinfo` 会被当素材备份、甚至交付出去
+    // ——既是隐私泄漏(用户明确删掉的东西又回来了)也是容量膨胀。
+    ".trash",
     ".fseventsd",              // `.fseventsd`:FSEvents 文件系统事件日志数据库
     ".spotlight-v100",         // `.Spotlight-V100`:Spotlight 索引数据库
     ".temporaryitems",         // `.TemporaryItems`:系统临时文件暂存区
@@ -142,29 +152,74 @@ const SYSTEM_ITEM_NAMES: &[&str] = &[
     ".appledb",      // netatalk 的 AFP 数据库
     ".appledesktop", // netatalk 的 AFP 桌面数据库
     ".apdisk",       // macOS 写在共享卷根的 AFP/Time Machine 卷配置
+    // ---- 本工具自己在卡上/项目里的落盘:必须**精确名**,不能写成 `.ocard` 前缀 ----
+    // R13 P0:`.ocard` 曾经躺在 `SYSTEM_ITEM_PREFIXES` 里,于是卡上的
+    // `.ocardinal.mov`、`.ocard-notes.txt`、`.ocard_backup/` 整个不进计划,
+    // 而告警还断言它们「不是素材」、整卷任务照样给「本卡可格式化」——正是
+    // 「形状判据兜底 → 漏拷却报成功」这条铁律禁止的东西,只是范围小了一点。
+    // 本工具真正会落在扫描范围里的名字只有下面两个,逐个列全即可。
+    // (本工具的**临时**文件名走 `SYSTEM_ITEM_SUFFIXES`,身份写在尾巴上。)
+    ".ocard",           // 项目元数据目录(manifest/journal/trash/settings)
+    ".ocard-volume-id", // 卡根的身份指纹文件
 ];
 
-/// 前缀式的系统项:名字带可变尾巴,只能按前缀认。同样是归一后(NFC + 全小写)的形态。
+/// 真·前缀式的系统项:尾巴是**原文件名**,长什么样完全由用户决定,除了前缀之外
+/// 没有任何可校验的形状。同样是归一后([`target_name_key`])的形态。
 ///
-/// 前缀是**不得已**才用的——它比精确列举更容易误伤,所以只有下面这几条,且每条的
-/// 命名空间都明确属于某个系统/本工具,不会和相机产出的文件名撞上。
+/// 这张表只允许放「尾巴不可预测」的条目——尾巴有规范形状的一律去
+/// [`SYSTEM_ITEM_TAILED`],只比前缀就是 `.ocard` 那条 P0 的同型错误。
 const SYSTEM_ITEM_PREFIXES: &[&str] = &[
     // `._DSC0001.JPG`:AppleDouble 伴生文件。macOS 往非 HFS 卷(exFAT 卡)写文件时,
-    // 把资源分支与扩展属性拆出来存进 `._` + 原名 的文件里。它是**伴生元数据**、
-    // 不是素材本体,拷到目的地也没有对应语义,只会凭空多出一堆同名影子文件。
+    // 把资源分支与扩展属性拆出来存进 `._` + **原文件名** 的文件里。尾巴就是素材自己
+    // 的名字(`DSC0001.JPG`),没有任何形状可校验,所以只能按前缀认——这也是它
+    // 与 `.ocard` 的根本区别。它是**伴生元数据**、不是素材本体,拷到目的地也没有
+    // 对应语义,只会凭空多出一堆同名影子文件。
     "._",
-    // `.ocard-volume-id`(卡身份指纹)、`.ocard`(项目元数据目录)——本工具自己的落盘。
-    // 不排除的话,同一张卡第二次拷会把上次写下的指纹当素材拷进目标夹。
-    ".ocard",
-    // `.Trash-1000`:freedesktop.org 规范的按 uid 分的回收站,Linux 机器在可移动卷上
-    // 删文件时生成。同样是「用户已经删掉的东西」。
-    ".trash-",
-    // `.smbdeleteAAA0f4a.4`:SMB 上删除一个仍被打开的文件时,服务端先把它改成这个
-    // 名字挂着。它是**已经被删掉**的东西的残骸,不是素材。
-    ".smbdelete",
-    // `.nfs0000000000e1a3`:NFS 的 silly-rename,语义同上。
-    ".nfs",
 ];
+
+/// 「命名空间前缀 + 规范定死的尾巴」式系统项。
+///
+/// 与 [`SYSTEM_ITEM_PREFIXES`] 的区别:这些条目的尾巴是**机器生成的令牌**,
+/// 形状由各自的规范/实现定死。既然形状是已知的,就必须一并校验——只比前缀会把
+/// `.trash-notes.txt`、`.nfs-交接单.txt` 这类用户文件一起静默吞掉,而那正是
+/// R13 P0(`.ocard` 前缀)的同型错误。
+///
+/// 每条给出:前缀、尾巴允许的字符集、尾巴最短长度。
+const SYSTEM_ITEM_TAILED: &[(&str, TailShape, usize)] = &[
+    // `.Trash-1000`:freedesktop.org Trash Specification 里按 uid 分的回收站。
+    // 规范写死尾巴就是 `$uid`——纯十进制数字,一位起。
+    (".trash-", TailShape::Digits, 1),
+    // `.smbdeleteAAA0f4a.4`:SMB 上删除一个仍被打开的文件时,服务端先把它改名挂着。
+    // 尾巴是 Samba 自己拼的不透明令牌(字母/数字/点),不同版本长度不同,故只约束
+    // 字符集与最短长度。它是**已经被删掉**的东西的残骸,不是素材。
+    (".smbdelete", TailShape::AlnumDot, 4),
+    // `.nfs0000000000e1a3`:NFS 客户端的 silly-rename(删一个仍被打开的文件)。
+    // Linux 实现拼的是 `.nfs` + 定长十六进制,故尾巴必须全是十六进制且不短于 8 位
+    // ——`.nfs` 三个字母太短,不加形状约束会误伤用户文件。
+    (".nfs", TailShape::Hex, 8),
+];
+
+/// 系统项尾巴允许的字符集(判据作用在 [`target_name_key`] 归一后的键上,
+/// 因此只需覆盖小写形态)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailShape {
+    /// 纯十进制数字(freedesktop 的 `$uid`)
+    Digits,
+    /// 十六进制数字(NFS silly-rename 的定长令牌)
+    Hex,
+    /// 字母/数字/点(Samba 的不透明令牌)
+    AlnumDot,
+}
+
+impl TailShape {
+    fn allows(self, c: char) -> bool {
+        match self {
+            Self::Digits => c.is_ascii_digit(),
+            Self::Hex => c.is_ascii_hexdigit(),
+            Self::AlnumDot => c.is_ascii_alphanumeric() || c == '.',
+        }
+    }
+}
 
 /// 后缀式的系统项:**本工具自己在 NAS 项目目录里落下的半截文件**。名字前半段是
 /// 用户的文件名或一个 uuid(可变),身份只写在尾巴上,只能按后缀认。
@@ -206,7 +261,7 @@ const SYSTEM_ITEM_SUFFIXES: &[&str] = &[
 /// 目录项名**上:项目自身的 `.ocard/`(清单、日志、回收站、分析缓存)不落在上面
 /// 那几条路径的扫描起点之下(它们分别扎在「N. 分类夹」「2. 原始素材」「6. 成片」
 /// 「精选/待修|已修」里,`.ocard` 是项目根的同级兄弟),这是第一道保证;
-/// 万一将来有人把扫描起点上提到项目根,`SYSTEM_ITEM_PREFIXES` 里的 `.ocard`
+/// 万一将来有人把扫描起点上提到项目根,`SYSTEM_ITEM_NAMES` 里的精确名 `.ocard`
 /// 是第二道。两道都在,才敢说项目元数据不会被当素材打进交付包。
 pub(crate) fn is_system_item(name: &str) -> bool {
     // 大小写/Unicode 归一走 target_name_key(与落点撞名判定同一把尺子):
@@ -215,9 +270,23 @@ pub(crate) fn is_system_item(name: &str) -> bool {
     SYSTEM_ITEM_NAMES.contains(&key.as_str())
         || SYSTEM_ITEM_PREFIXES.iter().any(|p| key.starts_with(p))
         || SYSTEM_ITEM_SUFFIXES.iter().any(|s| key.ends_with(s))
+        || SYSTEM_ITEM_TAILED
+            .iter()
+            .any(|&(prefix, shape, min_len)| matches_tailed(&key, prefix, shape, min_len))
 }
 
-fn note_symlink_skipped() {
+/// 「命名空间前缀 + 规范定死的尾巴」的判定(见 [`SYSTEM_ITEM_TAILED`])。
+/// 尾巴必须**整段**符合形状:形状对不上就说明这是个用户文件,必须照拷。
+fn matches_tailed(key: &str, prefix: &str, shape: TailShape, min_len: usize) -> bool {
+    let Some(tail) = key.strip_prefix(prefix) else {
+        return false;
+    };
+    tail.chars().count() >= min_len && tail.chars().all(|c| shape.allows(c))
+}
+
+/// 记一个被跳过的符号链接。**每一处扫描都必须用它**(而不是各自静默跳过):
+/// 计数由 `commands::notice_scan_skips` 统一取走并聚合成可见告警。
+pub(crate) fn note_symlink_skipped() {
     SCAN_SYMLINKS_SKIPPED.with(|c| c.set(c.get() + 1));
 }
 
@@ -360,7 +429,17 @@ pub fn plan_whole_volume(files: &[ScannedFile]) -> Vec<PlannedFile> {
 
 /// 计划摘要的版本前缀。口径变了就换版本号:老令牌会被判成「无法识别」并要求
 /// 重新确认(fail-closed),而不是被误判成「没变」。
-const PLAN_DIGEST_PREFIX: &str = "ocard-plan-v2";
+const PLAN_DIGEST_PREFIX: &str = "ocard-plan-v3";
+
+/// 规范化后的源选择(摘要与快照共用一把尺子):排序 + 去重后的文件夹列表。
+/// 整卷 = 空列表。摘要按它算,`ApprovedPlans` 也存它——两边分叉就会出现
+/// 「摘要说选择变了、快照却比不出差异」这种自相矛盾的报文。
+pub fn normalized_selection(selection: &SourceSelection) -> Vec<String> {
+    let mut folders = selection.to_folders();
+    folders.sort();
+    folders.dedup();
+    folders
+}
 
 /// 计划摘要:把「用户在双确认屏批准的到底是哪一份计划」压成一个可回传的短串。
 ///
@@ -368,14 +447,20 @@ const PLAN_DIGEST_PREFIX: &str = "ocard-plan-v2";
 /// 都会让两者不同——被删的已确认文件从新计划里消失后,剩下的照样能
 /// `all_verified = true`。
 ///
-/// **形态是分段的**(`ocard-plan-v2:<卷>:<文件集>:<修改时间>`),对前端仍是一个
-/// 不透明字符串原样回传,但后端比对时能按段定位**变化原因**:
+/// **形态是分段的**(`ocard-plan-v3:<卷>:<选择>:<文件集>:<修改时间>`),对前端仍是
+/// 一个不透明字符串原样回传,但后端比对时能按段定位**变化原因**:
 /// - `<卷>` = 卷身份(挂载点 + 卷名 + 卡指纹)——识别「换了一张卡」;
-/// - `<文件集>` = 规范化并排序后的源选择 + 排序后的 `(source_rel, target_rel, size)`
-///   三元组——识别「增删/改大小/落点被重新规划/勾选范围变了」;
+/// - `<选择>` = 规范化并排序后的源选择——识别「提交的勾选范围不是确认时那一份」;
+/// - `<文件集>` = 排序后的 `(source_rel, target_rel, size)` 三元组——识别
+///   「增删/改大小/落点被重新规划」;
 /// - `<修改时间>` = 排序后的 `(source_rel, source_mtime_ns)`——识别
 ///   **同大小、内容被替换**,这正是 size-only 摘要漏掉的那一类,而它在换卡场景里
 ///   完全可能发生。令牌的全部意义是「你批准的就是将要执行的」,漏掉这一类就白立了。
+///
+/// R13 C1(P0):`<选择>` 从 `<文件集>` 里**独立出来**。此前两者共用一段,于是
+/// 「卡完全没变、只是提交选择 B 时误带了选择 A 的令牌」这种纯前端状态错配,
+/// 会被逐条 diff 报成「A 被删、B 新增」,报文断言「卡上的文件变了」——把前端
+/// 错配说成有人动了卡。说错原因比不说更糟。
 ///
 /// 分段不是为了让前端解析,而是为了让报错说得出**对的**原因:
 /// 「多了 3 个文件」和「有 2 个文件被改动过」指向完全不同的排查方向。
@@ -388,16 +473,16 @@ pub fn plan_digest(
     vol.update(b"volume\0");
     vol.update(volume_identity.as_bytes());
 
-    let mut set = xxhash_rust::xxh3::Xxh3::new();
-    // 选择排序后再喂:同一批夹子换个勾选顺序不该判成「计划变了」
-    let mut folders = selection.to_folders();
-    folders.sort();
-    set.update(b"selection\0");
-    for f in &folders {
-        set.update(f.as_bytes());
-        set.update(b"\0");
+    // 选择规范化(排序 + 去重)后再喂:同一批夹子换个勾选顺序不该判成「计划变了」
+    let mut sel = xxhash_rust::xxh3::Xxh3::new();
+    sel.update(b"selection\0");
+    for f in &normalized_selection(selection) {
+        sel.update(f.as_bytes());
+        sel.update(b"\0");
     }
-    set.update(b"\nfiles\0");
+
+    let mut set = xxhash_rust::xxh3::Xxh3::new();
+    set.update(b"files\0");
     let mut items: Vec<(&str, &str, u64)> = plan
         .iter()
         .map(|p| (p.source_rel.as_str(), p.target_rel.as_str(), p.size))
@@ -430,8 +515,9 @@ pub fn plan_digest(
     }
 
     format!(
-        "{PLAN_DIGEST_PREFIX}:{:016x}:{:016x}:{:016x}",
+        "{PLAN_DIGEST_PREFIX}:{:016x}:{:016x}:{:016x}:{:016x}",
         vol.digest(),
+        sel.digest(),
         set.digest(),
         mt.digest()
     )
@@ -447,23 +533,32 @@ pub enum PlanChange {
     Unrecognized,
     /// 源卷身份变了 = 不是确认时的那张卡(优先级最高:换卡能解释后面所有差异)
     Volume,
-    /// 文件集变了:增/删/大小变/落点重新规划/勾选范围变了
+    /// 提交的**勾选范围**与确认时那一份不是同一套(R13 C1:与文件集分开定性,
+    /// 否则纯前端状态错配会被报成「卡上的文件变了」——把错配说成有人动卡)
+    Selection,
+    /// 文件集变了:增/删/大小变/落点重新规划
     FileSet,
     /// 文件集一模一样,只有修改时间变了 = 同大小、内容被替换
     ContentReplaced,
 }
 
 /// 逐段比对两份摘要,定位变化原因。`approved` 是前端回传的、`fresh` 是现算的。
+///
+/// 比对顺序 = 解释力从强到弱:换卡 → 换了勾选范围 → 文件集 → 修改时间。
+/// 前面的原因能解释后面所有差异,先说它才不会把人引向错误的排查方向。
+/// **选择必须排在文件集之前**:勾选范围换了,文件集当然跟着不同,这时候说
+/// 「卡上的文件变了」就是在冤枉这张卡。
 pub fn classify_plan_change(approved: &str, fresh: &str) -> PlanChange {
-    let parse = |s: &str| -> Option<[String; 3]> {
+    let parse = |s: &str| -> Option<[String; 4]> {
         let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() != 4 || parts[0] != PLAN_DIGEST_PREFIX {
+        if parts.len() != 5 || parts[0] != PLAN_DIGEST_PREFIX {
             return None;
         }
         Some([
             parts[1].to_string(),
             parts[2].to_string(),
             parts[3].to_string(),
+            parts[4].to_string(),
         ])
     };
     // 任一侧形态不对都判「无法识别」:现算的那份形态不对说明代码自身出了问题,
@@ -474,8 +569,10 @@ pub fn classify_plan_change(approved: &str, fresh: &str) -> PlanChange {
     if a[0] != b[0] {
         PlanChange::Volume
     } else if a[1] != b[1] {
-        PlanChange::FileSet
+        PlanChange::Selection
     } else if a[2] != b[2] {
+        PlanChange::FileSet
+    } else if a[3] != b[3] {
         PlanChange::ContentReplaced
     } else {
         PlanChange::None
@@ -857,21 +954,38 @@ pub(crate) fn base_name(rel: &str) -> &str {
 /// 四处必须用同一个函数,任何一处用别的口径都会漏出一个静默覆盖/静默合并的洞。
 ///
 /// 两层归一,缺一不可:
-/// - **Unicode NFC**:macOS 上 `é.mov` 可能是 NFC(U+00E9)也可能是 NFD
+/// - **Unicode 规范等价**:macOS 上 `é.mov` 可能是 NFC(U+00E9)也可能是 NFD
 ///   (`e` + U+0301),两串字节不同,APFS/HFS+ 却视为同一个文件名。不归一就会
 ///   规划出两个「不冲突」的落点,内容相同时第二个直接复用第一个的物理文件并
 ///   报 all_verified——**两个源最终只剩一个目录项,用户以为都备份了**。
-/// - **大小写折叠**:目的地常是 APFS/exFAT/SMB,`DSC1.JPG` 与 `dsc1.jpg` 同名。
+/// - **Unicode 大小写折叠**:目的地常是 APFS/exFAT/SMB,`DSC1.JPG` 与 `dsc1.jpg`
+///   是同一个文件。
 ///
-/// 先 NFC 再小写,末尾再 NFC 一次:少数字符小写后会产生新的可合成序列
-/// (如 `İ` → `i` + U+0307),不补这一步键就不稳定。
+/// ## 为什么是 case folding 而不是 `to_lowercase()`(R13 P0)
 ///
-/// 方向:宁可**多判成撞名**(多一次可见改名)也不漏判(静默合并)——
-/// 目的地是字节敏感的 ext4 时会多加一个前缀,代价只是清单上多一行,可接受。
+/// APFS 的大小写不敏感比较按 **Unicode 折叠**实现,要求 `σ` / `ς` / `Σ` 三者等价。
+/// `to_lowercase()` 做不到两件事:
+/// 1. `ς`(希腊词尾 sigma)**本来就是小写**,`to_lowercase()` 原样留下它,于是
+///    大小写敏感的源卷上 `σ.mov` 与 `ς.mov` 折出两个不同的键;
+/// 2. Rust 的 `str::to_lowercase` 还实现了 Final_Sigma 位置规则
+///    (`ΟΔΟΣ` → `οδο` + **ς**),同一个名字的大小写变体因此折出不同的键。
+///
+/// 两条都与刚修的 NFC 那条**完全同形**:两遍唯一性与全计划预检都认为它们不同,
+/// 内容相同时第二项复用第一项的物理文件并报 `all_verified`,两个源只落一个目录项。
+///
+/// 用的是 Unicode **默认(full)大小写折叠**(CaseFolding.txt 的 C + F 类,
+/// `caseless::default_case_fold_str`),不是 simple 折叠:full 会把 `ß` → `ss`、
+/// `ﬁ` → `fi` 这类一对多映射也折平。方向上 full 比 simple **更容易判成同名**,
+/// 而本函数的安全方向正是「宁可多判成撞名(多一次可见改名)也不漏判(静默合并)」。
+///
+/// 顺序按 Unicode 的 canonical caseless matching:先 NFD(折叠表按分解形定义,
+/// 且要吃掉 NFC/NFD 的写法差异),再折叠,最后 NFC 收成一个稳定、可比较的键
+/// (`NFC(fold(NFD(x)))` 与 `NFD(fold(NFD(x)))` 一一对应,取哪个都行,NFC 更短)。
 pub(crate) fn target_name_key(name: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
-    let nfc: String = name.nfc().collect();
-    nfc.to_lowercase().nfc().collect()
+    let nfd: String = name.nfd().collect();
+    let folded = caseless::default_case_fold_str(&nfd);
+    folded.nfc().collect()
 }
 
 /// 拆主名与扩展名(无扩展名或以点开头时 ext 为空)。
@@ -2715,14 +2829,18 @@ mod folder_selection_tests {
             f("100MSDCF_DSC1.JPG"),
             f("100msdcf_dsc1_2.jpg"),
         ]);
-        let keys: std::collections::HashSet<String> = planned
+        // R13 E3:唯一性断言**不许拿被测函数自己当预言机**。用 `target_name_key`
+        // 算键、再断言键两两不同,等于问「你自己觉得你们不同吗」——实现与目的地
+        // 文件系统一起错位(比如 σ/ς 折不平)时它照样绿。这里的输入全是纯 ASCII,
+        // 独立预言机就是 ASCII 小写:目的地把 `A.JPG` 与 `a.jpg` 视为同名。
+        let oracle: std::collections::HashSet<String> = planned
             .iter()
-            .map(|p| target_name_key(&p.target_rel))
+            .map(|p| p.target_rel.to_ascii_lowercase())
             .collect();
         assert_eq!(
-            keys.len(),
+            oracle.len(),
             planned.len(),
-            "落点必须两两不同: {:?}",
+            "落点必须两两不同(独立预言机:ASCII 小写): {:?}",
             planned
                 .iter()
                 .map(|p| p.target_rel.as_str())
@@ -2736,6 +2854,103 @@ mod folder_selection_tests {
             .collect();
         let got: Vec<&str> = renamed.iter().map(|r| r.source_rel.as_str()).collect();
         assert_eq!(got, expected, "改名清单不得漏项");
+    }
+
+    // ---------------- R13:Unicode 大小写折叠(σ / ς / Σ) ----------------
+
+    /// 希腊小写 sigma 的两种写法与它们共同的大写形。APFS 的大小写不敏感比较按
+    /// Unicode 折叠实现,三者是**同一个文件名**。
+    const SIGMA_MID: &str = "σ.mov"; // U+03C3 词中 sigma
+    const SIGMA_FINAL: &str = "ς.mov"; // U+03C2 词尾 sigma
+    const SIGMA_UPPER: &str = "Σ.mov"; // U+03A3 大写 sigma
+
+    /// R13 A3(P0):等价类断言。**不拿被测函数当预言机**——这里直接写出
+    /// 「目的地文件系统认为哪些名字是同一个」这个期望,再要求实现符合它。
+    ///
+    /// `to_lowercase()` 会让这条必红:它把 ς 原样留作 ς(ς 本来就是小写),
+    /// 于是 σ.mov 与 ς.mov 折出两个不同的键。
+    #[test]
+    fn target_name_key_folds_sigma_variants_into_one_class() {
+        assert!(
+            SIGMA_MID != SIGMA_FINAL && SIGMA_FINAL != SIGMA_UPPER,
+            "前置断言:三串字节确实互不相同"
+        );
+        // 期望的等价类:三者同键
+        let k = target_name_key(SIGMA_MID);
+        assert_eq!(target_name_key(SIGMA_FINAL), k, "ς 必须与 σ 同键");
+        assert_eq!(target_name_key(SIGMA_UPPER), k, "Σ 必须与 σ 同键");
+
+        // Final_Sigma 位置规则的坑:`str::to_lowercase("ΟΔΟΣ")` 末位会变成 ς,
+        // 于是同一个词的大小写变体折出不同的键。折叠不受位置影响。
+        assert_eq!(
+            target_name_key("ΟΔΟΣ.mov"),
+            target_name_key("οδοσ.mov"),
+            "同一个词的大小写变体必须同键(Final_Sigma 位置规则不得影响折叠)"
+        );
+        assert_eq!(
+            target_name_key("ΟΔΟΣ.mov"),
+            target_name_key("οδος.mov"),
+            "词尾 sigma 写法同样必须同键"
+        );
+
+        // 不同的字必须**不同键**(折叠不许把不该合并的合并掉)
+        assert_ne!(
+            target_name_key("σ.mov"),
+            target_name_key("ο.mov"),
+            "不同字母不得折成同键"
+        );
+    }
+
+    /// R13 A3(P0):端到端——大小写敏感的源卷上同时有 `σ.mov` 与 `ς.mov`,
+    /// 目的地是默认的大小写不敏感 APFS。折不平就与刚修的 NFC 那条**完全同形**:
+    /// 两遍唯一性与全计划预检都认为它们不同,内容相同时第二项复用第一项的物理
+    /// 文件并报 all_verified,两个源最终只落一个目录项。
+    ///
+    /// 本断言**不碰 `target_name_key`**:只看规划出来的两个落点是不是两串不同的
+    /// 字节、让位的那个有没有进改名清单。
+    #[test]
+    fn sigma_variants_never_land_on_one_target() {
+        let f = |rel: &str| ScannedFile {
+            rel: rel.to_string(),
+            size: 1,
+            mtime_ns: 0,
+        };
+        let (planned, renamed) = plan_flat_targets(&[f(SIGMA_MID), f(SIGMA_FINAL)]);
+        assert_eq!(planned.len(), 2);
+        assert_ne!(
+            planned[0].target_rel,
+            planned[1].target_rel,
+            "σ 与 ς 在 APFS 上是同一个文件名,落点必须被拉开: {:?}",
+            planned
+                .iter()
+                .map(|p| p.target_rel.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(renamed.len(), 1, "让位的那个必须进改名清单: {renamed:?}");
+    }
+
+    /// R13 A3:全计划预检也走同一把尺子——清单被改写成 σ/ς 两个「不同」落点时,
+    /// 必须在**任何写入之前**拒绝,而不是拷到第二个才静默并成一个。
+    #[test]
+    fn run_copy_precheck_refuses_sigma_duplicate_targets() {
+        let (_t, req, mut m, project) = setup(folders(&[""]));
+        let plan = vec![
+            PlannedFile {
+                source_rel: "ROOT.MP4".into(),
+                target_rel: SIGMA_MID.into(),
+                size: 4000,
+                source_mtime_ns: 0,
+            },
+            PlannedFile {
+                source_rel: "ROOT.MP4".into(),
+                target_rel: SIGMA_FINAL.into(),
+                size: 4000,
+                source_mtime_ns: 0,
+            },
+        ];
+        let e = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap_err();
+        assert!(e.to_string().contains("同一个落点"), "{e}");
+        assert!(!req.destinations[0].exists(), "拒绝要发生在任何写入之前");
     }
 
     // ---------------- R4:Unicode NFC/NFD 归一 ----------------
@@ -2864,12 +3079,58 @@ mod folder_selection_tests {
         );
     }
 
-    /// R11:同大小、内容被替换——只有 mtime 会动。这恰恰是 size-only 摘要漏掉的
-    /// 那一类,而它在换卡场景里完全可能发生。令牌的全部意义是「你批准的就是将要
-    /// 执行的」,漏掉这一类就白立了。
-    /// (把 `plan_digest` 里那段 mtime 拿掉,本测试必红。)
+    /// R13 C1(P0):**选择独占一段**。卡完全没变、只是提交选择 B 时误带了选择 A
+    /// 的令牌——这是纯前端状态错配。共用一段时逐条 diff 会显示「A 被删、B 新增」,
+    /// 报文于是断言「卡上的文件变了」,把人推去数卡上的文件、怀疑有人动过卡。
+    ///
+    /// 判别性:把选择段并回文件集段,`Selection` 那条断言会变成 `FileSet`,必红。
     #[test]
-    fn plan_digest_catches_same_size_content_replacement() {
+    fn selection_change_is_classified_apart_from_file_set_change() {
+        let f = |rel: &str, size: u64| ScannedFile {
+            rel: rel.to_string(),
+            size,
+            mtime_ns: 7,
+        };
+        // 同一张卡上的两批夹子:各自的文件集也不同(现实里必然如此)
+        let plan_a = plan_flat_targets(&[f("A/x.jpg", 10)]).0;
+        let plan_b = plan_flat_targets(&[f("B/y.jpg", 20)]).0;
+        let da = plan_digest(&folders(&["A"]), &plan_a, "vol-1");
+        let db = plan_digest(&folders(&["B"]), &plan_b, "vol-1");
+        assert_eq!(
+            classify_plan_change(&da, &db),
+            PlanChange::Selection,
+            "带错令牌 = 勾选范围对不上,绝不能报成「卡上的文件变了」"
+        );
+
+        // 选择一样、文件集变了 → 仍旧是 FileSet(选择段不许把它盖掉)
+        let more = plan_flat_targets(&[f("A/x.jpg", 10), f("A/z.jpg", 30)]).0;
+        assert_eq!(
+            classify_plan_change(&da, &plan_digest(&folders(&["A"]), &more, "vol-1")),
+            PlanChange::FileSet
+        );
+
+        // 勾选顺序 / 重复勾选不算变化(规范化后同键)
+        assert_eq!(
+            plan_digest(&folders(&["A", "B"]), &plan_a, "vol-1"),
+            plan_digest(&folders(&["B", "A", "B"]), &plan_a, "vol-1"),
+            "顺序与重复项不该动摘要"
+        );
+    }
+
+    /// R11:同大小、**修改时间变了**的替换——size-only 摘要漏掉的正是这一类,
+    /// 而它在换卡场景里完全可能发生。令牌的全部意义是「你批准的就是将要执行的」。
+    ///
+    /// R13 E1:名字必须**名副其实**。这个测试构造的是「同大小、mtime 变了」,
+    /// 它**证明不了**「内容被替换一定被抓到」——`cp -p` / `touch -r` 保留 mtime 的
+    /// 替换,以及「start 比对通过之后、实际复制之前」改源文件,都能绕过令牌。
+    /// 那条边界是**声明过的**(令牌是元数据级绑定,不是内容级绑定,见契约文档
+    /// 「令牌保护不了什么」一节):内容级绑定要把整张卡多读一遍,代价不可接受。
+    ///
+    /// 所以这里同时把边界**钉成断言**——真要收紧到内容级,下面第二段必须先变红,
+    /// 谁也不能悄悄以为令牌已经管住内容了。
+    /// (把 `plan_digest` 里那段 mtime 拿掉,第一段必红。)
+    #[test]
+    fn plan_digest_catches_retimed_replacement_but_not_timestamp_preserving_ones() {
         let f = |rel: &str, size: u64, ns: u128| ScannedFile {
             rel: rel.to_string(),
             size,
@@ -2877,11 +3138,60 @@ mod folder_selection_tests {
         };
         let sel = folders(&["A"]);
         let base = plan_flat_targets(&[f("A/x.jpg", 10, 1_000)]).0;
+        // ① 抓得到:同大小、mtime 变了
         let touched = plan_flat_targets(&[f("A/x.jpg", 10, 2_000)]).0;
         assert_ne!(
             plan_digest(&sel, &base, "vol-1"),
             plan_digest(&sel, &touched, "vol-1"),
             "大小一样、修改时间变了 = 内容可能被换掉,摘要必须变"
+        );
+        // ② 抓不到(**声明过的边界**):同大小、同 mtime —— `cp -p` / `touch -r`
+        //    保留时间戳的替换。摘要只看 (rel, target, size, mtime),看不见内容。
+        let preserved = plan_flat_targets(&[f("A/x.jpg", 10, 1_000)]).0;
+        assert_eq!(
+            plan_digest(&sel, &base, "vol-1"),
+            plan_digest(&sel, &preserved, "vol-1"),
+            "令牌是元数据级绑定:同大小同 mtime 的替换本就在保护范围之外。\
+             若这条变红,说明有人把令牌收紧到了内容级——请同步更新契约文档的边界声明"
+        );
+    }
+
+    /// R13 E1 配套:真·内容被替换(同大小、同 mtime)确实绕得过令牌,但**绕不过
+    /// 引擎的哈希校验**。这条把「令牌管不住的那一半到底谁在管」钉住:落点已被
+    /// 占用且内容不同时,引擎必须报冲突,绝不静默覆盖、也绝不静默当成功。
+    #[test]
+    fn same_size_same_mtime_replacement_is_caught_by_the_engine_not_the_token() {
+        let (_t, req, mut m, project) = setup(folders(&["DCIM/100MSDCF"]));
+        let src = req.source_root.join("DCIM/100MSDCF/ONLY.JPG");
+        let meta = fs::metadata(&src).unwrap();
+        let size = meta.len();
+        let plan = vec![PlannedFile {
+            source_rel: "DCIM/100MSDCF/ONLY.JPG".into(),
+            target_rel: "ONLY.JPG".into(),
+            size,
+            source_mtime_ns: super::super::media::mtime_nanos(&meta),
+        }];
+        // 目的地先落一份**同名、同大小、同 mtime,但内容不同**的旧版本
+        let dest = &req.destinations[0];
+        fs::create_dir_all(dest).unwrap();
+        let old = dest.join("ONLY.JPG");
+        fs::write(&old, vec![0xABu8; size as usize]).unwrap();
+        let f = fs::OpenOptions::new().write(true).open(&old).unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(meta.modified().unwrap()))
+            .unwrap();
+        drop(f);
+
+        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(
+            matches!(&out.files[0].status, FileStatus::Failed(e) if e.contains("同名")),
+            "同名不同内容必须报冲突,不许静默覆盖也不许静默当成功: {:?}",
+            out.files[0].status
+        );
+        assert!(!out.all_verified, "有冲突就不许说全部校验通过");
+        assert_eq!(
+            fs::read(&old).unwrap(),
+            vec![0xABu8; size as usize],
+            "目的地已有文件一个字节都不许被动"
         );
     }
 
@@ -2914,10 +3224,10 @@ mod folder_selection_tests {
             classify_plan_change(&d, &plan_digest(&sel, &touched, "vol-1")),
             PlanChange::ContentReplaced
         );
-        // 勾选范围变了算文件集变化(报文里再按逐条差异细分)
+        // 勾选范围变了单独定性(R13 C1:不许并进 FileSet 说成「卡上的文件变了」)
         assert_eq!(
             classify_plan_change(&d, &plan_digest(&folders(&["A", "B"]), &base, "vol-1")),
-            PlanChange::FileSet
+            PlanChange::Selection
         );
         // 老版本令牌 / 被改写的令牌:fail-closed,且说得出「认不出这个令牌」
         assert_eq!(
@@ -2979,11 +3289,12 @@ mod folder_selection_tests {
             .iter()
             .chain(SYSTEM_ITEM_PREFIXES)
             .chain(SYSTEM_ITEM_SUFFIXES)
+            .chain(SYSTEM_ITEM_TAILED.iter().map(|(p, _, _)| p))
         {
             assert_eq!(
                 &target_name_key(n),
                 n,
-                "白名单条目必须写成归一形态(NFC + 全小写): {n}"
+                "白名单条目必须写成归一形态(NFC + 大小写折叠): {n}"
             );
         }
     }
@@ -3005,8 +3316,14 @@ mod folder_selection_tests {
             "$RECYCLE.BIN",
             "Thumbs.db",
             "desktop.ini",
+            ".ocard",
             ".ocard-volume-id",
             ".Trash-1000",
+            // R13 A2:freedesktop 规范给可移动盘定义的**共享**回收站
+            // `$topdir/.Trash/$uid`。漏掉它 = 已删除的素材连同 .trashinfo
+            // 被当素材备份甚至交付(隐私泄漏 + 容量膨胀)。
+            ".Trash",
+            ".trash",
             // NAS / 网络共享(打包路径复用同一份名单)
             "@eaDir",
             ".@__thumb",
@@ -3048,6 +3365,68 @@ mod folder_selection_tests {
             "curatepart.jpg",
         ] {
             assert!(!is_system_item(name), "这不是系统项,必须照拷: {name}");
+        }
+    }
+
+    /// R13 A1(P0):`.ocard` 曾是**前缀**,于是卡上任何以它开头的合法素材整个
+    /// 不进计划,告警还断言它「不是素材」,整卷任务照样给「本卡可格式化」——
+    /// 「形状判据兜底 → 漏拷却报成功」的原样复发,只是范围小一点。
+    ///
+    /// 判别性:把 `.ocard` / `.ocard-volume-id` 两条精确名换回一条 `.ocard` 前缀,
+    /// 下面这批必红。
+    #[test]
+    fn ocard_namespace_is_matched_by_exact_name_not_by_prefix() {
+        // 本工具真正的落盘:必须排除
+        for name in [".ocard", ".OCard", ".ocard-volume-id", ".OCARD-VOLUME-ID"] {
+            assert!(is_system_item(name), "本工具自己的落盘必须排除: {name}");
+        }
+        // 只是以 `.ocard` 开头的**用户素材/文件**:一个都不许被排除
+        for name in [
+            ".ocardinal.mov",
+            ".ocard-notes.txt",
+            ".ocard_backup",
+            ".ocardio.jpg",
+            ".ocard-volume-id.bak", // 像那个指纹文件,但不是它
+        ] {
+            assert!(
+                !is_system_item(name),
+                "以 .ocard 开头不等于是系统项,必须照拷: {name}"
+            );
+        }
+    }
+
+    /// R13 A1(P0):带可变尾巴的系统项必须**连尾巴的形状一起校验**。
+    /// 只比前缀 = `.ocard` 那条 P0 的同型错误(`.trash-交接单.txt` 会被静默吞掉)。
+    ///
+    /// 判别性:把 `matches_tailed` 改成只比前缀(去掉形状与最短长度校验),
+    /// 下半批必红。
+    #[test]
+    fn tailed_system_items_validate_the_tail_shape() {
+        // 规范形态:排除
+        for name in [
+            ".Trash-1000",         // freedesktop:$uid 是纯数字
+            ".trash-0",            //
+            ".smbdeleteAAA0f4a.4", // Samba silly-rename
+            ".nfs0000000000e1a3",  // NFS silly-rename(十六进制,≥8 位)
+            ".NFS0000000000E1A3",  // 大小写不敏感
+        ] {
+            assert!(is_system_item(name), "规范形态的系统项必须排除: {name}");
+        }
+        // 只是**前缀**撞上了命名空间的用户文件:一律照拷
+        for name in [
+            ".trash-交接单.txt",   // uid 不可能是中文
+            ".trash-notes.txt",    // uid 不可能带点和字母
+            ".trash-",             // 没有尾巴,不是 `.Trash-$uid`
+            ".smbdelete-记录.txt", // Samba 令牌里不会有 `-` 和中文
+            ".smbdel.mov",         // 前缀都没撞上
+            ".nfs.mov",            // 尾巴不是十六进制
+            ".nfs-交接单.txt",     // 同上
+            ".nfs01ab",            // 十六进制但太短,不是 silly-rename 的形态
+        ] {
+            assert!(
+                !is_system_item(name),
+                "尾巴形状对不上就是用户文件,必须照拷: {name}"
+            );
         }
     }
 

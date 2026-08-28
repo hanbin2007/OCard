@@ -43,7 +43,14 @@ pub struct AppState {
 }
 
 /// 最多留几份批准过的计划(用户来回改勾选会连着拉好几次计划,只有最后一份会被批准)。
-const APPROVED_PLAN_SLOTS: usize = 4;
+///
+/// R13 C5:这条上限只是**兜底**。正常淘汰按「确认页实例 id」替换 + TTL,
+/// 否则五个确认页并发规划时,较旧的那次大扫描晚完成,会按「全局完成顺序」
+/// 把当前正开着的那份计划挤掉——用户还在看着确认屏,快照已经没了。
+const APPROVED_PLAN_SLOTS: usize = 16;
+/// 快照的存活时长。确认屏开着不动一整天之后再提交,那份计划早就不该被信任了;
+/// 到点淘汰也让被遗忘的槽位不会一直占着。
+const APPROVED_PLAN_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// 单份计划超过这么多文件就只记令牌、不记明细(几十万文件的卡不该把内存吃掉)。
 /// 记不下明细这件事会在报错里明说,不静默降级。
 const APPROVED_PLAN_MAX_FILES: usize = 50_000;
@@ -55,8 +62,9 @@ const APPROVED_PLAN_MAX_FILES: usize = 50_000;
 /// 过」——而这两句话指向完全不同的排查方向(去数卡上的文件 vs 去查是谁动了源),
 /// 说错原因比不说更糟。
 ///
-/// 有界:最多 [`APPROVED_PLAN_SLOTS`] 份,单份超过 [`APPROVED_PLAN_MAX_FILES`]
-/// 只记令牌不记明细。查不到明细时报文会**明说**查不到,不会假装说得出。
+/// 有界:最多 [`APPROVED_PLAN_SLOTS`] 份 + [`APPROVED_PLAN_TTL`] 到期淘汰,
+/// 单份超过 [`APPROVED_PLAN_MAX_FILES`] 只记令牌不记明细。
+/// 查不到明细时报文会**明说**查不到,不会假装说得出。
 #[derive(Default)]
 pub struct ApprovedPlans {
     /// 队首最旧
@@ -70,8 +78,16 @@ pub struct ApprovedSnapshot {
     /// 确认那一刻的卷身份原串(见 `volume_identity`)。留着它才说得出
     /// 「卷身份为什么变了」——尤其是「指纹是 OCard 自己后写上去的」这一种。
     pub volume_identity: String,
+    /// 确认那一刻**规范化后**的源选择(`copy::normalized_selection`)。
+    /// R13 C1:选择独占摘要一段之后,「勾选范围对不上」要能逐条点名到底差在哪。
+    pub selection: Vec<String>,
     /// `None` = 当时文件数超上限,没留逐条明细
     pub files: Option<Vec<copy::PlannedFile>>,
+    /// 发出这份计划的确认页实例 id(前端传;老客户端不传 = None)。
+    /// 有它才能按「同一个确认页的新一份计划替换旧一份」淘汰,而不是按全局顺序。
+    pub instance_id: Option<String>,
+    /// 记下的时刻(TTL 用)。
+    pub remembered_at: std::time::Instant,
 }
 
 /// 回忆一份批准过的计划的结果。三种情形的报文措辞必须不同——
@@ -96,15 +112,36 @@ impl RecalledPlan {
 
 impl ApprovedPlans {
     /// 记下一份刚返回给双确认屏的计划。
-    pub fn remember(&self, digest: &str, volume_identity: &str, plan: &[copy::PlannedFile]) {
+    ///
+    /// 淘汰顺序(R13 C5):① 过期的先丢;② 同一个确认页实例的旧计划被新计划
+    /// **替换**——用户在一个确认屏上来回改勾选只该占一个槽,不该把别的确认屏
+    /// 挤掉;③ 兜底才按最旧丢。此前只有 ③,于是五个确认页并发规划时,较旧的
+    /// 那次大扫描晚完成就会挤掉当前可见的计划。
+    pub fn remember(
+        &self,
+        digest: &str,
+        volume_identity: &str,
+        selection: &[String],
+        plan: &[copy::PlannedFile],
+        instance_id: Option<&str>,
+    ) {
         let snap = ApprovedSnapshot {
             digest: digest.to_string(),
             volume_identity: volume_identity.to_string(),
+            selection: selection.to_vec(),
             files: (plan.len() <= APPROVED_PLAN_MAX_FILES).then(|| plan.to_vec()),
+            instance_id: instance_id.map(str::to_string),
+            remembered_at: std::time::Instant::now(),
         };
         let mut slots = self.slots.lock().unwrap();
+        let now = std::time::Instant::now();
+        slots.retain(|s| now.duration_since(s.remembered_at) < APPROVED_PLAN_TTL);
         // 同一份计划被反复拉取时只留一份(前端进确认屏可能重复调用)
         slots.retain(|s| s.digest != digest);
+        // 同一个确认页实例的上一份计划:替换,不占新槽
+        if let Some(id) = instance_id {
+            slots.retain(|s| s.instance_id.as_deref() != Some(id));
+        }
         slots.push_back(snap);
         while slots.len() > APPROVED_PLAN_SLOTS {
             slots.pop_front();
@@ -112,10 +149,15 @@ impl ApprovedPlans {
     }
 
     /// 按令牌回忆。**不取走**:同一个令牌可能被连着提交两次(用户重试),
-    /// 第二次也该拿到同样的说明。
+    /// 第二次也该拿到同样的说明。过期的一律当作没有(措辞与被挤掉的一致:
+    /// 两者都只能给泛化原因)。
     pub fn recall(&self, digest: &str) -> RecalledPlan {
         let slots = self.slots.lock().unwrap();
-        match slots.iter().find(|s| s.digest == digest) {
+        let now = std::time::Instant::now();
+        match slots
+            .iter()
+            .find(|s| s.digest == digest && now.duration_since(s.remembered_at) < APPROVED_PLAN_TTL)
+        {
             Some(s) if s.files.is_some() => RecalledPlan::Found(s.clone()),
             Some(s) => RecalledPlan::TooLargeToKeep(s.clone()),
             None => RecalledPlan::Forgotten,
@@ -911,7 +953,11 @@ pub fn inspect_volume<R: tauri::Runtime>(
     app: AppHandle<R>,
     volume_id: String,
 ) -> CmdResult<VolumeInspectionDto> {
-    let root = PathBuf::from(&volume_id);
+    // R13 D1:源卷必须解析到权威卷清单,口径与另外三个入口
+    // (`list_source_folders` / `plan_source_selection` / `start_copy_task`)一致。
+    // 少这道闸,任意可读目录都能当源:递归扫描卡外的目录树,并把文件数、容量、
+    // 时间范围原样返回给调用方。
+    let root = ensure_source_volume(&volume_id)?;
     let scanned = copy::scan_source(&root);
     // R10:失败出口也要取走计数并告警——计数留着会算到下一次操作头上,报数失真
     notice_scan_skips(&app);
@@ -1152,16 +1198,22 @@ fn notice_scan_skips<R: tauri::Runtime>(app: &AppHandle<R>) {
         //
         // 通知码沿用 `copy-hidden-skipped`(与前端契约字段 `hiddenSkipped` 同源,
         // 改名会当场打断并行开发的前端);文案按新语义重写。
+        //
+        // R13 A1:措辞只能陈述**判据**(「命中系统项名单」),不能替名单打包票说
+        // 「这些都不是素材」——名单一旦写宽(`.ocard` 那条前缀就是),这句断言会
+        // 把真素材说成垃圾。样例超过 5 条时点不全名,更不该把没点到的也一并断言。
+        let more = (samples.len() as u64) < skipped;
         notify::warn(
             app,
             "copy-hidden-skipped",
             format!(
-                "源卷上有 {skipped} 个系统项被排除,不在本次范围内({}{})——都是操作系统/本工具自己的记账目录(废纸篓、索引、`.DS_Store` 等),不是素材。点开头的素材(如 .clip.mov)现在会照常拷贝",
+                "源卷上有 {skipped} 个条目命中了系统项名单(废纸篓、索引、`.DS_Store`、NAS 记账目录等),不在本次范围内:{}{}。点开头的素材(如 .clip.mov)会照常拷贝;{}",
                 samples.join("、"),
-                if (samples.len() as u64) < skipped {
-                    " 等"
+                if more { " 等" } else { "" },
+                if more {
+                    "样例只列前几条,若你怀疑其中有真素材,请对照卡上的完整列表核对后再决定是否格式化"
                 } else {
-                    ""
+                    "若这里面有你要的素材,请核对后再决定是否格式化"
                 }
             ),
         );
@@ -1286,11 +1338,18 @@ pub fn plan_source_selection<R: tauri::Runtime>(
     state: State<AppState>,
     volume_id: String,
     folders: Vec<String>,
+    confirm_instance_id: Option<String>,
 ) -> CmdResult<SourcePlanDto> {
     let root = ensure_source_volume(&volume_id)?;
     let parsed = parse_selection(&folders)?;
     notice_selection_aliases(&app, &parsed.aliases);
     let selection = parsed.selection;
+    // R13 C2(P0):**在算令牌之前**把计划绑到一块物理介质上。
+    // 此前 UID 是在 `start_copy_task` 的摘要比对**之后**才创建的,于是确认时的卡 A
+    // 根本没有 UID:随后换成同卷名、同挂载点、文件元数据也相同的另一张未标记的卡 B,
+    // 三段摘要一字不差,B 会按 A 的批准直接开跑。绑定失败时**不得宣称**绑定完成
+    // ——告警与后续诊断措辞都必须是不确定的(见 `why_volume_differs`)。
+    bind_medium_identity(&app, &root);
     let scanned = copy::scan_selection(&root, &selection);
     let (hidden_skipped, hidden_samples) = peek_skipped_for_dto();
     notice_scan_skips(&app);
@@ -1299,10 +1358,15 @@ pub fn plan_source_selection<R: tauri::Runtime>(
     // 必须比对同一个摘要,不一致就退回重新确认(知情同意,不自动重试)
     let identity = volume_identity(&root);
     let plan_digest = copy::plan_digest(&selection, &plan, &identity);
-    // R11:留一份快照(计划 + 卷身份原串),好让「令牌对不上」时能说清到底哪儿变了
-    state
-        .approved_plans
-        .remember(&plan_digest, &identity, &plan);
+    // R11:留一份快照(计划 + 卷身份原串 + 规范化选择),好让「令牌对不上」时
+    // 能说清到底哪儿变了
+    state.approved_plans.remember(
+        &plan_digest,
+        &identity,
+        &copy::normalized_selection(&selection),
+        &plan,
+        confirm_instance_id.as_deref(),
+    );
     Ok(SourcePlanDto {
         file_count: plan.len(),
         total_bytes,
@@ -1317,6 +1381,66 @@ pub fn plan_source_selection<R: tauri::Runtime>(
         hidden_samples,
         plan_digest,
     })
+}
+
+/// 把「这次规划/这次拷贝」绑到一块**物理介质**上:取得(必要时创建)卡根的
+/// `.ocard-volume-id`。返回 `Some(uid)` = 绑定成功。
+///
+/// R13 C2(P0):绑定必须发生在**返回计划之前**,不能等到摘要比对之后。
+/// 卷名 + 挂载点 + 文件元数据都可以在两张卡之间完全一致,只有指纹是随介质走的;
+/// 没有它,「这是你确认时那张卡」这句话就没有任何证据。
+///
+/// 零静默 + 不许自吹:拿不到指纹时**如实告警**说明降级后果,并且绝不在任何地方
+/// 宣称完成了介质绑定(诊断措辞见 `why_volume_differs`)。
+/// - 系统内置盘不写(与 `create_storage_card` 同一道闸:在 `/` 造出指纹文件会让
+///   启动盘被认成登记卡);
+/// - 不在挂载列表里的卷不写(不核实挂载点就写 = 往任意目录塞文件)。
+fn bind_medium_identity<R: tauri::Runtime>(app: &AppHandle<R>, root: &Path) -> Option<String> {
+    let mounted = known_source_volumes()
+        .into_iter()
+        .find(|v| normalize_lexical(&v.mount_point) == normalize_lexical(root));
+    let label = mounted
+        .as_ref()
+        .map(|v| v.name.clone())
+        .unwrap_or_else(|| root.display().to_string());
+    match &mounted {
+        Some(v) if v.system => {
+            notify::warn(
+                app,
+                "volume-uid-skipped",
+                format!(
+                    "源「{label}」是系统内置盘,不在其上写身份指纹:本次计划**没有**绑定到具体介质,\
+                     确认与开拷之间换了盘将无法被发现"
+                ),
+            );
+            None
+        }
+        Some(_) => {
+            let uid = volumes::ensure_volume_uid(root);
+            if uid.is_none() {
+                notify::warn(
+                    app,
+                    "volume-uid-unwritable",
+                    format!(
+                        "无法在卡「{label}」上写入身份指纹(可能写保护):本次计划**没有**绑定到具体介质,\
+                         确认与开拷之间换成同卷名的另一张未标记的卡将无法被发现;中断后续传也只能按卷名匹配"
+                    ),
+                );
+            }
+            uid
+        }
+        None => {
+            notify::warn(
+                app,
+                "volume-uid-skipped",
+                format!(
+                    "所选源「{label}」不是当前挂载的卷,跳过身份指纹写入:本次计划**没有**绑定到具体介质;\
+                     中断后续传将按卷名匹配,同名卡存在误认风险"
+                ),
+            );
+            None
+        }
+    }
 }
 
 /// 摘要里的卷身份:挂载点 + 卷名 + 卡指纹。
@@ -1510,9 +1634,17 @@ fn no_detail_tail(recalled: &RecalledPlan) -> &'static str {
 /// 其中「指纹从无到有」这一种根本不是换卡——`start_copy_task` 自己会往卡上写
 /// `.ocard-volume-id`,首拷失败后重试同一个令牌就会撞上它。这时候报「你换了一
 /// 张卡」是彻头彻尾的假警报,会让人去翻读卡器而不是去看真正的失败原因。
+///
+/// R13 C5:**快照拿不到时不许扣具体帽子**。此前这里直接断言「不是同一张卡」,
+/// 既没披露快照已被淘汰,也没有任何证据支撑那句话——摘要只能证明「卷身份段
+/// 对不上」,而挂载点变了、卷名变了、指纹是 OCard 自己后写的,都会让那一段变。
 fn why_volume_differs(recalled: &RecalledPlan, now: &str) -> String {
     let Some(then) = recalled.snapshot().map(|s| s.volume_identity.as_str()) else {
-        return "源卷不是你确认时的那一张卡(卡被换过,或拔插/重新挂载后卷身份变了)。".to_string();
+        return format!(
+            "源卷的身份(挂载点 / 卷名 / 卡指纹)与你确认时那一份对不上。具体是哪一段变了无法判定{}——\
+             既可能是换了卡或换了读卡器,也可能只是 OCard 在确认之后往卡上写了身份指纹。",
+            no_detail_tail(recalled)
+        );
     };
     let split = |s: &str| {
         let mut it = s.split('\u{0}');
@@ -1524,8 +1656,14 @@ fn why_volume_differs(recalled: &RecalledPlan, now: &str) -> String {
     let (m0, n0, u0) = split(then);
     let (m1, n1, u1) = split(now);
     if u0.is_empty() && !u1.is_empty() && m0 == m1 && n0 == n1 {
-        return "这张卡的身份指纹是在你确认之后才写上去的(OCard 自己写的,用于中断续传认卡)——\
-                源卷本身没换,但确认令牌因此失效了,重新确认一次即可。"
+        // R13 C2:这里**不能**断言「指纹是 OCard 写的、源卷没换」。
+        // 规划时会先给卡创建指纹(见 `plan_source_selection`),`u0` 为空只可能是
+        // 那一步**失败**了(写保护 / 卷不在挂载列表)——而失败时我们并没有拿到
+        // 任何介质标识,所以现在卡上这个指纹到底是 OCard 后来写的,还是换上来的
+        // 另一张已标记的卡自带的,**没有证据可以区分**。措辞必须留有余地。
+        return "确认时读不到(也没能写上)这张卡的身份指纹,现在卡上有一个。\
+                它可能是 OCard 在确认之后才写上去的,也可能是换上了另一张已经带指纹的卡——\
+                当时没能完成介质绑定,两者无法区分。请重新确认前先核对插着的是不是同一张卡。"
             .to_string();
     }
     if !u0.is_empty() && u1.is_empty() {
@@ -1540,7 +1678,9 @@ fn why_volume_differs(recalled: &RecalledPlan, now: &str) -> String {
     if n0 != n1 {
         return format!("源卷的卷名变了(确认时是「{n0}」,现在是「{n1}」)。");
     }
-    "源卷不是你确认时的那一张卡(卡被换过,或拔插/重新挂载后卷身份变了)。".to_string()
+    // 三段逐段都相等、整串却不同:只可能是身份串的形态变了(工具自身的问题),
+    // 这时候更不该扣「你换了卡」的帽子
+    "源卷的身份串与确认时那一份对不上,但逐段比对不出差异(工具内部状态异常)。".to_string()
 }
 
 /// 令牌对不上时的人话报文。
@@ -1551,12 +1691,17 @@ fn why_volume_differs(recalled: &RecalledPlan, now: &str) -> String {
 ///
 /// 定性来自摘要分段(总是拿得到),明细来自 [`ApprovedPlans`] 里那份批准过的
 /// 计划(可能拿不到)。拿不到明细就**明说**拿不到,不含糊、不编。
+///
+/// R13 C1:勾选范围自成一段、且比文件集**先判**。此前两者共用一段,「卡完全没变、
+/// 只是提交选择 B 时误带了选择 A 的令牌」会被逐条 diff 报成「A 被删、B 新增」,
+/// 于是断言「卡上的文件变了」——把前端状态错配说成有人动了卡。
 fn plan_changed_message(
     state: &AppState,
     approved: &str,
     fresh: &str,
     fresh_plan: &[copy::PlannedFile],
     volume_identity: &str,
+    fresh_selection: &[String],
 ) -> String {
     let recalled = state.approved_plans.recall(approved);
     let diff = match &recalled {
@@ -1579,6 +1724,50 @@ fn plan_changed_message(
         // 卷身份能解释后面所有差异,所以优先说它——先让人去看插的是哪张卡,
         // 而不是去数文件。但「哪一段变了」必须说准(见 why_volume_differs)
         copy::PlanChange::Volume => why_volume_differs(&recalled, volume_identity),
+        // R13 C1:勾选范围对不上 = 前端把**另一次规划**的令牌带过来了(或用户在
+        // 确认屏之外改了勾选)。这不是卡的问题,一个字都不能提「卡上的文件变了」。
+        copy::PlanChange::Selection => {
+            let named = recalled.snapshot().map(|s| {
+                let then: std::collections::HashSet<&str> =
+                    s.selection.iter().map(String::as_str).collect();
+                let now: std::collections::HashSet<&str> =
+                    fresh_selection.iter().map(String::as_str).collect();
+                let label = |f: &str| {
+                    if f.is_empty() {
+                        "卡根目录".to_string()
+                    } else {
+                        f.to_string()
+                    }
+                };
+                let mut only_then: Vec<String> =
+                    then.difference(&now).map(|f| label(f)).collect();
+                let mut only_now: Vec<String> = now.difference(&then).map(|f| label(f)).collect();
+                only_then.sort();
+                only_now.sort();
+                (only_then, only_now)
+            });
+            match named {
+                Some((only_then, only_now)) if !only_then.is_empty() || !only_now.is_empty() => {
+                    let mut parts = Vec::new();
+                    if !only_then.is_empty() {
+                        parts.push(format!("确认时勾了、这次没勾:{}", name_a_few(&only_then)));
+                    }
+                    if !only_now.is_empty() {
+                        parts.push(format!("这次多勾了:{}", name_a_few(&only_now)));
+                    }
+                    format!(
+                        "本次提交的勾选范围(选中的文件夹)与你确认时的那一份不是同一套:{}。\
+                         这与卡上的内容无关——多半是确认屏与提交用的不是同一次规划。",
+                        parts.join(";")
+                    )
+                }
+                _ => format!(
+                    "本次提交的勾选范围(选中的文件夹)与你确认时的那一份不是同一套{}。\
+                     这与卡上的内容无关——多半是确认屏与提交用的不是同一次规划。",
+                    no_detail_tail(&recalled)
+                ),
+            }
+        }
         copy::PlanChange::FileSet => match &diff {
             Some(d) if d.file_set_changed() => {
                 let mut parts = Vec::new();
@@ -1596,9 +1785,11 @@ fn plan_changed_message(
                 }
                 format!("卡上的文件在你确认之后变了:{}。", parts.join(";"))
             }
-            // 文件一条没变、文件集摘要却不同 = 本次提交的勾选范围和确认时那份不是同一套
+            // 勾选范围已经先判过(Selection 段相同才会走到这里),所以文件集段不同
+            // 却逐条比不出差异,只可能是工具自身的口径出了问题——照样拦,但不扣帽子
             Some(_) => {
-                "本次提交的勾选范围(选中的文件夹)与你确认时的那一份不一致。".to_string()
+                "文件集摘要与确认时那一份对不上,逐条却比不出差异(工具内部状态异常)。"
+                    .to_string()
             }
             None => format!(
                 "卡上的文件在你确认之后有增删或改动,现在共 {} 个文件{}。",
@@ -1689,6 +1880,7 @@ pub fn start_copy_task<R: tauri::Runtime>(
                 &fresh_digest,
                 &plan,
                 &identity,
+                &copy::normalized_selection(&selection),
             ));
         }
         Some(_) => {}
@@ -1736,38 +1928,12 @@ pub fn start_copy_task<R: tauri::Runtime>(
     // 读不动目标夹时这里会返回 Err(R6),因此必须排在任何写入之前。
     notice_target_name_clashes(&app, &plan, &dest_targets)?;
 
-    // 卡片指纹:身份随卡走。**全部路径校验通过后**才允许往卡上写文件;
-    // 写保护/非挂载卷拿不到指纹要告知(退化为卷名匹配,零静默)
-    let source_uid = if mounted.as_ref().is_some_and(|m| m.system) {
-        // 系统盘不写指纹:create_storage_card 拒绑系统盘,这里保持同一道闸,
-        // 否则拷贝路径能在 `/` 造出指纹文件让启动盘被认成登记卡(评审 P2)
-        notify::warn(
-            &app,
-            "volume-uid-skipped",
-            format!("源「{volume_name}」是系统内置盘,不在其上写身份指纹"),
-        );
-        None
-    } else if mounted.is_some() {
-        volumes::ensure_volume_uid(&source_root)
-    } else {
-        notify::warn(
-            &app,
-            "volume-uid-skipped",
-            format!(
-                "所选源「{volume_name}」不是当前挂载的卷,跳过身份指纹写入:中断后续传将按卷名匹配,同名卡存在误认风险"
-            ),
-        );
-        None
-    };
-    if mounted.is_some() && source_uid.is_none() {
-        notify::warn(
-            &app,
-            "volume-uid-unwritable",
-            format!(
-                "无法在卡「{volume_name}」上写入身份指纹(可能写保护):中断后续传将按卷名匹配,同名卡存在误认风险"
-            ),
-        );
-    }
+    // 卡片指纹:身份随卡走。规划期(`plan_source_selection`)已经绑过一次,这里
+    // 再绑一次是为了覆盖「整卷拷可以不带令牌」和「规划时写不进、现在写得进」两种
+    // 路径;`ensure_volume_uid` 幂等,已有指纹时直接读回。
+    // 写保护/非挂载卷/系统盘拿不到指纹的告警口径与规划期同一份(零静默,且不许
+    // 宣称完成了介质绑定)。
+    let source_uid = bind_medium_identity(&app, &source_root);
     m.source_uid = source_uid.clone();
     // 拷完自动转代理意图持久化(M3 T1.5:intent = manifest id,at-least-once 补投递)
     m.auto_proxy = input.auto_proxy && stats.meta.scenario == project::Scenario::A;
@@ -1827,6 +1993,9 @@ pub fn start_copy_task<R: tauri::Runtime>(
                 // 审计:整卷 = 空数组;按夹子拷时连改名条数一并留痕
                 "sourceFolders": m.source_selection,
                 "renamedCount": m.renamed_files.len(),
+                // R13 C6:这次用的是哪一版扫描口径(缺字段/0 = 旧口径,会漏拷
+                // 点开头的素材却照样报 100%)。审计行必须自带这个证据。
+                "scanPolicyVersion": m.scan_policy_version,
             }),
         ),
     );
@@ -2004,6 +2173,15 @@ fn refresh_resume_plan<R: tauri::Runtime>(
         // R10:失败出口也要取走计数(留着会算到下一次操作头上,报数失真)
         notice_scan_skips(app);
         let mut files = scanned.map_err(err)?;
+        // R13 C4:union **之前**先按老基线逐条 diff。整卷路径此前没有 resized /
+        // retimed 告警(只有按文件夹的那条有):暂停期间源文件被改大小、或同大小
+        // 改了 mtime,新计划会直接覆盖持久化的 size/mtime,把用户批准过的那份基线
+        // 无声抹掉——之后再也查不出「拷的到底是哪一版」。
+        let old_plan: Vec<copy::PlannedFile> = m.planned.iter().map(|p| p.to_plan()).collect();
+        if !old_plan.is_empty() {
+            let fresh_plan = copy::plan_whole_volume(&files);
+            notice_resume_baseline_diff(app, &copy::diff_plans(&old_plan, &fresh_plan), "源卷上");
+        }
         for p in &m.planned {
             if !files.iter().any(|f| f.rel == p.rel_path) {
                 // 计划内、源上已消失:留在清单里让引擎显式记失败,绝不静默漏拷
@@ -2019,8 +2197,13 @@ fn refresh_resume_plan<R: tauri::Runtime>(
         // R11:排除口径收紧后,续传老任务时会有一批**以前被排除、现在算素材**的
         // 文件(点开头的合法素材)第一次进入整卷计划并被拷贝。多拷不是漏拷,但
         // 用户会看到「已经跑完的任务又冒出新文件」——不解释清楚,他会以为卡被人动过。
-        notice_policy_widened(app, m.planned.iter().map(|p| p.rel_path.as_str()), &plan);
-        persist_refreshed_plan(app, m, project_root, &plan);
+        notice_policy_widened(
+            app,
+            m.planned.iter().map(|p| p.rel_path.as_str()),
+            &plan,
+            m.scan_policy_version,
+        );
+        persist_refreshed_plan(app, m, project_root, &plan)?;
         return Ok(plan);
     }
 
@@ -2037,56 +2220,44 @@ fn refresh_resume_plan<R: tauri::Runtime>(
     notice_scan_skips(app);
     match scanned {
         Ok((fresh, _, _)) => {
-            let mut resized = 0usize;
-            // 同大小但 mtime 变了 = 内容很可能被换掉(换卡/别人动过源文件)。
-            // 只比 size 的话这种替换完全无声,而它恰恰是最危险的一种
-            let mut retimed = 0usize;
+            // 与整卷路径同一份逐条 diff(R13 C4):被改大小、或同大小改了 mtime 的
+            // 文件意味着**开拷时批准的基线即将被新值覆盖**,两条路径的告警必须一致。
+            // 只比 size 的话「同大小内容被替换」完全无声,而它恰恰是最危险的一种。
+            let mut d = copy::PlanDiff::default();
             for p in plan.iter_mut() {
                 if let Some(f) = fresh.iter().find(|f| f.source_rel == p.source_rel) {
                     if f.size != p.size {
-                        resized += 1;
+                        d.resized.push(p.source_rel.clone());
                     } else if p.source_mtime_ns != 0
                         && f.source_mtime_ns != 0
                         && f.source_mtime_ns != p.source_mtime_ns
                     {
-                        retimed += 1;
+                        d.retimed.push(p.source_rel.clone());
                     }
                     p.size = f.size;
                     p.source_mtime_ns = f.source_mtime_ns;
                 }
             }
-            if resized > 0 {
-                notify::warn(
-                    app,
-                    "copy-resume-size-changed",
-                    format!(
-                        "所选文件夹里有 {resized} 个文件在暂停期间大小变了,已按当前实际大小续传;若这不是预期,请核对是否换了卡或有人动过源文件"
-                    ),
-                );
-            }
-            if retimed > 0 {
-                notify::warn(
-                    app,
-                    "copy-resume-content-replaced",
-                    format!(
-                        "所选文件夹里有 {retimed} 个文件大小没变、修改时间却变了——内容很可能被替换过。续传会按内容哈希重新核对,已拷到目的地的旧版本不会被覆盖(会报冲突让你人工裁决);若这不是预期,请核对是否换了卡"
-                    ),
-                );
-            }
+            d.resized.sort();
+            d.retimed.sort();
+            notice_resume_baseline_diff(app, &d, "所选文件夹里");
             let added: Vec<&str> = fresh
                 .iter()
                 .filter(|f| !plan.iter().any(|p| p.source_rel == f.source_rel))
                 .map(|f| f.source_rel.as_str())
                 .collect();
             if !added.is_empty() {
-                // R11:排除口径从「点开头一律跳过」收紧成明确列举的系统项之后,
-                // **升级前**建的任务续传时会凭空多出一批点开头的文件。不点破的话,
-                // 用户看到的是「卡上多了文件」,第一反应是有人动过这张卡——把他推向
-                // 完全错误的排查方向。所以这一类要单独说清楚是口径变了。
+                // R11 / R13 C6:排除口径从「点开头一律跳过」收紧成明确列举的系统项
+                // 之后,**升级前**建的任务续传时会凭空多出一批点开头的文件。
+                // 但反过来,本版本新建的任务在暂停期间用户真的新增了 `.clip.mov`,
+                // 也长这个样子——两者从这里看**分辨不出来**。旧措辞直接断言
+                // 「并不是这张卡被人动过」就是在编:归因错了,用户会放过一次真实变更。
+                // 判据只有清单里的 `scan_policy_version`(缺失 = 旧口径)。
                 let widened = added.iter().filter(|r| has_dot_segment(r)).count();
                 let because = if widened > 0 {
                     format!(
-                        ";其中 {widened} 个是「.」开头的条目——OCard 升级后不再一律排除点开头的条目(只排除废纸篓、索引这类明确的系统项),所以它们这次才出现,并不是这张卡被人动过"
+                        ";其中 {widened} 个是「.」开头的条目{}",
+                        policy_upgrade_caveat(m.scan_policy_version)
                     )
                 } else {
                     String::new()
@@ -2102,7 +2273,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
                     ),
                 );
             }
-            persist_refreshed_plan(app, m, project_root, &plan);
+            persist_refreshed_plan(app, m, project_root, &plan)?;
         }
         Err(e) => notify::warn(
             app,
@@ -2120,15 +2291,40 @@ fn has_dot_segment(rel: &str) -> bool {
     rel.split('/').any(|s| s.starts_with('.'))
 }
 
+/// 「点开头的条目这次才冒出来」的归因措辞(R13 C6)。
+///
+/// 两种原因长得一模一样,而清单里唯一的证据是 `scan_policy_version`:
+/// - 缺失(0)= 这份清单是**旧口径**下锁定的,策略升级足以解释;
+/// - 已是当前版本 = 锁定时就已经是新口径,策略升级**解释不了**,只能是卡上真的
+///   多了东西。
+///
+/// 即便是前者也**不能排除**卡内容同时发生了变化——所以措辞一律留有余地。
+/// 说错原因比不说更糟:断言「不是这张卡被人动过」会让用户放过一次真实变更。
+fn policy_upgrade_caveat(scan_policy_version: u32) -> String {
+    if scan_policy_version < manifest::SCAN_POLICY_VERSION {
+        format!(
+            "——本任务的清单是在扫描策略 v{scan_policy_version}(旧口径:点开头一律排除)下锁定的,\
+             当前是 v{}(只排除废纸篓、索引这类明确的系统项)。它们**可能**是策略升级带来的,\
+             也**可能**是确认之后卡上真的新增了这些文件——两者无法区分,请核对后再做判断",
+            manifest::SCAN_POLICY_VERSION
+        )
+    } else {
+        "——本任务锁定时就已经是当前扫描策略,策略升级解释不了它们,\
+         应当按「源卷内容在开拷之后发生了变化」来核对"
+            .to_string()
+    }
+}
+
 /// 整卷续传时,因排除口径收紧而**新进入计划**的条目的可见告警。
 ///
 /// 零静默:这批文件会被真的拷到目的地,任务的文件数和「完成」判定都跟着变。
-/// 老任务的 `planned` 是升级前锁定的,升级后重扫会多出这些条目——必须说清是
-/// OCard 改了口径,不是卡被人动过。
+/// 老任务的 `planned` 是升级前锁定的,升级后重扫会多出这些条目——但同样的形状
+/// 也可能来自「卡上真的新增了点开头的素材」,归因必须留有余地(R13 C6)。
 fn notice_policy_widened<'a, R: tauri::Runtime>(
     app: &AppHandle<R>,
     locked: impl Iterator<Item = &'a str>,
     plan: &[copy::PlannedFile],
+    scan_policy_version: u32,
 ) {
     let locked: std::collections::HashSet<&str> = locked.collect();
     let newly: Vec<&str> = plan
@@ -2143,40 +2339,79 @@ fn notice_policy_widened<'a, R: tauri::Runtime>(
         app,
         "copy-resume-scope-widened",
         format!(
-            "续传时新纳入了 {} 个「.」开头的条目({}{}),它们**会被拷贝**:OCard 升级后不再一律排除点开头的条目(只排除废纸篓、索引这类明确的系统项),所以它们这次才出现——不是这张卡被人动过。任务进度会因此回退到未完成,拷完再看「可格式化」提示",
+            "续传时新纳入了 {} 个「.」开头的条目({}{}),它们**会被拷贝**{}。任务进度会因此回退到未完成,拷完再看「可格式化」提示",
             newly.len(),
             newly.iter().take(3).copied().collect::<Vec<_>>().join("、"),
             if newly.len() > 3 { " 等" } else { "" },
+            policy_upgrade_caveat(scan_policy_version),
         ),
     );
 }
 
+/// 续传前「新旧计划逐条差异」的可见告警(R13 C4)。
+///
+/// 整卷与按文件夹两条路径共用同一套措辞:被改了大小、或同大小改了 mtime 的文件,
+/// 意味着**用户批准过的那份 size/mtime 基线即将被新值覆盖**。不点破就等于无声
+/// 抹掉基线——事后再也说不清「拷的到底是哪一版」。
+fn notice_resume_baseline_diff<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    d: &copy::PlanDiff,
+    scope: &str,
+) {
+    if !d.resized.is_empty() {
+        notify::warn(
+            app,
+            "copy-resume-size-changed",
+            format!(
+                "{scope}有 {} 个文件在暂停期间大小变了({}),已按当前实际大小续传,开拷时记录的基线会被覆盖;若这不是预期,请核对是否换了卡或有人动过源文件",
+                d.resized.len(),
+                name_a_few(&d.resized)
+            ),
+        );
+    }
+    if !d.retimed.is_empty() {
+        notify::warn(
+            app,
+            "copy-resume-content-replaced",
+            format!(
+                "{scope}有 {} 个文件大小没变、修改时间却变了({})——内容很可能被替换过。续传会按内容哈希重新核对,已拷到目的地的旧版本不会被覆盖(会报冲突让你人工裁决);若这不是预期,请核对是否换了卡",
+                d.retimed.len(),
+                name_a_few(&d.retimed)
+            ),
+        );
+    }
+}
+
 /// 把刷新后的计划原子写回清单(planned + completed 一起,同一次 save)。
 ///
-/// 落盘失败不阻断续传(引擎每完成一个文件还会再写一次清单),但必须可见:
-/// 清单是审计凭证,写不进去就意味着「事后查到的范围」和「实际拷的范围」可能对不上。
+/// R13 C3(P0):写回失败必须 **fail-closed**。此前只发一条告警就放行,而 worker
+/// 会拿着内存里的新计划开跑、按**磁盘上的旧 `planned`** 保存进度——审计范围与
+/// 实际拷贝范围就此分叉,事后查到的「拷了什么」不是真的拷了什么。清单是这个
+/// 工具的审计凭证,写不进去就没有资格继续。
 fn persist_refreshed_plan<R: tauri::Runtime>(
     app: &AppHandle<R>,
     m: &mut manifest::CopyManifest,
     project_root: &Path,
     plan: &[copy::PlannedFile],
-) {
+) -> CmdResult<()> {
     let refreshed: Vec<manifest::PlannedFile> =
         plan.iter().map(manifest::PlannedFile::from_plan).collect();
     if refreshed == m.planned {
-        return; // 一个字没变,不必重写
+        return Ok(()); // 一个字没变,不必重写
     }
     m.planned = refreshed;
     // 计划变了就还没跑完:`completed` 必须跟着回落,否则会留下
     // 「清单说完成了、里面却有未验证项」的自相矛盾状态
     m.completed = false;
     if let Err(e) = manifest::save(project_root, m) {
-        notify::warn(
-            app,
-            "copy-resume-manifest-not-persisted",
-            format!("续传前刷新的文件清单未能写回拷卡清单(审计记录可能与实际拷贝范围不一致): {e}"),
+        let msg = format!(
+            "续传前刷新的文件清单**未能**写回拷卡清单,已拒绝续传(继续跑会让审计范围与实际拷贝范围对不上:\
+             worker 用的是刷新后的新清单,磁盘上却还是旧的那份)。请排查目的地/NAS 是否可写后重试: {e}"
         );
+        notify::warn(app, "copy-resume-manifest-not-persisted", msg.clone());
+        return Err(msg);
     }
+    Ok(())
 }
 
 /// 启动时从各项目未完成的 manifest 重建 paused 任务(评审 H3/P0-3):
@@ -2320,6 +2555,8 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
                     .unwrap_or(&m.target_rel)
                     .to_string(),
                 source_folders: m.source_selection.clone(),
+                // 重建的任务照实报清单里的口径版本:0 = 旧口径锁定的清单
+                scan_policy_version: m.scan_policy_version,
                 destinations: m
                     .destinations
                     .iter()

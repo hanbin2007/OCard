@@ -127,19 +127,102 @@ const LAYER_PROBE = (spec) => {
 };
 
 /**
- * 三种浮层的合成配方。
+ * 全屏层的**扫描面自检**(在页面上下文里跑)。
  *
- * 不去点开真实浮层(依赖素材与项目状态,会脆),而是用真类名挂一份超高的
- * 合成内容:要钉的本来就是**样式层的定律**,不是某一次的接线。
+ * 下面那份 LAYER_RECIPES 是手抄清单——手抄清单会落后于 CSS,这正是同一轮
+ * 在单测里刚修掉的毛病(stacking.test 曾经只手抄扫两张样式表,于是
+ * shell.css 的 `.topbar__project-menu` 整整漏了一轮)。这里反过来钉:
+ * **CSS 里有几族全屏层,recipe 就必须覆盖几族**,缺一个就点名判红。
+ *
+ * 做法上刻意**不在页面里重写一遍选择器解析器**:从活的样式表里把出现过的
+ * 类名捞成候选(多捞无害,少捞才致命,所以 `.x` 与 `[class~="x"]` 两种形态
+ * 都捞),然后逐个挂一个空 div,让浏览器**自己**算级联,读计算值判定
+ * 「fixed + 竖直方向铺满 + grid/flex」。这比任何静态解析都准。
+ */
+const LAYER_SCAN = () => {
+  const names = new Set();
+  const blocked = [];
+  let ruleCount = 0;
+
+  // 注意:CSSRuleList / StyleSheetList 按 CSSOM 规范**不是 iterable**
+  // (只有 length + item()),`for...of` 会直接抛 TypeError。
+  // 第一版就是这么写的,再被一个空 catch 吞掉 → 扫到 0 族 → 「全绿」。
+  // 这正是本文件通篇在防的静默 fail-open,所以:按下标遍历,并且把读不到的
+  // 样式表如实报上去,由用例判红。
+  const harvest = (rules) => {
+    for (let i = 0; i < rules.length; i++) {
+      const r = rules.item(i);
+      // 先收自己的选择器,**再**往下递归。
+      // 顺序不能反:支持 CSS 嵌套之后,`CSSStyleRule` 也带一个(空的)
+      // `cssRules`,先判 `if (r.cssRules) { recurse; continue; }` 会把每一条
+      // 普通规则都当成分组规则跳过 —— 第一版就是这么写的,扫到 0 条。
+      const sel = r.selectorText;
+      if (sel) {
+        ruleCount++;
+        for (const m of sel.matchAll(/\.(-?[_a-zA-Z][\w-]*)/g)) names.add(m[1]);
+        for (const m of sel.matchAll(/\[class[~*^$|]?=\s*["']([^"']+)["']/g)) {
+          for (const t of m[1].split(/\s+/)) if (t) names.add(t);
+        }
+      }
+      // @media / @supports / @layer / 嵌套规则;@keyframes 的关键帧没有
+      // selectorText,递归进去也只是空转
+      if (r.cssRules && r.cssRules.length) harvest(r.cssRules);
+    }
+  };
+  const sheets = document.styleSheets;
+  for (let i = 0; i < sheets.length; i++) {
+    try {
+      harvest(sheets[i].cssRules);
+    } catch (e) {
+      blocked.push(`${sheets[i].href || "(inline)"}: ${e.message}`);
+    }
+  }
+
+  const probe = document.createElement("div");
+  probe.dataset.e2eScan = "1";
+  document.body.appendChild(probe);
+  const vh = window.innerHeight;
+  const layers = [];
+  for (const n of [...names].sort()) {
+    // 修饰类单独挂不成层(`.overlay--drawer` 身上没有 position:fixed),
+    // 族名一律取基类
+    if (n.includes("--")) continue;
+    probe.className = n;
+    const cs = getComputedStyle(probe);
+    if (cs.position !== "fixed") continue;
+    const disp = cs.display.replace(/^inline-/, "");
+    if (disp !== "grid" && disp !== "flex") continue;
+    const pinnedBothEnds = parseFloat(cs.top) === 0 && parseFloat(cs.bottom) === 0;
+    const viewportTall = Math.abs(probe.getBoundingClientRect().height - vh) < 2;
+    if (!pinnedBothEnds && !viewportTall) continue;
+    layers.push(n);
+  }
+  probe.remove();
+  return { layers, blocked, ruleCount, classCount: names.size };
+};
+
+/**
+ * 全屏层的合成配方。
+ *
+ * 不去点开真实浮层(依赖素材与项目状态,会脆),而是用真类名挂一份合成内容:
+ * 要钉的本来就是**样式层的定律**,不是某一次的接线。
+ *
+ * `covers` 是这份配方覆盖的层族(基类名),由上面 LAYER_SCAN 交叉核对——
+ * 新增一族全屏层而没写配方,那条用例会点名判红。
  *
  * `unmask` 是「拆掉兄弟兜底」那一趟要注入的 CSS。缘由见用例注释:同一提交里
  * 加的 `.drawer{overflow-y:auto}` 会把 `.overlay` 少写 grid-template-rows 的
  * 症状整个盖住,只跑原样那一趟等于只守住「两个修复同时被撤销」。
+ *
+ * **注意配方形状不是一个模子**:`.lightbox` 的舞台是刻意裁剪的(见它自己的
+ * 注释),塞 4000px 探针会误红。别为了让数字对上而硬塞一个会误红的配方——
+ * 那是把防线换成一条永远绿或永远红的噪声。
  */
 const LAYER_RECIPES = [
   {
     name: "抽屉(审计日志)",
     layer: "overlay overlay--drawer",
+    covers: "overlay",
     html:
       '<div class="drawer"><div class="drawer__head">头</div>' +
       '<div class="drawer__filters">筛选</div>' +
@@ -153,6 +236,7 @@ const LAYER_RECIPES = [
   {
     name: "对话框",
     layer: "overlay",
+    covers: "overlay",
     html: '<div class="dialog">__TALL__</div>',
     // 对话框自封闭:max-height + 自身滚动成对出现;它自己就是滚动容器,没有可拆的兄弟兜底
     scroller: ".dialog",
@@ -162,6 +246,7 @@ const LAYER_RECIPES = [
   {
     name: "连拍组全屏层",
     layer: "group-layer",
+    covers: "group-layer",
     html:
       '<div class="group-layer__bar">头</div>' +
       '<div class="group-layer__tools">工具</div>' +
@@ -171,7 +256,51 @@ const LAYER_RECIPES = [
     pinned: ".group-layer__foot",
     unmask: "",
   },
+  /*
+   * 大图全屏预览。**形状和上面三个不一样,这是刻意的。**
+   *
+   * `.lightbox__stage` 的 `overflow: hidden` 是设计,不是遗漏(overflow.test.ts
+   * 的 CLIP_EXEMPT 里写了理由):舞台里只有一张 `object-fit: contain` +
+   * `max-height: 100%` 的媒体,结构上不产生溢出。往里塞 4000px 的通用探针会
+   * 立刻踩中探针第 5 条「有可滚内容被 hidden/clip 裁掉」→ 误红。
+   *
+   * 所以这里换一个**同样致命、但形状对得上**的探针:放一张 4000×4000 的
+   * 假媒体(真 <img> 在无网的 headless 里不会加载,用带 lightbox__image 类的
+   * 空 div 代替,`max-width/max-height: 100%` 对它一样生效)。这一族真正要守的
+   * 不变式是:
+   *
+   *   ① 层自己恰好一屏、不被内容撑大(探针第 1 条);
+   *   ② 媒体被舞台**界住**——`max-height: 100%` 要解析得出定值,前提是舞台
+   *      有确定高度(`flex: 1 1 auto` + `min-height: 0` + 层本身定高)。
+   *      舞台的高度一旦失去参照,这张 4000px 的媒体就会顶穿视口下沿,
+   *      pinned 那条断言直接抓住(探针第 4 条);
+   *   ③ 舞台仍然不产生可滚溢出(探针第 5 条)——它是刻意裁剪的,
+   *      一旦真的裁掉了内容,说明 ② 已经先破了。
+   *
+   * 没有 scroller 是对的:这一族**结构上就不该有内部滚动容器**。
+   * 别为了跟别的配方长得一样而给它塞一个。
+   */
+  {
+    name: "大图全屏预览",
+    layer: "lightbox",
+    covers: "lightbox",
+    html:
+      '<div class="lightbox__bar"><span class="lightbox__badges">徽标</span></div>' +
+      '<div class="lightbox__stage">' +
+      '<div class="lightbox__image" style="width:4000px;height:4000px"></div>' +
+      "</div>" +
+      '<div class="lightbox__actions">动作条</div>',
+    scroller: null,
+    pinned: ".lightbox__image",
+    unmask: "",
+  },
 ];
+
+/**
+ * 扫描面豁免:某一族全屏层确实不该有 recipe 时,写在这里并说明理由。
+ * 空着是好事——空着意味着每一族都真的被探针跑过。
+ */
+const LAYER_SCAN_EXEMPT = {};
 
 describe("OCard M1 冒烟", () => {
   it("启动进入欢迎窗口,预置配置已生效(无首跑引导)", async () => {
@@ -381,6 +510,47 @@ describe("OCard M1 冒烟", () => {
    *     并且同一时刻真能滚的容器有且只有它一个(零高度的 overflow:auto 容器
    *     也有可滚量,却对用户完全不存在)。
    */
+  /**
+   * 扫描面自检:手抄的 recipe 清单不许落后于 CSS。
+   *
+   * 上一版这份清单只有抽屉/对话框/连拍组三条,`.lightbox` 不在里面,
+   * 将来新增的全屏层也不会自动进——和 stacking.test 当年只手抄扫两张样式表
+   * 是同一个毛病:**防线看不见新东西**。这条用例让 CSS 自己报数。
+   */
+  it("浮层扫描面自检:CSS 里的每一族全屏层都必须有配方(手抄清单不许落后)", async () => {
+    await browser.setWindowRect(null, null, 1280, 860);
+    await browser.pause(400);
+
+    const scan = await browser.execute(LAYER_SCAN);
+
+    // 先钉住扫描器自己没瞎:读不到的样式表、扫到 0 条规则、扫到 0 族,
+    // 这三种情况都会让下面的比对「恰好全绿」。
+    expect(scan.blocked, "有样式表读不到 cssRules,扫描面不完整").toEqual([]);
+    expect(
+      scan.ruleCount,
+      `只扫到 ${scan.ruleCount} 条样式规则 / ${scan.classCount} 个类名 —— 扫描器本身失效了`,
+    ).toBeGreaterThan(300);
+    const found = scan.layers;
+    expect(found.length, "一族全屏层都没扫到 = 扫描判据本身失效").toBeGreaterThanOrEqual(1);
+
+    const covered = new Set(LAYER_RECIPES.map((r) => r.covers));
+    const missing = found.filter((n) => !covered.has(n) && !(n in LAYER_SCAN_EXEMPT));
+    expect(
+      missing,
+      `这几族全屏层在 CSS 里存在,却没有任何 recipe 跑过它们:[${missing.join(",")}]。\n` +
+        "请给它写一份配方(注意形状要贴合它自己的结构,别照抄一个会误红的)," +
+        "或者加进 LAYER_SCAN_EXEMPT 并写明为什么它不需要探针。\n" +
+        `当前扫到:[${found.join(",")}];当前覆盖:[${[...covered].join(",")}]`,
+    ).toEqual([]);
+
+    const stale = [...covered].filter((n) => !found.includes(n));
+    expect(
+      stale,
+      `这几份 recipe 的 covers 在 CSS 里已经不是全屏层了:[${stale.join(",")}]。\n` +
+        "要么是类名改了、要么是这一族不再 fixed 铺满——配方已经在空跑,请更新。",
+    ).toEqual([]);
+  });
+
   it("浮层不变式:铺满视口、行不被撑大、溢出由内部滚动容器真正承担", async () => {
     await browser.setWindowRect(null, null, 1280, 860);
     await browser.pause(400);

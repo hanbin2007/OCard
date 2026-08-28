@@ -583,13 +583,29 @@ export function listSourceFolders(volumeId: string): Promise<SourceFolder[]> {
  *
  * 返回的 `planDigest` 是这次批准的绑定令牌，发起拷卡时必须原样回传；
  * 后端重扫后比对不上会返回 `PLAN_CHANGED:`（卡上内容在确认之后变了）。
+ *
+ * `confirmInstanceId` 是**确认页实例**的稳定 id（页面存活期间不变，换一次确认屏
+ * 换一个）。后端的计划快照缓存只有 16 个槽，带上它之后**同一个确认页**来回改
+ * 勾选、重试核算只占一个槽，不会把别的确认屏正在用的那份挤掉。
+ *
+ * 不传也能用（退化成「TTL + 按时间淘汰」），但多个确认屏并发时快照可能被挤掉——
+ * 而快照正是 `PLAN_CHANGED` 报文说得出「多了哪几个文件」「勾选差在哪」的唯一来源，
+ * 丢了就只剩泛化原因。所以有 id 就一定带上；没有时**不发这个键**（而不是发
+ * `undefined`），让后端收到干净的 `None`，请求体与老客户端逐字节一致。
  */
 export function planSourceSelection(
   volumeId: string,
   folders: string[],
+  confirmInstanceId?: string,
 ): Promise<SourcePlan> {
-  if (IS_TAURI) return ipc("plan_source_selection", { volumeId, folders });
-  return reply(mockSourcePlan(volumeId, folders));
+  if (IS_TAURI) {
+    return ipc("plan_source_selection", {
+      volumeId,
+      folders,
+      ...(confirmInstanceId ? { confirmInstanceId } : {}),
+    });
+  }
+  return reply(mockSourcePlan(volumeId, folders, confirmInstanceId));
 }
 
 /** 探查源卷：素材时间范围 + 建议时段前缀（PRD §5.3「从素材时间戳自动推断，可改」） */

@@ -25,278 +25,188 @@
  * 这类问题在单测里只能钉文本。
  *
  * ------------------------------------------------------------------
- * 本文件的默认方向是 **fail-closed**:不认识的写法一律判红。
+ * 第三轮重写(2026-08-28):解析层整体从正则换成 **postcss AST**。
  *
- * 上一版被两路评审实测出五类假绿,全部来自「判据认得太少」:
+ * 前两轮的所有漏网之鱼根因只有一条:**用正则模拟选择器解析和 CSS 级联,做不对**。
+ * 第二轮评审用等价改写实测出的逃逸/误判(全部已复现):
  *
- *  ① 只看 `minmax(...)` 逗号前那一段,不管整条声明浏览器认不认。
- *     headless Chrome 实测(1280×860 视口 / 1313px 内容):
+ *   逃逸(该红没红)                                              现在
+ *   minmax(0, calc(100vh - )) 语法非法的 calc                    RED  calc 表达式真解析
+ *   grid-template-rows: auto !important; 后跟一条安全值           RED  !important 参与级联
+ *   把 position/inset/display 拆成两个规则块                      RED  按「元素」而不是「块」判层
+ *   [class~="overlay"] { overflow-y: hidden }                    RED  属性选择器进类名集合
+ *   position:fixed; top/left:0; width:100vw; height:100vh        RED  竖直方向铺满即入扫描面
  *
- *       grid-template-rows              .overlay scrollH  body 可滚量  判定
- *       (不写)                           1507             0           病灶
- *       auto / 1fr / minmax(auto, 1fr)   1507             0           病灶
- *       minmax(0, 1fr)                   840              667         安全
- *       minmax(0, auto)                  840              667         安全
- *       minmax(0, max-content)           840              667         安全
- *       100%                             840              667         安全
- *       minmax(0, fit-content(100vh))    1507             0           ★ 非法值
- *       minmax(0, 1rf)                   1257             0           ★ 单位打错
- *       minmax(0, var(--nope))           1507             0           ★ 变量不存在
+ *   误红(不该红却红了)                                          现在
+ *   [row-start header] 一个方括号里多个命名线                     GREEN 方括号成对跳过
+ *   :is(.a, .b) .child { … } 后代规则                            GREEN 逗号拆分由 AST 做
+ *   .chip[data-kind=".overlay"] 属性值里含 ".overlay" 字符串       GREEN 类名只从真类名位置取
  *
- *     后三条都是「浏览器整条丢弃该声明 → 退回隐式 auto 行 → 原样复现病灶」,
- *     而只看 min 的旧判据全部放行。所以现在每条轨道**整体过白名单**:
- *     合法性(浏览器认不认)与安全性(最小值是否与内容无关)分开判,
- *     两关都过才算绿。注意 `minmax(0, auto)` / `minmax(0, max-content)`
- *     经实测是**安全**的(容器高度确定时轨道被 maximize 到容器高度),
- *     「只看 min 的语义」本身没错,错的是没做合法性校验。
- *
- *  ② 选择器族按「字符串结尾匹配」判,`div.overlay{auto}` 与
- *     `.overlay.overlay--drawer{auto}` 这两种**更高优先级**的合法覆盖直接漏检。
- *     现在改成解析选择器的**主语**(最后一个复合选择器)里的类名集合。
- *
- *  ③ `BLOCKS.find` 只看第一个同选择器块,追加一个重复块就能把病灶放回来。
- *     现在一律 `filter`,对每一个块都断言;块内也取**最后一条**声明(级联最终值)。
- *
- *  ④ 扫描判据写死 `display: grid`,看不见新增的 flex 全屏层(`.group-layer` /
- *     `.lightbox`)。现在 grid / flex 两支都扫,flex 支按「恰好一条弹性子轨 +
- *     它必须非裁剪地滚 + 它必须 min-height:0(保险丝,见用例内实测口径)」判。
- *
- *  ⑤ 解析器本身退化(扫不到 = 零发现 = 全绿)只靠「块数 ≥ 200」这种弱自检。
- *     现在增加**交叉核对**:关键属性在原文里出现几次,解析器就必须解析到几次。
+ * 三条设计原则:
+ *  ① **判据的主语是「元素」,不是「规则块」**。契约先从所有选择器主语里枚举出
+ *     「可能存在的元素」(类名集合,BEM 修饰类自动补上基类),再把每个元素身上
+ *     所有命中的规则按 (!important, specificity, 源序) 算级联最终值。
+ *     于是「拆块」「加重复块」「更高 specificity 的覆盖」「!important」全都算得对。
+ *  ② **不认识 = 判红**。选择器解析不了、轨道写法不在白名单、calc 表达式不合法、
+ *     var() 展不开——一律进 UNPARSED 判红,并在失败信息里说清「契约看不懂」。
+ *  ③ **自检钉的是「新东西不会隐形」**,而不是「旧东西还在」:
+ *     - AST 里的规则总数必须等于契约登记到的规则数(少一条 = 有写法被吞了);
+ *     - 每一条规则都必须至少被一个候选元素命中(否则它对所有断言不可见);
+ *     - main.tsx 的 import 清单必须与磁盘上的 *.css 完全一致(新表不会漏扫)。
  *
  * 已知边界(写明比假装覆盖强):本契约只认识 grid / flex 两种全屏层。
  * `position:fixed; inset:0; display:block` 的纯遮罩不在扫描范围内——
  * 它的高度不受内容影响,不会复现本病灶。
  */
 
-import { readdirSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
-import process from "node:process";
 import { describe, expect, it } from "vitest";
-
-const DIR = resolve(process.cwd(), "src/styles");
-
-/**
- * 剥注释,但用等量空白填回去——位置/下标断言依赖偏移不变。
- * (直接在原文上跑正则的话,「把真规则整段换成同内容的注释」测试照样绿。)
- */
-function stripComments(css: string): string {
-  return css.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "));
-}
-
-/** 全量扫 src/styles 下每一张表,不维护手抄清单(漏表 = 漏防线) */
-const SHEETS = readdirSync(DIR)
-  .filter((f) => f.endsWith(".css"))
-  .map((f) => ({ name: f, css: stripComments(readFileSync(resolve(DIR, f), "utf8")) }));
-
-/* ------------------------------------------------------------------ *
- * 选择器解析
- * ------------------------------------------------------------------ */
-
-/**
- * 取选择器的**主语**:最后一个复合选择器(depth 0 的组合符切开后的最后一段)。
- *
- * 为什么是主语而不是「整条里出现过」:`.overlay .child { … }` 作用在后代身上,
- * 拿它去判「浮层自己的行」会误红;而 `div.overlay` / `#root .overlay` /
- * `.overlay.overlay--drawer` 的主语都含 `.overlay`,一个都跑不掉。
- */
-function subjectOf(selector: string): string {
-  let depth = 0;
-  let cur = "";
-  let last = "";
-  for (const ch of selector) {
-    if (ch === "(" || ch === "[") depth++;
-    else if (ch === ")" || ch === "]") depth--;
-    if (depth === 0 && /[\s>+~]/.test(ch)) {
-      if (cur) last = cur;
-      cur = "";
-    } else {
-      cur += ch;
-    }
-  }
-  return cur || last;
-}
-
-/** 主语里出现的所有类名(`:not(.x)` 之类伪类里的也算——多算只会更严) */
-function subjectClasses(selector: string): string[] {
-  return [...subjectOf(selector).matchAll(/\.(-?[_a-zA-Z][\w-]*)/g)].map((m) => m[1]);
-}
-
-interface Block {
-  sheet: string;
-  /** 逗号拆开后的每一个选择器 */
-  selectors: string[];
-  /** 所有选择器主语里的类名并集 */
-  classes: Set<string>;
-  body: string;
-}
-
-/** 逐规则块解析:看得见缩进的、后代的、逗号列表里的每一个选择器 */
-function blocks(): Block[] {
-  const out: Block[] = [];
-  for (const { name, css } of SHEETS) {
-    const ruleRe = /([^{}]+)\{([^{}]*)\}/g;
-    let m: RegExpExecArray | null;
-    while ((m = ruleRe.exec(css))) {
-      const selectors = m[1]
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      // @media / @supports 这类外层块本身没有声明体,拆出来的"选择器"以 @ 开头
-      if (selectors.some((s) => s.startsWith("@"))) continue;
-      const classes = new Set<string>();
-      for (const s of selectors) for (const c of subjectClasses(s)) classes.add(c);
-      out.push({ sheet: name, selectors, classes, body: m[2] });
-    }
-  }
-  return out;
-}
-
-const BLOCKS = blocks();
-
-const where = (b: Block) => `${b.sheet} ${b.selectors.join(",")}`;
-
-/* ------------------------------------------------------------------ *
- * 声明解析(块内取**最后一条** = 级联最终值)
- * ------------------------------------------------------------------ */
-
-/** 一个块里某属性的全部声明(按源序);`!important` 只影响优先级,不影响取值合法性 */
-function decls(body: string, prop: string): string[] {
-  const re = new RegExp(`(?:^|;)\\s*${prop}\\s*:\\s*([^;]+)`, "g");
-  const out: string[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(body))) out.push(m[1].replace(/!\s*important\s*$/i, "").trim());
-  return out;
-}
-
-/** 块内该属性的最终值:同块里后写的赢(旧版只取第一条,「先安全后 auto」能骗过它) */
-function decl(body: string, prop: string): string | null {
-  const all = decls(body, prop);
-  return all.length ? all[all.length - 1] : null;
-}
-
-/** 某个选择器族(主语含这些类名之一)的所有块,按源序 */
-function blocksFor(match: (cls: string) => boolean): Block[] {
-  return BLOCKS.filter((b) => [...b.classes].some(match));
-}
-
-/** 基础类名 + 它的修饰类:`overlay` / `overlay--drawer` / `overlay--gate` */
-const family = (base: string) => (cls: string) =>
-  cls === base || cls.startsWith(`${base}--`);
-/** BEM 子元素:`group-layer__grid` / `group-layer__grid--x` */
-const element = (base: string) => (cls: string) => cls.startsWith(`${base}__`);
-
-/* ------------------------------------------------------------------ *
- * 自定义属性(var 解析)
- * ------------------------------------------------------------------ */
-
-/**
- * 收集全表的自定义属性。同名多值(明暗主题各写一份)时不做猜测——
- * 直接判成「解析不了」,让轨道值写死。
- */
-const VARS = (() => {
-  const out = new Map<string, Set<string>>();
-  for (const { css } of SHEETS) {
-    for (const m of css.matchAll(/(--[\w-]+)\s*:\s*([^;{}]+)[;}]/g)) {
-      const name = m[1];
-      const value = m[2].trim();
-      if (!out.has(name)) out.set(name, new Set());
-      out.get(name)!.add(value);
-    }
-  }
-  return out;
-})();
-
-/**
- * 展开 `var(--x)` / `var(--x, 回退值)`。展不开返回 null——
- * 变量名打错时浏览器会**整条丢弃声明**并退回隐式 auto 行(实测复现原病灶),
- * 所以「展不开」必须等于判红,而不是放行。
- */
-function expandVars(value: string, depth = 0): string | null {
-  if (!value.includes("var(")) return value;
-  if (depth > 4) return null;
-  const at = value.indexOf("var(");
-  let i = at + 4;
-  let level = 1;
-  while (i < value.length && level > 0) {
-    if (value[i] === "(") level++;
-    else if (value[i] === ")") level--;
-    i++;
-  }
-  if (level !== 0) return null;
-  const inner = value.slice(at + 4, i - 1);
-  const comma = topLevelSplit(inner, ",");
-  const name = comma[0].trim();
-  const fallback = comma.length > 1 ? comma.slice(1).join(",").trim() : null;
-  const defs = VARS.get(name);
-  let sub: string | null = null;
-  if (defs && defs.size === 1) sub = [...defs][0];
-  else if (fallback !== null) sub = fallback;
-  if (sub === null) return null;
-  return expandVars(value.slice(0, at) + sub + value.slice(i), depth + 1);
-}
-
-/** 按 depth 0 的分隔符切(括号内的分隔符不算) */
-function topLevelSplit(value: string, sep: string): string[] {
-  const out: string[] = [];
-  let depth = 0;
-  let cur = "";
-  for (const ch of value) {
-    if (ch === "(") depth++;
-    else if (ch === ")") depth--;
-    if (depth === 0 && ch === sep) {
-      out.push(cur);
-      cur = "";
-    } else {
-      cur += ch;
-    }
-  }
-  out.push(cur);
-  return out;
-}
-
-/* ------------------------------------------------------------------ *
- * 轨道白名单:合法性 + 「最小值与内容无关」
- * ------------------------------------------------------------------ */
+import {
+  AST_SELECTOR_COUNT,
+  CANDIDATES,
+  cascade,
+  cmpSpec,
+  elName,
+  expandVars,
+  finalOf,
+  hits,
+  IMPORTED,
+  matchGroup,
+  ON_DISK,
+  RULES,
+  SHEETS,
+  SHEET_ORDER,
+  topLevelSplit,
+  UNPARSED,
+  where,
+} from "./_css-contract";
+import type { Decl } from "./_css-contract";
 
 const UNITS = [
   "px", "rem", "em", "ch", "ex", "cap", "ic", "lh", "rlh",
   "vh", "vw", "vmin", "vmax", "vi", "vb",
-  "svh", "svw", "lvh", "lvw", "dvh", "dvw",
+  "svh", "svw", "svmin", "svmax", "lvh", "lvw", "lvmin", "lvmax",
+  "dvh", "dvw", "dvmin", "dvmax",
   "cm", "mm", "q", "in", "pt", "pc",
 ];
-const NUM = String.raw`\d+(?:\.\d+)?`;
-const LENGTH = new RegExp(`^(?:0|${NUM}(?:${UNITS.join("|")}))$`);
-const PERCENT = new RegExp(`^${NUM}%$`);
-const FLEX = new RegExp(`^${NUM}fr$`);
+const NUM = String.raw`[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?`;
+const LENGTH = new RegExp(`^(?:${NUM})(?:${UNITS.join("|")})$|^[+-]?0(?:\\.0+)?$`, "i");
+const PERCENT = new RegExp(`^(?:${NUM})%$`, "i");
+const FLEX = new RegExp(`^(?:${NUM})fr$`, "i");
 const INTRINSIC = /^(auto|min-content|max-content)$/;
 
-/** calc():只允许数字/已知单位/百分号/四则运算,括号必须配平 */
-function isCalc(v: string): boolean {
-  if (!/^calc\(.*\)$/.test(v)) return false;
-  const inner = v.slice(5, -1);
-  if (/[^0-9.+\-*/()%\s a-z]/.test(inner)) return false;
-  for (const word of inner.match(/[a-z]+/g) ?? []) {
-    if (!UNITS.includes(word)) return false;
+/* ---------------- calc() 表达式的真解析 ---------------- *
+ * 旧版只查「字符集 + 括号配平」,`calc(100vh - )` / `calc(100% * 2px)`
+ * 这种浏览器会整条丢弃的写法照样放行,退回隐式 auto 行 = 原病灶。
+ */
+
+type CalcKind = "number" | "length" | "percent" | "length-percent";
+
+interface CalcToken { t: "num" | "op" | "lp" | "rp"; v: string; ws: boolean }
+
+function calcTokens(src: string): CalcToken[] | null {
+  const out: CalcToken[] = [];
+  let i = 0;
+  let ws = false;
+  while (i < src.length) {
+    const ch = src[i];
+    if (/\s/.test(ch)) { ws = true; i++; continue; }
+    if (ch === "(") { out.push({ t: "lp", v: ch, ws }); ws = false; i++; continue; }
+    if (ch === ")") { out.push({ t: "rp", v: ch, ws }); ws = false; i++; continue; }
+    if (ch === "*" || ch === "/") { out.push({ t: "op", v: ch, ws }); ws = false; i++; continue; }
+    if (ch === "+" || ch === "-") {
+      // 数字的正负号 vs 二元运算符:CSS 要求二元 +/- 两侧都有空白
+      const nextIsNum = /^[+-][\d.]/.test(src.slice(i));
+      if (nextIsNum && !ws) { /* 落到数字分支 */ }
+      else { out.push({ t: "op", v: ch, ws }); ws = false; i++; continue; }
+    }
+    const m = new RegExp(`^(?:${NUM})(?:%|[a-z]+)?`, "i").exec(src.slice(i));
+    if (!m) return null;
+    out.push({ t: "num", v: m[0].toLowerCase(), ws });
+    ws = false;
+    i += m[0].length;
   }
-  let depth = 0;
-  for (const ch of inner) {
-    if (ch === "(") depth++;
-    else if (ch === ")") depth--;
-    if (depth < 0) return false;
-  }
-  return depth === 0;
+  return out;
 }
 
-/** 定值:与内容无关(长度 / 百分比 / calc) */
+function calcKindOf(token: string): CalcKind | null {
+  if (PERCENT.test(token)) return "percent";
+  if (LENGTH.test(token)) return "length";
+  if (new RegExp(`^(?:${NUM})$`, "i").test(token)) return "number";
+  return null; // fr / 未知单位 → calc 里非法
+}
+
+/** 返回表达式的量纲;不合法返回 null */
+function parseCalcExpr(tk: CalcToken[], pos: { i: number }): CalcKind | null {
+  let left = parseCalcTerm(tk, pos);
+  if (left === null) return null;
+  while (pos.i < tk.length && tk[pos.i].t === "op" && (tk[pos.i].v === "+" || tk[pos.i].v === "-")) {
+    const op = tk[pos.i];
+    // CSS 规范:二元 +/- 前后必须有空白
+    if (!op.ws) return null;
+    pos.i++;
+    if (pos.i >= tk.length || !tk[pos.i].ws) return null;
+    const right = parseCalcTerm(tk, pos);
+    if (right === null) return null;
+    if (left === right) continue;
+    const set = new Set([left, right]);
+    if (set.has("number")) return null; // 长度 + 纯数 → 非法
+    left = "length-percent";
+  }
+  return left;
+}
+
+function parseCalcTerm(tk: CalcToken[], pos: { i: number }): CalcKind | null {
+  let left = parseCalcFactor(tk, pos);
+  if (left === null) return null;
+  while (pos.i < tk.length && tk[pos.i].t === "op" && (tk[pos.i].v === "*" || tk[pos.i].v === "/")) {
+    const op = tk[pos.i].v;
+    pos.i++;
+    const right = parseCalcFactor(tk, pos);
+    if (right === null) return null;
+    if (op === "/") {
+      if (right !== "number") return null; // 只能除以纯数
+      continue;
+    }
+    if (left === "number") { left = right; continue; }
+    if (right === "number") continue;
+    return null; // 长度 × 长度 → 非法
+  }
+  return left;
+}
+
+function parseCalcFactor(tk: CalcToken[], pos: { i: number }): CalcKind | null {
+  if (pos.i >= tk.length) return null;
+  const t = tk[pos.i];
+  if (t.t === "lp") {
+    pos.i++;
+    const inner = parseCalcExpr(tk, pos);
+    if (inner === null) return null;
+    if (pos.i >= tk.length || tk[pos.i].t !== "rp") return null;
+    pos.i++;
+    return inner;
+  }
+  if (t.t === "num") { pos.i++; return calcKindOf(t.v); }
+  return null;
+}
+
+/** `calc(...)` 是否是浏览器认得的 <length-percentage> */
+function isCalc(v: string): boolean {
+  const m = /^calc\(([\s\S]*)\)$/i.exec(v.trim());
+  if (!m) return false;
+  const tk = calcTokens(m[1]);
+  if (!tk || !tk.length) return false;
+  const pos = { i: 0 };
+  const kind = parseCalcExpr(tk, pos);
+  if (kind === null || pos.i !== tk.length) return false;
+  return kind !== "number";
+}
+
+/** 定值:与内容无关(长度 / 百分比 / 合法 calc) */
 const isFixed = (v: string) => LENGTH.test(v) || PERCENT.test(v) || isCalc(v);
 
 interface TrackVerdict {
-  /** 浏览器认不认这条轨道(不认 → 整条声明被丢弃 → 退回隐式 auto 行 = 原病灶) */
   valid: boolean;
-  /** 最小值是否与内容无关 */
   safe: boolean;
-  /** 最大值是不是 <flex>(1fr 这种弹性轨) */
   flexible: boolean;
   why: string;
 }
@@ -310,23 +220,23 @@ interface TrackVerdict {
  * 浏览器会整条丢弃——实测 `minmax(0, fit-content(100vh))` 100% 复现原病灶。
  */
 function judgeTrack(raw: string): TrackVerdict {
-  const expanded = expandVars(raw.toLowerCase().trim());
+  const expanded = expandVars(raw.trim());
   if (expanded === null) {
     return { valid: false, safe: false, flexible: false, why: "var() 展不开(变量不存在或同名多值)" };
   }
-  const t = expanded.trim();
+  const t = expanded.trim().toLowerCase();
 
-  const mm = /^minmax\((.*)\)$/.exec(t);
+  const mm = /^minmax\(([\s\S]*)\)$/.exec(t);
   if (mm) {
     const args = topLevelSplit(mm[1], ",").map((s) => s.trim());
-    if (args.length !== 2) {
-      return { valid: false, safe: false, flexible: false, why: "minmax() 参数不是两个" };
-    }
+    if (args.length !== 2) return { valid: false, safe: false, flexible: false, why: "minmax() 参数不是两个" };
     const [min, max] = args;
-    const minOk = isFixed(min) || INTRINSIC.test(min);
-    const maxOk = isFixed(max) || INTRINSIC.test(max) || FLEX.test(max);
-    if (!minOk) return { valid: false, safe: false, flexible: false, why: `minmax() 的 min "${min}" 不是合法的 <inflexible-breadth>` };
-    if (!maxOk) return { valid: false, safe: false, flexible: false, why: `minmax() 的 max "${max}" 不是合法的 <track-breadth>` };
+    if (!(isFixed(min) || INTRINSIC.test(min))) {
+      return { valid: false, safe: false, flexible: false, why: `minmax() 的 min "${min}" 不是合法的 <inflexible-breadth>` };
+    }
+    if (!(isFixed(max) || INTRINSIC.test(max) || FLEX.test(max))) {
+      return { valid: false, safe: false, flexible: false, why: `minmax() 的 max "${max}" 不是合法的 <track-breadth>` };
+    }
     return {
       valid: true,
       safe: isFixed(min),
@@ -336,120 +246,173 @@ function judgeTrack(raw: string): TrackVerdict {
   }
 
   if (FLEX.test(t)) {
-    // 裸 <flex> ≡ minmax(auto, <flex>):min 是 auto,内容一超就被撑大
     return { valid: true, safe: false, flexible: true, why: "裸 <flex> ≡ minmax(auto, …),最小值是内容尺寸" };
   }
   if (INTRINSIC.test(t)) {
     return { valid: true, safe: false, flexible: false, why: `"${t}" 的最小值是内容尺寸` };
   }
-  if (isFixed(t)) {
-    return { valid: true, safe: true, flexible: false, why: "" };
-  }
-  const fc = /^fit-content\((.*)\)$/.exec(t);
+  if (isFixed(t)) return { valid: true, safe: true, flexible: false, why: "" };
+
+  const fc = /^fit-content\(([\s\S]*)\)$/.exec(t);
   if (fc) {
     const arg = fc[1].trim();
     return isFixed(arg)
       ? { valid: true, safe: false, flexible: false, why: "fit-content() 的最小值是 auto(内容尺寸)" }
       : { valid: false, safe: false, flexible: false, why: `fit-content(${arg}) 的参数不是 <length-percentage>` };
   }
-  return { valid: false, safe: false, flexible: false, why: `不认识的轨道写法(白名单之外一律判红)` };
+  return { valid: false, safe: false, flexible: false, why: "不认识的轨道写法(白名单之外一律判红,请改写或扩展解析器)" };
 }
 
-/** 把 grid-template-rows 的值拆成一条条轨道(括号里的空格不算分隔) */
-function tracks(value: string): string[] {
+/**
+ * 把 `grid-template-rows` 的值拆成一条条轨道。
+ *
+ * `[a b]` 是**一组**命名线(CSS Grid 允许一个方括号里写多个名字),
+ * 整个方括号跳过——旧版按空格拆会把它切成 `[a` 与 `b]` 两半,后者被当成
+ * 一条不认识的轨道判红(实测误红)。
+ */
+function tracks(value: string): string[] | null {
   const out: string[] = [];
-  let depth = 0;
   let cur = "";
-  for (const ch of value) {
-    if (ch === "(") depth++;
-    if (ch === ")") depth--;
-    if (depth === 0 && /\s/.test(ch)) {
-      if (cur) out.push(cur);
-      cur = "";
-    } else {
-      cur += ch;
+  let i = 0;
+  while (i < value.length) {
+    const ch = value[i];
+    if (ch === "[") {
+      if (cur) { out.push(cur); cur = ""; }
+      let end: number;
+      try { end = matchGroup(value, i); } catch { return null; }
+      i = end;
+      continue;
     }
+    if (ch === "(") {
+      let end: number;
+      try { end = matchGroup(value, i); } catch { return null; }
+      cur += value.slice(i, end);
+      i = end;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (cur) { out.push(cur); cur = ""; }
+      i++;
+      continue;
+    }
+    cur += ch;
+    i++;
   }
   if (cur) out.push(cur);
-  // 命名线 [foo] 不是轨道
-  return out.filter((t) => !t.startsWith("["));
+  return out;
 }
 
-/* ------------------------------------------------------------------ *
- * overflow
- * ------------------------------------------------------------------ */
+/* ================================================================== *
+ * 六、overflow
+ * ================================================================== */
 
 const CLIPPING = /^(hidden|clip)$/;
+const SCROLLABLE = /^(auto|scroll|overlay)$/;
 
 /** 一条 overflow / overflow-y 声明解析出来的 y 轴取值 */
 function yOf(prop: string, value: string): string {
-  const parts = value.split(/\s+/);
-  // `overflow: hidden auto` 这类两值写法:第一个是 x,第二个是 y
+  const parts = value.trim().split(/\s+/);
   return (prop === "overflow" ? (parts[1] ?? parts[0]) : parts[0]).toLowerCase();
 }
 
-/** 块内 y 轴溢出的**最终值**(overflow 与 overflow-y 按源序谁后写谁赢) */
-function effectiveOverflowY(body: string): string | null {
-  const re = /(?:^|;)\s*(overflow|overflow-y)\s*:\s*([^;]+)/g;
-  let last: string | null = null;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(body))) last = yOf(m[1], m[2].replace(/!\s*important\s*$/i, "").trim());
-  return last;
+const isOverflowY = (d: Decl) => d.prop === "overflow" || d.prop === "overflow-y";
+
+/** 元素身上 y 轴溢出的级联最终值(overflow 简写与 overflow-y 长写一起参战) */
+function finalOverflowY(el: ReadonlySet<string>): string | null {
+  const h = cascade(hits(el, isOverflowY));
+  return h ? yOf(h.decl.prop, h.decl.value) : null;
 }
 
-/** 一族块里 y 轴溢出的级联最终值 */
-function lastOverflowY(list: Block[]): string | null {
-  let last: string | null = null;
-  for (const b of list) {
-    const v = effectiveOverflowY(b.body);
-    if (v !== null) last = v;
+/* ================================================================== *
+ * 七、全屏层扫描(判据的主语是元素,不是规则块)
+ * ================================================================== */
+
+const isZero = (v: string | null) => v !== null && /^[+-]?0(px|%|em|rem)?$/i.test(v.trim());
+const VIEWPORT_TALL = /^100(vh|dvh|svh|lvh|%)$/i;
+
+/** 元素身上解析出来的四边定位(inset 简写与四条长写按级联合并) */
+function insetsOf(el: ReadonlySet<string>): Record<"top" | "right" | "bottom" | "left", string | null> {
+  const sides: Record<"top" | "right" | "bottom" | "left", string | null> = {
+    top: null, right: null, bottom: null, left: null,
+  };
+  const list = hits(el, (d) =>
+    ["inset", "inset-block", "inset-inline", "top", "right", "bottom", "left"].includes(d.prop),
+  );
+  // 按级联权重排序后依次施加(后生效的覆盖先生效的)
+  const sorted = [...list].sort((a, b) => {
+    if (a.decl.important !== b.decl.important) return a.decl.important ? 1 : -1;
+    const s = cmpSpec(a.rule.spec, b.rule.spec);
+    return s !== 0 ? s : a.rule.order - b.rule.order;
+  });
+  for (const { decl } of sorted) {
+    const parts = decl.value.trim().split(/\s+/);
+    const pick = (n: number) => parts[n] ?? parts[n - 2] ?? parts[0];
+    if (decl.prop === "inset") {
+      sides.top = parts[0];
+      sides.right = parts[1] ?? parts[0];
+      sides.bottom = pick(2);
+      sides.left = parts[3] ?? parts[1] ?? parts[0];
+    } else if (decl.prop === "inset-block") {
+      sides.top = parts[0];
+      sides.bottom = parts[1] ?? parts[0];
+    } else if (decl.prop === "inset-inline") {
+      sides.left = parts[0];
+      sides.right = parts[1] ?? parts[0];
+    } else {
+      sides[decl.prop as "top"] = decl.value.trim();
+    }
   }
-  return last;
+  return sides;
 }
 
-/** 块里出现过的任何一条裁剪型 y 溢出(哪怕后面又被覆盖——零静默,不许写) */
-function anyClippingOverflow(body: string): string | null {
-  const re = /(?:^|;)\s*(overflow|overflow-y)\s*:\s*([^;]+)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(body))) {
-    const v = m[2].replace(/!\s*important\s*$/i, "").trim();
-    if (CLIPPING.test(yOf(m[1], v))) return `${m[1]}: ${v}`;
-  }
-  return null;
-}
-
-/* ------------------------------------------------------------------ *
- * 全屏层扫描
- * ------------------------------------------------------------------ */
-
-const isZero = (v: string | null) => v !== null && /^0(px|%)?$/.test(v.trim());
-
-/** inset:0 或拆成四边写的 top/right/bottom/left:0(拆开写也必须扫得到) */
-function coversViewport(body: string): boolean {
-  const inset = decl(body, "inset");
-  if (inset && inset.split(/\s+/).every((v) => /^0(px|%)?$/.test(v))) return true;
-  return ["top", "right", "bottom", "left"].every((p) => isZero(decl(body, p)));
-}
-
-interface Layer extends Block {
-  base: string[];
+interface Layer {
+  el: Set<string>;
+  name: string;
   display: "grid" | "flex";
+  /** 基础类名(去掉 BEM 修饰形态) */
+  base: string[];
 }
 
-/** 铺满视口的 grid / flex 层:这正是「一条隐式 auto 行被内容撑大」能发生的全部条件 */
-const LAYERS: Layer[] = BLOCKS.flatMap((b) => {
-  if (!/(?:^|;)\s*position\s*:\s*fixed/.test(b.body)) return [];
-  if (!coversViewport(b.body)) return [];
-  const display = (decl(b.body, "display") ?? "").trim();
-  if (display !== "grid" && display !== "flex") return [];
-  // 基础类名:主语类名里去掉修饰形态(`.overlay--drawer` 的基是 `overlay`)
-  const base = [...b.classes].filter((c) => !c.includes("--"));
-  return [{ ...b, base, display: display as "grid" | "flex" }];
-});
+/**
+ * 铺满视口的 grid / flex 层。
+ *
+ * 「铺满」按**竖直方向**判:top/bottom 都钉死,或者 height 直接吃满视口。
+ * 旧版只认 `inset:0` 和四边各写,于是
+ * `position:fixed; top:0; left:0; width:100vw; height:100vh`
+ * 这种等价写法整层连同它的 overflow 一起从扫描面消失(实测假绿)。
+ */
+const LAYERS: Layer[] = (() => {
+  const out: Layer[] = [];
+  for (const el of CANDIDATES) {
+    if ((finalOf(el, "position") ?? "").trim().toLowerCase() !== "fixed") continue;
+    const sides = insetsOf(el);
+    const height = (expandVars(finalOf(el, "height") ?? "") ?? "").trim();
+    const pinned = (isZero(sides.top) && isZero(sides.bottom)) || VIEWPORT_TALL.test(height);
+    if (!pinned) continue;
+    const display = (finalOf(el, "display") ?? "").trim().toLowerCase().replace(/^inline-/, "");
+    if (display !== "grid" && display !== "flex") continue;
+    out.push({
+      el,
+      name: elName(el),
+      display: display as "grid" | "flex",
+      base: [...el].filter((c) => !c.includes("--")),
+    });
+  }
+  return out;
+})();
 
-/* ------------------------------------------------------------------ *
- * 豁免(必须写明理由,且必须真的命中——过期的豁免要判红)
- * ------------------------------------------------------------------ */
+/* ================================================================== *
+ * 八、族与豁免
+ * ================================================================== */
+
+/** 基础类名 + 它的修饰类:`overlay` / `overlay--drawer` / `overlay--gate` */
+const family = (base: string) => (cls: string) => cls === base || cls.startsWith(`${base}--`);
+/** BEM 子元素:`group-layer__grid` / `group-layer__grid--x` */
+const element = (base: string) => (cls: string) => cls.startsWith(`${base}__`);
+
+/** 类名满足 pred 的候选元素 */
+const elementsWith = (pred: (cls: string) => boolean) =>
+  CANDIDATES.filter((el) => [...el].some(pred));
 
 /**
  * `.lightbox__stage` 的 `overflow: hidden` 是刻意的:
@@ -459,58 +422,92 @@ const LAYERS: Layer[] = BLOCKS.flatMap((b) => {
  */
 const CLIP_EXEMPT = ["lightbox__stage"];
 
+/* ================================================================== *
+ * 用例
+ * ================================================================== */
+
 describe("全屏浮层的溢出契约", () => {
-  it("解析器确实抓到了样式表和规则块(自身不许静默失效)", () => {
-    // 解析器一旦被写法绕过就会退化成「零发现 → 全绿」,先钉住它有产出
-    expect(SHEETS.length).toBeGreaterThanOrEqual(5);
-    expect(BLOCKS.length).toBeGreaterThanOrEqual(200);
-    for (const sel of ["overlay", "drawer", "dialog", "drawer__body"]) {
-      expect(
-        BLOCKS.some((b) => b.classes.has(sel)),
-        `.${sel} 的规则块应当被解析到——扫不到就等于这套断言全部落空`,
-      ).toBe(true);
-    }
+  it("解析层自检:AST 里的每一条规则都必须被契约登记,一条都不许吞", () => {
+    // 这条自检钉的是「新东西不会对防线隐形」,不是「旧东西还在」。
+    // 旧版钉的是 `BLOCKS.length >= 200` —— 解析器漏掉一整类写法它也毫无察觉。
+    expect(
+      UNPARSED,
+      "下面这些写法契约看不懂。看不懂 = 它对所有断言隐形 = 假绿,所以一律判红。\n" +
+        "请改写成契约认得的形式,或扩展本文件的选择器/at-rule 解析器。",
+    ).toEqual([]);
+    expect(
+      RULES.length,
+      `AST 有 ${AST_SELECTOR_COUNT} 条(选择器已按逗号拆开),契约只登记了 ${RULES.length} 条`,
+    ).toBe(AST_SELECTOR_COUNT);
+
+    // 每条**按类名定位**的规则都必须至少被一个候选元素命中,
+    // 否则它身上的声明永远不参与任何级联 = 对所有断言隐形。
+    const classScoped = RULES.filter((r) => r.constrains);
+    const invisible = classScoped.filter((r) => !CANDIDATES.some((el) => r.match(el))).map(where);
+    expect(
+      invisible,
+      "这些按类名定位的规则不被任何候选元素命中,等于它们的声明对本契约完全不可见。" +
+        "多半是候选元素的构造(BEM 基类补全)没跟上某种新写法。",
+    ).toEqual([]);
+    // 明确写下边界:纯元素/伪类选择器(`html`、`body`、`.x > :last-child` …)不在
+    // 「元素 = 一组类名」这个模型里,不参与级联。
+    // 于是「把关键声明藏进一条不带类名的选择器」就成了新的逃逸口:
+    //     `html, body { overflow: hidden }` 这类规则会作用到浮层链上,却对模型隐形。
+    // 所以反过来钉死:**关键属性不许出现在不带类名判据的规则里**,
+    // 已知的全局重置写进 GLOBAL_RESET 白名单(它正是本契约「body 已禁滚」的前提)。
+    const CRITICAL = ["grid-template-rows", "grid-auto-rows", "grid", "grid-template", "overflow", "overflow-y"];
+    // `position` 只有 fixed 与本契约有关(它是全屏层扫描的第一道判据);
+    // absolute/relative 是屏内定位,不参与浮层链。
+    const critical = (d: Decl) =>
+      CRITICAL.includes(d.prop) ||
+      (d.prop === "position" && /fixed/i.test(d.value));
+    const GLOBAL_RESET = ["html", "body", "#root", "*", "*::before", "*::after", ":root"];
+    const hidden = RULES.filter((r) => !r.constrains)
+      .filter((r) => !GLOBAL_RESET.includes(r.selector))
+      .flatMap((r) => r.decls.filter(critical).map((d) => `${where(r)} → ${d.prop}: ${d.value}`));
+    expect(
+      hidden,
+      "关键属性被写进了「不带类名判据」的选择器里。本契约的元素模型只由类名描述," +
+        "这类规则不参与级联 = 它对所有断言隐形。请改写成带类名的选择器," +
+        "或者(确属全局重置时)加进 GLOBAL_RESET 并写明理由。",
+    ).toEqual([]);
   });
 
-  it("解析器与原文交叉核对:属性在原文出现几次就必须解析到几次", () => {
-    // 「块数 ≥ 200」这种弱自检挡不住「解析器漏掉某一类规则」——
-    // 上一版 sticky.test 就是被一条 `sel.startsWith(".")` 弄成半瞎却毫无察觉。
-    // 这里直接数:原文里的声明数必须等于解析出来的声明数,少一条就是有块没扫到。
-    for (const prop of ["grid-template-rows", "overflow-y", "position", "flex"]) {
-      const raw = SHEETS.reduce(
-        (n, s) =>
-          n +
-          // @media / @supports 的条件里也会出现 `属性: 值`,那不是声明,先抹掉
-          (s.css.replace(/@[^{;]*[{;]/g, "").match(new RegExp(`(?:^|[;{]|\\n)\\s*${prop}\\s*:`, "g")) ?? [])
-            .length,
-        0,
-      );
-      const parsed = BLOCKS.reduce((n, b) => n + decls(b.body, prop).length, 0);
-      expect(parsed, `${prop}: 原文 ${raw} 条,解析到 ${parsed} 条——对不上说明有规则块没被解析`).toBe(raw);
-    }
+  it("扫描面自检:magic 清单不许存在,磁盘上的表与 main.tsx 的 import 必须一一对应", () => {
+    expect(ON_DISK.length, "src/styles 下的样式表").toBeGreaterThanOrEqual(5);
+    expect(
+      [...IMPORTED].sort(),
+      "main.tsx 的 import 清单与磁盘上的 *.css 必须完全一致:" +
+        "多出来的是死表,少掉的那张既没被应用加载、又会让契约的层叠顺序算错",
+    ).toEqual(ON_DISK);
+    expect(SHEETS.map((s) => s.name), "扫描面").toEqual(SHEET_ORDER);
   });
 
   it("铺满视口的浮层(grid 与 flex 都算)必须被扫到", () => {
-    // 扫不到任何块 = 判据被改写绕过(比如 inset 拆成 top/right/bottom/left),
-    // 那就是假绿,先钉住它非空且包含已知的 .overlay
+    expect(LAYERS.map((l) => l.name), "扫描判据失效:一个铺满视口的浮层都没找到").not.toEqual([]);
     expect(
-      LAYERS.map(where),
-      "扫描判据失效:一个铺满视口的浮层都没找到",
-    ).not.toEqual([]);
-    expect(
-      LAYERS.some((l) => l.classes.has("overlay")),
+      LAYERS.some((l) => l.el.has("overlay")),
       ".overlay 必须落在扫描范围内",
     ).toBe(true);
-    // 已知三层:.overlay(grid)、.group-layer(flex)、.lightbox(flex)。
-    // 数量掉下来 = 判据又被某种写法绕过了。
-    expect(LAYERS.length, `扫到的全屏层:${LAYERS.map(where).join(" / ")}`).toBeGreaterThanOrEqual(3);
+    // 全屏层名册。少一族 = 判据被某种写法绕过了;多一族 = 有人新加了一个
+    // 铺满视口的浮层却没人过一遍这套行/溢出的口径——两个方向都必须有人看一眼,
+    // 所以这里用相等而不是「≥ 3」。
+    const bases = new Set(LAYERS.flatMap((l) => l.base));
+    expect(
+      [...bases].sort(),
+      `扫到的全屏层:${LAYERS.map((l) => l.name).join(" / ")}\n` +
+        "少一族 = 扫描判据又被某种等价写法绕过(position/inset/display 拆块、" +
+        "100vw+100vh 代替 inset:0 …),请修解析器而不是改这条名册;\n" +
+        "多一族 = 新增了铺满视口的浮层:请确认它的行(grid)或弹性子轨(flex)" +
+        "已经过了下面那几条用例,然后把它加进这个名册。",
+    ).toEqual(["group-layer", "lightbox", "overlay"]);
   });
 
   it("grid 全屏层必须显式声明 grid-template-rows,且不许用 grid/grid-template 简写绕过", () => {
     const grids = LAYERS.filter((l) => l.display === "grid");
     expect(grids.length, "一个 grid 全屏层都没扫到").toBeGreaterThanOrEqual(1);
 
-    const bad = grids.filter((l) => !decl(l.body, "grid-template-rows")).map(where);
+    const bad = grids.filter((l) => finalOf(l.el, "grid-template-rows") === null).map((l) => l.name);
     expect(
       bad,
       "铺满视口的 grid 浮层不写 grid-template-rows,就只有一条隐式 auto 行:" +
@@ -520,11 +517,12 @@ describe("全屏浮层的溢出契约", () => {
     ).toEqual([]);
 
     // 简写会覆盖 grid-template-rows 却绕开上面的判据,契约只认长写法
-    const shorthand = BLOCKS.filter(
-      (b) =>
-        [...b.classes].some((c) => grids.some((g) => g.base.some((base) => family(base)(c)))) &&
-        (decl(b.body, "grid-template") || decl(b.body, "grid")),
-    ).map(where);
+    const shorthand: string[] = [];
+    for (const l of grids) {
+      for (const h of hits(l.el, (d) => d.prop === "grid" || d.prop === "grid-template")) {
+        shorthand.push(`${where(h.rule)} → ${h.decl.prop}: ${h.decl.value}`);
+      }
+    }
     expect(
       shorthand,
       "全屏层不许用 `grid` / `grid-template` 简写设置行:简写能覆盖 grid-template-rows " +
@@ -533,45 +531,37 @@ describe("全屏浮层的溢出契约", () => {
   });
 
   it("grid 全屏层的每一条轨道:浏览器认得 + 最小值与内容无关", () => {
-    // 覆盖浮层自己的**每一个**规则块:基础规则、修饰类、元素限定(div.overlay)、
-    // 复合类(.overlay.overlay--drawer)、追加的重复块、媒体查询里的覆盖——
+    // 覆盖浮层元素身上的**每一条**行声明:基础规则、修饰类、元素限定(div.overlay)、
+    // 属性选择器([class~="overlay"])、追加的重复块、媒体查询里的覆盖、!important——
     // 任何一处写成 auto 都能把病灶原样放回来,所以一条都不能漏。
     const grids = LAYERS.filter((l) => l.display === "grid");
-    const bases = [...new Set(grids.flatMap((l) => l.base))];
-    expect(bases, "grid 全屏层的基础类名").not.toEqual([]);
-
-    const rowBlocks = BLOCKS.filter(
-      (b) =>
-        [...b.classes].some((c) => bases.some((base) => family(base)(c))) &&
-        (decl(b.body, "grid-template-rows") || decl(b.body, "grid-auto-rows")),
-    );
-    expect(
-      rowBlocks.length,
-      `${bases.map((b) => `.${b}`).join(" / ")} 族应当至少有一处 grid-template-rows(找不到说明基础规则被删了)`,
-    ).toBeGreaterThanOrEqual(1);
+    expect(grids.map((l) => l.name), "grid 全屏层").not.toEqual([]);
 
     const bad: string[] = [];
-    for (const b of rowBlocks) {
-      for (const prop of ["grid-template-rows", "grid-auto-rows"]) {
-        const value = decl(b.body, prop);
-        if (!value) continue;
-        const list = tracks(value);
-        if (!list.length) {
-          bad.push(`${where(b)} → ${prop}: ${value}(解析不出任何轨道)`);
+    let seen = 0;
+    for (const l of grids) {
+      const list = hits(l.el, (d) => d.prop === "grid-template-rows" || d.prop === "grid-auto-rows");
+      if (!list.length) continue;
+      for (const { rule, decl } of list) {
+        seen++;
+        const parsed = tracks(decl.value);
+        if (!parsed || !parsed.length) {
+          bad.push(`${l.name} @ ${where(rule)} → ${decl.prop}: ${decl.value}(解析不出任何轨道)`);
           continue;
         }
-        for (const t of list) {
+        for (const t of parsed) {
           const v = judgeTrack(t);
-          if (!v.valid) bad.push(`${where(b)} → ${prop}: ${value}(轨道 "${t}" 非法:${v.why})`);
-          else if (!v.safe) bad.push(`${where(b)} → ${prop}: ${value}(轨道 "${t}" 不安全:${v.why})`);
+          if (!v.valid) bad.push(`${l.name} @ ${where(rule)} → ${decl.prop}: ${decl.value}(轨道 "${t}" 非法:${v.why})`);
+          else if (!v.safe) bad.push(`${l.name} @ ${where(rule)} → ${decl.prop}: ${decl.value}(轨道 "${t}" 不安全:${v.why})`);
         }
       }
     }
+    expect(seen, "grid 全屏层应当至少有一处行声明(找不到说明基础规则被删了)").toBeGreaterThanOrEqual(1);
     expect(
       bad,
       "全屏层的行必须两关都过:\n" +
-        "① 合法——浏览器不认的写法(minmax 里塞 fit-content()、单位打错、var 不存在)" +
-        "会让整条声明被丢弃,退回隐式 auto 行,100% 复现原病灶,实测三种写法都是 1507px;\n" +
+        "① 合法——浏览器不认的写法(minmax 里塞 fit-content()、单位打错、calc 表达式不合法、" +
+        "var 不存在)会让整条声明被丢弃,退回隐式 auto 行,100% 复现原病灶,实测三种写法都是 1507px;\n" +
         "② 与内容无关——`auto`/`min-content`/`max-content`/裸 `1fr`(≡ minmax(auto,1fr))" +
         "的最小值都是内容尺寸,内容一超视口轨道就跟着长。\n" +
         "请写 `minmax(0, 1fr)` 或定长/百分比。",
@@ -587,42 +577,42 @@ describe("全屏浮层的溢出契约", () => {
     //     自动最小尺寸本来就是 0。所以**承重的是 overflow-y**,min-height:0
     //     是保险丝。两条都钉,理由见下面的失败信息。
     const flexes = LAYERS.filter((l) => l.display === "flex");
-    expect(
-      flexes.map(where),
-      "一个 flex 全屏层都没扫到——.group-layer / .lightbox 应当在内",
-    ).not.toEqual([]);
+    expect(flexes.map((l) => l.name), "一个 flex 全屏层都没扫到——.group-layer / .lightbox 应当在内").not.toEqual([]);
 
     const bad: string[] = [];
     for (const layer of flexes) {
-      const dir = decl(layer.body, "flex-direction");
+      const dir = finalOf(layer.el, "flex-direction");
       if (dir !== "column") {
-        bad.push(`${where(layer)} → flex-direction: ${dir ?? "(未写,默认 row)"};本契约只认识列方向的全屏层`);
+        bad.push(`${layer.name} → flex-direction: ${dir ?? "(未写,默认 row)"};本契约只认识列方向的全屏层`);
         continue;
       }
       for (const base of layer.base) {
-        const kids = blocksFor(element(base));
+        const kids = elementsWith(element(base));
         if (!kids.length) {
-          bad.push(`${where(layer)} → 扫不到任何 .${base}__* 子块(判据失效)`);
+          bad.push(`${layer.name} → 扫不到任何 .${base}__* 子元素(判据失效)`);
           continue;
         }
-        // 子轨的 flex-grow 取级联最终值:按子类名归组,后写的赢
+        // 子轨按「主体类名」归组:`.lightbox__image--empty` 与 `.lightbox__image`
+        // 是同一个 DOM 节点的两种形态,不能算成两条子轨。
         const grow = new Map<string, number>();
-        for (const b of kids) {
-          const g = growOf(b.body);
+        for (const el of kids) {
+          const primary = [...el].filter((c) => element(base)(c) && !c.includes("--")).sort()[0];
+          if (!primary) continue;
+          const g = growOf(el);
           if (g === null) continue;
-          for (const c of b.classes) if (element(base)(c)) grow.set(c, g);
+          grow.set(primary, Math.max(grow.get(primary) ?? 0, g)); // 任一形态会瓜分 = 判它瓜分
         }
         const flexible = [...grow].filter(([, g]) => g > 0).map(([c]) => c);
         if (flexible.length !== 1) {
           bad.push(
-            `${where(layer)} → 弹性子轨有 ${flexible.length} 条(${flexible.join(",") || "无"});` +
+            `${layer.name} → 弹性子轨有 ${flexible.length} 条(${flexible.join(",") || "无"});` +
               "必须有且只有一条瓜分剩余高度,其余一律 flex:0 0 auto",
           );
           continue;
         }
         const name = flexible[0];
-        const own = blocksFor((c) => c === name);
-        const minH = lastOf(own, "min-height");
+        const own = new Set([name]);
+        const minH = finalOf(own, "min-height");
         if (!isZero(minH)) {
           bad.push(
             `.${name} 的 min-height 是 ${minH ?? "(未写)"},必须是 0。\n` +
@@ -633,15 +623,15 @@ describe("全屏浮层的溢出契约", () => {
               "唯一的护栏——零成本的保险,不是当前能滚的原因。",
           );
         }
-        const y = lastOverflowY(own);
+        const y = finalOverflowY(own);
         if (CLIP_EXEMPT.includes(name)) {
           // 豁免也要留痕:它必须仍然写着裁剪值,否则这条豁免已经过期,该删
-          if (!y || !CLIPPING.test(yOf("overflow-y", y))) {
-            bad.push(`.${name} 在 CLIP_EXEMPT 名单里却不再裁剪(${y ?? "未写"})——过期的豁免请删掉`);
+          if (!y || !CLIPPING.test(y)) {
+            bad.push(`.${name} 在 CLIP_EXEMPT 名单里却不再裁剪(级联最终值 ${y ?? "未写"})——过期的豁免请删掉`);
           }
           continue;
         }
-        if (!y || !/^(auto|scroll|overlay)$/.test(yOf("overflow-y", y))) {
+        if (!y || !SCROLLABLE.test(y)) {
           bad.push(
             `.${name} 是唯一的弹性子轨,溢出必须由它自己承担,现在是 "${y ?? "未写"}"。` +
               "写 auto/scroll;hidden/clip 会把够不着的内容锁死(评审判过 P0 的静默 fail-open)",
@@ -653,42 +643,46 @@ describe("全屏浮层的溢出契约", () => {
   });
 
   it("抽屉正文行必须可压缩(minmax(0, 1fr)),否则内容会顶开整个抽屉", () => {
-    // 用 filter 而不是 find:追加一个重复的 `.drawer{grid-template-rows: auto …}`
-    // 就能把病灶放回来,只看第一个块等于放行(实测假绿)。
-    const drawers = blocksFor((c) => c === "drawer");
-    expect(drawers.map(where), ".drawer 规则块应当存在").not.toEqual([]);
-
-    const rowBlocks = drawers.filter((b) => decl(b.body, "grid-template-rows"));
-    expect(
-      rowBlocks.map(where),
-      ".drawer 必须显式声明 grid-template-rows",
-    ).not.toEqual([]);
+    // 按元素而不是按块:追加一个重复的 `.drawer{grid-template-rows: auto …}`、
+    // 或者 `body .drawer{…}` 这种更高 specificity 的覆盖,都会被扫到。
+    const drawers = elementsWith((c) => c === "drawer" || c.startsWith("drawer--"));
+    expect(drawers.map(elName), ".drawer 元素应当存在").not.toEqual([]);
 
     const bad: string[] = [];
-    for (const b of rowBlocks) {
-      const value = decl(b.body, "grid-template-rows")!;
-      const list = tracks(value).map((t) => ({ raw: t, v: judgeTrack(t) }));
-      // 骨架行(头/过滤/脚)写 auto 是对的——抽屉自己已经被 height:100% 定高了;
-      // 但只要有一条非法,整条声明会被浏览器丢弃 → 退回隐式 auto 行 → 原病灶。
-      for (const { raw, v } of list) {
-        if (!v.valid) bad.push(`${where(b)} → ${value}(轨道 "${raw}" 非法:${v.why})`);
-      }
-      const flexible = list.filter(({ v }) => v.flexible);
-      if (flexible.length !== 1) {
-        bad.push(`${where(b)} → ${value}(弹性行 ${flexible.length} 条,必须恰好 1 条正文行)`);
-        continue;
-      }
-      if (!flexible[0].v.safe) {
-        bad.push(
-          `${where(b)} → ${value}(正文行 "${flexible[0].raw}" 的最小值必须是 0:` +
-            "min 若是内容尺寸,19 条日志会把这行撑成 1313px,把脚顶到视口外)",
-        );
+    let rowDecls = 0;
+    for (const el of drawers) {
+      const list = hits(el, (d) => d.prop === "grid-template-rows");
+      for (const { rule, decl } of list) {
+        rowDecls++;
+        const parsed = tracks(decl.value);
+        if (!parsed || !parsed.length) {
+          bad.push(`${elName(el)} @ ${where(rule)} → ${decl.value}(解析不出任何轨道)`);
+          continue;
+        }
+        const judged = parsed.map((t) => ({ raw: t, v: judgeTrack(t) }));
+        // 骨架行(头/过滤/脚)写 auto 是对的——抽屉自己已经被 height:100% 定高了;
+        // 但只要有一条非法,整条声明会被浏览器丢弃 → 退回隐式 auto 行 → 原病灶。
+        for (const { raw, v } of judged) {
+          if (!v.valid) bad.push(`${elName(el)} @ ${where(rule)} → ${decl.value}(轨道 "${raw}" 非法:${v.why})`);
+        }
+        const flexible = judged.filter(({ v }) => v.flexible);
+        if (flexible.length !== 1) {
+          bad.push(`${elName(el)} @ ${where(rule)} → ${decl.value}(弹性行 ${flexible.length} 条,必须恰好 1 条正文行)`);
+          continue;
+        }
+        if (!flexible[0].v.safe) {
+          bad.push(
+            `${elName(el)} @ ${where(rule)} → ${decl.value}(正文行 "${flexible[0].raw}" 的最小值必须是 0:` +
+              "min 若是内容尺寸,19 条日志会把这行撑成 1313px,把脚顶到视口外)",
+          );
+        }
       }
     }
+    expect(rowDecls, ".drawer 必须显式声明 grid-template-rows").toBeGreaterThanOrEqual(1);
     expect(bad, ".drawer 的行契约").toEqual([]);
 
     expect(
-      lastOf(drawers, "height"),
+      finalOf(new Set(["drawer"]), "height"),
       ".drawer 靠 height:100% 吃满 overlay 的那一行——这也是上面那条轨道契约的意义所在",
     ).toBe("100%");
   });
@@ -698,17 +692,19 @@ describe("全屏浮层的溢出契约", () => {
     // 溢出抽屉自己的盒子,脚被推到视口外。挂一条 auto 让抽屉自身能滚,那点行程就够得着。
     // 实测日常态(933px 视口)scrollHeight === clientHeight === 933、
     // scrollWidth === clientWidth === 559 → 不出条、不吃滚轮,同一时刻只有 .drawer__body 在滚。
-    const drawers = blocksFor((c) => c === "drawer");
-    const y = lastOf(drawers, "overflow-y") ?? lastOf(drawers, "overflow");
-    expect(
-      y,
-      ".drawer 必须声明溢出兜底:退化态下脚会被挤出自己的盒子,没有兜底就够不着",
-    ).not.toBeNull();
-    expect(
-      /^(auto|scroll)/.test(y!),
-      `.drawer 的溢出兜底是 "${y}"——必须是 auto/scroll。` +
-        "hidden/clip 会把够不着的内容直接锁死,是评审判过 P0 的静默 fail-open。",
-    ).toBe(true);
+    for (const el of elementsWith((c) => c === "drawer" || c.startsWith("drawer--"))) {
+      const y = finalOverflowY(el);
+      expect(
+        y,
+        `${elName(el)} 必须声明溢出兜底:退化态下脚会被挤出自己的盒子,没有兜底就够不着`,
+      ).not.toBeNull();
+      expect(
+        SCROLLABLE.test(y!),
+        `${elName(el)} 的溢出兜底(级联最终值)是 "${y}"——必须是 auto/scroll。` +
+          "hidden/clip 会把够不着的内容直接锁死,是评审判过 P0 的静默 fail-open;" +
+          "visible/未写则等于没有兜底。",
+      ).toBe(true);
+    }
   });
 
   it("浮层链上不许出现裁剪型 overflow(零静默)", () => {
@@ -716,23 +712,22 @@ describe("全屏浮层的溢出契约", () => {
     // 守的不变式是「同一片区域同一时刻只有一个容器响应滚轮/出条」,
     // 不是「结构上只许有一个 overflow:auto」——一个 scrollHeight === clientHeight
     // 的兜底 auto 对用户不存在,却能在退化态兜住可达性。
-    // 浮层族 = 三层浮层 + 两层全屏层,连同它们的修饰类与 BEM 子元素
-    const inFamily = (c: string) =>
-      ["overlay", "drawer", "dialog", "group-layer", "lightbox"].some(
-        (base) => family(base)(c) || element(base)(c),
-      );
-    const scanned = BLOCKS.filter((b) => [...b.classes].some(inFamily));
-    expect(
-      scanned.length,
-      "浮层族的规则块应当被扫到(扫不到 = 判据失效 = 假绿)",
-    ).toBeGreaterThanOrEqual(6);
+    const BASES = ["overlay", "drawer", "dialog", "group-layer", "lightbox"];
+    const inFamily = (c: string) => BASES.some((b) => family(b)(c) || element(b)(c));
+
+    // 扫的是「主语属于浮层族」的规则(后代规则如 `.overlay .badge` 主语是 .badge,不算)
+    const scanned = RULES.filter((r) => [...r.subjectClasses].some(inFamily));
+    expect(scanned.length, "浮层族的规则应当被扫到(扫不到 = 判据失效 = 假绿)").toBeGreaterThanOrEqual(6);
 
     const bad: string[] = [];
-    for (const b of scanned) {
-      const hit = anyClippingOverflow(b.body);
-      if (!hit) continue;
-      if ([...b.classes].some((c) => CLIP_EXEMPT.includes(c))) continue;
-      bad.push(`${where(b)} → ${hit}`);
+    for (const r of scanned) {
+      if ([...r.subjectClasses].some((c) => CLIP_EXEMPT.includes(c))) continue;
+      for (const d of r.decls) {
+        if (!isOverflowY(d)) continue;
+        if (CLIPPING.test(yOf(d.prop, d.value))) {
+          bad.push(`${where(r)} → ${d.prop}: ${d.value}${d.important ? " !important" : ""}`);
+        }
+      }
     }
     expect(
       bad,
@@ -740,13 +735,14 @@ describe("全屏浮层的溢出契约", () => {
         "该用 auto 兜底,让退化态仍然可达。确属刻意裁剪的,请加进 CLIP_EXEMPT 并写明理由。",
     ).toEqual([]);
 
-    // 过期的豁免要判红:名单里的类名必须还真的存在、还真的在裁剪
+    // 过期的豁免要判红:名单里的类名必须还真的存在、还真的在裁剪(按级联最终值)
     for (const name of CLIP_EXEMPT) {
-      const own = blocksFor((c) => c === name);
+      const own = elementsWith((c) => c === name);
       expect(own.length, `CLIP_EXEMPT 里的 .${name} 已经不存在了,请删掉这条豁免`).toBeGreaterThanOrEqual(1);
+      const y = finalOverflowY(new Set([name]));
       expect(
-        own.some((b) => anyClippingOverflow(b.body)),
-        `CLIP_EXEMPT 里的 .${name} 已经不裁剪了,请删掉这条豁免`,
+        y !== null && CLIPPING.test(y),
+        `CLIP_EXEMPT 里的 .${name} 的级联最终值是 "${y ?? "未写"}",已经不裁剪了,请删掉这条豁免`,
       ).toBe(true);
     }
   });
@@ -754,55 +750,47 @@ describe("全屏浮层的溢出契约", () => {
   it("对话框自封闭:max-height 与自身滚动必须成对出现", () => {
     // body 已全局禁滚。dialog 只有「收缩到一屏 + 自己滚」同时成立才是自封闭的;
     // 少任何一半,超窗内容都会溢出到视口外而不可达。
-    // 另:overflow-y:auto 让它的最小内容高度为 0,max-height:100% 才真正约束得住——
-    // 这也是修复前 .dialog 在 Chrome 里侥幸没出事的原因,但那依赖的是
-    // 「循环百分比」这种引擎自定行为;行显式定高之后,100% 是有定值可依的。
     // 按族扫:`.dialog--wide{max-height:none}` 这种修饰类覆盖同样是把自封闭解开
-    const dialogs = blocksFor(family("dialog"));
-    expect(dialogs.map(where), ".dialog 规则块应当存在").not.toEqual([]);
-    const heights = dialogs.flatMap((b) => decls(b.body, "max-height").map((v) => `${where(b)} → ${v}`));
+    const dialogs = elementsWith(family("dialog"));
+    expect(dialogs.map(elName), ".dialog 元素应当存在").not.toEqual([]);
+
+    const heights: string[] = [];
+    for (const el of dialogs) {
+      for (const { rule, decl } of hits(el, (d) => d.prop === "max-height")) {
+        heights.push(`${where(rule)} → ${decl.value}`);
+      }
+    }
     expect(heights.length, ".dialog 必须收缩到一屏(没有任何一处 max-height)").toBeGreaterThanOrEqual(1);
     expect(
       heights.filter((h) => !h.endsWith("→ 100%")),
       ".dialog 族的 max-height 只许是 100%——任何一处放开都会让超窗内容溢出到视口外",
     ).toEqual([]);
-    const y = lastOverflowY(dialogs);
-    expect(
-      y !== null && /^(auto|scroll)/.test(y),
-      `.dialog 的溢出是 "${y}"——必须能自己滚,否则超窗内容溢出到视口外够不着`,
-    ).toBe(true);
+
+    for (const el of dialogs) {
+      const y = finalOverflowY(el);
+      expect(
+        y !== null && SCROLLABLE.test(y),
+        `${elName(el)} 的溢出(级联最终值)是 "${y ?? "未写"}"——必须能自己滚,否则超窗内容溢出到视口外够不着`,
+      ).toBe(true);
+    }
   });
 });
 
-/** 一族块里某属性的级联最终值(源序最后一条) */
-function lastOf(list: Block[], prop: string): string | null {
-  let last: string | null = null;
-  for (const b of list) {
-    const v = decl(b.body, prop);
-    if (v !== null) last = v;
-  }
-  return last;
-}
-
 /**
- * 块里声明的 flex-grow(简写 / 长写 / 关键字都认);没声明返回 null。
- * 简写与长写同块共存时按源序取后写的那条。
+ * 元素身上的 flex-grow(简写 / 长写 / 关键字都认),按级联取最终值;没声明返回 null。
  */
-function growOf(body: string): number | null {
-  const re = /(?:^|;)\s*(flex|flex-grow)\s*:\s*([^;]+)/g;
-  let value: string | null = null;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(body))) {
-    const raw = m[2].replace(/!\s*important\s*$/i, "").trim().toLowerCase();
-    if (m[1] === "flex-grow") value = raw;
-    else if (raw === "none" || raw === "initial") value = "0";
-    else {
-      const first = raw.split(/\s+/)[0];
-      // `flex: 1 1 auto` → 1;`flex: auto` / `flex: 30%`(= 1 1 <basis>)→ 1
-      value = /^\d/.test(first) && !/[a-z%]/.test(first) ? first : "1";
-    }
+function growOf(el: ReadonlySet<string>): number | null {
+  const h = cascade(hits(el, (d) => d.prop === "flex" || d.prop === "flex-grow"));
+  if (!h) return null;
+  const raw = h.decl.value.trim().toLowerCase();
+  let value: string;
+  if (h.decl.prop === "flex-grow") value = raw;
+  else if (raw === "none" || raw === "initial") value = "0";
+  else {
+    const first = raw.split(/\s+/)[0];
+    // `flex: 1 1 auto` → 1;`flex: auto` / `flex: 30%`(= 1 1 <basis>)→ 1
+    value = /^\d/.test(first) && !/[a-z%]/.test(first) ? first : "1";
   }
-  if (value === null) return null;
   const n = Number.parseFloat(value);
   return Number.isFinite(n) ? n : 1; // 认不出的写法按「会瓜分高度」算(fail-closed)
 }

@@ -34,7 +34,7 @@ import {
 import type { SortingAsset, SortingCategory } from "../api/types";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import { animateOnce } from "../lib/motion";
-import { resolveShortcut } from "../lib/sorting";
+import { resolveShortcut, shouldYieldShortcut } from "../lib/sorting";
 import { JudgementBadges } from "./JudgementBadges";
 import { Badge, EmptyState, Kbd } from "./ui";
 
@@ -180,11 +180,23 @@ export interface GalleryViewProps {
    */
   onExitToGrid?: () => void;
   /**
-   * 库里的**总**素材数。分页加载时它大于 `assets.length`。
+   * 库里的**总**素材数，且与 `assets` **同口径**。分页加载时它大于 `assets.length`。
    *
    * 不传 = 调用方没有分页概念，已加载即全部，位置栏照旧写「共 N 张」。
+   * 上层开着筛选时**不许**把全库总数塞进来充数——那是在把「库里有 1240 张」
+   * 说成「符合当前筛选的有 1240 张」。那种场景改传 `unloadedCount`。
    */
   total?: number;
+  /**
+   * 还有多少张**原始素材**尚未加载。**筛选态下用它代替 `total`**（评审 D1）。
+   *
+   * 筛选之后，库里还没加载的那一批能命中多少张是**未知**的：
+   * 说「共 M 张」是谎话，说「已经是最后一张」更是把「还没看的部分」
+   * 直接说成不存在。传了它就一律按「未知总量」口径措辞，
+   * 读屏那边对应 `aria-setsize="-1"`（WAI-ARIA 的未知集合大小）。
+   * 与 `total` 同时传时以本项为准。
+   */
+  unloadedCount?: number;
   /** 上层正在续拉下一页。不传 = 当作没有加载中的请求，只是不显示加载态 */
   loading?: boolean;
   /**
@@ -193,6 +205,15 @@ export interface GalleryViewProps {
    * 不传时**不会静默停住**：会明确提示「已到已加载的末尾，还有 M 张未加载」。
    */
   onEndReached?: () => void;
+  /**
+   * 把画廊根节点交给上层。
+   *
+   * 上层在浮层（全屏大图 / 二次确认）收起后要把键盘焦点交回**这个节点**，
+   * 而不是外层容器。交错地方的实测后果（评审 B2）：焦点落到外层 wrap 上，
+   * 方向键与 Esc 由 wrap 的兜底处理器接住又被原样放掉，
+   * 按下去毫无反应且没有任何迹象——而打标键还能用，看起来像"坏了一半"。
+   */
+  rootNodeRef?: { current: HTMLDivElement | null };
 }
 
 export function GalleryView({
@@ -211,8 +232,10 @@ export function GalleryView({
   onThumbLoad,
   onExitToGrid,
   total,
+  unloadedCount,
   loading = false,
   onEndReached,
+  rootNodeRef,
 }: GalleryViewProps): JSX.Element {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLElement | null>(null);
@@ -236,8 +259,19 @@ export function GalleryView({
   const loadedCount = assets.length;
   /** total 比已加载还小只可能是上层算错；宁可少说，也不编一个更小的数 */
   const totalCount = Math.max(total ?? loadedCount, loadedCount);
-  const pendingCount = totalCount - loadedCount;
+  /** 上层开着筛选：未加载那部分能命中多少张未知，一律按「未知总量」说话 */
+  const filteredScope = unloadedCount !== undefined;
+  const pendingCount = filteredScope
+    ? Math.max(0, unloadedCount)
+    : totalCount - loadedCount;
   const hasMore = pendingCount > 0;
+  /**
+   * 总量可知吗。
+   *
+   * 筛选态下只要还有没加载的素材，「一共几张」就是不可知的——
+   * 位置栏、胶片条 aria-label、以及每一格的 `aria-setsize` 都得据此改口。
+   */
+  const totalKnown = !(filteredScope && hasMore);
 
   /**
    * 「你刚按的这个键为什么没动静」。
@@ -296,18 +330,19 @@ export function GalleryView({
       setNotice(`已经是最后一张（共 ${loadedCount} 张）。`);
       return;
     }
+    const tail = totalKnown
+      ? `已到已加载素材的末尾（已加载 ${loadedCount} 张，共 ${totalCount} 张），` +
+        `还有 ${pendingCount} 张未加载`
+      : // 筛选态：命中数是真的，总数不是——不许拿全库总数把话说满
+        `已到已加载素材的末尾（当前筛选在已加载的部分里命中 ${loadedCount} 张），` +
+        `库里还有 ${pendingCount} 张未加载，其中能命中多少未知`;
     if (onEndReached) {
-      setNotice(
-        `已到已加载的第 ${loadedCount} 张，另有 ${pendingCount} 张未加载，已请求继续加载。`,
-      );
+      setNotice(`${tail}，已请求继续加载。`);
       onEndReached();
       return;
     }
-    setNotice(
-      `已到已加载素材的末尾（已加载 ${loadedCount} 张，共 ${totalCount} 张），` +
-        `还有 ${pendingCount} 张未加载。当前视图无法继续加载，回网格视图加载更多后再回来。`,
-    );
-  }, [hasMore, loadedCount, onEndReached, pendingCount, totalCount]);
+    setNotice(`${tail}。当前视图无法继续加载，回网格视图加载更多后再回来。`);
+  }, [hasMore, loadedCount, onEndReached, pendingCount, totalCount, totalKnown]);
 
   const step = useCallback(
     (delta: number) => {
@@ -447,10 +482,16 @@ export function GalleryView({
 
   const handleKeyDown = useCallback(
     (e: ReactKeyboardEvent<HTMLDivElement>) => {
-      // 输入框里打字不该被当成打标键
-      const target = e.target as HTMLElement | null;
-      const tag = target?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || target?.isContentEditable) return;
+      /*
+       * 这一击键归不归事件目标自己（评审 B1）。
+       *
+       * 从前这里只挡输入类目标（连 SELECT 都漏了），于是 Tab 到本组件动作条上的
+       * 任何一个按钮再按 Enter / 空格，都会被解释成 `preview` → 打开全屏大图 +
+       * preventDefault + stopPropagation，**按钮完全不执行**。父层几处已经铺上了
+       * `shouldYieldShortcut`，唯独漏了组件自己这份——而父层的兜底挡不住
+       * 本组件挂在子树上的 bubble 处理器。四层里修了三层等于没修。
+       */
+      if (shouldYieldShortcut(e.target, e.key)) return;
 
       const action = resolveShortcut(
         {
@@ -594,9 +635,14 @@ export function GalleryView({
    * 位置栏只敢说自己知道的事：画廊拿到的永远只是**已加载**那一批，
    * 把它写成「共 200 张」而库里其实有 1240 张，就是在对用户说谎（评审 D2）。
    */
-  const positionText = hasMore
-    ? `第 ${index + 1} 张 / 已加载 ${loadedCount} 张（共 ${totalCount} 张）`
-    : `第 ${index + 1} 张 / 共 ${loadedCount} 张`;
+  const positionText = !hasMore
+    ? `第 ${index + 1} 张 / 共 ${loadedCount} 张`
+    : totalKnown
+      ? `第 ${index + 1} 张 / 已加载 ${loadedCount} 张（共 ${totalCount} 张）`
+      : `第 ${index + 1} 张 / 当前筛选已命中 ${loadedCount} 张（库里还有 ` +
+        `${pendingCount} 张未加载，能命中多少未知）`;
+  /** 集合位置语义（评审 D2）：窗口化只挂载二十几格，总数不可知时按 -1 说 */
+  const setSize = totalKnown ? totalCount : -1;
 
   /** 胶片条要渲染的下标（含占位块的分段结构） */
   const renderedCount = segments.reduce((sum, s) => sum + (s.end - s.start), 0);
@@ -619,6 +665,7 @@ export function GalleryView({
           selected={i === index}
           marked={markedSet.has(asset.id)}
           curated={curatedIds.has(asset.id)}
+          setSize={setSize}
           registerShot={registerShot}
           onPick={pickShot}
           onThumbError={handleShotError}
@@ -636,7 +683,11 @@ export function GalleryView({
     <div
       className="gallery"
       data-testid="gallery-view"
-      ref={rootRef}
+      ref={(node) => {
+        rootRef.current = node;
+        // 上层拿它做焦点交接（评审 B2）；卸载时会被回调成 null，不会留下野指针
+        if (rootNodeRef) rootNodeRef.current = node;
+      }}
       /* 与 SortingScreen 的 .sorting__grid-wrap 同一手法：容器自己可聚焦，
          快捷键只在焦点位于画廊内时生效，不去 document 上抢键 */
       tabIndex={0}
@@ -880,9 +931,11 @@ export function GalleryView({
         tabIndex={0}
         aria-activedescendant={shotDomId(index)}
         aria-label={
-          hasMore
-            ? `胶片条，已加载 ${loadedCount} 张，共 ${totalCount} 张`
-            : `胶片条，共 ${loadedCount} 张`
+          !hasMore
+            ? `胶片条，共 ${loadedCount} 张`
+            : totalKnown
+              ? `胶片条，已加载 ${loadedCount} 张，共 ${totalCount} 张`
+              : `胶片条，当前筛选已命中 ${loadedCount} 张，库里还有 ${pendingCount} 张未加载`
         }
         data-testid="gallery-strip"
         /* 当前真正挂在 DOM 里的格数（窗口化的可观测出口，也给测试当闸门） */
@@ -1039,6 +1092,7 @@ export const StripShot = memo(function StripShot({
   selected,
   marked,
   curated,
+  setSize,
   registerShot,
   onPick,
   onThumbError,
@@ -1049,6 +1103,13 @@ export const StripShot = memo(function StripShot({
   selected: boolean;
   marked: boolean;
   curated: boolean;
+  /**
+   * 集合总数（评审 D2）。窗口化之后 listbox 里同时只挂着二十几个 option，
+   * 不给 `aria-setsize` 的话读屏会拿这二十几个 DOM 节点当整个集合，
+   * 把「第 901 项，共 1000 项」念成「第 4 项，共 23 项」。
+   * 总数不可知时传 `-1`——WAI-ARIA 对虚拟化 listbox 规定的正是这个口径。
+   */
+  setSize: number;
   registerShot: (id: string, node: HTMLElement | null) => void;
   onPick: (id: string, index: number) => void;
   onThumbError: () => void;
@@ -1066,6 +1127,9 @@ export const StripShot = memo(function StripShot({
       ref={(node) => registerShot(asset.id, node)}
       role="option"
       aria-selected={selected}
+      /* 只挂载窗口内的一段，序号必须自己报，不能让读屏按 DOM 节点数去数 */
+      aria-posinset={index + 1}
+      aria-setsize={setSize}
       tabIndex={-1}
       className={`gallery__shot${selected ? " gallery__shot--active" : ""}`}
       data-testid="gallery-shot"

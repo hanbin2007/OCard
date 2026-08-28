@@ -17,6 +17,27 @@ import type { BadgeTone } from "../components/ui";
 import { classifyCopyScope, formatScopeFolders } from "./copyScope";
 import { formatBytes, formatDuration, formatTimestamp } from "./format";
 
+/**
+ * 当前的**扫描策略版本**，必须与 Rust 的 `core::manifest::SCAN_POLICY_VERSION`
+ * 是同一个数。
+ *
+ * | 值 | 含义 |
+ * |---|---|
+ * | `0`（记录里缺这个字段）| **旧口径**：以「.」开头的条目一律跳过 |
+ * | `1` | 当前口径：只排除明确列举的系统项（废纸篓、索引、`.DS_Store` …） |
+ *
+ * 为什么前端要硬编码一份：这个数字要判的是**审计日志里的历史行**，判据是
+ * 「这条记录里的版本 < 我这一版」，而历史行里没有「当时的当前版本」可读。
+ * 后端也没有把它作为独立命令暴露——`CopyTaskDto.scanPolicyVersion` 只覆盖
+ * **未完成**的任务（`rebuild_tasks` 只重建未完成清单），够不到升级前就已经
+ * `completed` 的那批，而那批正是本标注唯一要救的对象。
+ *
+ * **防漂移**：`audit.test.ts` 里有一条测试直接读
+ * `src-tauri/src/core/manifest.rs`，把这两个数字钉在一起。Rust 侧递增而这里
+ * 忘了跟，那条测试当场变红——不会等到界面上把新口径的记录标成旧口径才发现。
+ */
+export const SCAN_POLICY_VERSION = 1;
+
 /** 事件所属的业务环节，对应顶部过滤 chips */
 export type AuditGroup = "copy" | "sorting" | "delivery" | "transcode" | "other";
 
@@ -151,6 +172,95 @@ export function auditKindMeta(kind: unknown): AuditKindMeta {
   };
 }
 
+/* ------------------------------------------------------------------ *
+ * 扫描策略版本：认出「旧口径下跑出来的那条绿色的完成」
+ * ------------------------------------------------------------------ */
+
+/**
+ * 会带 `scanPolicyVersion` 的两个事件（后端 `commands::mod` / `commands::tasks`）。
+ * 只有这两个 kind 缺字段才说明问题；别的事件本来就没有这个字段。
+ */
+const SCAN_POLICY_KINDS: ReadonlySet<string> = new Set([
+  "copy_started",
+  "copy_completed",
+]);
+
+/** 明细里这条标注的字段名 */
+const SCAN_POLICY_LABEL = "扫描口径";
+
+export type ScanPolicyState =
+  /** 记录自证跑在当前口径上：无需标注 */
+  | { state: "current" }
+  /** 旧口径（字段缺失按 0 记）：当时以「.」开头的条目一律跳过 */
+  | { state: "legacy"; version: number }
+  /** 有值但读不出：**不许**当成当前口径放绿灯 */
+  | { state: "unreadable"; raw: string | null };
+
+/**
+ * 判定一条审计记录出自哪一版扫描口径。非 copy_started/copy_completed 返回 null。
+ *
+ * **缺字段 = 旧口径**，这是后端定的判据（`manifest::SCAN_POLICY_VERSION` 的注释）。
+ * 也因此，`data` 根本不是对象（损坏行、老版本补录）同样算旧口径——它一样
+ * 证明不了自己跑在新口径上，而这里唯一不能犯的错是**把没看懂的记录涂成绿色**。
+ */
+export function classifyScanPolicy(
+  kind: unknown,
+  data: unknown,
+): ScanPolicyState | null {
+  const raw = typeof kind === "string" ? kind.trim() : "";
+  if (!SCAN_POLICY_KINDS.has(raw)) return null;
+
+  const record = asRecord(data);
+  if (!record || !Object.prototype.hasOwnProperty.call(record, "scanPolicyVersion")) {
+    return { state: "legacy", version: 0 };
+  }
+  const value = record.scanPolicyVersion;
+  // 版本号是 u32：非整数 / 负数一律算读不出，宁可标一句「不明」也不印出「v-1」
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+    return value >= SCAN_POLICY_VERSION
+      ? { state: "current" }
+      : { state: "legacy", version: value };
+  }
+  return { state: "unreadable", raw: formatLoose(value) };
+}
+
+/**
+ * 「这条记录出自旧的扫描口径」的可见标注。
+ *
+ * **为什么非标不可**：升级**前**跑完的整卷任务，当时按旧口径（点开头一律跳过）
+ * 漏掉了卡上合法的点开头素材，却报了 100% 完成 +「本卡可格式化」。
+ * `rebuild_tasks` 只重建未完成的清单，那批任务根本不进 `list_copy_tasks`，
+ * 两条续传告警也够不到它们——审计日志是它们**唯一**留下痕迹的地方。
+ * 不标，升级后那一行就还是一条无标注的绿色完成，没有任何机制说明它出自旧口径。
+ *
+ * **措辞必须诚实**：不断言「这张卡一定漏了东西」（卡上可能压根没有点开头的
+ * 素材），也不能让人觉得无所谓。口径与 Rust 的 `policy_upgrade_caveat()` 一致——
+ * 说清「无法区分 / 判断不了」，把结论留给去核对的人，而不是替他下。
+ */
+function scanPolicyCaveat(kind: unknown, data: unknown): AuditDetail | null {
+  const policy = classifyScanPolicy(kind, data);
+  if (!policy || policy.state === "current") return null;
+
+  if (policy.state === "unreadable") {
+    const shown = policy.raw ? `（${policy.raw}）` : "";
+    return {
+      label: SCAN_POLICY_LABEL,
+      value: `版本读不出${shown}：这条记录证明不了它跑在当前口径 v${SCAN_POLICY_VERSION} 上，「.」开头的素材有没有被拷到，判断不了`,
+    };
+  }
+
+  const base = `旧口径 v${policy.version}（当前 v${SCAN_POLICY_VERSION}）：当时以「.」开头的条目一律跳过，卡上若有这类素材就没进本次范围`;
+  // 「完成」那一条还额外背着两句结论,必须点名说它们不覆盖被跳过的条目
+  const verdict =
+    typeof kind === "string" && kind.trim() === "copy_completed"
+      ? "，「校验通过」与「本卡可格式化」都不覆盖它们"
+      : "";
+  return {
+    label: SCAN_POLICY_LABEL,
+    value: `${base}${verdict}；卡上当时到底有没有，这条记录判断不了`,
+  };
+}
+
 /**
  * 取一条记录的呈现口径——**连 data 一起看**。
  *
@@ -163,22 +273,42 @@ export function auditKindMeta(kind: unknown): AuditKindMeta {
  * 被看见"**,不是机械地按成功/失败上色。这里把它从 kind 推广到 data。
  *
  * 降级只朝一个方向:绿/中性 → 琥珀;已经是 danger 的不会被调轻。
+ *
+ * 现在压两道:**范围**（这次到底拷了多少）与**扫描口径**（那份结论可不可信）。
+ * 两道各自独立,同时命中就并列写进抬头——「拷卡完成（部分 · 旧扫描口径）」。
  */
 export function auditEventMeta(kind: unknown, data: unknown): AuditKindMeta {
   const meta = auditKindMeta(kind);
+  /* 抬头后缀的顺序 = 阅读顺序:先说这次拷了多少,再说那个数字出自哪一版口径 */
+  const tags: string[] = [];
+  let degraded = false;
+
   const record = asRecord(data);
-  if (!record || !Object.prototype.hasOwnProperty.call(record, "sourceFolders")) {
-    /* 没有这个字段 = 按文件夹多选这个特性上线之前的旧记录,当时只可能是整卷。
-       不额外标注,也不擅自改色——替旧记录编一个"范围"同样是替后端背书。 */
-    return meta;
+  if (record && Object.prototype.hasOwnProperty.call(record, "sourceFolders")) {
+    const scope = classifyCopyScope(record.sourceFolders);
+    if (scope !== "whole") {
+      degraded = true;
+      // 范围读不懂时只降色、不拼字:替它编一个「部分」同样是替后端背书
+      if (scope === "partial") tags.push("部分");
+    }
   }
-  const scope = classifyCopyScope(record.sourceFolders);
-  if (scope === "whole") return meta;
+  /* 没有 sourceFolders 字段 = 按文件夹多选上线之前的旧记录,当时只可能是整卷。
+     不额外标注范围,也不因此改色——但下面那道口径检查照旧要走。 */
+
+  const policy = classifyScanPolicy(kind, data);
+  if (policy && policy.state !== "current") {
+    degraded = true;
+    tags.push(policy.state === "legacy" ? "旧扫描口径" : "扫描口径不明");
+  }
+
+  if (!degraded) return meta;
   return {
     ...meta,
     /* 颜色不是信息:灰度、色觉障碍、截图转发之后都只剩文字。
-       抬头本身要说清这次只拷了一部分,不能只靠把绿改成琥珀。 */
-    label: meta.known && scope === "partial" ? `${meta.label}（部分）` : meta.label,
+       抬头本身要说清这一行哪里不能照单全收,不能只靠把绿改成琥珀。
+       未收录的 kind 抬头是等宽原始值,不给它拼中文后缀。 */
+    label:
+      meta.known && tags.length > 0 ? `${meta.label}（${tags.join(" · ")}）` : meta.label,
     tone: meta.tone === "danger" ? "danger" : "warn",
   };
 }
@@ -212,6 +342,9 @@ type ValueKind =
   /** `allVerified`：值本身要带上范围口径，避免被读成"整卡都校验过了" */
   | "verifyScope";
 
+/** 拷贝范围那一项的字段名——「扫描口径」标注要插在它后面，故收成常量 */
+const SCOPE_LABEL = "范围";
+
 /**
  * 已知字段的取用顺序 = 重要性顺序。排在前面的先占掉那 4 个位置。
  * 失败原因排第一：一条失败记录里，"为什么"永远比"多少个"重要。
@@ -232,7 +365,7 @@ const KNOWN_FIELDS: ReadonlyArray<{
    * 与整卷**逐字相同**——一条绿色的"拷卡完成 · 容量 39.1 GB",足以让人去
    * 相机里格式化掉没备份的素材。
    */
-  { keys: ["sourceFolders"], label: "范围", kind: "scope" },
+  { keys: ["sourceFolders"], label: SCOPE_LABEL, kind: "scope" },
   { keys: ["allVerified"], label: "校验", kind: "verifyScope" },
   { keys: ["rel", "fileName", "file", "path"], label: "文件", kind: "text" },
   { keys: ["succeeded"], label: "成功", kind: "count" },
@@ -389,9 +522,38 @@ function formatField(
 
 /**
  * 从 data 里挑出最多 `limit` 项关键明细。
+ *
+ * `kind` 可选，但**只有带上它**才能给出与 kind 绑定的标注（目前是「扫描口径」：
+ * 判据是「`copy_started` / `copy_completed` 缺 `scanPolicyVersion` 字段」，
+ * 光看 data 分不出「这条记录出自旧口径」和「这个 kind 本来就没这个字段」）。
+ * `toAuditRow` 一律传；只想看 data 挑字段的调用方可以不传。
+ *
  * 任何形状的输入都只会得到"少一点"的结果，不会得到异常。
  */
-export function auditDetails(data: unknown, limit = MAX_AUDIT_DETAILS): AuditDetail[] {
+export function auditDetails(
+  data: unknown,
+  limit = MAX_AUDIT_DETAILS,
+  kind?: unknown,
+): AuditDetail[] {
+  if (limit <= 0) return [];
+  const caveat = scanPolicyCaveat(kind, data);
+  // 标注自己也占一格,总数仍守住 limit:挤掉一项排最后的次要计数,
+  // 好过让这一行长到读不动
+  const picked = pickDataDetails(data, caveat ? limit - 1 : limit);
+  if (!caveat) return picked;
+  /*
+   * 插在「范围」之后、其余一切之前。
+   * 之后：范围那一位是拿命换来的（见 KNOWN_FIELDS 里那段注释），不许被挤走；
+   * 之前：这条标注直接推翻「校验」的适用范围，读到「校验 全部通过」之前
+   *       必须先读到它，否则顺序本身就在误导人。
+   */
+  const at = picked.findIndex((d) => d.label === SCOPE_LABEL);
+  const index = at >= 0 ? at + 1 : 0;
+  return [...picked.slice(0, index), caveat, ...picked.slice(index)];
+}
+
+/** `auditDetails` 里纯看 data 的那一半：按 KNOWN_FIELDS 挑，挑不到就露生键值 */
+function pickDataDetails(data: unknown, limit: number): AuditDetail[] {
   const record = asRecord(data);
   if (!record) {
     // data 本身就是标量或数组：能读就直接读，读不出就是空
@@ -467,7 +629,8 @@ export function toAuditRow(raw: unknown, index: number): AuditRow {
   const record = asRecord(raw) ?? {};
   const kind = asText(record.kind, "");
   const ts = asText(record.ts, "");
-  const details = auditDetails(record.data);
+  // 连 kind 一起传:「缺 scanPolicyVersion = 旧口径」这条判据离了 kind 不成立
+  const details = auditDetails(record.data, MAX_AUDIT_DETAILS, kind);
   return {
     key: `${ts || "?"}-${kind || "?"}-${index}`,
     ts,

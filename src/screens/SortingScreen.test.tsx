@@ -24,7 +24,12 @@ import { SortingScreen } from "./SortingScreen";
 import { StoreProvider, useStore } from "../state/store";
 import { ThemeProvider } from "../state/theme";
 import { WindowBridgeProvider } from "../state/windowBridge";
-import type { AssetPage, IndexProgressEvent, SortingAsset } from "../api/types";
+import type {
+  AssetPage,
+  BulkResult,
+  IndexProgressEvent,
+  SortingAsset,
+} from "../api/types";
 
 afterEach(cleanup);
 
@@ -1373,6 +1378,84 @@ function fakeAsset(id: string): SortingAsset {
   return { ...mockPendingAssets[0], id, fileName: id, judgement: undefined };
 }
 
+/** 把交付打包推成 running：分类 / 删除链路的互斥全靠它 */
+function StartDeliveryButton() {
+  const { dispatch } = useStore();
+  return (
+    <button
+      type="button"
+      data-testid="test-start-delivery"
+      onClick={() =>
+        dispatch({
+          type: "jobProgress",
+          job: {
+            id: "job-delivery",
+            kind: "delivery",
+            projectId: project.id,
+            state: "running",
+            done: 1,
+            total: 10,
+            bytesDone: 0,
+            revision: 1,
+            startedAt: new Date().toISOString(),
+          },
+        })
+      }
+    >
+      开始打包
+    </button>
+  );
+}
+
+describe("A2 确认之后、下发之前被拦下，也必须说出来", () => {
+  it("★ 破坏性动作凭空蒸发是最坏的一种静默：对话框照常消失，但要有可见交代", async () => {
+    const user = userEvent.setup();
+    const trash = vi.spyOn(api, "trashAssets");
+
+    render(
+      <ThemeProvider>
+        <StoreProvider preloaded={preloaded}>
+          <WindowBridgeProvider role="main">
+            <SortingScreen />
+            <StartDeliveryButton />
+            <NoticeToasts />
+          </WindowBridgeProvider>
+        </StoreProvider>
+      </ThemeProvider>,
+    );
+    await screen.findAllByTestId("asset-cell");
+    await waitFor(() =>
+      expect(document.querySelector(".asset--focused")).not.toBeNull(),
+    );
+
+    fireEvent.keyDown(screen.getByTestId("sorting-grid-wrap"), { key: "d" });
+    await user.click(screen.getByTestId("sorting-confirm-delete"));
+    await screen.findByRole("alertdialog");
+
+    // 确认框已经开着、用户正要按下红色按钮的那一瞬间，交付作业转 running
+    await user.click(screen.getByTestId("test-start-delivery"));
+    await user.click(screen.getByRole("button", { name: "移入回收站" }));
+
+    /*
+     * 旧行为：`commitDelete` 一句静默 `return`，而 ConfirmDialog 无条件
+     * `close()`——对话框正常消失，一个**已经二次确认过的破坏性动作凭空蒸发**：
+     * 没有 toast、没有通知、没有内联提示。
+     */
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(trash).not.toHaveBeenCalled();
+
+    const toast = await screen.findByTestId("notice-toast-warning");
+    expect(toast.getAttribute("data-code")).toBe("sorting-delete-blocked");
+    expect(toast.textContent).toContain("待删标记一个没少");
+
+    // 标记必须原样留着，而且清单还能再提交（状态机没有卡在 confirming）
+    expect(screen.getByTestId("sorting-pending-delete").textContent).toContain(
+      "已标记 1 个待删除",
+    );
+    trash.mockRestore();
+  }, 15000);
+});
+
 describe("B5 切项目后旧项目的响应不许灌进新项目的网格", () => {
   it("★ 索引驱动的重拉在切项目后返回：整批丢弃，计数与格子都不受污染", async () => {
     const other = mockProjects.find((p) => p.id !== project.id)!;
@@ -1444,5 +1527,445 @@ describe("B5 切项目后旧项目的响应不许灌进新项目的网格", () =
 
     listSpy.mockRestore();
     subSpy.mockRestore();
+  }, 15000);
+});
+
+/* ================================================================== *
+ * 第二轮评审：零静默 / 焦点交接 / 分页接线
+ *
+ * 焦点相关的用例一律 `.focus()` + `user.keyboard(...)`（派发到
+ * `document.activeElement`）并直接断言 `document.activeElement`——
+ * `fireEvent.keyDown(具体元素, …)` 绕过真实焦点链，正是这些 bug
+ * 逃过上一轮所有用例的原因。
+ * ================================================================== */
+
+/** 让「待删清单提交」停在飞行中：返回 resolve 句柄，用完必须放掉 */
+function hangTrash() {
+  let release: ((result: BulkResult) => void) | null = null;
+  const spy = vi
+    .spyOn(api, "trashAssets")
+    .mockImplementation(
+      () =>
+        new Promise<BulkResult>((resolve) => {
+          release = resolve;
+        }),
+    );
+  return {
+    spy,
+    finish: (result: BulkResult = { succeeded: [], failed: [] }) =>
+      release?.(result),
+  };
+}
+
+describe("A1 「取消标记」不许绕过受理闸门", () => {
+  it("★ 提交在飞时按钮变灰并当面写明原因，而不是按下去毫无反应", async () => {
+    const user = userEvent.setup();
+    const trash = hangTrash();
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "d" });
+    await user.click(screen.getByTestId("sorting-confirm-delete"));
+    await user.click(screen.getByRole("button", { name: "移入回收站" }));
+    await waitFor(() => expect(trash.spy).toHaveBeenCalledTimes(1));
+
+    /*
+     * 旧行为：这个按钮直接对状态机下发 `clear`，而 reducer 在 working 态
+     * 一句 `return state`——按钮可点、点了什么都不发生、零反馈；
+     * 同一刻按 D/U 却有明确说明。静默的偏偏是更常用的鼠标那条路。
+     */
+    const unmarkAll = screen.getByTestId("sorting-unmark-all") as HTMLButtonElement;
+    await waitFor(() => expect(unmarkAll.disabled).toBe(true));
+    expect(unmarkAll.title).toContain("正在提交进回收站");
+    // 只藏在 title 里不算说清楚：屏上要有一行看得见的字
+    expect(screen.getByTestId("sorting-commit-busy").textContent).toContain(
+      "标记暂时不能改动",
+    );
+    expect(screen.getByTestId("sorting-pending-delete").textContent).toContain(
+      "已标记 1 个待删除",
+    );
+
+    trash.finish();
+  });
+
+  it("★ 键盘路径给的是同一个答案（口径必须一致）", async () => {
+    const user = userEvent.setup();
+    const trash = hangTrash();
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "d" });
+    await user.click(screen.getByTestId("sorting-confirm-delete"));
+    await user.click(screen.getByRole("button", { name: "移入回收站" }));
+    await waitFor(() => expect(trash.spy).toHaveBeenCalledTimes(1));
+
+    fireEvent.keyDown(grid(), { key: "u" });
+    const toast = await screen.findByTestId("notice-toast-warning");
+    expect(toast.getAttribute("data-code")).toBe("sorting-action-commit-busy");
+
+    trash.finish();
+  });
+
+  it("提交结束后「取消标记」照常可用，并且真的清空清单", async () => {
+    const user = userEvent.setup();
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "d" });
+    fireEvent.keyDown(grid(), { key: "ArrowRight" });
+    fireEvent.keyDown(grid(), { key: "d" });
+    expect(screen.getByTestId("sorting-pending-delete").textContent).toContain(
+      "已标记 2 个待删除",
+    );
+
+    await user.click(screen.getByTestId("sorting-unmark-all"));
+    expect(screen.queryByTestId("sorting-pending-delete")).toBeNull();
+  });
+
+  it("提交在飞时再按 Shift+D 不重复下发，并说明为什么", async () => {
+    const user = userEvent.setup();
+    const trash = hangTrash();
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "d" });
+    await user.click(screen.getByTestId("sorting-confirm-delete"));
+    await user.click(screen.getByRole("button", { name: "移入回收站" }));
+    await waitFor(() => expect(trash.spy).toHaveBeenCalledTimes(1));
+
+    fireEvent.keyDown(grid(), { key: "D", shiftKey: true });
+    const toast = await screen.findByTestId("notice-toast-warning");
+    expect(toast.getAttribute("data-code")).toBe("sorting-delete-committing");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(trash.spy).toHaveBeenCalledTimes(1);
+
+    trash.finish();
+  });
+});
+
+describe("C1 控件把自己禁用 / 卸载掉时，焦点不许掉到 body", () => {
+  it("★ 点分类 chip：chip 随即 disabled，键盘要有接盘（旧行为焦点落 body）", async () => {
+    const user = userEvent.setup();
+    // 挂住 moveAssets，让 busy 一直为 true，chip 停在禁用态
+    const move = vi
+      .spyOn(api, "moveAssets")
+      .mockImplementation(() => new Promise(() => {}));
+    await renderSorting();
+
+    const chip = screen
+      .getAllByTestId("sorting-category")
+      .find((c) => c.getAttribute("data-category") === "cat-1") as HTMLButtonElement;
+    await user.click(chip);
+
+    await waitFor(() => expect(chip.disabled).toBe(true));
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(grid());
+
+    move.mockRestore();
+  });
+
+  it("★ 点「取消标记」：整条待删条随之卸载，焦点回网格且方向键立刻可用", async () => {
+    const user = userEvent.setup();
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "d" });
+    await user.click(screen.getByTestId("sorting-unmark-all"));
+
+    expect(screen.queryByTestId("sorting-pending-delete")).toBeNull();
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(grid());
+
+    const before = focusedAsset();
+    await user.keyboard("{ArrowRight}");
+    await waitFor(() => expect(focusedAsset()).not.toBe(before));
+  });
+
+  it("★ 点「撤销」：按钮先禁用、成功后整条卸载，焦点同样要回网格", async () => {
+    const user = userEvent.setup();
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "1" });
+    await screen.findByTestId("sorting-undo-bar");
+
+    await user.click(screen.getByTestId("sorting-undo"));
+    await waitFor(() => expect(screen.queryByTestId("sorting-undo-bar")).toBeNull());
+
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(grid());
+
+    const before = focusedAsset();
+    await user.keyboard("{ArrowRight}");
+    await waitFor(() => expect(focusedAsset()).not.toBe(before));
+  }, 15000);
+});
+
+describe("E2 被分类移走的素材必须离开待删清单", () => {
+  it("★ 先按 D 标删、再按 1 分类走：清单要跟着剪掉，不留看不见的条目", async () => {
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "d" });
+    expect(screen.getByTestId("sorting-pending-delete").textContent).toContain(
+      "已标记 1 个待删除",
+    );
+
+    fireEvent.keyDown(grid(), { key: "1" });
+    await waitFor(() =>
+      expect(screen.getByTestId("sorting-remaining").textContent).toContain("1239"),
+    );
+
+    /*
+     * 旧行为：素材已经离开待分类夹，却仍算在「已标记 1 个待删除」里——
+     * 「只看已标删」筛出来是空的，Shift+D 提交时 trashAssets 对它必然失败，
+     * 而失败项按设计**永久留在清单里**，用户除了清空全部之外摘不掉它。
+     */
+    await waitFor(() =>
+      expect(screen.queryByTestId("sorting-pending-delete")).toBeNull(),
+    );
+  });
+
+  it("★ 状态机真的回到空：此后 Shift+D 说的是「清单是空的」", async () => {
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "d" });
+    fireEvent.keyDown(grid(), { key: "1" });
+    await waitFor(() =>
+      expect(screen.queryByTestId("sorting-pending-delete")).toBeNull(),
+    );
+
+    fireEvent.keyDown(grid(), { key: "D", shiftKey: true });
+    const toast = await screen.findByTestId("notice-toast-warning");
+    expect(toast.getAttribute("data-code")).toBe("sorting-delete-empty");
+  });
+
+  it("没被标删的素材被移走时，别人的标记不受影响", async () => {
+    await renderSorting();
+
+    // 标第 1 张，然后把第 2 张分类走
+    fireEvent.keyDown(grid(), { key: "d" });
+    fireEvent.keyDown(grid(), { key: "ArrowRight" });
+    fireEvent.keyDown(grid(), { key: "1" });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("sorting-remaining").textContent).toContain("1239"),
+    );
+    expect(screen.getByTestId("sorting-pending-delete").textContent).toContain(
+      "已标记 1 个待删除",
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 画廊模式：焦点交接 / 分页接线 / 光标口径
+ * ------------------------------------------------------------------ */
+
+async function enterGallery(user: ReturnType<typeof userEvent.setup>) {
+  await renderSorting();
+  await user.click(screen.getByTestId("sorting-view-gallery"));
+  const gallery = await screen.findByTestId("gallery-view");
+  await waitFor(() =>
+    expect(screen.getByTestId("gallery-position").textContent).toContain("第 1 张"),
+  );
+  return gallery;
+}
+
+function galleryPosition() {
+  return screen.getByTestId("gallery-position").textContent ?? "";
+}
+
+describe("B2 画廊里关掉大图之后，键盘焦点要回到画廊本身", () => {
+  it("★ Esc 关掉全屏：activeElement 是画廊根节点，方向键与 Esc 立刻还能用", async () => {
+    const user = userEvent.setup();
+    const gallery = await enterGallery(user);
+
+    gallery.focus();
+    await user.keyboard("{Enter}");
+    await screen.findByTestId("asset-lightbox");
+
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByTestId("asset-lightbox")).toBeNull());
+
+    /*
+     * 旧行为：还原 effect 无条件 `gridWrapRef.current?.focus()`，焦点给了
+     * **外层 wrap**；画廊的键盘流挂在它自己的根节点上收不到父节点事件，
+     * 而 wrap 的兜底处理器把 move / selectAll / Esc 原样放掉——
+     * 方向键与 Esc 全部无反应且零提示，打标键却还能用。
+     */
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(screen.getByTestId("gallery-view"));
+
+    await user.keyboard("{ArrowRight}");
+    await waitFor(() => expect(galleryPosition()).toContain("第 2 张"));
+
+    // Esc 也得有回音（本屏没接「返回网格」，那就当面说清楚）
+    await user.keyboard("{Escape}");
+    const notice = await screen.findByTestId("gallery-notice");
+    expect(notice.textContent).toContain("没有选区可清");
+  }, 15000);
+
+  it("★ 画廊模式下外层 wrap 退出 Tab 序，焦点不会停在一个收不到键的容器上", async () => {
+    const user = userEvent.setup();
+    await enterGallery(user);
+
+    expect(grid().getAttribute("tabindex")).toBe("-1");
+    // 兜底：真被点到边缘留白拿了焦点，也要立刻转交给画廊根节点
+    grid().focus();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByTestId("gallery-view")),
+    );
+  });
+});
+
+describe("D1 画廊的分页边界必须接到真实调用方上（集成，不是孤立组件用例）", () => {
+  it("★ 位置栏如实写「已加载 200 张（共 1240 张）」，不再谎报「共 200 张」", async () => {
+    const user = userEvent.setup();
+    await enterGallery(user);
+
+    /*
+     * 旧行为：SortingScreen 一个分页 prop 都没传，组件于是走「已加载即全部」
+     * 的降级分支——第 200 张写着「共 200 张」「已经是最后一张」。
+     * 用户据此认为选片做完了，剩下 1040 张完全没检查过。
+     */
+    expect(galleryPosition()).toContain("已加载 200 张");
+    expect(galleryPosition()).toContain("共 1240 张");
+    expect(galleryPosition()).not.toMatch(/\/\s*共 200 张/);
+    expect(screen.getByTestId("gallery-strip-more").textContent).toBe(
+      "还有 1040 张未加载",
+    );
+  });
+
+  it("★ 翻到已加载的第 200 张再往后：真的续拉下一页，不是「已经是最后一张」", async () => {
+    const user = userEvent.setup();
+    const gallery = await enterGallery(user);
+
+    fireEvent.keyDown(gallery, { key: "End" });
+    await waitFor(() => expect(galleryPosition()).toContain("第 200 张"));
+
+    const listSpy = vi.spyOn(api, "listPendingAssets");
+    fireEvent.keyDown(gallery, { key: "ArrowRight" });
+
+    const notice = await screen.findByTestId("gallery-notice");
+    expect(notice.textContent).not.toContain("已经是最后一张");
+    expect(notice.textContent).toContain("已请求继续加载");
+
+    // 现成的 loadMore 必须真的被调到（旧行为：onEndReached 没接，永不续拉）
+    await waitFor(() =>
+      expect(listSpy.mock.calls.some((c) => c[1] === 200)).toBe(true),
+    );
+    await waitFor(() => expect(galleryPosition()).toContain("已加载 400 张"));
+
+    listSpy.mockRestore();
+  }, 15000);
+
+  it("★ 筛选态不许拿全库 total 冒充筛选结果总数", async () => {
+    const user = userEvent.setup();
+    await enterGallery(user);
+
+    await user.click(screen.getByTestId("sorting-judge-filter"));
+    await user.click(screen.getByRole("option", { name: "糊片" }));
+
+    await waitFor(() => expect(galleryPosition()).toContain("当前筛选已命中"));
+    // 库里还没加载的那 1040 张能命中多少，谁也不知道——不许把 1240 说成命中总数
+    expect(galleryPosition()).toContain("1040 张未加载");
+    expect(galleryPosition()).toContain("能命中多少未知");
+    expect(galleryPosition()).not.toContain("1240");
+  }, 15000);
+});
+
+describe("E1 画廊里不移出列表的动作，在最后一张不许把光标往回跳", () => {
+  it("★ 最后一张按 D：光标原地不动，连按两次动的是同一张", async () => {
+    const user = userEvent.setup();
+    const gallery = await enterGallery(user);
+
+    fireEvent.keyDown(gallery, { key: "End" });
+    await waitFor(() => expect(galleryPosition()).toContain("第 200 张"));
+    const shown = screen.getByTestId("gallery-path").textContent;
+
+    fireEvent.keyDown(gallery, { key: "d" });
+    await screen.findByTestId("sorting-pending-delete");
+    expect(screen.getByTestId("sorting-pending-delete").textContent).toContain(
+      "已标记 1 个待删除",
+    );
+
+    /*
+     * 旧行为：D / P / U 与「分类」共用「往前不行就退一张」，而这三种动作
+     * **都不把素材移出列表**。于是在最后一张按 D，光标静默退回上一张
+     * （刚处理过的那张）；再按一次 D，标的就是那一张——快速收尾时会在
+     * 最后两张之间来回反转标记，全程没有提示。大图那边一直是「原地不动」。
+     */
+    expect(galleryPosition()).toContain("第 200 张");
+    expect(screen.getByTestId("gallery-path").textContent).toBe(shown);
+
+    // 再按一次撤回的必须是同一张
+    fireEvent.keyDown(gallery, { key: "d" });
+    await waitFor(() =>
+      expect(screen.queryByTestId("sorting-pending-delete")).toBeNull(),
+    );
+    expect(galleryPosition()).toContain("第 200 张");
+  }, 15000);
+
+  it("★ 最后一张按 P（精选，同样不移出列表）也原地不动", async () => {
+    const user = userEvent.setup();
+    const curate = vi.spyOn(api, "curateAssets");
+    const gallery = await enterGallery(user);
+
+    fireEvent.keyDown(gallery, { key: "End" });
+    await waitFor(() => expect(galleryPosition()).toContain("第 200 张"));
+    const shown = screen.getByTestId("gallery-path").textContent;
+
+    fireEvent.keyDown(gallery, { key: "p" });
+    await waitFor(() => expect(curate).toHaveBeenCalledTimes(1));
+
+    expect(galleryPosition()).toContain("第 200 张");
+    expect(screen.getByTestId("gallery-path").textContent).toBe(shown);
+    curate.mockRestore();
+  }, 15000);
+
+  it("分类会把这张移出列表，末尾时仍然退回上一张（这条分叉是刻意的）", async () => {
+    const user = userEvent.setup();
+    const gallery = await enterGallery(user);
+
+    fireEvent.keyDown(gallery, { key: "End" });
+    await waitFor(() => expect(galleryPosition()).toContain("第 200 张"));
+
+    fireEvent.keyDown(gallery, { key: "1" });
+    // 当前这张马上就要消失，末尾时退回上一张是唯一可站的位置
+    await waitFor(() => expect(galleryPosition()).toContain("第 199 张"));
+    expect(screen.queryByTestId("gallery-cursor-lost")).toBeNull();
+  }, 15000);
+});
+
+describe("画廊筛到空集时，打标键也不许静默落空", () => {
+  it("★ 画廊筛到空集后按数字键：与网格同一句「落空了」，不是按了没反应", async () => {
+    const user = userEvent.setup();
+    const move = vi.spyOn(api, "moveAssets");
+    // 全部已判定且都不糊：切到「糊片」后命中 0 条，画廊里连一张可作用的都没有
+    const judged = ["J/a.JPG", "J/b.JPG"].map((id) => ({
+      ...mockPendingAssets[0],
+      id,
+      fileName: id,
+      groupId: undefined,
+      judgement: {
+        score: 90,
+        faces: 1,
+        blurry: false,
+        overExposed: false,
+        underExposed: false,
+        suggestedKeep: false,
+      },
+    }));
+    const listSpy = vi
+      .spyOn(api, "listPendingAssets")
+      .mockResolvedValue({ items: judged, total: judged.length });
+
+    await enterGallery(user);
+    await user.click(screen.getByTestId("sorting-judge-filter"));
+    await user.click(screen.getByRole("option", { name: "糊片" }));
+    await screen.findByTestId("sorting-filter-empty");
+
+    fireEvent.keyDown(grid(), { key: "1" });
+
+    // 旧行为：galleryAssign 一句 `if (!galleryCursor) return;`——静默落空
+    const toast = await screen.findByTestId("notice-toast-warning");
+    expect(toast.getAttribute("data-code")).toBe("sorting-action-no-target");
+    expect(move).not.toHaveBeenCalled();
+
+    listSpy.mockRestore();
+    move.mockRestore();
   }, 15000);
 });

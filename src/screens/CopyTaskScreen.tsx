@@ -102,6 +102,19 @@ interface DestDraft {
 interface ConfirmDraft {
   /** 单调递增的请求版本号：草稿、preview、plan、提交四者靠它对齐 */
   requestId: number;
+  /**
+   * 这一屏确认页的**实例 id**，随草稿生灭（契约 2026-08-28）。
+   *
+   * 与 `requestId` 是两件事，别合并：
+   *   - `requestId` 管**前端**的时序——旧响应对不上就丢弃，每换一次核算就 +1；
+   *   - `confirmInstanceId` 管**后端**的计划快照占哪个槽——后端只留最近 16 份
+   *     计划，同一个 instance id 的新计划**替换**旧的而不是再占一格。
+   *
+   * 所以它的生命周期跟着「用户还站不站在这一屏确认页上」走，而不是跟着核算次数走：
+   * 屏内重试核算、`PLAN_CHANGED` 后的重新核算都还是同一个确认页，id 保持不变；
+   * 只有「返回修改」/切项目/换卷/提交成功把草稿整个作废，下一次才换新 id。
+   */
+  confirmInstanceId: string;
   projectId: string;
   volumeId: string;
   volumeName: string;
@@ -149,6 +162,29 @@ let destSeq = 0;
 function newDest(kind: DestinationKind, path = ""): DestDraft {
   destSeq += 1;
   return { id: `dest-${destSeq}`, kind, path };
+}
+
+/** 确认页实例 id 的进程内序号，只用来给兜底分支做防撞的确定性部分 */
+let confirmInstanceSeq = 0;
+
+/**
+ * 生成一个确认页实例 id。
+ *
+ * 它对后端只是一把**缓存槽的钥匙**（不参与令牌、不进 manifest、不做鉴权），
+ * 唯一的硬要求是**别撞**：撞了就等于两个确认屏共用一个槽，互相把对方批准过的
+ * 计划快照挤掉，`PLAN_CHANGED` 的报文随即退化成泛化原因——正是这个参数要防的事。
+ *
+ * 所以 `crypto.randomUUID` 缺席时（老 WebView / 非安全上下文）不是静默放弃，
+ * 而是退到「时间 + 随机 + 进程内自增」：自增段保证同一个窗口内绝不重复，
+ * 随机段拉开多窗口之间的距离。这不是需要向用户报警的降级——id 弱一点不改变
+ * 任何用户可见的保证，而**不传**才会让后端退化，所以任何情况下都要给出一个。
+ */
+function newConfirmInstanceId(): string {
+  confirmInstanceSeq += 1;
+  const uuid = globalThis.crypto?.randomUUID?.();
+  if (uuid) return `confirm-${uuid}`;
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `confirm-${Date.now().toString(36)}-${rand}-${confirmInstanceSeq}`;
 }
 
 /** SVG 不会自己打省略号：卡面小字先在 JS 里截断 */
@@ -868,6 +904,13 @@ export function CopyTaskScreen() {
          * 旧 requestId 下所有在飞的响应就此作废，新的规模/改名清单与新的
          * planDigest 必然出自同一次核算，用户重新过目、重新按「确认开始」，
          * 提交的才是他刚看过的那一份。这是知情同意，不是重试。
+         *
+         * 但 `confirmInstanceId` **原样保留**（靠展开继承，别在这里换新的）：
+         * 用户根本没离开这一屏确认页，换的只是他要核对的那份清单。保留同一个
+         * id，后端才会拿新计划去**替换**这一屏的旧快照——那份旧快照刚被判定
+         * 不成立，已经是死的。换新 id 等于把这具尸体留在 16 格缓存里等 TTL，
+         * 还可能顺手挤掉别的确认屏正在用的活快照，让**那一屏**将来的
+         * PLAN_CHANGED 只说得出泛化原因。这正是这个参数存在的理由。
          */
         const renewed: ConfirmDraft = { ...draft, requestId: nextConfirmId() };
         setConfirmDraft(renewed);
@@ -966,6 +1009,9 @@ export function CopyTaskScreen() {
       const result = await api.planSourceSelection(
         draft.volumeId,
         draft.sourceFolders,
+        // 同一屏确认页的每一次核算都报同一个 instance id:后端据此**替换**
+        // 而不是新占一格快照槽,别的确认屏正在用的那份就不会被挤掉
+        draft.confirmInstanceId,
       );
       // 过期响应一律丢弃:方案 A 的规模与改名清单绝不许出现在方案 B 的确认屏上
       if (confirmSeqRef.current !== draft.requestId) return;
@@ -989,6 +1035,8 @@ export function CopyTaskScreen() {
     // 都只来自它。中途改表单也只影响下一份草稿。
     const draft: ConfirmDraft = {
       requestId: nextConfirmId(),
+      // 只有这里会**新开**一屏确认页,所以 instance id 也只在这里出生
+      confirmInstanceId: newConfirmInstanceId(),
       projectId: project.id,
       volumeId,
       volumeName: volume.name,

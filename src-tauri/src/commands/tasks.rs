@@ -130,6 +130,21 @@ pub fn file_status_str(status: &copy::FileStatus) -> &'static str {
 }
 
 /// 启动(或续跑)一个任务的后台工作线程。
+///
+/// ## 已知未修:`Paused → Preparing → Running` 缺一个状态机 CAS(R12/R13 连续两轮被点名)
+///
+/// `running` 只是一个布尔。`resume_copy_task` 的流程是「读 `running` → 重解析源卷
+/// → 复扫刷新清单 → 写回 `handle.plan`/快照 → `spawn_worker`」,这一整段**不是原子的**:
+/// 两个 `resume` 并发进来时,两边都可能读到 `running == false`,于是**两遍**复扫、
+/// 两遍写 `handle.plan`,最后靠这里的 `swap(true)` 只让一个 worker 真的起来。
+/// 后果是准备阶段的副作用(清单写回、告警)可能重复,而不是两个 worker 同时拷同一份
+/// 计划(那一层由 `swap` 挡住了)。
+///
+/// 为什么这一轮**没有**修:不是本轮引入的缺陷,正确的修法是把任务状态从布尔升级成
+/// 一个 `Paused/Preparing/Running/Done` 状态机,并让整个准备阶段跑在一次 CAS 之内
+/// ——改动面横跨 `TaskHandle`、`resume_copy_task`、`rebuild_tasks` 与全部快照读写,
+/// 与本轮的白名单/令牌修复混在一起会让评审无法归因。留档在此与契约文档「已知未修」
+/// 一节,下一轮单独做。
 pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle>) {
     // 先清暂停标志再判 running:若旧 worker 还在跑且刚收到暂停请求,
     // 用户此刻点「继续」应让旧 worker 撤销暂停继续跑(评审 L19/P1-9)。
@@ -524,6 +539,11 @@ fn run_worker<R: tauri::Runtime>(
                     "bytesCopied": outcome.bytes_copied,
                     // 审计必须记下这次的范围:allVerified 在部分拷贝下只覆盖所选夹子
                     "sourceFolders": m.source_selection,
+                    // R13 C6:也记下扫描策略版本。缺这个字段(或为 0)的历史行
+                    // 出自**旧口径**——当时点开头的素材根本没进计划,`allVerified`
+                    // 与「本卡可格式化」都不可信。审计日志是唯一能追溯到那批
+                    // 「假绿」的地方,没有版本号就永远分不出真绿假绿。
+                    "scanPolicyVersion": m.scan_policy_version,
                 }),
             ),
         );
@@ -643,6 +663,8 @@ pub fn build_task(
         tags: input.tags.clone(),
         target_folder,
         source_folders: source_folders.to_vec(),
+        // 新任务一律是当前口径(与 `manifest::CopyManifest::new` 同源)
+        scan_policy_version: manifest::SCAN_POLICY_VERSION,
         destinations: dest_dtos,
         files: file_dtos,
         file_count: Some(plan.len()),

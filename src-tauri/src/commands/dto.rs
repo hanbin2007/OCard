@@ -188,6 +188,11 @@ pub struct CopyTaskDto {
     /// 前端据此判断「拷完能不能说本卡可格式化」——部分拷贝时卡上还有没拷的
     /// 内容,那句话会直接导致用户格式化掉未备份素材。
     pub source_folders: Vec<String>,
+    /// 锁定这份任务清单时的**扫描策略版本**(`core::manifest::SCAN_POLICY_VERSION`)。
+    /// `0` = 旧口径(以点开头一律跳过)——那一版会漏拷卡上点开头的合法素材,却照样
+    /// 报 100% 与「本卡可格式化」。界面**必须**把 `0` 的记录标注出来:那是一条
+    /// 由旧口径产生的、不可信的绿色。当前口径的值见后端常量。
+    pub scan_policy_version: u32,
     pub destinations: Vec<CopyDestinationDto>,
     pub files: Vec<CopyFileItemDto>,
     #[serde(skip_serializing_if = "Option::is_none")]

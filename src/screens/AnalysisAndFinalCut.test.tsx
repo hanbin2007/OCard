@@ -1082,6 +1082,60 @@ describe("B6 组失效后自动退回网格，不留锁死键盘的空壳", () =
   }, 15000);
 });
 
+describe("C2 组失效退回网格后，光标不许还指着已经消失的组条目", () => {
+  it("★ 开组后不点成员直接分类：光标落到幸存单张，打标立刻还能用", async () => {
+    const user = userEvent.setup();
+    /*
+     * 组排在**最前面**——素材载入时光标自动落位就落在这个组条目上，
+     * 这正是出事的前提（B6 那条用例里组在末尾，光标从来没落到过组上，
+     * 所以它一直绿着也照不出这个 bug）。
+     */
+    const items = mockPendingAssets.slice(0, 4).map((a, i) => ({
+      ...a,
+      id: `C2/${i}.JPG`,
+      fileName: `C2-${i}.JPG`,
+      groupId: i <= 1 ? "burst-c2" : undefined,
+      judgement: undefined,
+    }));
+    vi.spyOn(api, "listPendingAssets").mockResolvedValue({
+      items,
+      total: items.length,
+    });
+
+    render(<App preloaded={sorting} />);
+    const group = (await screen.findAllByTestId("asset-group"))[0];
+    await waitFor(() => expect(group.className).toContain("asset--focused"));
+
+    await user.click(within(group).getByTestId("group-expand"));
+    const layer = await screen.findByTestId("group-overlay");
+    expect(within(layer).getAllByTestId("group-item")).toHaveLength(2);
+
+    // 不点任何成员，直接按数字键分类 —— 组只剩一张，浮层卸载并退回网格
+    fireEvent.keyDown(layer, { key: "1" });
+    await waitFor(() => expect(screen.queryByTestId("group-overlay")).toBeNull());
+    const toast = await screen.findByTestId("notice-toast-warning");
+    expect(toast.getAttribute("data-code")).toBe("sorting-group-gone");
+
+    /*
+     * 旧行为：`removedEntryIds` 认为组没有整体消失（当时另一张还在组里），
+     * applyBulk 于是不推光标；下一帧组缩成单件、合成条目蒸发，
+     * selection.cursor 留着一个指向虚无的组 id。再打一次标，
+     * `resolveEntryIds` 解出空集，被闸门以「没有选中任何素材」拒掉——
+     * 用户刚从组里退出来，只会觉得键盘忽然失灵。
+     */
+    await waitFor(() => expect(cursorAsset()).toBe("C2/1.JPG"));
+    expect(document.activeElement).toBe(gridWrap());
+
+    // 键盘流真的活着：直接按 D 就能标删幸存的那张
+    await user.keyboard("d");
+    const bar = await screen.findByTestId("sorting-pending-delete");
+    expect(bar.textContent).toContain("已标记 1 个待删除");
+    expect(screen.queryByTestId("notice-toast-warning")?.getAttribute("data-code")).not.toBe(
+      "sorting-action-no-target",
+    );
+  }, 15000);
+});
+
 describe("B7 / B9 组层的按钮与焦点圈定", () => {
   it("★ Tab 到「全选」按回车：执行的是按钮，不会被解释成「看大图」", async () => {
     const user = userEvent.setup();

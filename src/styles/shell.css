@@ -341,7 +341,14 @@
   top: calc(100% + 6px);
   left: 50%;
   transform: translateX(-50%);
-  z-index: 70;
+  /* 外壳级非模态浮层,和 .notice-panel(40)/.quick-copy(45) 同类,排在模态浮层
+     .overlay(50) 之下。此前写的是 70——与 .select-pop 并列,于是它压过了
+     .overlay(50)/.group-layer(55)/.lightbox(60)/.overlay--keyhelp(65)。
+     .select-pop 需要 70 是因为 Select 会长在 dialog 里面,顶栏下拉不会。
+     普通模态没有 focus trap(全仓只有 SessionGuard 用 inert),Tab 能走到被
+     遮罩盖住的顶栏 chip,回车打开就画在模态之上——安全边界(会话门 80)没破,
+     但那是靠巧合。层叠关系由 stacking.test 静态钉住。 */
+  z-index: 35;
   display: flex;
   flex-direction: column;
   gap: var(--space-2);

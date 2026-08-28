@@ -50,6 +50,16 @@ log = "0.4"
 # 并报 all_verified——两个源最终只剩一个目录项。NFC 需要完整 UCD 分解/合成表
 # (数千行数据),自己实现既大又易错,故引入这个只做归一、无传递重依赖的小库。
 unicode-normalization = "0.1.25"
+# 落点撞名判定的第二层归一:Unicode **默认大小写折叠**(CaseFolding.txt 的 C+F 类)。
+# 为什么不能用 `to_lowercase()`:APFS/exFAT 的大小写不敏感比较按 Unicode 折叠实现,
+# 要求 σ / ς / Σ 三者等价,而 `to_lowercase()` 把 ς 原样留作 ς(它本来就是小写),
+# 于是大小写敏感的源卷上 `σ.mov` 与 `ς.mov` 会被规划成两个「不冲突」的落点;
+# 内容相同时第二项直接复用第一项的物理文件并报 all_verified——两个源只剩一个目录项。
+# `str::to_lowercase` 还带 Final_Sigma 位置规则(`ΟΔΟΣ` → `οδος` 末位是 ς),
+# 同一个名字的大小写变体因此会折出不同的键,是同型缺陷的第二个入口。
+# 折叠需要 CaseFolding.txt 全表(千余条映射),手写既大又易错;caseless 只做折叠、
+# 唯一依赖是本仓已有的 unicode-normalization,无 build 脚本,是最小的正确解。
+caseless = "0.2.2"
 
 [dev-dependencies]
 tempfile = "3"

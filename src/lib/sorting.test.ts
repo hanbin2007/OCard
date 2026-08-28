@@ -322,6 +322,67 @@ describe("待删清单状态机（两段式删除）", () => {
   });
 });
 
+/* ------------------------------------------------------------------ *
+ * E2：素材离开待分类夹后，待删清单必须跟着剪枝
+ * ------------------------------------------------------------------ */
+
+describe("待删清单 prune（评审 E2：被分类移走的素材不许留在清单里）", () => {
+  it("★ 把移走的素材从 marked 与 failed 里一并摘掉", () => {
+    const state: PendingDeleteState = {
+      phase: "marked",
+      marked: ["a", "b", "c"],
+      failed: [{ assetId: "b", message: "上次失败" }],
+    };
+    const next = pendingDeleteReducer(state, { type: "prune", assetIds: ["a", "b"] });
+    expect(next.marked).toEqual(["c"]);
+    // 失败项按设计永久留在清单里,唯一的例外就是「文件已经不在那儿了」
+    expect(next.failed).toEqual([]);
+    expect(next.phase).toBe("marked");
+  });
+
+  it("★ 剪到空就回 idle：屏底那条「已标记 N 个待删除」不许挂着 0 条不走", () => {
+    const state: PendingDeleteState = { phase: "marked", marked: ["a"], failed: [] };
+    const next = pendingDeleteReducer(state, { type: "prune", assetIds: ["a"] });
+    expect(next.phase).toBe("idle");
+    expect(next.marked).toEqual([]);
+  });
+
+  it("★ 提交进行中照样剪：unmark 拦的是「用户改主意」，prune 说的是「文件没了」", () => {
+    const working: PendingDeleteState = {
+      phase: "working",
+      marked: ["a", "b"],
+      failed: [],
+    };
+    // 对照组：同一状态下 unmark 被原样挡回
+    expect(pendingDeleteReducer(working, { type: "unmark", assetIds: ["a"] })).toBe(
+      working,
+    );
+
+    const next = pendingDeleteReducer(working, { type: "prune", assetIds: ["a"] });
+    expect(next.marked).toEqual(["b"]);
+    // 提交还在飞,phase 不许半路掉下来——收尾归 commitFinished 管
+    expect(next.phase).toBe("working");
+  });
+
+  it("确认框开着时 phase 保持 confirming：不许在半路给「只有确认过才下发」开缺口", () => {
+    const confirming: PendingDeleteState = {
+      phase: "confirming",
+      marked: ["a", "b"],
+      failed: [],
+    };
+    const next = pendingDeleteReducer(confirming, { type: "prune", assetIds: ["a"] });
+    expect(next.phase).toBe("confirming");
+    expect(next.marked).toEqual(["b"]);
+  });
+
+  it("一条都没命中就返回原对象：绝大多数批量操作与待删清单无关，别白推一次渲染", () => {
+    const state: PendingDeleteState = { phase: "marked", marked: ["a"], failed: [] };
+    expect(pendingDeleteReducer(state, { type: "prune", assetIds: ["x", "y"] })).toBe(
+      state,
+    );
+  });
+});
+
 describe("连拍分组", () => {
   it("相邻同 groupId 归为一组", () => {
     const groups = groupBurst([

@@ -7,6 +7,8 @@
  * 在真实场景里就意味着整个抽屉白屏——而白屏等于把这条记录静默吞掉了。
  */
 
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { mockAuditLog } from "../api/mock";
 import { isPartialCopy } from "./copyScope";
@@ -14,11 +16,13 @@ import {
   AUDIT_GROUP_FILTERS,
   KNOWN_AUDIT_KINDS,
   MAX_AUDIT_DETAILS,
+  SCAN_POLICY_VERSION,
   auditDetailText,
   auditDetails,
   auditEventMeta,
   auditGroupCounts,
   auditKindMeta,
+  classifyScanPolicy,
   matchesAuditFilter,
   toAuditRow,
   toAuditRows,
@@ -235,7 +239,13 @@ describe("auditDetails：从 unknown 里挑关键明细", () => {
  * 后端已经把范围写进了 `sourceFolders`,这一组测试盯的是前端别再把它丢掉。
  */
 describe("★ 拷贝范围（sourceFolders）", () => {
-  /** 后端 `COPY_COMPLETED` 的真实载荷形状（src-tauri/src/commands/tasks.rs） */
+  /**
+   * 后端 `COPY_COMPLETED` 的真实载荷形状（src-tauri/src/commands/tasks.rs）。
+   *
+   * 带上 `scanPolicyVersion` 是**必须**的：真载荷里有它，而缺了它这一整组
+   * 用例就会同时踩中「旧扫描口径」那道标注，测的东西从范围串到口径。
+   * 口径那一轴另有专门的一组用例（见下面「★ 扫描策略版本」）。
+   */
   function completed(sourceFolders: unknown, over: Record<string, unknown> = {}) {
     return {
       ts: "2026-08-24T09:58:47+08:00",
@@ -248,6 +258,7 @@ describe("★ 拷贝范围（sourceFolders）", () => {
         allVerified: true,
         bytesCopied: 42 * GB,
         sourceFolders,
+        scanPolicyVersion: SCAN_POLICY_VERSION,
         ...over,
       },
     };
@@ -350,6 +361,7 @@ describe("★ 拷贝范围（sourceFolders）", () => {
           targetFolder: "上午_DJIRonin4D_B_ZS",
           sourceFolders: ["DCIM/100MSDCF"],
           renamedCount: 0,
+          scanPolicyVersion: SCAN_POLICY_VERSION,
         },
       },
       0,
@@ -374,7 +386,11 @@ describe("★ 拷贝范围（sourceFolders）", () => {
       ["DCIM", true],
     ];
     for (const [value, partial] of cases) {
-      const meta = auditEventMeta("copy_completed", { sourceFolders: value });
+      // 带上 scanPolicyVersion:这条测的是范围那一轴,别让口径那一轴串进来
+      const meta = auditEventMeta("copy_completed", {
+        sourceFolders: value,
+        scanPolicyVersion: SCAN_POLICY_VERSION,
+      });
       // 审计的语气色分叉必须与共享判据同步：非整卷一律降级成琥珀
       expect(meta.tone === "warn", JSON.stringify(value)).toBe(partial);
       expect(isPartialCopy(value), JSON.stringify(value)).toBe(partial);
@@ -382,9 +398,14 @@ describe("★ 拷贝范围（sourceFolders）", () => {
   });
 
   it("旧记录（没有 sourceFolders 这个字段）保持原样，不擅自编一个范围", () => {
-    // 按文件夹多选是新特性,此前的记录只可能是整卷;替它编一行同样是替后端背书
+    // 按文件夹多选是新特性,此前的记录只可能是整卷;替它编一行同样是替后端背书。
+    // scanPolicyVersion 要带上:否则这条同时踩中「旧扫描口径」,测的就不是范围了
     const row = toAuditRow(
-      { ts: "2026-08-24T09:58:47+08:00", kind: "copy_completed", data: { bytesCopied: GB } },
+      {
+        ts: "2026-08-24T09:58:47+08:00",
+        kind: "copy_completed",
+        data: { bytesCopied: GB, scanPolicyVersion: SCAN_POLICY_VERSION },
+      },
       0,
     );
     expect(row.meta.tone).toBe("ok");
@@ -401,10 +422,216 @@ describe("★ 拷贝范围（sourceFolders）", () => {
     expect(unknown.tone).toBe("warn");
   });
 
-  it("data 不是对象时 auditEventMeta 退回纯 kind 口径，不抛", () => {
+  it("data 不是对象时不抛，范围那一轴退回纯 kind 口径", () => {
     for (const bad of [null, undefined, 42, "x", ["DCIM"]]) {
-      expect(auditEventMeta("copy_completed", bad).tone).toBe("ok");
+      // 读不出 data 就不谈范围:不拼「部分」,也不因为范围而改色
+      expect(auditEventMeta("copy_completed", bad).label).not.toContain("部分");
+      // 与拷贝无关的 kind 因此完全不受影响
+      expect(auditEventMeta("assets_moved", bad).tone).toBe("neutral");
+      expect(auditEventMeta("delivery_built", bad).tone).toBe("ok");
     }
+  });
+});
+
+/**
+ * ★ 旧扫描口径的标注。
+ *
+ * 这一轮把「以点开头一律跳过」换成了「只排除明确列举的系统项」。换之**前**跑完
+ * 的整卷任务，当时按旧口径漏掉了卡上合法的点开头素材（某些机型的 `.clip.mov`、
+ * 被误设隐藏属性的素材、用户自建的隐藏素材夹），却报了 100% 完成 +「本卡可格式化」。
+ *
+ * 而 `rebuild_tasks` 只重建**未完成**的清单：那批任务根本不进 `list_copy_tasks`，
+ * `CopyTaskDto.scanPolicyVersion` 够不到，两条续传告警也够不到。审计日志是它们
+ * 唯一留下痕迹的地方——不标，升级后那一行就还是一条**无标注的绿色完成**，
+ * 这是这一轮唯一一处「旧的假绿被新代码原样继承下去」。
+ *
+ * 判据与后端 `manifest::SCAN_POLICY_VERSION` 一致：**字段缺失 = 旧口径**。
+ */
+describe("★ 扫描策略版本（scanPolicyVersion）", () => {
+  function copyEvent(kind: string, data: Record<string, unknown>) {
+    return {
+      ts: "2026-08-24T09:58:47+08:00",
+      machine: "WS-7C4A21",
+      operator: "李萌",
+      kind,
+      data,
+    };
+  }
+
+  /** 升级前跑完的那条：清单里根本没有 scanPolicyVersion 这个字段 */
+  const legacyDone = copyEvent("copy_completed", {
+    taskId: "t-old",
+    allVerified: true,
+    bytesCopied: 42 * GB,
+  });
+  /** 升级后跑的那条：自证跑在当前口径上 */
+  const freshDone = copyEvent("copy_completed", {
+    taskId: "t-new",
+    allVerified: true,
+    bytesCopied: 42 * GB,
+    scanPolicyVersion: SCAN_POLICY_VERSION,
+  });
+
+  it("★ 升级前跑完的那条与升级后的那条必须能区分开——这是本条的判据", () => {
+    const old = toAuditRow(legacyDone, 0);
+    const now = toAuditRow(freshDone, 1);
+
+    // 症状:两行逐字相同、同为绿色,没有任何机制说明前者出自旧口径
+    expect(old.detailText).not.toBe(now.detailText);
+    expect(old.meta.label).not.toBe(now.meta.label);
+    expect(old.meta.tone).not.toBe(now.meta.tone);
+
+    // 新记录不许被误伤:它是真绿,标了就是狼来了
+    expect(now.meta.label).toBe("拷卡完成");
+    expect(now.meta.tone).toBe("ok");
+    expect(now.details.some((d) => d.label === "扫描口径")).toBe(false);
+  });
+
+  it("旧口径写明版本、写明当时跳过了什么、写明「校验通过」不覆盖它们", () => {
+    const detail = toAuditRow(legacyDone, 0).details.find(
+      (d) => d.label === "扫描口径",
+    );
+    expect(detail).toBeDefined();
+    expect(detail!.value).toContain("旧口径 v0");
+    expect(detail!.value).toContain(`当前 v${SCAN_POLICY_VERSION}`);
+    expect(detail!.value).toContain("「.」开头");
+    expect(detail!.value).toContain("校验通过");
+    expect(detail!.value).toContain("可格式化");
+  });
+
+  it("★ 措辞诚实：不断言这张卡一定漏了东西，只说判断不了", () => {
+    // 卡上可能压根没有点开头的素材。替用户下结论跟不说一样坏——
+    // 口径与 Rust 的 policy_upgrade_caveat() 一致:说清「无法区分」
+    const value = toAuditRow(legacyDone, 0).details.find(
+      (d) => d.label === "扫描口径",
+    )!.value;
+    expect(value).toContain("判断不了");
+    expect(value).toMatch(/若有/);
+    for (const overclaim of ["一定", "肯定", "必然", "已漏拷", "确实漏"]) {
+      expect(value, `不许断言「${overclaim}」`).not.toContain(overclaim);
+    }
+  });
+
+  it("★ 抬头也要改，不能只靠把绿改成琥珀", () => {
+    // 先例见部分拷贝:灰度打印 / 色觉障碍 / 截图转发之后只剩文字
+    const row = toAuditRow(legacyDone, 0);
+    expect(row.meta.label).toBe("拷卡完成（旧扫描口径）");
+    expect(row.meta.tone).toBe("warn");
+    // 但它不是失败,不该混进「只看失败与取消」
+    expect(row.meta.abnormal).toBe(false);
+  });
+
+  it("copy_started 同样标注，但不提「校验通过」——那条记录还没有结论", () => {
+    const row = toAuditRow(
+      copyEvent("copy_started", { taskId: "t-old", volumeName: "CFE-01" }),
+      0,
+    );
+    const detail = row.details.find((d) => d.label === "扫描口径");
+    expect(detail?.value).toContain("旧口径 v0");
+    expect(detail?.value).not.toContain("校验通过");
+    expect(row.meta.label).toBe("开始拷卡（旧扫描口径）");
+    expect(row.meta.tone).toBe("warn");
+  });
+
+  it("范围与口径同时不对时两个后缀并列，谁都不许被吞掉", () => {
+    const row = toAuditRow(
+      copyEvent("copy_completed", {
+        allVerified: true,
+        sourceFolders: ["DCIM/100MSDCF"],
+      }),
+      0,
+    );
+    expect(row.meta.label).toBe("拷卡完成（部分 · 旧扫描口径）");
+    // 口径紧跟范围之后、校验之前:它推翻的正是「校验通过」的适用范围
+    expect(row.details.map((d) => d.label)).toEqual(["范围", "扫描口径", "校验"]);
+  });
+
+  it("明细总数仍守住上限，范围与容量都没被挤掉", () => {
+    const row = toAuditRow(
+      copyEvent("copy_completed", {
+        allVerified: true,
+        bytesCopied: 42 * GB,
+        sourceFolders: ["DCIM/100MSDCF"],
+      }),
+      0,
+    );
+    expect(row.details.length).toBeLessThanOrEqual(MAX_AUDIT_DETAILS);
+    expect(row.details.map((d) => d.label)).toEqual([
+      "范围",
+      "扫描口径",
+      "校验",
+      "容量",
+    ]);
+  });
+
+  it("与拷卡无关的 kind 缺这个字段不代表任何事，绝不乱标", () => {
+    for (const kind of [
+      "assets_moved",
+      "delivery_built",
+      "transcode_completed",
+      "trash_emptied",
+      "project_note_added",
+    ]) {
+      expect(classifyScanPolicy(kind, { succeeded: 1 }), kind).toBeNull();
+      const row = toAuditRow(copyEvent(kind, { succeeded: 1 }), 0);
+      expect(row.details.some((d) => d.label === "扫描口径"), kind).toBe(false);
+    }
+  });
+
+  it("版本号读不出时说「不明」，绝不当成当前口径放绿灯", () => {
+    for (const bad of ["1", null, {}, [], 1.5, -1, Number.NaN]) {
+      const row = toAuditRow(
+        copyEvent("copy_completed", { allVerified: true, scanPolicyVersion: bad }),
+        0,
+      );
+      const detail = row.details.find((d) => d.label === "扫描口径");
+      expect(detail, JSON.stringify(bad)).toBeDefined();
+      expect(detail!.value).toContain("读不出");
+      expect(row.meta.tone, `${JSON.stringify(bad)} 不该是绿的`).not.toBe("ok");
+      expect(row.meta.label).toBe("拷卡完成（扫描口径不明）");
+    }
+  });
+
+  it("比当前更新的版本号不标注——那是更新的客户端写的，不是旧口径", () => {
+    const row = toAuditRow(
+      copyEvent("copy_completed", {
+        allVerified: true,
+        scanPolicyVersion: SCAN_POLICY_VERSION + 1,
+      }),
+      0,
+    );
+    expect(row.meta.tone).toBe("ok");
+    expect(row.details.some((d) => d.label === "扫描口径")).toBe(false);
+  });
+
+  it("data 根本不是对象时也算旧口径——它同样证明不了自己跑在新口径上", () => {
+    for (const bad of [null, undefined, 42, "x", ["DCIM"]]) {
+      expect(classifyScanPolicy("copy_completed", bad), JSON.stringify(bad)).toEqual({
+        state: "legacy",
+        version: 0,
+      });
+    }
+  });
+
+  it("★ 前端这份版本号必须与 Rust 的 SCAN_POLICY_VERSION 同步（防漂移）", () => {
+    /*
+     * 前端硬编码了一份当前版本号——判据是「记录里的版本 < 我这一版」，
+     * 而历史行里读不到「当时的当前版本」，只能自己带一份。
+     *
+     * 漂移的后果是双向的:Rust 递增而这里没跟,新口径的记录会被一路标成
+     * 「旧口径」(狼来了喊多了,真的旧记录也跟着被忽略);这里先改而 Rust 没动,
+     * 反过来把真旧记录漏标。所以直接把两个数字钉死在一起。
+     */
+    const rust = readFileSync(
+      resolve(process.cwd(), "src-tauri/src/core/manifest.rs"),
+      "utf8",
+    );
+    const match = rust.match(/pub const SCAN_POLICY_VERSION:\s*u32\s*=\s*(\d+)\s*;/);
+    expect(
+      match,
+      "src-tauri/src/core/manifest.rs 里找不到 SCAN_POLICY_VERSION，同步判据失效",
+    ).not.toBeNull();
+    expect(Number(match![1])).toBe(SCAN_POLICY_VERSION);
   });
 });
 
@@ -416,7 +643,7 @@ describe("toAuditRow：整行归一", () => {
         machine: "WS-7C4A21",
         operator: "张涵斌",
         kind: "copy_completed",
-        data: { succeeded: 12, failed: 0 },
+        data: { succeeded: 12, failed: 0, scanPolicyVersion: SCAN_POLICY_VERSION },
       },
       0,
     );
@@ -430,7 +657,9 @@ describe("toAuditRow：整行归一", () => {
   });
 
   it("缺字段/空字段回落成可读占位，不渲染 undefined", () => {
-    const row = toAuditRow({ kind: "copy_started" }, 3);
+    // 用一个与扫描口径无关的 kind:copy_* 缺 data 会另外吃一条「旧口径」标注
+    // （那是刻意的，见「★ 扫描策略版本」那一组），会盖住这里要测的空明细
+    const row = toAuditRow({ kind: "assets_moved" }, 3);
     expect(row.machine).toBe("未知机器");
     expect(row.operator).toBe("未署名");
     expect(row.time).toBe("—");
@@ -532,6 +761,16 @@ describe("mock 时间线", () => {
   it("刻意留了未收录 kind 与空 data，开发期就能看见防御性渲染的样子", () => {
     expect(rows.some((r) => !r.meta.known)).toBe(true);
     expect(rows.some((r) => r.details.length === 0)).toBe(true);
+  });
+
+  it("刻意留了一对「升级前跑完」的拷卡记录，旧口径标注在浏览器里就看得见", () => {
+    // 只留新口径的话,这个标注在开发期永远不出现,坏了也没人发现;
+    // 全留旧口径的话,又看不出「真绿」长什么样。两种都要在时间线里。
+    const copyRows = rows.filter((r) => r.meta.group === "copy");
+    expect(copyRows.some((r) => r.meta.label.includes("旧扫描口径"))).toBe(true);
+    expect(copyRows.some((r) => r.meta.label === "拷卡完成" && r.meta.tone === "ok")).toBe(
+      true,
+    );
   });
 
   it("整批归一不抛异常，每行都有可渲染的时间与标签", () => {

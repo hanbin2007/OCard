@@ -37,6 +37,7 @@ import {
   gateAction,
   resolveEntryIds,
   emptySelection,
+  GROUP_ID_PREFIX,
   initialPendingDelete,
   JUDGEMENT_FILTER_LABEL,
   moveCursor,
@@ -172,6 +173,8 @@ export function SortingScreen() {
   const commitPhaseRef = useRef<"a" | "b">("b");
 
   const gridWrapRef = useRef<HTMLDivElement>(null);
+  /** 画廊根节点：画廊模式下真正的键盘宿主（评审 B2） */
+  const galleryRootRef = useRef<HTMLDivElement | null>(null);
   const loadedCountRef = useRef(0);
   const lastRefreshRef = useRef(0);
   /**
@@ -257,6 +260,30 @@ export function SortingScreen() {
 
   const onThumbError = useCallback(() => setThumbFailStreak((n) => n + 1), []);
   const onThumbLoad = useCallback(() => setThumbFailStreak(0), []);
+
+  /**
+   * 把键盘焦点交回「当前视图的键盘宿主」。
+   *
+   * 网格模式是 `.sorting__grid-wrap`；**画廊模式是 GalleryView 的根节点**。
+   * 交错地方的实测后果（评审 B2）：画廊里 Enter 开全屏、Esc 关掉之后，
+   * 焦点被无条件还给外层 wrap，而画廊的键盘流挂在它自己的根节点上收不到
+   * 父节点的事件；wrap 的兜底处理器又把 move / selectAll / Esc 原样放掉——
+   * 方向键和 Esc 全部无反应且零提示，打标键却还能用，
+   * 于是这一屏看起来像"坏了一半"。这正是选片主循环里最高频的那条路径。
+   *
+   * 第二个用途是「控件把自己卸载/禁用掉」之后的接盘（评审 C1）：
+   * 分类 chip 一按就 disabled、待删条一清空就整条卸载、撤销条一成功就消失——
+   * 被禁用/被移除的元素会把焦点丢给 body，键盘流就此断掉，屏上没有任何迹象。
+   * 这三条路径与已修的「组层关闭焦点落 body」是同一类事故。
+   */
+  const focusKeyboardHost = useCallback(() => {
+    const host =
+      viewMode === "gallery" && galleryRootRef.current
+        ? galleryRootRef.current
+        : gridWrapRef.current;
+    // preventScroll：收焦点不该顺手把网格滚到别处去
+    host?.focus({ preventScroll: true });
+  }, [viewMode]);
 
   const visibleAssets = useMemo(() => {
     const byJudge = filterByJudgement(assets, judgeFilter, LOW_SCORE_AT);
@@ -393,7 +420,10 @@ export function SortingScreen() {
    *
    * 它们收起时，下面那一层必须把键盘拿回来。用户若是点关闭/取消按钮退出来的，
    * 焦点会随那个按钮一起消失（落到 body），键盘流就此断掉——按 Esc / 方向键
-   * 全无反应，还看不出为什么。组层自己按 coveredAbove 收焦点，这里只管网格那一路。
+   * 全无反应，还看不出为什么。组层自己按 coveredAbove 收焦点，这里只管主视图那一路。
+   *
+   * 交回**哪个节点**按视图分叉，见 focusKeyboardHost：从前这里无条件还给 wrap，
+   * 于是画廊模式下关掉大图之后方向键与 Esc 全部静默失效（评审 B2）。
    */
   const modalAbove = previewId !== null || confirm !== null;
   const hadModalRef = useRef(false);
@@ -401,8 +431,8 @@ export function SortingScreen() {
     const had = hadModalRef.current;
     hadModalRef.current = modalAbove;
     if (!had || modalAbove) return;
-    if (openGroup === null) gridWrapRef.current?.focus();
-  }, [modalAbove, openGroup]);
+    if (openGroup === null) focusKeyboardHost();
+  }, [modalAbove, openGroup, focusKeyboardHost]);
 
   /**
    * 组全屏层收起时的焦点还原——与上面那条**对称**的另一半。
@@ -419,8 +449,8 @@ export function SortingScreen() {
     hadGroupRef.current = openGroup !== null;
     if (!had || openGroup !== null) return;
     // 组层之上还压着大图/确认框时先不抢：等它们收起时由上面那条负责
-    if (!modalAbove) gridWrapRef.current?.focus();
-  }, [openGroup, modalAbove]);
+    if (!modalAbove) focusKeyboardHost();
+  }, [openGroup, modalAbove, focusKeyboardHost]);
 
   /**
    * 组失效兜底：浮层没了，`openGroup` 却还锁着主网格。
@@ -430,10 +460,56 @@ export function SortingScreen() {
    * 但 `openGroup` 仍非空 → 网格的键盘处理器在第一行就 `return`，
    * **键盘彻底失效且屏上没有任何迹象**。必须原子地退回网格并说明原因。
    */
+  /**
+   * 组条目在网格里的下标。组整体消失（被筛掉）时用它把光标落回原来的位置附近。
+   * 只在「还量得到」时更新：组一旦不见了，保住的就是最后一次有效的位置。
+   */
+  const openGroupEntryIndexRef = useRef(-1);
+  useEffect(() => {
+    if (openGroup === null) return;
+    const at = entries.findIndex(
+      (e) => e.kind === "group" && e.groupId === openGroup,
+    );
+    if (at >= 0) openGroupEntryIndexRef.current = at;
+  }, [entries, openGroup]);
+
   useEffect(() => {
     if (openGroup === null || openGroupItems.length > 0) return;
     setOpenGroup(null);
     setGroupCursorId(null);
+    /*
+     * C2：组条目没了，`selection` 里那个合成组 id 却还留着。
+     *
+     * 实测路径：两张的连拍组打开后，直接用快捷键移走一张。`removedEntryIds`
+     * 判定「组没有整体消失」（当时另一张还在组里），applyBulk 于是不推光标；
+     * 下一帧组缩成单件、合成条目蒸发，选区里就剩一个指向虚无的 id。
+     * 再打一次标，`resolveEntryIds` 解出空集，被闸门以「没有选中任何素材」
+     * 拒掉——用户刚从组里退出来，只会觉得键盘忽然失灵。
+     * 落点优先取「组缩成的那张幸存单件」（它就顶在组原来的位置上），
+     * 整组被筛掉时退而落到组原来的下标附近。
+     */
+    const ents = entriesRef.current;
+    const ghostId = `${GROUP_ID_PREFIX}${openGroup}`;
+    setSelection((prev) => {
+      if (prev.cursor !== ghostId && !prev.selected.includes(ghostId)) return prev;
+      const survivor = ents.find(
+        (e) => e.kind === "asset" && e.asset.groupId === openGroup,
+      );
+      const nearby =
+        ents[
+          Math.min(Math.max(openGroupEntryIndexRef.current, 0), ents.length - 1)
+        ];
+      const landing = survivor?.id ?? nearby?.id ?? null;
+      const swap = (id: string | null) => (id === ghostId ? landing : id);
+      return {
+        cursor: swap(prev.cursor),
+        anchor: swap(prev.anchor),
+        // 选区里的幽灵 id 换成幸存单件；连它都没有就直接摘掉
+        selected: prev.selected.flatMap((id) =>
+          id === ghostId ? (survivor ? [survivor.id] : []) : [id],
+        ),
+      };
+    });
     notifyRef.current(
       "warning",
       "sorting-group-gone",
@@ -796,6 +872,19 @@ export function SortingScreen() {
           const done = new Set(result.succeeded);
           setAssets((prev) => prev.filter((a) => !done.has(a.id)));
           setTotal((t) => Math.max(0, t - result.succeeded.length));
+          /*
+           * 评审 E2：移走的素材必须**同时离开待删清单**。
+           *
+           * 漏掉这一步的实测后果：按 D 标删 A、再按 1 把 A 分类走。A 已经不在
+           * 待分类夹里，却仍算在屏底「已标记 N 个待删除」里——「只看已标删」
+           * 筛出来是空的（A 已不在网格），Shift+D 提交时 trashAssets 对 A
+           * 必然失败，而失败项按设计**永久留在清单里**，用户除了「取消标记」
+           * 清空全部之外无法单独摘掉它。`pruneSelection` 早就替选区做了这件事，
+           * 待删清单这条状态机一直被漏着。
+           * 用 prune 而不是 unmark：提交在飞时 unmark 会被 working 态挡掉，
+           * 而「文件已经不在那儿了」不是用户改主意，不该被挡。
+           */
+          dispatchDelete({ type: "prune", assetIds: result.succeeded });
         }
         if (result.failed.length > 0) {
           // 失败项重新选中，方便直接重试
@@ -860,17 +949,20 @@ export function SortingScreen() {
    * 必须能在推光标**之前**问一句「这一下会被接受吗」。答案为否时既不推光标
    * 也不发请求，改为亮出原因。这就是 B1 那类「界面伪装成操作成功」的根治点。
    */
+  /** 待删清单正在提交进回收站（trashAssets 在飞）：期间不许改标记 */
+  const committing = pendingDelete.phase === "working";
+
   const canAct = useCallback(
     (kind: SortingActionKind, targets: string[], markedCount?: number) =>
       gateAction(kind, {
         hasProject: projectId !== null,
         busy: busyRef.current,
         deliveryWorking,
-        committing: pendingDelete.phase === "working",
+        committing,
         targetCount: targets.length,
         markedCount,
       }),
-    [projectId, deliveryWorking, pendingDelete.phase],
+    [projectId, deliveryWorking, committing],
   );
 
   /** 被拒必须看得见：进通知中心 + 弹 toast（同 code 会自动折叠，连打不会刷屏） */
@@ -1203,32 +1295,86 @@ export function SortingScreen() {
     ? previewAssets.findIndex((a) => a.id === galleryCursor)
     : -1;
 
-  /** 打标后自动前进到下一张（与全屏预览同一套「看一张→按一键→看下一张」） */
-  const advanceGalleryCursor = useCallback(() => {
-    if (galleryIndex < 0) return;
-    const next =
-      previewAssets[galleryIndex + 1]?.id ??
-      previewAssets[galleryIndex - 1]?.id ??
-      null;
-    setGalleryCursorId(next);
-  }, [galleryIndex, previewAssets]);
+  /**
+   * 画廊的分页口径（评审 D1）。
+   *
+   * `previewAssets` 是**筛选之后**的摊平列表，而 `total` 数的是全库待分类。
+   * 没开筛选时两者同口径，total 就是诚实的总数；一开筛选，库里还没加载的
+   * 那 1040 张能命中多少完全未知——此时把 total 传下去，位置栏就会写出
+   * 「已加载 37 张（共 1240 张）」这种把「库存」说成「筛选结果总数」的谎话。
+   * 所以筛选态改传「还有多少张原始素材没加载」，让画廊按未知总量措辞。
+   */
+  const galleryFiltered = judgeFilter !== "all" || markedOnly;
+  const galleryUnloaded = Math.max(0, total - assets.length);
+
+  /**
+   * 打标后自动前进到下一张（与全屏预览同一套「看一张→按一键→看下一张」）。
+   *
+   * `leavesList` 分叉是评审 E1 点名的口径不一致：
+   * - 分类 / 其他 会把当前这张**移出列表**，末尾时它马上就要消失，
+   *   退回上一张是唯一可站的位置；
+   * - 精选 / 标删 / 取消标删**都不移出列表**。末尾时退回上一张的实测后果是：
+   *   在最后一张按 D 标删，光标静默退到上一张（刚处理过的那张），再按一次 D
+   *   标的就是那一张——快速收尾时会在最后两张之间来回反转标记，全程没有提示。
+   *   大图那边（previewToggleDelete / previewCurate）用的是「没有下一张就
+   *   原地不动」，两条路径必须同一口径，而不一致的那条恰好会误伤。
+   */
+  const advanceGalleryCursor = useCallback(
+    (leavesList = false) => {
+      if (galleryIndex < 0) return;
+      const next = previewAssets[galleryIndex + 1]?.id ?? null;
+      if (next) {
+        setGalleryCursorId(next);
+        return;
+      }
+      // 末尾：只有"当前这张要消失"时才退一张，否则原地不动
+      if (leavesList) setGalleryCursorId(previewAssets[galleryIndex - 1]?.id ?? null);
+    },
+    [galleryIndex, previewAssets],
+  );
+
+  /**
+   * 画廊里「一个可作用的素材都没有」（筛到空集）时的统一回执。
+   *
+   * 四个 gallery* 回调从前一律是 `if (!galleryCursor) return;`——又一处
+   * 按了没反应，而网格里同一情形会明确说「没有选中任何素材，落空了」。
+   * 走同一个闸门拿同一套措辞，两条路径口径一致。
+   */
+  const announceNoGalleryTarget = useCallback(
+    (kind: SortingActionKind) => announceRejected(canAct(kind, [])),
+    [canAct, announceRejected],
+  );
 
   const galleryAssign = useCallback(
     (categoryId: string) => {
-      if (!galleryCursor) return;
+      if (!galleryCursor) {
+        announceNoGalleryTarget("assign");
+        return;
+      }
       const gate = canAct("assign", [galleryCursor]);
       if (!gate.accepted) {
         announceRejected(gate);
         return;
       }
-      advanceGalleryCursor();
+      // 分类会把这张移出列表 → 末尾时允许退一张
+      advanceGalleryCursor(true);
       void runAssign(categoryId, [galleryCursor]);
     },
-    [galleryCursor, advanceGalleryCursor, runAssign, canAct, announceRejected],
+    [
+      galleryCursor,
+      advanceGalleryCursor,
+      runAssign,
+      canAct,
+      announceRejected,
+      announceNoGalleryTarget,
+    ],
   );
 
   const galleryCurate = useCallback(() => {
-    if (!galleryCursor) return;
+    if (!galleryCursor) {
+      announceNoGalleryTarget("curate");
+      return;
+    }
     const gate = canAct("curate", [galleryCursor]);
     if (!gate.accepted) {
       announceRejected(gate);
@@ -1236,28 +1382,70 @@ export function SortingScreen() {
     }
     void runCurate([galleryCursor]);
     advanceGalleryCursor();
-  }, [galleryCursor, advanceGalleryCursor, runCurate, canAct, announceRejected]);
+  }, [
+    galleryCursor,
+    advanceGalleryCursor,
+    runCurate,
+    canAct,
+    announceRejected,
+    announceNoGalleryTarget,
+  ]);
 
   const galleryToggleDelete = useCallback(() => {
-    if (!galleryCursor) return;
+    if (!galleryCursor) {
+      announceNoGalleryTarget("mark");
+      return;
+    }
     if (!toggleMark([galleryCursor]).accepted) return;
     advanceGalleryCursor();
-  }, [galleryCursor, advanceGalleryCursor, toggleMark]);
+  }, [galleryCursor, advanceGalleryCursor, toggleMark, announceNoGalleryTarget]);
 
   /** U：画廊里也必须只撤回标删（此前这里与 D 共用 toggle，等于把 U 变成了标删） */
   const galleryUnmarkDelete = useCallback(() => {
-    if (!galleryCursor) return;
+    if (!galleryCursor) {
+      announceNoGalleryTarget("unmark");
+      return;
+    }
     if (!unmarkOnly([galleryCursor]).accepted) return;
     advanceGalleryCursor();
-  }, [galleryCursor, advanceGalleryCursor, unmarkOnly]);
+  }, [galleryCursor, advanceGalleryCursor, unmarkOnly, announceNoGalleryTarget]);
 
   const galleryOpenFullscreen = useCallback(() => {
     if (galleryCursor) openPreview(galleryCursor);
-  }, [galleryCursor, openPreview]);
+    // 空列表里按 Enter 也不许一动不动：说清没有可看的那一张
+    else announceNoGalleryTarget("assign");
+  }, [galleryCursor, openPreview, announceNoGalleryTarget]);
 
   const commitDelete = useCallback(async () => {
-    // 双保险：即使对话框以某种方式被触发，打包期间也绝不下发删除
-    if (!projectId || deliveryWorkingRef.current) return;
+    /*
+     * 评审 A2：第二道防线不许是静默 return。
+     *
+     * 触发窗口窄但真实：确认框已经打开、用户正要按下红色「移入回收站」的
+     * 那一瞬间，交付作业转 running。从前这里只有一句 `return`，而 ConfirmDialog
+     * 无条件 `close()`——对话框正常消失，一个**已经二次确认过的破坏性动作
+     * 凭空蒸发**：没有 toast、没有通知、没有内联提示。这与同文件
+     * `requestDeleteConfirm` 自己立下的标准（前置条件不满足要当面说清）直接矛盾。
+     */
+    if (!projectId) {
+      notifyRef.current(
+        "warning",
+        "sorting-delete-no-project",
+        "还没有选中项目，这次「移入回收站」没有下发。待删标记一个没少。",
+      );
+      return;
+    }
+    if (deliveryWorkingRef.current) {
+      notifyRef.current(
+        "warning",
+        "sorting-delete-blocked",
+        "刚才那一下没有生效：确认之后、下发之前交付打包开始了，" +
+          "为避免同一批文件边打包边被挪走，这次「移入回收站」已被拦下。" +
+          "待删标记一个没少，等打包结束再按一次 Shift+D。",
+      );
+      // 清单还停在 confirming：退回 marked，确认入口才不至于卡住
+      dispatchDelete({ type: "cancelConfirm" });
+      return;
+    }
     dispatchDelete({ type: "commitStarted" });
     const epoch = epochRef.current;
     const marked = pendingDelete.marked;
@@ -1321,6 +1509,19 @@ export function SortingScreen() {
         "warning",
         "sorting-delete-blocked",
         "交付打包进行中，暂不能移入回收站。待删标记都还在，等打包结束再按 Shift+D 提交。",
+      );
+      return;
+    }
+    if (committing) {
+      /*
+       * 上一批还在飞时再进一次确认流，会把状态机从 working 拽回 confirming，
+       * 于是同一批文件被 trashAssets 下发两次（第二次必然整批失败，而失败项
+       * 按设计永久留在清单里）。拦下来，并且说清为什么。
+       */
+      notify(
+        "warning",
+        "sorting-delete-committing",
+        "上一批正在提交进回收站，等它结束再按。这一下没有重复下发（重复提交会让同一批文件整批报失败）。",
       );
       return;
     }
@@ -1625,11 +1826,17 @@ export function SortingScreen() {
                     !hasTargets
                   }
                   /* 精选是「复制进精选/待修」，不是移动——点击路径必须与 P 键一致 */
-                  onClick={() =>
-                    category.kind === "curated"
-                      ? void runCurate()
-                      : void runAssign(category.id)
-                  }
+                  onClick={() => {
+                    if (category.kind === "curated") void runCurate();
+                    else void runAssign(category.id);
+                    /*
+                     * 评审 C1：这一按 `busy` 立刻转 true，chip 随之 disabled，
+                     * 而**被禁用的元素会丢掉焦点**，activeElement 落到 body——
+                     * 键盘流就此断掉，用户得先用鼠标点一下网格才能继续，
+                     * 屏上没有任何迹象说明为什么。点完就把键盘还给网格/画廊。
+                     */
+                    focusKeyboardHost();
+                  }}
                   title={
                     category.kind === "inbox"
                       ? category.name
@@ -1811,7 +2018,18 @@ export function SortingScreen() {
           <div
             className="sorting__grid-wrap"
             ref={gridWrapRef}
-            tabIndex={0}
+            /*
+             * 画廊模式下 wrap 自己退出 Tab 序（评审 B2）：真正的键盘宿主是
+             * GalleryView 根节点，焦点若停在 wrap 上，方向键 / Esc 会落进
+             * handleGalleryKeyDown 的 default 分支被原样放掉——按了没反应。
+             * 保留 tabIndex=-1 是为了程序化收焦点仍然可用。
+             */
+            tabIndex={viewMode === "gallery" ? -1 : 0}
+            onFocus={(e) => {
+              // 兜底：点到 wrap 边缘留白也会让它拿到焦点，立刻转交给画廊根节点
+              if (viewMode !== "gallery" || e.target !== e.currentTarget) return;
+              galleryRootRef.current?.focus({ preventScroll: true });
+            }}
             onKeyDown={viewMode === "gallery" ? handleGalleryKeyDown : handleKeyDown}
             data-testid="sorting-grid-wrap"
             data-view={viewMode}
@@ -1898,6 +2116,27 @@ export function SortingScreen() {
                 onOpenFullscreen={galleryOpenFullscreen}
                 onThumbError={onThumbError}
                 onThumbLoad={onThumbLoad}
+                /*
+                 * 分页边界（评审 D1）。上一轮给 GalleryView 加了 total /
+                 * loading / onEndReached 用来如实说明「已加载 ≠ 全部」，
+                 * 却**一个都没接到这里**：组件于是走「已加载即全部」的降级分支，
+                 * 第 200 张写着「共 200 张」「已经是最后一张」，也不会续拉——
+                 * 用户据此认为选片做完了，剩下 1040 张完全没检查过。
+                 * 组件测试全绿、产品路径上是死的，与「光标丢失告警成死代码」同族。
+                 *
+                 * total 与 unloadedCount 二选一，取决于当前是不是筛选态：
+                 * 无筛选时 previewAssets 与 assets 同口径，total 就是诚实的总数；
+                 * 一旦开了筛选，库里没加载的那部分能命中多少张无从得知，
+                 * 拿全库 total 冒充筛选结果的总数就是说谎（见 galleryScopeTotal）。
+                 */
+                total={galleryFiltered ? undefined : total}
+                unloadedCount={galleryFiltered ? galleryUnloaded : undefined}
+                loading={loading}
+                onEndReached={
+                  galleryUnloaded > 0 ? () => void loadMore() : undefined
+                }
+                /* 浮层收起后把键盘焦点交回**画廊根节点**，不是外层 wrap（B2） */
+                rootNodeRef={galleryRootRef}
               />
             ) : (
               <VirtualGrid
@@ -2035,7 +2274,13 @@ export function SortingScreen() {
                       ? "交付打包进行中，暂不能撤销移动（撤销也是在动同一批文件）"
                       : "把刚才那批文件移回「待分类」"
                   }
-                  onClick={() => void undoLastMove()}
+                  onClick={() => {
+                    void undoLastMove();
+                    /* 按下去 `undoing` 立刻 true → 本按钮 disabled；成功后
+                       `setLastMove(null)` 又把整条撤销条卸载。两步都会把焦点
+                       丢给 body（评审 C1），所以点完就先把键盘还回去。 */
+                    focusKeyboardHost();
+                  }}
                 >
                   {undoing ? "撤销中…" : "撤销"}
                 </button>
@@ -2043,7 +2288,11 @@ export function SortingScreen() {
                   type="button"
                   className="btn btn--ghost btn--sm"
                   aria-label="收起撤销提示"
-                  onClick={() => setLastMove(null)}
+                  onClick={() => {
+                    setLastMove(null);
+                    // 收起 = 本按钮连同整条一起卸载，焦点必须有去处（C1）
+                    focusKeyboardHost();
+                  }}
                 >
                   收起
                 </button>
@@ -2079,6 +2328,12 @@ export function SortingScreen() {
                   ? `（上次有 ${pendingDelete.failed.length} 个失败，仍在清单里）`
                   : ""}
               </span>
+              {/* 两个按钮为什么同时变灰，写在脸上而不是只藏进 title（零静默） */}
+              {committing ? (
+                <span className="text-2xs dim" data-testid="sorting-commit-busy">
+                  正在提交进回收站，标记暂时不能改动…
+                </span>
+              ) : null}
               <button
                 type="button"
                 className="btn btn--sm push-right"
@@ -2089,11 +2344,32 @@ export function SortingScreen() {
               >
                 {markedOnly ? "显示全部" : "只看已标删"}
               </button>
+              {/*
+                评审 A1：这个按钮曾经是**唯一**一个直接对状态机下发、
+                既不过 `changeMark` 也不过 `gateAction` 的标记变更入口。
+                reducer 在 `phase === "working"` 时一句 `return state`，
+                于是 trashAssets 在飞时点它：什么都不发生、零反馈；
+                而同一刻按 D / U 会得到 `sorting-action-commit-busy` 的明确说明。
+                同一件事，鼠标路径静默、键盘路径有话说，静默的还是更常用的那条。
+                现在两条路走同一个闸门，并且按钮自己写明为什么按不动。
+              */}
               <button
                 type="button"
                 className="btn btn--sm"
                 data-testid="sorting-unmark-all"
-                onClick={() => dispatchDelete({ type: "clear" })}
+                disabled={committing}
+                title={
+                  committing
+                    ? "待删清单正在提交进回收站，此刻不能改标记；等提交结束再取消"
+                    : "把待删清单整个清空（只是撤回标记，不会动任何文件）"
+                }
+                onClick={() => {
+                  // 走闸门：将来若出现别的拒收理由，这条路同样会当面说清
+                  unmarkOnly(pendingDelete.marked);
+                  /* 清单归零会把整条待删条卸载，焦点随按钮一起落到 body，
+                     键盘流就此断掉且屏上没有任何迹象（评审 C1） */
+                  focusKeyboardHost();
+                }}
               >
                 取消标记
               </button>
@@ -2101,11 +2377,13 @@ export function SortingScreen() {
                 type="button"
                 className="btn btn--sm btn--danger-solid"
                 data-testid="sorting-confirm-delete"
-                disabled={deliveryWorking}
+                disabled={deliveryWorking || committing}
                 title={
                   deliveryWorking
                     ? "交付打包进行中，暂不能移入回收站"
-                    : "快捷键 Shift+D"
+                    : committing
+                      ? "上一批正在提交进回收站，等它结束再按"
+                      : "快捷键 Shift+D"
                 }
                 onClick={requestDeleteConfirm}
               >

@@ -72,6 +72,36 @@ fn is_hidden(name: &str) -> bool {
     super::copy::is_system_item(name)
 }
 
+/// 单文件落包的 staging 临时名后缀(见 [`deliver_one`])。
+const DELIVERY_PART_SUFFIX: &str = ".deliverypart";
+/// 清单原子写的 staging 临时名后缀(见 [`write_atomic`])。
+const MANIFEST_PART_SUFFIX: &str = ".manifestpart";
+
+/// packaging **自己**在 NAS 上留下的半截文件的识别(R13 B2)。
+///
+/// 两种临时名(`.<uuid>.deliverypart` / `.<uuid>.manifestpart`)是「先写唯一临时
+/// 名、校验/写完再原子改名」这套零覆盖写法的**设计产物**:进程被杀、NAS 断连、
+/// 断电时它们按设计留在交付目录里,内容是**不完整的**。重跑交付时若不认出来,
+/// 它们会作为普通文件进入包清单、包文件数与容量——交付一个截断的文件比漏掉它更坏。
+///
+/// **为什么不扩大 `copy::SYSTEM_ITEM_SUFFIXES`**:那份名单是**源卷**扫描的口径。
+/// 卡上永远不会出现 packaging 的内部临时名,把 NAS 内部命名塞进源卷白名单等于
+/// 让「卡上什么不算素材」这条判据白白变宽,而变宽的方向就是漏拷。判据留在
+/// packaging 内部,并且认得**严**:必须是 `.` + 规范 UUID(8-4-4-4-12 十六进制)
+/// + 固定后缀,少一位都不认——认宽了就会吞掉用户真的叫这个名字的交付物。
+///
+/// 返回 `Some(人话种类)` 表示命中。
+fn packaging_temp_kind(name: &str) -> Option<&'static str> {
+    let (uuid, kind) = if let Some(rest) = name.strip_suffix(DELIVERY_PART_SUFFIX) {
+        (rest, "落包")
+    } else {
+        (name.strip_suffix(MANIFEST_PART_SUFFIX)?, "清单")
+    };
+    let uuid = uuid.strip_prefix('.')?;
+    // uuid::Uuid 的解析比手写字符校验严(段长、连字符位置都查),直接用它
+    uuid::Uuid::try_parse(uuid).ok().map(|_| kind)
+}
+
 fn out_push_entry_err(warnings: &mut Vec<String>, dir: &Path, err: std::io::Error) {
     warnings.push(format!("目录 {} 中有条目读取失败: {err}", dir.display()));
 }
@@ -102,7 +132,19 @@ fn collect(dir: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf> {
                     continue;
                 }
             };
-            if is_hidden(&e.file_name().to_string_lossy()) {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            // R13 B2:packaging 自己的半截文件——隔离(不进包、不进清单计数)
+            // **并且告警**,绝不静默跳过:它是上次打包被打断的证据,用户有权知道
+            // 交付目录里躺着一个不完整的文件。
+            if let Some(kind) = packaging_temp_kind(&name) {
+                warnings.push(format!(
+                    "交付目录里发现上次打包中断留下的半截{kind}文件,已隔离(不计入本次交付与包清单): {} —— 确认无用后可手工删除",
+                    e.path().display()
+                ));
+                continue;
+            }
+            if is_hidden(&name) {
                 continue;
             }
             let p = e.path();
@@ -160,7 +202,7 @@ fn deliver_one(
     if dst.exists() {
         return verdict_existing(src, dst);
     }
-    let tmp = dst_dir.join(format!(".{}.deliverypart", uuid::Uuid::new_v4()));
+    let tmp = dst_dir.join(format!(".{}{DELIVERY_PART_SUFFIX}", uuid::Uuid::new_v4()));
     if let Err(e) = fs::copy(src, &tmp) {
         let _ = fs::remove_file(&tmp);
         return Err(("error", format!("复制失败: {e}")));
@@ -474,7 +516,7 @@ fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
         return Err(std::io::Error::other("清单位置是符号链接,拒绝写入"));
     }
     let dir = path.parent().unwrap_or(Path::new("."));
-    let tmp = dir.join(format!(".{}.manifestpart", uuid::Uuid::new_v4()));
+    let tmp = dir.join(format!(".{}{MANIFEST_PART_SUFFIX}", uuid::Uuid::new_v4()));
     fs::write(&tmp, content.as_bytes())?;
     fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
@@ -558,6 +600,143 @@ mod tests {
         let manifest = fs::read_to_string(delivery.join(pkg).join(MANIFEST_NAME)).unwrap();
         assert!(manifest.contains("a.jpg") && manifest.contains("hero.jpg"));
         assert!(manifest.contains("文件数: 3") || manifest.contains("文件数: 2"),);
+    }
+
+    /// R13 B1(P0):打包腿的白名单**回归覆盖**。
+    ///
+    /// 评审做的变异:把 packaging 的排除收窄到只挡 `.ocard`(放行 `.ocardpart`、
+    /// `@eaDir`、`._*`、`Thumbs.db`)——273 个用例**全绿**。也就是说「六处统一」
+    /// 里的第六处只钉住了 1/N 的判据,而没钉住的恰好是本轮专门为它新增
+    /// `SYSTEM_ITEM_SUFFIXES` 的那一项:`.ocardpart` 是断连留下的**半截文件**,
+    /// 交付一个截断的文件比漏掉它更坏。全局退回旧判据的变异没抓到,是因为
+    /// `.ocard` 本身以点开头、旧判据照样挡得住——一个正确的断言掩护了一整条
+    /// 未覆盖的腿。
+    ///
+    /// 判别性:把 `is_hidden` 换成任何比 `copy::is_system_item` 窄的判据
+    /// (只挡 `.ocard`、或退回 `starts_with('.')`),本测试必红。
+    #[test]
+    fn delivery_excludes_every_class_of_system_item_not_just_dot_prefixed() {
+        let (_t, root, meta) = setup();
+        let cat = root.join("2. 开幕式");
+        // 拷卡引擎断连留下的**半截**素材文件(不以点开头,旧判据从来没挡住过)
+        fs::write(cat.join("CLIP.MP4.t7f3a2.ocardpart"), vec![9u8; 11]).unwrap();
+        // 群晖自己生成的低码率预览(目录名不以点开头)
+        fs::create_dir_all(cat.join("@eaDir")).unwrap();
+        fs::write(cat.join("@eaDir/SYNOPHOTO_FILM_x.mp4"), vec![9u8; 12]).unwrap();
+        // AppleDouble 伴生文件
+        fs::write(cat.join("._CLIP.MP4"), vec![9u8; 13]).unwrap();
+        // 资源管理器缩略图缓存(不以点开头)
+        fs::write(cat.join("Thumbs.db"), vec![9u8; 14]).unwrap();
+        // 精选复制的半截文件(不以点开头)
+        fs::write(
+            root.join("3. 精选/已修/.9f1c0f6e-0000-4000-8000-000000000000.curatepart"),
+            vec![9u8; 15],
+        )
+        .unwrap();
+        // 真素材(点开头,必须**照常交付**——反方向的静默漏交付同样不可接受)
+        fs::write(cat.join(".clip.mov"), vec![7u8; 16]).unwrap();
+
+        let out = build_delivery(&root, &meta).unwrap();
+        assert!(out.failures.is_empty(), "{:?}", out.failures);
+
+        // 包里到底有什么:实扫交付目录(不信任 out.files,它只记本轮新复制的)
+        let delivery = root.join(DELIVERY_DIR);
+        let mut delivered: Vec<String> = Vec::new();
+        let mut stack = vec![delivery.clone()];
+        while let Some(d) = stack.pop() {
+            for e in fs::read_dir(&d).unwrap().flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if e.path().is_dir() {
+                    stack.push(e.path());
+                } else if n != MANIFEST_NAME && n != SUMMARY_NAME {
+                    delivered.push(n);
+                }
+            }
+        }
+        delivered.sort();
+        assert_eq!(
+            delivered,
+            vec![
+                ".clip.mov".to_string(),
+                "a.jpg".to_string(),
+                "b.jpg".to_string(),
+                "hero.jpg".to_string(),
+            ],
+            "包里只许有真素材(含点开头的合法素材),系统项一个都不许进"
+        );
+
+        // 包清单同样不许把系统项算进文件数/容量
+        for pkg in &out.packages {
+            let text = fs::read_to_string(delivery.join(pkg).join(MANIFEST_NAME)).unwrap();
+            for junk in [
+                "ocardpart",
+                "SYNOPHOTO_FILM",
+                "._CLIP.MP4",
+                "Thumbs.db",
+                "curatepart",
+            ] {
+                assert!(
+                    !text.contains(junk),
+                    "包清单里混进了系统项「{junk}」:\n{text}"
+                );
+            }
+        }
+    }
+
+    /// R13 B2(P1):packaging **自己**的半截文件(`.<uuid>.deliverypart` /
+    /// `.<uuid>.manifestpart`)。进程被杀后它们残留在交付目录里,重跑交付时会
+    /// 作为正常文件进入包清单、文件数与容量。必须隔离,而且必须**可见告警**。
+    ///
+    /// 判别性:去掉 `collect` 里的 `packaging_temp_kind` 分支,第一组断言必红;
+    /// 把告警改成静默 `continue`,第二组必红。
+    #[test]
+    fn packaging_own_leftover_parts_are_isolated_and_reported() {
+        let (_t, root, meta) = setup();
+        let first = build_delivery(&root, &meta).unwrap();
+        let delivery = root.join(DELIVERY_DIR);
+        let pkg_dir = delivery.join(&first.packages[0]).join("2. 开幕式");
+
+        // 模拟「复制到一半进程被杀」:两种 staging 名各留一个
+        let leftover_copy = pkg_dir.join(".2f1c0f6e-1111-4000-8000-000000000000.deliverypart");
+        let leftover_manifest = pkg_dir.join(".3a2b0f6e-2222-4000-8000-000000000000.manifestpart");
+        fs::write(&leftover_copy, vec![9u8; 4096]).unwrap();
+        fs::write(&leftover_manifest, b"half written").unwrap();
+        // 只是名字**像**、UUID 不合规范的用户文件:判据必须认得严,不许吞掉它
+        let lookalike = pkg_dir.join(".not-a-uuid.deliverypart");
+        fs::write(&lookalike, b"user file").unwrap();
+
+        let out = build_delivery(&root, &meta).unwrap();
+
+        // ① 隔离:不进包清单的文件数与容量
+        let text =
+            fs::read_to_string(delivery.join(&first.packages[0]).join(MANIFEST_NAME)).unwrap();
+        assert!(
+            !text.contains("deliverypart") || text.contains("not-a-uuid"),
+            "packaging 自己的半截文件不许进包清单:\n{text}"
+        );
+        assert!(
+            !text.contains("2f1c0f6e") && !text.contains("3a2b0f6e"),
+            "两种 staging 残留都不许进包清单:\n{text}"
+        );
+        // 认得严:UUID 不合规范的同名后缀文件是用户文件,照常计入
+        assert!(
+            text.contains("not-a-uuid"),
+            "判据必须认得严,不许把用户文件当 staging 残留吞掉:\n{text}"
+        );
+
+        // ② 可见告警:两条残留各点名一次,绝不静默跳过
+        let warned = out.warnings.join("\n");
+        assert!(
+            warned.contains("2f1c0f6e") && warned.contains("落包"),
+            "半截落包文件必须可见告警: {warned}"
+        );
+        assert!(
+            warned.contains("3a2b0f6e") && warned.contains("清单"),
+            "半截清单文件必须可见告警: {warned}"
+        );
+
+        // ③ 隔离 ≠ 删除:证据留在盘上让人核对
+        assert!(leftover_copy.is_file() && leftover_manifest.is_file());
     }
 
     /// R2 变异复核:交付复制必须保留源 mtime。源 mtime 被改会影响半天分包,

@@ -246,6 +246,13 @@ pub fn curated_todo_dir(project_root: &Path, meta: &project::ProjectMeta) -> Opt
 /// 起点是**分类夹**(`project_root.join(folder)`,folder 出自
 /// `scenario_b_dirs`),不是项目根:`.ocard/`(清单、日志、回收站、分析缓存)
 /// 是项目根的同级兄弟,永远不在这棵树里,不可能被计数。
+/// R13 D2:类型判定必须走 `DirEntry::file_type()`(**不解析链接**),不能用
+/// `Path::is_dir()`(**跟随链接**)。此前「点开头一律跳过」这条旧规则恰好把
+/// `.assets` 这类链接挡在外面,口径放宽到点开头也算素材之后就挡不住了:
+/// 跟随一个指向祖先的链接会无限递归,指向项目外的链接会把外部文件算进角标,
+/// 而正式扫描(`copy::scan_source`)从来不跟随链接——两个数字都出自 OCard,
+/// 却对不上。链接一律跳过并计数,由 `commands::notice_scan_skips` 统一告警
+/// (与其它扫描同口径,零静默)。
 fn count_files(dir: &Path) -> usize {
     let mut n = 0usize;
     let mut stack = vec![dir.to_path_buf()];
@@ -258,10 +265,16 @@ fn count_files(dir: &Path) -> usize {
             if copy::is_system_item(&name.to_string_lossy()) {
                 continue;
             }
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else {
+            let Ok(ft) = e.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                copy::note_symlink_skipped();
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(e.path());
+            } else if ft.is_file() {
                 n += 1;
             }
         }

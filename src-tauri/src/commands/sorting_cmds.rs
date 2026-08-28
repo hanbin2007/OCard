@@ -642,7 +642,11 @@ pub fn list_categories<R: tauri::Runtime>(
 ) -> CmdResult<Vec<SortingCategoryDto>> {
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
-    Ok(sorting::list_categories(&stats.root, &stats.meta)
+    let listed = sorting::list_categories(&stats.root, &stats.meta);
+    // R13 D2:分类计数扫描跳过的符号链接必须可见(失败出口也要取走计数,
+    // 留着会算到下一次操作头上)。角标数字与正式扫描同口径,不许静默分叉。
+    crate::commands::notice_scan_skips(&app);
+    Ok(listed
         .map_err(err)?
         .into_iter()
         .map(|c| SortingCategoryDto {
@@ -722,7 +726,10 @@ pub fn move_assets<R: tauri::Runtime>(
     let stats = find_project(&nas, &project_id)?;
     // 分类夹白名单:必须是该项目已知分类;精选是复制语义,走 curate_assets,
     // move 到精选一律拒绝(codex 评审 11:防止素材被移出流程)
-    let cats = sorting::list_categories(&stats.root, &stats.meta).map_err(err)?;
+    let cats = sorting::list_categories(&stats.root, &stats.meta);
+    // 同上:这条路径也会走分类计数扫描,跳过的链接同样要取走并告警
+    crate::commands::notice_scan_skips(&app);
+    let cats = cats.map_err(err)?;
     match cats.iter().find(|c| c.id == category_id) {
         Some(c) if c.kind == "custom" || c.kind == "other" => {}
         Some(c) if c.kind == "curated" => {
