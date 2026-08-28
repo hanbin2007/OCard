@@ -576,6 +576,12 @@ pub fn file_item_dto(p: &copy::PlannedFile) -> CopyFileItemDto {
 
 /// 由 StartCopyInput 组装任务快照与落盘目标。
 /// 目标夹命名走规范函数(评审 M14/P1-13):工况 A 强制 YYYYMMDD 前缀。
+///
+/// `source_folders` 必须由调用方传**引擎真正采用的** selection
+/// (`SourceSelection::to_folders()`),不能拿 `input.source_folders` 原始输入:
+/// DTO 的这个字段是「拷完能不能说本卡可格式化」的唯一判据,与 manifest 分叉
+/// 会让同一个任务重启前后显示的范围不一样,判据一旦不可信就可能引导用户
+/// 格式化掉未备份素材(R2)。
 #[allow(clippy::too_many_arguments)]
 pub fn build_task(
     input: &StartCopyInput,
@@ -586,6 +592,7 @@ pub fn build_task(
     operator: &str,
     plan: &[copy::PlannedFile],
     manifest_id: &str,
+    source_folders: &[String],
 ) -> crate::core::Result<(CopyTaskDto, Vec<PathBuf>)> {
     let target_folder = match scenario {
         project::Scenario::A => {
@@ -635,7 +642,7 @@ pub fn build_task(
         note: input.note.clone(),
         tags: input.tags.clone(),
         target_folder,
-        source_folders: input.source_folders.clone(),
+        source_folders: source_folders.to_vec(),
         destinations: dest_dtos,
         files: file_dtos,
         file_count: Some(plan.len()),

@@ -38,6 +38,89 @@ pub struct AppState {
     pub notices: std::sync::Mutex<Vec<notify::NoticeDto>>,
     /// 本机「交付 ↔ 分类/回收站」互斥闸(原子、可单测、panic 安全,见 OpsMutex)。
     pub ops: sorting_cmds::OpsMutex,
+    /// 双确认屏批准过的计划快照(见 [`ApprovedPlans`])。
+    pub approved_plans: ApprovedPlans,
+}
+
+/// 最多留几份批准过的计划(用户来回改勾选会连着拉好几次计划,只有最后一份会被批准)。
+const APPROVED_PLAN_SLOTS: usize = 4;
+/// 单份计划超过这么多文件就只记令牌、不记明细(几十万文件的卡不该把内存吃掉)。
+/// 记不下明细这件事会在报错里明说,不静默降级。
+const APPROVED_PLAN_MAX_FILES: usize = 50_000;
+
+/// 双确认屏批准过的计划快照(按 `planDigest` 存;仅进程内,不落盘)。
+///
+/// 存在的**唯一**理由:`start_copy_task` 发现令牌对不上时要说清「到底哪儿变了」。
+/// 只靠摘要分段只能说出「哪一类变了」,说不出「多了哪几个文件」「是哪几个被改动
+/// 过」——而这两句话指向完全不同的排查方向(去数卡上的文件 vs 去查是谁动了源),
+/// 说错原因比不说更糟。
+///
+/// 有界:最多 [`APPROVED_PLAN_SLOTS`] 份,单份超过 [`APPROVED_PLAN_MAX_FILES`]
+/// 只记令牌不记明细。查不到明细时报文会**明说**查不到,不会假装说得出。
+#[derive(Default)]
+pub struct ApprovedPlans {
+    /// 队首最旧
+    slots: std::sync::Mutex<std::collections::VecDeque<ApprovedSnapshot>>,
+}
+
+/// 一份批准过的计划的快照。
+#[derive(Clone)]
+pub struct ApprovedSnapshot {
+    pub digest: String,
+    /// 确认那一刻的卷身份原串(见 `volume_identity`)。留着它才说得出
+    /// 「卷身份为什么变了」——尤其是「指纹是 OCard 自己后写上去的」这一种。
+    pub volume_identity: String,
+    /// `None` = 当时文件数超上限,没留逐条明细
+    pub files: Option<Vec<copy::PlannedFile>>,
+}
+
+/// 回忆一份批准过的计划的结果。三种情形的报文措辞必须不同——
+/// 「没留明细」和「没这份令牌」是两回事。
+pub enum RecalledPlan {
+    /// 找到了确认时的那份计划,可以逐条对比
+    Found(ApprovedSnapshot),
+    /// 记得这个令牌,但当时文件数超过上限,没留逐条明细
+    TooLargeToKeep(ApprovedSnapshot),
+    /// 没有这个令牌(应用重启过,或中间又拉了好几次计划把它挤掉了)
+    Forgotten,
+}
+
+impl RecalledPlan {
+    fn snapshot(&self) -> Option<&ApprovedSnapshot> {
+        match self {
+            Self::Found(s) | Self::TooLargeToKeep(s) => Some(s),
+            Self::Forgotten => None,
+        }
+    }
+}
+
+impl ApprovedPlans {
+    /// 记下一份刚返回给双确认屏的计划。
+    pub fn remember(&self, digest: &str, volume_identity: &str, plan: &[copy::PlannedFile]) {
+        let snap = ApprovedSnapshot {
+            digest: digest.to_string(),
+            volume_identity: volume_identity.to_string(),
+            files: (plan.len() <= APPROVED_PLAN_MAX_FILES).then(|| plan.to_vec()),
+        };
+        let mut slots = self.slots.lock().unwrap();
+        // 同一份计划被反复拉取时只留一份(前端进确认屏可能重复调用)
+        slots.retain(|s| s.digest != digest);
+        slots.push_back(snap);
+        while slots.len() > APPROVED_PLAN_SLOTS {
+            slots.pop_front();
+        }
+    }
+
+    /// 按令牌回忆。**不取走**:同一个令牌可能被连着提交两次(用户重试),
+    /// 第二次也该拿到同样的说明。
+    pub fn recall(&self, digest: &str) -> RecalledPlan {
+        let slots = self.slots.lock().unwrap();
+        match slots.iter().find(|s| s.digest == digest) {
+            Some(s) if s.files.is_some() => RecalledPlan::Found(s.clone()),
+            Some(s) => RecalledPlan::TooLargeToKeep(s.clone()),
+            None => RecalledPlan::Forgotten,
+        }
+    }
 }
 
 type CmdResult<T> = std::result::Result<T, String>;
@@ -824,21 +907,27 @@ pub fn list_volumes<R: tauri::Runtime>(
 }
 
 #[tauri::command(async)]
-pub fn inspect_volume(volume_id: String) -> CmdResult<VolumeInspectionDto> {
+pub fn inspect_volume<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    volume_id: String,
+) -> CmdResult<VolumeInspectionDto> {
     let root = PathBuf::from(&volume_id);
-    let files = copy::scan_source(&root).map_err(err)?;
-    let total_bytes = files.iter().map(|(_, s)| *s).sum();
+    let scanned = copy::scan_source(&root);
+    // R10:失败出口也要取走计数并告警——计数留着会算到下一次操作头上,报数失真
+    notice_scan_skips(&app);
+    let files = scanned.map_err(err)?;
+    let total_bytes = files.iter().map(|f| f.size).sum();
 
     // EXIF 拍摄时间优先(M2 技术债:mtime 会因拷贝/修复时间戳失真);
     // 大卡按步长采样(≤300 个样本)控制 EXIF 解析耗时
     let mut earliest: Option<chrono::DateTime<Utc>> = None;
     let mut latest: Option<chrono::DateTime<Utc>> = None;
     let step = files.len().div_ceil(300).max(1); // 向上取整:301-599 个也只采 ≤300 样本
-    for (i, (rel, _)) in files.iter().enumerate() {
+    for (i, f) in files.iter().enumerate() {
         if i % step != 0 {
             continue;
         }
-        let p: PathBuf = rel.split('/').fold(root.clone(), |acc, c| acc.join(c));
+        let p: PathBuf = f.rel.split('/').fold(root.clone(), |acc, c| acc.join(c));
         let t = crate::core::media::exif_shot_at(&p).or_else(|| {
             std::fs::metadata(&p)
                 .ok()
@@ -874,11 +963,86 @@ pub fn inspect_volume(volume_id: String) -> CmdResult<VolumeInspectionDto> {
 
 // ---------- 源文件夹多选 ----------
 
-/// 源卷可达性闸。零静默:卷不存在/挂载点半死/没权限必须各说各的,
+/// 测试用的「额外可信卷」。生产构建里这段整体不存在(`cfg(test)`),
+/// 只是让集成测试能拿一个临时目录当卡跑真实命令链路——不是给生产留后门。
+#[cfg(test)]
+pub(crate) static TEST_EXTRA_VOLUMES: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// 测试里把一个临时目录登记成「插着的卡」,离开作用域自动摘除。
+#[cfg(test)]
+pub(crate) struct TestVolumeGuard(PathBuf);
+
+#[cfg(test)]
+impl TestVolumeGuard {
+    pub(crate) fn mount(p: &Path) -> Self {
+        TEST_EXTRA_VOLUMES.lock().unwrap().push(p.to_path_buf());
+        Self(p.to_path_buf())
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestVolumeGuard {
+    fn drop(&mut self) {
+        let mut v = TEST_EXTRA_VOLUMES.lock().unwrap();
+        if let Some(i) = v.iter().position(|p| p == &self.0) {
+            v.remove(i);
+        }
+    }
+}
+
+/// 当前可作为拷卡源的权威卷清单。
+fn known_source_volumes() -> Vec<volumes::VolumeInfo> {
+    #[allow(unused_mut)]
+    let mut list = volumes::list_volumes();
+    #[cfg(test)]
+    for p in TEST_EXTRA_VOLUMES.lock().unwrap().iter() {
+        list.push(volumes::VolumeInfo {
+            name: p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            mount_point: p.clone(),
+            removable: true,
+            system: false,
+            total_bytes: 0,
+            available_bytes: 0,
+            file_system: "test".into(),
+        });
+    }
+    list
+}
+
+/// 源卷解析闸。返回权威挂载点。
+///
+/// R9:此前只检查「是不是个文件夹」,于是 `list_source_folders` /
+/// `plan_source_selection` 接受**任意可读目录**当 volumeId——能读到卡外的
+/// 目录树、文件计数与部分文件名。拷贝本身另有 `validate_copy_paths` 兜底,
+/// 但读取边界已经越过,报错也不准。先解析到权威卷清单再谈可达性。
+///
+/// 零静默:卷不在清单/不存在/挂载点半死/没权限必须各说各的,
 /// 绝不吞成空列表——用户会把「列不出来」读成「卡是空的」。
-fn ensure_source_volume(root: &Path) -> CmdResult<()> {
-    match std::fs::metadata(root) {
-        Ok(m) if m.is_dir() => Ok(()),
+pub(crate) fn ensure_source_volume(volume_id: &str) -> CmdResult<PathBuf> {
+    let want = normalize_lexical(Path::new(volume_id));
+    let Some(vol) = known_source_volumes()
+        .into_iter()
+        .find(|v| normalize_lexical(&v.mount_point) == want)
+    else {
+        // 先把「路径根本不存在」与「存在但不是挂载卷」分开说,否则用户
+        // 对着一个明明能在访达里打开的目录看「不在挂载卷列表中」会一头雾水
+        return Err(match std::fs::metadata(&want) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                format!("源卷不存在或已被拔出: {}", want.display())
+            }
+            _ => format!(
+                "所选源不是当前挂载的存储卷,拒绝作为拷卡源读取: {}。请在卷列表里选择真实插着的卡",
+                want.display()
+            ),
+        });
+    };
+    let root = vol.mount_point;
+    match std::fs::metadata(&root) {
+        Ok(m) if m.is_dir() => Ok(root),
         Ok(_) => Err(format!("源卷路径不是文件夹: {}", root.display())),
         Err(e) => Err(match e.kind() {
             std::io::ErrorKind::NotFound => {
@@ -896,27 +1060,81 @@ fn ensure_source_volume(root: &Path) -> CmdResult<()> {
     }
 }
 
+/// `parse_selection` 的产物:规范化后的选择 + 需要向用户点名的告警。
+pub(crate) struct ParsedSelection {
+    pub selection: copy::SourceSelection,
+    /// 折叠后同名(大小写/NFC)的分组描述,供命令层发可见告警。
+    pub aliases: Vec<String>,
+}
+
 /// 把前端传来的文件夹列表转成引擎口径的选择。空 = 整卷(契约)。
 /// 每一项都要过相对路径闸:空串(卷根)放行,其余必须是安全相对路径——
 /// `../` 之类等于让拷贝去读卡外的东西。
-fn parse_selection(folders: &[String]) -> CmdResult<copy::SourceSelection> {
+///
+/// R1:去重**只按字节完全相同**。此前按目的地的大小写口径(`fold_key`)给
+/// **源侧**选择去重,源卷大小写敏感时(大小写敏感 APFS / Linux ext4 导出 /
+/// 部分 SMB·NFS / 磁盘映像)`DCIM` 与 `dcim` 是两个真实存在的不同目录,
+/// `list_source_folders` 会两条都列出来让用户勾——勾了之后第二个被**无声丢弃**,
+/// 漏拷却报 all_verified。`scan_selection` 里的 `files.sort(); files.dedup()`
+/// 已按真实 rel 天然收敛,字节重复项本来就安全,不需要请求层再裁一刀。
+///
+/// 折叠后同名的两项仍然保留(不合并),但要点名告警:源卷若其实大小写不敏感,
+/// 这两项会扫出同一批文件,用户有权在开拷前知道。
+fn parse_selection(folders: &[String]) -> CmdResult<ParsedSelection> {
     let mut clean: Vec<String> = Vec::with_capacity(folders.len());
     for f in folders {
         if !f.is_empty() && !crate::core::paths::is_safe_rel(f) {
             return Err(format!("文件夹路径非法,拒绝执行: {f}"));
         }
-        // 去重按大小写不敏感:卡多是 exFAT,`DCIM` 与 `dcim` 是同一个夹子,
-        // 当成两项会把同一批文件规划两遍(内容重复、落点还不一样)
-        if !clean.iter().any(|c| copy::fold_key(c) == copy::fold_key(f)) {
+        if !clean.iter().any(|c| c == f) {
             clean.push(f.clone());
         }
     }
-    Ok(copy::SourceSelection::from_folders(clean))
+    // 折叠同名分组(≥2 项才报):只告警,绝不静默合并
+    let mut aliases: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for f in &clean {
+        seen.entry(copy::target_name_key(f))
+            .or_default()
+            .push(if f.is_empty() {
+                "卡根目录".to_string()
+            } else {
+                f.clone()
+            });
+    }
+    let mut groups: Vec<Vec<String>> = seen.into_values().filter(|g| g.len() > 1).collect();
+    groups.sort();
+    for g in groups {
+        aliases.push(g.join("、"));
+    }
+    Ok(ParsedSelection {
+        selection: copy::SourceSelection::from_folders(clean),
+        aliases,
+    })
 }
 
-/// 扫描期跳过的符号链接聚合告警(链接目标不会被拷贝,必须让用户知道)。
-/// 失败路径也要调用:计数留着会算到下一次操作头上,报数失真。
-fn notice_symlinks_skipped<R: tauri::Runtime>(app: &AppHandle<R>) {
+/// 折叠同名的源文件夹选择告警(零静默:不合并,但必须点名)。
+fn notice_selection_aliases<R: tauri::Runtime>(app: &AppHandle<R>, aliases: &[String]) {
+    if aliases.is_empty() {
+        return;
+    }
+    notify::warn(
+        app,
+        "source-folders-case-alias",
+        format!(
+            "勾选里有 {} 组只差大小写(或 Unicode 写法)的文件夹({}):它们会各扫一遍。若这张卡的文件系统大小写不敏感,同一批文件会被规划两次并因撞名被加前缀——请确认这是你要的",
+            aliases.len(),
+            aliases.join(" / ")
+        ),
+    );
+}
+
+/// 扫描期被跳过条目的聚合告警:符号链接 + 明确列举的系统项。
+///
+/// **每一个**扫描出口(含失败出口)都必须调用:计数是按线程累计的,不取走
+/// 就会算到下一次操作头上,报数失真(`copy::take_scan_symlinks_skipped`
+/// 自己的文档也点名了这条不变式)。
+fn notice_scan_skips<R: tauri::Runtime>(app: &AppHandle<R>) {
     let n = copy::take_scan_symlinks_skipped();
     if n > 0 {
         notify::warn(
@@ -925,36 +1143,81 @@ fn notice_symlinks_skipped<R: tauri::Runtime>(app: &AppHandle<R>) {
             format!("源卷上发现 {n} 个符号链接,已跳过(链接目标不会被拷贝)"),
         );
     }
+    let (skipped, samples) = copy::take_scan_system_skipped();
+    if skipped > 0 {
+        // R11:排除口径已收紧成明确列举的系统项(`.Trashes`/`System Volume
+        // Information` 之类),点开头的素材不再被误伤。即便如此,排除了什么也必须
+        // 报到用户面前:配上「100% 完成 → 可格式化」这句话,静默排除就是引导
+        // 用户格式化掉没备份的东西。
+        //
+        // 通知码沿用 `copy-hidden-skipped`(与前端契约字段 `hiddenSkipped` 同源,
+        // 改名会当场打断并行开发的前端);文案按新语义重写。
+        notify::warn(
+            app,
+            "copy-hidden-skipped",
+            format!(
+                "源卷上有 {skipped} 个系统项被排除,不在本次范围内({}{})——都是操作系统/本工具自己的记账目录(废纸篓、索引、`.DS_Store` 等),不是素材。点开头的素材(如 .clip.mov)现在会照常拷贝",
+                samples.join("、"),
+                if (samples.len() as u64) < skipped {
+                    " 等"
+                } else {
+                    ""
+                }
+            ),
+        );
+    }
 }
 
 /// 目标夹里已存在同名文件的可见告警(不阻断:引擎对同内容复用、异内容拒覆盖,
 /// 但用户有权在开拷**之前**就知道这次会碰上哪些已有文件)。
-fn notice_target_name_clashes<R: tauri::Runtime>(
+///
+/// R6 两处:
+/// - 读目标夹失败**只有 `NotFound` 能解释成「还没创建」**。此前 `let Ok(..) else
+///   { continue }` 把「NAS 断了 / 无权限」也吞成「没有可撞的东西」,而扁平化模式下
+///   这条预警恰恰是最该有的——必须在开拷前返回 Err。
+/// - 撞名判定改 `HashSet`:此前 `clashes.contains(&..)` 是 Vec 线性查找,重复拷进
+///   同一目标夹时每个文件都撞名,5 万文件 = 十亿量级比较,而本函数在起 worker
+///   **之前同步跑**,UI 会卡死几十秒。
+pub(crate) fn notice_target_name_clashes<R: tauri::Runtime>(
     app: &AppHandle<R>,
     plan: &[copy::PlannedFile],
     dest_targets: &[PathBuf],
-) {
-    let mut clashes: Vec<String> = Vec::new();
+) -> CmdResult<()> {
+    let mut clashes: Vec<String> = Vec::new(); // 保序,消息里的样例稳定
+    let mut clashed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for d in dest_targets {
-        let Ok(entries) = std::fs::read_dir(d) else {
-            continue; // 目标夹还不存在 = 没有可撞的东西;不可读会在拷贝时显式失败
+        let entries = match std::fs::read_dir(d) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // 还没创建
+            Err(e) => {
+                return Err(format!(
+                "无法读取目标夹,拒绝开拷(读不到就没法在开拷前告诉你会撞上哪些同名文件): {} — {e}",
+                d.display()
+            ))
+            }
         };
-        let existing: std::collections::HashSet<String> = entries
-            .flatten()
-            .map(|e| copy::fold_key(&e.file_name().to_string_lossy()))
-            .collect();
+        let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "读取目标夹条目失败,拒绝开拷(目录可能在读的过程中断开): {} — {e}",
+                    d.display()
+                )
+            })?;
+            existing.insert(copy::target_name_key(&entry.file_name().to_string_lossy()));
+        }
         for p in plan {
             // 只看扁平落点(整卷带层级的落点由目录结构天然隔开)
             if !p.target_rel.contains('/')
-                && existing.contains(&copy::fold_key(&p.target_rel))
-                && !clashes.contains(&p.target_rel)
+                && existing.contains(&copy::target_name_key(&p.target_rel))
+                && clashed.insert(p.target_rel.clone())
             {
                 clashes.push(p.target_rel.clone());
             }
         }
     }
     if clashes.is_empty() {
-        return;
+        return Ok(());
     }
     let shown: Vec<&str> = clashes.iter().take(5).map(|s| s.as_str()).collect();
     notify::warn(
@@ -967,6 +1230,7 @@ fn notice_target_name_clashes<R: tauri::Runtime>(
             if clashes.len() > shown.len() { " 等" } else { "" }
         ),
     );
+    Ok(())
 }
 
 /// 列出源卷里可勾选的文件夹(含卷根)。勾选后只拷该文件夹的直接子文件。
@@ -975,10 +1239,9 @@ pub fn list_source_folders<R: tauri::Runtime>(
     app: AppHandle<R>,
     volume_id: String,
 ) -> CmdResult<Vec<SourceFolderDto>> {
-    let root = PathBuf::from(&volume_id);
-    ensure_source_volume(&root)?;
+    let root = ensure_source_volume(&volume_id)?;
     let listed = copy::list_source_folders(&root);
-    notice_symlinks_skipped(&app);
+    notice_scan_skips(&app);
     let (folders, unreadable) = listed.map_err(err)?;
     // 零静默:读不动的子目录被跳过了,必须逐条报出来——否则用户看到的
     // 文件夹列表是残缺的,而他不会知道
@@ -1020,15 +1283,26 @@ pub fn list_source_folders<R: tauri::Runtime>(
 #[tauri::command(async)]
 pub fn plan_source_selection<R: tauri::Runtime>(
     app: AppHandle<R>,
+    state: State<AppState>,
     volume_id: String,
     folders: Vec<String>,
 ) -> CmdResult<SourcePlanDto> {
-    let root = PathBuf::from(&volume_id);
-    ensure_source_volume(&root)?;
-    let selection = parse_selection(&folders)?;
+    let root = ensure_source_volume(&volume_id)?;
+    let parsed = parse_selection(&folders)?;
+    notice_selection_aliases(&app, &parsed.aliases);
+    let selection = parsed.selection;
     let scanned = copy::scan_selection(&root, &selection);
-    notice_symlinks_skipped(&app);
+    let (hidden_skipped, hidden_samples) = peek_skipped_for_dto();
+    notice_scan_skips(&app);
     let (plan, renamed, total_bytes) = scanned.map_err(err)?;
+    // R5:用户在双确认屏批准的是**这一份**计划;`start_copy_task` 重扫后
+    // 必须比对同一个摘要,不一致就退回重新确认(知情同意,不自动重试)
+    let identity = volume_identity(&root);
+    let plan_digest = copy::plan_digest(&selection, &plan, &identity);
+    // R11:留一份快照(计划 + 卷身份原串),好让「令牌对不上」时能说清到底哪儿变了
+    state
+        .approved_plans
+        .remember(&plan_digest, &identity, &plan);
     Ok(SourcePlanDto {
         file_count: plan.len(),
         total_bytes,
@@ -1039,7 +1313,30 @@ pub fn plan_source_selection<R: tauri::Runtime>(
                 target_rel: r.target_rel,
             })
             .collect(),
+        hidden_skipped,
+        hidden_samples,
+        plan_digest,
     })
+}
+
+/// 摘要里的卷身份:挂载点 + 卷名 + 卡指纹。
+/// 换卡(哪怕挂到同一个挂载点、连文件列表都碰巧一样)必须让摘要变化。
+fn volume_identity(root: &Path) -> String {
+    let name = known_source_volumes()
+        .into_iter()
+        .find(|v| normalize_lexical(&v.mount_point) == normalize_lexical(root))
+        .map(|v| v.name)
+        .unwrap_or_default();
+    let uid = volumes::read_volume_uid(root).unwrap_or_default();
+    format!("{}\u{0}{name}\u{0}{uid}", root.display())
+}
+
+/// 取本线程扫描期排除的系统项(**不清零**:随后的 `notice_scan_skips`
+/// 才负责取走并告警,DTO 这里只是顺带把同一组数字带给双确认屏)。
+fn peek_skipped_for_dto() -> (u64, Vec<String>) {
+    let taken = copy::take_scan_system_skipped();
+    copy::restore_scan_system_skipped(taken.clone());
+    taken
 }
 
 // ---------- 拷卡任务 ----------
@@ -1088,7 +1385,7 @@ use crate::core::paths::normalize_lexical;
 /// 校验源卷与目的地(评审 H5/P1-5):卷白名单 + 布局校验(core::paths)。
 fn validate_copy_paths(source_root: &Path, dest_targets: &[PathBuf]) -> CmdResult<()> {
     let source_root_n = normalize_lexical(source_root);
-    let known = volumes::list_volumes();
+    let known = known_source_volumes();
     if !known
         .iter()
         .any(|v| normalize_lexical(&v.mount_point) == source_root_n)
@@ -1103,15 +1400,33 @@ fn validate_copy_paths(source_root: &Path, dest_targets: &[PathBuf]) -> CmdResul
 }
 
 /// 目标夹已存在且非空 → 需要人工确认(评审 F1 的第一道闸)。
-fn check_existing_target(dest_targets: &[PathBuf], confirmed: bool) -> CmdResult<()> {
-    if confirmed {
-        return Ok(());
-    }
+///
+/// R6:读不动**不等于**空。只有 `NotFound` 能解释成「还没创建」,其余
+/// (NAS 断了 / 无权限)此前被 `unwrap_or(false)` 吞成「空目录」,直接跳过这道
+/// 人工确认闸。读不动就当场报错——这道闸的意义正是防同名重复拷卡。
+/// 可读性一律先探(即使用户已确认继续),坏掉的目的地不该等写了清单才发现。
+pub(crate) fn check_existing_target(dest_targets: &[PathBuf], confirmed: bool) -> CmdResult<()> {
     for t in dest_targets {
-        let non_empty = std::fs::read_dir(t)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-        if non_empty {
+        let non_empty = match std::fs::read_dir(t) {
+            Ok(mut d) => match d.next() {
+                Some(Ok(_)) => true,
+                None => false,
+                Some(Err(e)) => {
+                    return Err(format!(
+                        "无法读取目标夹,拒绝开拷(读不到就没法判断是不是同名重复拷卡): {} — {e}",
+                        t.display()
+                    ))
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                return Err(format!(
+                    "无法读取目标夹,拒绝开拷(读不到就没法判断是不是同名重复拷卡): {} — {e}",
+                    t.display()
+                ))
+            }
+        };
+        if non_empty && !confirmed {
             return Err(format!(
                 "TARGET_EXISTS: 目标夹已存在且非空: {}。可能是同名重复拷卡;确认继续将只补缺失文件、绝不覆盖已有文件",
                 t.display()
@@ -1139,6 +1454,8 @@ pub fn preview_copy_task<R: tauri::Runtime>(
         .find(|c| c.id == input.camera_id)
         .ok_or_else(|| format!("相机未登记: {}", input.camera_id))?;
     let op = operator(&app, &state);
+    // 预览也走同一条规范化(路径闸在这里就该拒非法项),口径与 start 一致
+    let parsed = parse_selection(&input.source_folders)?;
     let (dto, _) = tasks::build_task(
         &input,
         &stats.root,
@@ -1148,12 +1465,165 @@ pub fn preview_copy_task<R: tauri::Runtime>(
         &op,
         &[],
         "preview",
+        &parsed.selection.to_folders(),
     )
     .map_err(err)?;
     Ok(serde_json::json!({
         "targetFolder": dto.target_folder,
         "destinations": dto.destinations,
     }))
+}
+
+/// 「a、b、c 等 5 个」——数量给全,样例最多三条。
+fn name_a_few(items: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let shown: Vec<&str> = items.iter().take(SHOWN).map(|s| s.as_str()).collect();
+    format!(
+        "{} 个({}{})",
+        items.len(),
+        shown.join("、"),
+        if items.len() > shown.len() {
+            " 等"
+        } else {
+            ""
+        }
+    )
+}
+
+/// 「确认时那份计划没留下来」的两种不同说法(措辞必须分开:一个是内存被挤掉了,
+/// 一个是当初就没留;含糊其辞会让用户以为工具在敷衍)。
+fn no_detail_tail(recalled: &RecalledPlan) -> &'static str {
+    match recalled {
+        RecalledPlan::Found(_) => "",
+        RecalledPlan::TooLargeToKeep(_) => {
+            "(本次计划文件数超过上限,确认时未保留逐条明细,无法点名是哪几个)"
+        }
+        RecalledPlan::Forgotten => {
+            "(确认时的那份计划已不在内存中——应用重启过,或中间又拉过好几次计划——无法点名是哪几个)"
+        }
+    }
+}
+
+/// 卷身份为什么变了。
+///
+/// 身份串是 `挂载点\0卷名\0卡指纹`(见 `volume_identity`)。**必须逐段说**:
+/// 其中「指纹从无到有」这一种根本不是换卡——`start_copy_task` 自己会往卡上写
+/// `.ocard-volume-id`,首拷失败后重试同一个令牌就会撞上它。这时候报「你换了一
+/// 张卡」是彻头彻尾的假警报,会让人去翻读卡器而不是去看真正的失败原因。
+fn why_volume_differs(recalled: &RecalledPlan, now: &str) -> String {
+    let Some(then) = recalled.snapshot().map(|s| s.volume_identity.as_str()) else {
+        return "源卷不是你确认时的那一张卡(卡被换过,或拔插/重新挂载后卷身份变了)。".to_string();
+    };
+    let split = |s: &str| {
+        let mut it = s.split('\u{0}');
+        let mount = it.next().unwrap_or_default().to_string();
+        let name = it.next().unwrap_or_default().to_string();
+        let uid = it.next().unwrap_or_default().to_string();
+        (mount, name, uid)
+    };
+    let (m0, n0, u0) = split(then);
+    let (m1, n1, u1) = split(now);
+    if u0.is_empty() && !u1.is_empty() && m0 == m1 && n0 == n1 {
+        return "这张卡的身份指纹是在你确认之后才写上去的(OCard 自己写的,用于中断续传认卡)——\
+                源卷本身没换,但确认令牌因此失效了,重新确认一次即可。"
+            .to_string();
+    }
+    if !u0.is_empty() && u1.is_empty() {
+        return "读不到源卷上的身份指纹了(卡可能被换成了另一张、或指纹文件被删)。".to_string();
+    }
+    if !u0.is_empty() && !u1.is_empty() && u0 != u1 {
+        return "源卷不是你确认时的那一张卡:卡上的身份指纹变了(确实是另一张卡)。".to_string();
+    }
+    if m0 != m1 {
+        return format!("源卷的挂载点变了(确认时是 {m0},现在是 {m1})——卡被重新挂载或换了读卡器。");
+    }
+    if n0 != n1 {
+        return format!("源卷的卷名变了(确认时是「{n0}」,现在是「{n1}」)。");
+    }
+    "源卷不是你确认时的那一张卡(卡被换过,或拔插/重新挂载后卷身份变了)。".to_string()
+}
+
+/// 令牌对不上时的人话报文。
+///
+/// R11:**原因必须说对**。「多了 3 个文件」和「有 2 个文件被改动过」指向完全不同
+/// 的排查方向(去数卡上的文件 vs 去查是谁动了源文件),说错原因比不说更糟。
+/// 三类原因的处置都是退回双确认屏重新确认,但说法必须各是各的。
+///
+/// 定性来自摘要分段(总是拿得到),明细来自 [`ApprovedPlans`] 里那份批准过的
+/// 计划(可能拿不到)。拿不到明细就**明说**拿不到,不含糊、不编。
+fn plan_changed_message(
+    state: &AppState,
+    approved: &str,
+    fresh: &str,
+    fresh_plan: &[copy::PlannedFile],
+    volume_identity: &str,
+) -> String {
+    let recalled = state.approved_plans.recall(approved);
+    let diff = match &recalled {
+        RecalledPlan::Found(s) => s
+            .files
+            .as_deref()
+            .map(|old| copy::diff_plans(old, fresh_plan)),
+        _ => None,
+    };
+    let why = match copy::classify_plan_change(approved, fresh) {
+        // 走到这里说明两串不相等,不可能判成 None;真出现就说明比对口径有 bug,
+        // 照样 fail-closed,但要说得让人看得出是工具的问题
+        copy::PlanChange::None => {
+            "确认令牌与本次计划的比对结果自相矛盾(工具内部状态异常)。".to_string()
+        }
+        copy::PlanChange::Unrecognized => {
+            "无法识别你回传的确认令牌(可能来自旧版本的确认屏,或令牌在回传路上被改写)。"
+                .to_string()
+        }
+        // 卷身份能解释后面所有差异,所以优先说它——先让人去看插的是哪张卡,
+        // 而不是去数文件。但「哪一段变了」必须说准(见 why_volume_differs)
+        copy::PlanChange::Volume => why_volume_differs(&recalled, volume_identity),
+        copy::PlanChange::FileSet => match &diff {
+            Some(d) if d.file_set_changed() => {
+                let mut parts = Vec::new();
+                if !d.added.is_empty() {
+                    parts.push(format!("新增 {}", name_a_few(&d.added)));
+                }
+                if !d.removed.is_empty() {
+                    parts.push(format!("少了 {}", name_a_few(&d.removed)));
+                }
+                if !d.resized.is_empty() {
+                    parts.push(format!("大小变了 {}", name_a_few(&d.resized)));
+                }
+                if !d.retargeted.is_empty() {
+                    parts.push(format!("落点被重新规划 {}", name_a_few(&d.retargeted)));
+                }
+                format!("卡上的文件在你确认之后变了:{}。", parts.join(";"))
+            }
+            // 文件一条没变、文件集摘要却不同 = 本次提交的勾选范围和确认时那份不是同一套
+            Some(_) => {
+                "本次提交的勾选范围(选中的文件夹)与你确认时的那一份不一致。".to_string()
+            }
+            None => format!(
+                "卡上的文件在你确认之后有增删或改动,现在共 {} 个文件{}。",
+                fresh_plan.len(),
+                no_detail_tail(&recalled)
+            ),
+        },
+        copy::PlanChange::ContentReplaced => match &diff {
+            Some(d) if !d.retimed.is_empty() => format!(
+                "有 {} 个文件在你确认之后被改动过(大小没变,但内容可能已经不是你确认时看到的那份):{}。",
+                d.retimed.len(),
+                name_a_few(&d.retimed)
+            ),
+            // 摘要说修改时间变了、逐条却比不出来:只可能是某个文件的 mtime 在
+            // 「读得到」与「读不到(记 0)」之间跳了一次。照样拦,但别乱扣帽子
+            Some(_) => "卡上有文件的修改时间在你确认之后变得读不出来(或从读不出来变成读得出来),\
+                 无法确认内容还是你批准的那份。"
+                .to_string(),
+            None => format!(
+                "有文件在你确认之后被改动过(大小没变、修改时间变了,内容可能已经不是你确认时看到的那份){}。",
+                no_detail_tail(&recalled)
+            ),
+        },
+    };
+    format!("PLAN_CHANGED: {why}这次不会按旧清单开跑。请重新核对本次要拷的范围与改名清单后再确认。")
 }
 
 #[tauri::command(async)]
@@ -1176,12 +1646,16 @@ pub fn start_copy_task<R: tauri::Runtime>(
         .find(|c| c.id == input.camera_id)
         .ok_or_else(|| format!("相机未登记: {}", input.camera_id))?;
 
-    let source_root = PathBuf::from(&input.volume_id);
+    // 源卷解析到权威卷清单(R9):拷贝前的读取边界也必须是真卡,不是任意目录
+    let source_root = ensure_source_volume(&input.volume_id)?;
     // 空 / 不传 = 整卷(与改造前逐字节同路径);非空 = 按文件夹多选 + 落盘扁平化
-    let selection = parse_selection(&input.source_folders)?;
+    let parsed = parse_selection(&input.source_folders)?;
+    notice_selection_aliases(&app, &parsed.aliases);
+    let selection = parsed.selection;
     let scanned = copy::scan_selection(&source_root, &selection);
-    // 零静默:扫描跳过的符号链接必须让用户知道(链接目标不会被拷贝)
-    notice_symlinks_skipped(&app);
+    let (hidden_skipped, hidden_samples) = peek_skipped_for_dto();
+    // 零静默:扫描跳过的符号链接/系统项必须让用户知道(它们不会被拷贝)
+    notice_scan_skips(&app);
     let (plan, renamed, _) = scanned.map_err(err)?;
     if plan.is_empty() {
         return Err(match &selection {
@@ -1193,13 +1667,44 @@ pub fn start_copy_task<R: tauri::Runtime>(
     }
     // 源必须是当前真实挂载的卷:这是后面写卡片指纹文件的前提
     // (codex 评审 12:不核实挂载点就写指纹,等于往任意目录塞文件)
-    let mounted = volumes::list_volumes()
+    let mounted = known_source_volumes()
         .into_iter()
         .find(|v| v.mount_point == source_root);
     let volume_name = mounted
         .as_ref()
         .map(|v| v.name.clone())
         .unwrap_or_else(|| input.volume_id.clone());
+
+    // ---- R5:双确认屏批准的那份计划,和这里重扫出来的这份,必须是同一份 ----
+    // 闸放在**任何** UID / manifest / 审计副作用之前:窗口内换卡、别的进程写入、
+    // 文件被删,都会让 L2 ≠ L1(被删的已确认文件直接从新计划里消失,剩下的照样
+    // 能 all_verified);新出现的重名还会改变已批准的改名清单。
+    let identity = volume_identity(&source_root);
+    let fresh_digest = copy::plan_digest(&selection, &plan, &identity);
+    match input.plan_digest.as_deref().filter(|d| !d.is_empty()) {
+        Some(approved) if approved != fresh_digest => {
+            return Err(plan_changed_message(
+                &state,
+                approved,
+                &fresh_digest,
+                &plan,
+                &identity,
+            ));
+        }
+        Some(_) => {}
+        // 缺字段 = 老客户端或绕过了双确认屏。**不许 fail-open 成整卷**:
+        // 按文件夹拷时改名清单与范围都是用户逐条批准过的东西,没有令牌就没有
+        // 「批准过」这件事;整卷保留原层级、不改名,才可以豁免(向后兼容)。
+        None => {
+            if !matches!(selection, copy::SourceSelection::WholeVolume) {
+                return Err(
+                    "按文件夹拷卡必须带上双确认屏返回的 planDigest(缺少它就无法确认你批准的范围与改名清单还成立)。请退回确认屏重新核对;若客户端版本过旧,请先升级 OCard"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     let op = operator(&app, &state);
     let mut m = manifest::CopyManifest::new("", &volume_name, &camera.code, &op, &input.note);
     m.tags = input.tags.clone();
@@ -1212,6 +1717,12 @@ pub fn start_copy_task<R: tauri::Runtime>(
         &op,
         &plan,
         &m.id,
+        // R2:DTO 必须报**引擎真正采用的** selection,不是原始输入。
+        // 前端据 `task.sourceFolders` 决定拷完说「本卡可格式化」还是「这是部分
+        // 拷贝,请勿格式化」——判据不可信 = 可能引导用户格式化掉未备份素材;
+        // 而 manifest 存的是 `selection.to_folders()`,重启后 `rebuild_tasks`
+        // 也读它,两边分叉会让同一个任务重启前后显示的范围不一样。
+        &selection.to_folders(),
     )
     .map_err(err)?;
 
@@ -1219,6 +1730,11 @@ pub fn start_copy_task<R: tauri::Runtime>(
     let dest_targets: Vec<PathBuf> = dest_targets.iter().map(|t| normalize_lexical(t)).collect();
     validate_copy_paths(&source_root, &dest_targets)?;
     check_existing_target(&dest_targets, input.confirm_existing_target)?;
+    // 零静默:扁平化把「目标夹已有同名文件」从边角情形变成常态
+    //(先拷 100MSDCF 再拷 101MSDCF 到同一个夹子)。同名同内容会被复用、
+    // 同名不同内容会在拷到那一刻报冲突——开拷前就该点名,别让人拷到一半才知道。
+    // 读不动目标夹时这里会返回 Err(R6),因此必须排在任何写入之前。
+    notice_target_name_clashes(&app, &plan, &dest_targets)?;
 
     // 卡片指纹:身份随卡走。**全部路径校验通过后**才允许往卡上写文件;
     // 写保护/非挂载卷拿不到指纹要告知(退化为卷名匹配,零静默)
@@ -1272,6 +1788,10 @@ pub fn start_copy_task<R: tauri::Runtime>(
     // 审计痕迹:勾了哪些夹子、谁被改了名——事后必须查得到(改名=系统动了用户的文件名)
     m.source_selection = selection.to_folders();
     m.renamed_files = renamed;
+    // R7/R11:被系统项名单排除掉的条目也进清单,事后查得到这次到底没拷什么
+    // (字段名沿用 hidden_*:它同时是前端契约字段名,改名会打断并行开发的前端)
+    m.hidden_skipped = hidden_skipped;
+    m.hidden_samples = hidden_samples;
     manifest::save(&stats.root, &m).map_err(err)?;
 
     // 零静默,且必须在清单**落盘之后**才说(不然「已写入清单」是空头支票):
@@ -1289,11 +1809,6 @@ pub fn start_copy_task<R: tauri::Runtime>(
             ),
         );
     }
-    // 零静默:扁平化把「目标夹已有同名文件」从边角情形变成常态
-    //(先拷 100MSDCF 再拷 101MSDCF 到同一个夹子)。同名同内容会被复用、
-    // 同名不同内容会在拷到那一刻报冲突——开拷前就该点名,别让人拷到一半才知道
-    notice_target_name_clashes(&app, &plan, &dest_targets);
-
     tasks::append_audit(
         &app,
         &stats.root,
@@ -1438,7 +1953,11 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         }
         // 刷新清单:源卡内容可能在暂停期间变化,快照与引擎必须消费同一份新清单。
         // (planned 的合法性已在上方 manifest 加载后整单校验。)
-        let plan = refresh_resume_plan(&app, &m, &resolved)?;
+        // R8:清单里的 size/mtime 若被刷新,必须**连同持久化的 planned 一起**更新
+        // 并落盘——只改内存会留下 `planned.size = 旧值` / `entry.size = 新值` /
+        // `completed = true` 的自相矛盾清单。
+        let mut m = m;
+        let plan = refresh_resume_plan(&app, &mut m, &handle.project_root, &resolved)?;
         let mut snap = handle.snapshot.lock().unwrap();
         let old: std::collections::HashMap<String, &'static str> = snap
             .files
@@ -1468,22 +1987,41 @@ pub fn resume_copy_task<R: tauri::Runtime>(
 /// - **按文件夹**:落点在开拷那一刻就锁定了(重名前缀是拿**整组**文件算出来的,
 ///   卡上多一个同名文件会让已拷文件换个落点,续传就认不出它已经拷过),
 ///   所以只认持久化计划;卡上新增的文件不悄悄带进来,而是发可见告警让用户另起任务。
+///
+/// R8:任何对计划的刷新(size / mtime)都必须**原子地**同时落到
+/// `m.planned` 与磁盘上的清单。只改内存里的 `handle.plan` 会留下
+/// `planned.size = 旧值`、`entry.size = 新值`、`completed = true`
+/// 的自相矛盾清单——事后既查不清拷的到底是哪一版,重启重建也会用错尺寸。
 fn refresh_resume_plan<R: tauri::Runtime>(
     app: &AppHandle<R>,
-    m: &manifest::CopyManifest,
+    m: &mut manifest::CopyManifest,
+    project_root: &Path,
     source_root: &Path,
 ) -> CmdResult<Vec<copy::PlannedFile>> {
     let selection = copy::SourceSelection::from_folders(m.source_selection.clone());
     if matches!(selection, copy::SourceSelection::WholeVolume) {
-        let mut files = copy::scan_source(source_root).map_err(err)?;
-        notice_symlinks_skipped(app);
+        let scanned = copy::scan_source(source_root);
+        // R10:失败出口也要取走计数(留着会算到下一次操作头上,报数失真)
+        notice_scan_skips(app);
+        let mut files = scanned.map_err(err)?;
         for p in &m.planned {
-            if !files.iter().any(|(rel, _)| rel == &p.rel_path) {
-                files.push((p.rel_path.clone(), p.size));
+            if !files.iter().any(|f| f.rel == p.rel_path) {
+                // 计划内、源上已消失:留在清单里让引擎显式记失败,绝不静默漏拷
+                files.push(copy::ScannedFile {
+                    rel: p.rel_path.clone(),
+                    size: p.size,
+                    mtime_ns: p.source_mtime_ns,
+                });
             }
         }
         files.sort();
-        return Ok(copy::plan_whole_volume(&files));
+        let plan = copy::plan_whole_volume(&files);
+        // R11:排除口径收紧后,续传老任务时会有一批**以前被排除、现在算素材**的
+        // 文件(点开头的合法素材)第一次进入整卷计划并被拷贝。多拷不是漏拷,但
+        // 用户会看到「已经跑完的任务又冒出新文件」——不解释清楚,他会以为卡被人动过。
+        notice_policy_widened(app, m.planned.iter().map(|p| p.rel_path.as_str()), &plan);
+        persist_refreshed_plan(app, m, project_root, &plan);
+        return Ok(plan);
     }
 
     if m.planned.is_empty() {
@@ -1496,16 +2034,25 @@ fn refresh_resume_plan<R: tauri::Runtime>(
     // 沿用旧 size 会让 manifest 记下与实际内容不符的长度(进度也会失真),
     // 续传下一轮才靠哈希发现问题。失败不阻断续传,但必须可见。
     let scanned = copy::scan_selection(source_root, &selection);
+    notice_scan_skips(app);
     match scanned {
         Ok((fresh, _, _)) => {
-            notice_symlinks_skipped(app);
             let mut resized = 0usize;
+            // 同大小但 mtime 变了 = 内容很可能被换掉(换卡/别人动过源文件)。
+            // 只比 size 的话这种替换完全无声,而它恰恰是最危险的一种
+            let mut retimed = 0usize;
             for p in plan.iter_mut() {
                 if let Some(f) = fresh.iter().find(|f| f.source_rel == p.source_rel) {
                     if f.size != p.size {
                         resized += 1;
-                        p.size = f.size;
+                    } else if p.source_mtime_ns != 0
+                        && f.source_mtime_ns != 0
+                        && f.source_mtime_ns != p.source_mtime_ns
+                    {
+                        retimed += 1;
                     }
+                    p.size = f.size;
+                    p.source_mtime_ns = f.source_mtime_ns;
                 }
             }
             if resized > 0 {
@@ -1517,19 +2064,45 @@ fn refresh_resume_plan<R: tauri::Runtime>(
                     ),
                 );
             }
-            let added = fresh
+            if retimed > 0 {
+                notify::warn(
+                    app,
+                    "copy-resume-content-replaced",
+                    format!(
+                        "所选文件夹里有 {retimed} 个文件大小没变、修改时间却变了——内容很可能被替换过。续传会按内容哈希重新核对,已拷到目的地的旧版本不会被覆盖(会报冲突让你人工裁决);若这不是预期,请核对是否换了卡"
+                    ),
+                );
+            }
+            let added: Vec<&str> = fresh
                 .iter()
                 .filter(|f| !plan.iter().any(|p| p.source_rel == f.source_rel))
-                .count();
-            if added > 0 {
+                .map(|f| f.source_rel.as_str())
+                .collect();
+            if !added.is_empty() {
+                // R11:排除口径从「点开头一律跳过」收紧成明确列举的系统项之后,
+                // **升级前**建的任务续传时会凭空多出一批点开头的文件。不点破的话,
+                // 用户看到的是「卡上多了文件」,第一反应是有人动过这张卡——把他推向
+                // 完全错误的排查方向。所以这一类要单独说清楚是口径变了。
+                let widened = added.iter().filter(|r| has_dot_segment(r)).count();
+                let because = if widened > 0 {
+                    format!(
+                        ";其中 {widened} 个是「.」开头的条目——OCard 升级后不再一律排除点开头的条目(只排除废纸篓、索引这类明确的系统项),所以它们这次才出现,并不是这张卡被人动过"
+                    )
+                } else {
+                    String::new()
+                };
                 notify::warn(
                     app,
                     "copy-resume-new-files",
                     format!(
-                        "所选文件夹里新增了 {added} 个文件,不在本任务开拷时锁定的清单内,本次续传不会拷它们;需要的话请对这些文件另发起一次拷卡"
+                        "所选文件夹里新增了 {} 个文件({}{}),不在本任务开拷时锁定的清单内,本次续传不会拷它们{because};需要的话请对这些文件另发起一次拷卡",
+                        added.len(),
+                        added.iter().take(3).copied().collect::<Vec<_>>().join("、"),
+                        if added.len() > 3 { " 等" } else { "" },
                     ),
                 );
             }
+            persist_refreshed_plan(app, m, project_root, &plan);
         }
         Err(e) => notify::warn(
             app,
@@ -1538,6 +2111,72 @@ fn refresh_resume_plan<R: tauri::Runtime>(
         ),
     }
     Ok(plan)
+}
+
+/// 相对路径里有没有「.」开头的一段(文件名或中间某级目录)。
+/// R11 的口径变化只可能让这类条目凭空出现,用它把「口径变了」和「卡被人动过」
+/// 这两种截然不同的原因分开。
+fn has_dot_segment(rel: &str) -> bool {
+    rel.split('/').any(|s| s.starts_with('.'))
+}
+
+/// 整卷续传时,因排除口径收紧而**新进入计划**的条目的可见告警。
+///
+/// 零静默:这批文件会被真的拷到目的地,任务的文件数和「完成」判定都跟着变。
+/// 老任务的 `planned` 是升级前锁定的,升级后重扫会多出这些条目——必须说清是
+/// OCard 改了口径,不是卡被人动过。
+fn notice_policy_widened<'a, R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    locked: impl Iterator<Item = &'a str>,
+    plan: &[copy::PlannedFile],
+) {
+    let locked: std::collections::HashSet<&str> = locked.collect();
+    let newly: Vec<&str> = plan
+        .iter()
+        .map(|p| p.target_rel.as_str())
+        .filter(|rel| !locked.contains(rel) && has_dot_segment(rel))
+        .collect();
+    if newly.is_empty() {
+        return;
+    }
+    notify::warn(
+        app,
+        "copy-resume-scope-widened",
+        format!(
+            "续传时新纳入了 {} 个「.」开头的条目({}{}),它们**会被拷贝**:OCard 升级后不再一律排除点开头的条目(只排除废纸篓、索引这类明确的系统项),所以它们这次才出现——不是这张卡被人动过。任务进度会因此回退到未完成,拷完再看「可格式化」提示",
+            newly.len(),
+            newly.iter().take(3).copied().collect::<Vec<_>>().join("、"),
+            if newly.len() > 3 { " 等" } else { "" },
+        ),
+    );
+}
+
+/// 把刷新后的计划原子写回清单(planned + completed 一起,同一次 save)。
+///
+/// 落盘失败不阻断续传(引擎每完成一个文件还会再写一次清单),但必须可见:
+/// 清单是审计凭证,写不进去就意味着「事后查到的范围」和「实际拷的范围」可能对不上。
+fn persist_refreshed_plan<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    m: &mut manifest::CopyManifest,
+    project_root: &Path,
+    plan: &[copy::PlannedFile],
+) {
+    let refreshed: Vec<manifest::PlannedFile> =
+        plan.iter().map(manifest::PlannedFile::from_plan).collect();
+    if refreshed == m.planned {
+        return; // 一个字没变,不必重写
+    }
+    m.planned = refreshed;
+    // 计划变了就还没跑完:`completed` 必须跟着回落,否则会留下
+    // 「清单说完成了、里面却有未验证项」的自相矛盾状态
+    m.completed = false;
+    if let Err(e) = manifest::save(project_root, m) {
+        notify::warn(
+            app,
+            "copy-resume-manifest-not-persisted",
+            format!("续传前刷新的文件清单未能写回拷卡清单(审计记录可能与实际拷贝范围不一致): {e}"),
+        );
+    }
 }
 
 /// 启动时从各项目未完成的 manifest 重建 paused 任务(评审 H3/P0-3):
@@ -1634,6 +2273,8 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
                         source_rel: e.rel_path.clone(),
                         target_rel: e.rel_path.clone(),
                         size: e.size,
+                        // 旧格式清单没有 mtime 基线,0 = 「无从比对」
+                        source_mtime_ns: 0,
                     })
                     .collect()
             } else {

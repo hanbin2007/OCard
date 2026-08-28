@@ -235,6 +235,15 @@ pub struct StartCopyInput {
     /// (相对卷根、`/` 分隔;空串代表卷根自身)。
     #[serde(default)]
     pub source_folders: Vec<String>,
+    /// 双确认屏拿到的 `SourcePlanDto.planDigest`,原样回传。
+    ///
+    /// 用户批准的是那一刻的清单 L1,真正执行的是重扫得到的 L2:窗口内换卡、
+    /// 别的进程写入、文件被删都会让两者不同(被删的已确认文件直接从新计划里
+    /// 消失,剩下的照样能 all_verified)。缺失时的策略见 `start_copy_task`:
+    /// **按文件夹拷必须带**,整卷(source_folders 为空)才豁免——不许 fail-open
+    /// 成整卷。
+    #[serde(default)]
+    pub plan_digest: Option<String>,
 }
 
 /// 拷卡源里的一个可勾选文件夹(`list_source_folders`)。
@@ -266,6 +275,19 @@ pub struct SourcePlanDto {
     pub total_bytes: u64,
     /// **只含被改写的**;没有重名时为空数组
     pub renamed_files: Vec<RenamedFileDto>,
+    /// 被**系统项名单**排除的条目数(R11:`.Trashes`/`.fseventsd`/
+    /// `System Volume Information` 等明确列举的东西;点开头的素材不再被排除)。
+    /// 可见化的理由:它们不在本次范围内,却完全不影响 all_verified——
+    /// 用户据此说「本卡可格式化」就会丢东西。
+    ///
+    /// 字段名沿用 `hiddenSkipped`(语义已从「隐藏项」改为「系统项」):改名会
+    /// 当场打断并行开发的前端。**前端文案需同步改口径**——见契约文档「系统项」一节。
+    pub hidden_skipped: u64,
+    /// 上述条目的前几条路径(样例)
+    pub hidden_samples: Vec<String>,
+    /// 本次计划的绑定令牌:前端原样回传给 `start_copy_task`。**对前端不透明**。
+    /// 后端重扫后比对,不一致 = 卡上内容在双确认之后变了,返回 `PLAN_CHANGED:`。
+    pub plan_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

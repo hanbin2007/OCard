@@ -1,8 +1,13 @@
 /**
- * 分类工作台的纯逻辑（PRD §5.4 键盘驱动分类）。
+ * 分类工作台的逻辑层（PRD §5.4 键盘驱动分类）。
  *
- * 这里只有纯函数：选区模型、快捷键映射、待删清单状态机。
+ * 主体是纯函数：选区模型、快捷键映射、待删清单状态机、动作受理闸门。
  * 组件负责渲染与 IPC，判断逻辑全部在这里，便于单测锁死行为。
+ *
+ * 末尾一节「键盘可达性」是**唯一**碰 DOM 的部分（焦点圈定 / 事件目标判定）。
+ * 它放这里而不是各组件里各写一份，是因为网格、连拍组全屏层、大图、速查表
+ * 四处必须遵守**同一套**规则——分散实现过一次，结果是四处规则各不相同，
+ * Tab 从大图跑到背后的网格、Enter 在按钮上被快捷键劫持这类问题就是这么来的。
  */
 
 import type { SortingCategory } from "../api/types";
@@ -557,4 +562,233 @@ export function filterByJudgement<
     default:
       return assets;
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * 动作受理闸门（零静默的落点）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 打标类动作的「受理结果」。
+ *
+ * 存在的理由是一次真实事故：`busy` / `deliveryWorking` 时底层函数直接
+ * `return`，调用方却已经把大图/画廊的光标推到了下一张——界面表现得
+ * 一模一样，用户于是相信刚才那张已经分好类/精选/标删了，实际什么都没发生。
+ * 从此打标动作一律返回本类型：**被拒必须带 code + 原因**，调用方据此
+ * ① 发一条用户看得见的通知，② 绝不前进光标。
+ */
+export type ActionOutcome =
+  | { accepted: true }
+  | { accepted: false; code: string; reason: string };
+
+export type SortingActionKind = "assign" | "curate" | "mark" | "unmark";
+
+const ACTION_VERB: Record<SortingActionKind, string> = {
+  assign: "分类",
+  curate: "精选",
+  mark: "标删",
+  unmark: "取消标删",
+};
+
+export interface ActionGate {
+  /** 已选定项目（没有项目就没有作用对象） */
+  hasProject: boolean;
+  /** 上一批分类/精选的 IPC 还在飞 */
+  busy: boolean;
+  /** 交付打包进行中：同一批文件不能边打包边被挪走 */
+  deliveryWorking: boolean;
+  /** 待删清单正在提交进回收站（trashAssets 在飞） */
+  committing: boolean;
+  /** 本次动作解析出的目标数 */
+  targetCount: number;
+  /** 目标里已经在待删清单上的张数（只有 mark / unmark 用得上） */
+  markedCount?: number;
+}
+
+/**
+ * 这一下能不能被接受。
+ *
+ * 口径上刻意不对称的一条：**取消标删（U）在交付打包期间照样放行**。
+ * 打包期禁的是「把文件挪走 / 新增删除意图」，而 U 只会让待删清单变短，
+ * 不碰任何文件；把它一并锁住只会制造一个「误标了却撤不掉」的死角。
+ */
+export function gateAction(
+  kind: SortingActionKind,
+  gate: ActionGate,
+): ActionOutcome {
+  const verb = ACTION_VERB[kind];
+  if (!gate.hasProject) {
+    return {
+      accepted: false,
+      code: "sorting-action-no-project",
+      reason: `还没有选中项目，${verb}没有作用对象。`,
+    };
+  }
+  if (gate.targetCount === 0) {
+    return {
+      accepted: false,
+      code: "sorting-action-no-target",
+      reason:
+        `没有选中任何素材，${verb}落空了。` +
+        `先用方向键移动光标或点一格选中，再按这个键。`,
+    };
+  }
+  if (gate.deliveryWorking && kind !== "unmark") {
+    return {
+      accepted: false,
+      code: "sorting-action-delivery-locked",
+      reason:
+        `交付打包进行中，${verb}已暂时禁用（避免同一批文件边打包边被挪走）。` +
+        `这一下没有生效，等打包结束再按一次。`,
+    };
+  }
+  if (gate.committing && (kind === "mark" || kind === "unmark")) {
+    return {
+      accepted: false,
+      code: "sorting-action-commit-busy",
+      reason: `待删清单正在提交进回收站，此刻不能改标记。这一下没有生效，稍候再按。`,
+    };
+  }
+  if (gate.busy && (kind === "assign" || kind === "curate")) {
+    return {
+      accepted: false,
+      code: "sorting-action-busy",
+      reason:
+        `上一批${verb}还没落定，这一下没有被接受（不是已经做完了）。` +
+        `等格子刷新后再按——连按会丢操作。`,
+    };
+  }
+  if (kind === "unmark" && gate.markedCount === 0) {
+    return {
+      accepted: false,
+      code: "sorting-action-not-marked",
+      reason:
+        "这些素材本来就没有标删，U 不会改变任何东西。" +
+        "（U 只负责撤回标删；要标删请按 D。）",
+    };
+  }
+  if (
+    kind === "mark" &&
+    gate.markedCount !== undefined &&
+    gate.markedCount === gate.targetCount
+  ) {
+    return {
+      accepted: false,
+      code: "sorting-action-already-marked",
+      reason: "这些素材已经全部在待删清单里了，这一下没有新增任何标记。",
+    };
+  }
+  return { accepted: true };
+}
+
+/* ------------------------------------------------------------------ *
+ * 键盘可达性（本文件唯一碰 DOM 的一节）
+ * ------------------------------------------------------------------ */
+
+/** 事件目标像不像「正在输入文字」的地方。用 duck typing，不依赖 DOM 全局。 */
+export function isTextEntryTarget(target: unknown): boolean {
+  const el = target as { tagName?: unknown; isContentEditable?: unknown } | null;
+  if (!el || typeof el.tagName !== "string") return false;
+  const tag = el.tagName.toUpperCase();
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+  return el.isContentEditable === true;
+}
+
+/**
+ * 焦点落在原生可交互元素上时，Enter / 空格是**它自己的**语义。
+ *
+ * 少了这一条的后果是实测过的：Tab 到「重试」「全选」「上一张」按钮上按回车，
+ * 父容器（或大图的 document capture 监听）把它解释成「预览 / 收起大图」并
+ * `preventDefault`，按钮**完全不执行**——键盘用户被挡在按钮外面。
+ */
+export function isNativeActivationTarget(target: unknown, key: string): boolean {
+  // "Spacebar" 是老 Edge/IE 的 key 值，一并认下不吃亏
+  if (key !== "Enter" && key !== " " && key !== "Spacebar") return false;
+  const el = target as {
+    tagName?: unknown;
+    getAttribute?: (name: string) => string | null;
+  } | null;
+  if (!el || typeof el.tagName !== "string") return false;
+  const tag = el.tagName.toUpperCase();
+  if (tag === "BUTTON" || tag === "SUMMARY" || tag === "OPTION") return true;
+  const attr =
+    typeof el.getAttribute === "function" ? el.getAttribute.bind(el) : null;
+  if (tag === "A" && attr && attr("href") !== null) return true;
+  const role = attr ? attr("role") : null;
+  return (
+    role === "button" ||
+    role === "link" ||
+    role === "menuitem" ||
+    role === "menuitemcheckbox" ||
+    role === "checkbox" ||
+    role === "switch" ||
+    role === "tab" ||
+    role === "option"
+  );
+}
+
+/**
+ * 这一击键要不要让给事件目标自己处理。
+ * 输入类目标一律全让（所有键）；可交互元素只让 Enter / 空格。
+ */
+export function shouldYieldShortcut(target: unknown, key: string): boolean {
+  return isTextEntryTarget(target) || isNativeActivationTarget(target, key);
+}
+
+/** 焦点圈定用的可聚焦元素选择器（顺序即 Tab 顺序：querySelectorAll 按文档序返回） */
+const FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  '[tabindex]:not([tabindex="-1"])',
+].join(",");
+
+export function focusablesIn(container: HTMLElement): HTMLElement[] {
+  return Array.from(
+    container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
+  ).filter((el) => el.getAttribute("aria-hidden") !== "true");
+}
+
+/**
+ * 全屏浮层的焦点圈定（focus trap）。
+ *
+ * `aria-modal="true"` 只是**说**自己是模态，浏览器不会因此拦住 Tab。
+ * 不圈定的实际后果：Tab 几下焦点就跑到层背后的网格/按钮上，而此时 Esc
+ * 又被浮层的键盘流吃掉——用户被困在一个看得见却操作不了的界面里。
+ *
+ * 只接管**边界**上的那一下（首项 Shift+Tab、末项 Tab、焦点不在层内），
+ * 中间位置原样交给浏览器原生 Tab 顺序，避免自己实现一套有出入的顺序。
+ * 返回 true 表示已接管，调用方应 `preventDefault()`。
+ */
+export function trapTabFocus(
+  container: HTMLElement | null,
+  event: { key: string; shiftKey?: boolean },
+): boolean {
+  if (event.key !== "Tab" || !container) return false;
+  const items = focusablesIn(container);
+  if (items.length === 0) {
+    // 层里没有可聚焦子元素：焦点留在层本身，别让它溜到背后
+    container.focus();
+    return true;
+  }
+  const active =
+    typeof document !== "undefined"
+      ? (document.activeElement as HTMLElement | null)
+      : null;
+  const index = active ? items.indexOf(active) : -1;
+  if (index < 0) {
+    (event.shiftKey ? items[items.length - 1] : items[0]).focus();
+    return true;
+  }
+  if (event.shiftKey && index === 0) {
+    items[items.length - 1].focus();
+    return true;
+  }
+  if (!event.shiftKey && index === items.length - 1) {
+    items[0].focus();
+    return true;
+  }
+  return false;
 }

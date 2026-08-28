@@ -456,6 +456,15 @@ export function getCopyTask(taskId: string): Promise<CopyTask | null> {
 /** 双确认通过后发起拷卡；返回创建出的任务 */
 export function startCopyTask(input: StartCopyInput): Promise<CopyTask> {
   if (IS_TAURI) return ipc("start_copy_task", { input });
+  // mock 也守同一条契约：按文件夹拷必须带双确认屏的绑定令牌，
+  // 缺了就拒——绝不悄悄放行成整卷（后端同此，见 start_copy_task）
+  if ((input.sourceFolders?.length ?? 0) > 0 && !input.planDigest) {
+    return Promise.reject(
+      new Error(
+        "按文件夹拷卡必须带上双确认屏返回的 planDigest（缺少它就无法确认你批准的范围与改名清单还成立）",
+      ),
+    );
+  }
   const template = mockCopyTasks[0];
   const volume = mockVolumes.find((v) => v.id === input.volumeId);
   const camera = mockCameras.find((c) => c.id === input.cameraId);
@@ -473,6 +482,8 @@ export function startCopyTask(input: StartCopyInput): Promise<CopyTask> {
     targetFolder: buildCopyTargetFolder(prefix, camera?.code ?? ""),
     note: input.note,
     tags: [...input.tags],
+    // 「拷完能不能说本卡可格式化」的唯一判据，必须跟着任务走
+    sourceFolders: [...(input.sourceFolders ?? [])],
     destinations: input.destinations.map((d, i) => ({
       id: nextId(`d${i}`),
       kind: d.kind,
@@ -569,6 +580,9 @@ export function listSourceFolders(volumeId: string): Promise<SourceFolder[]> {
  * 进双确认屏时调用。`folders` 为空 = 整卷（整卷保留原层级，不会撞名，
  * `renamedFiles` 恒为空）。它与 `previewCopyTask` 是两件事：那个解析
  * **落盘路径**，这个回答**拷多少、谁被改名**，不许合成一个命令。
+ *
+ * 返回的 `planDigest` 是这次批准的绑定令牌，发起拷卡时必须原样回传；
+ * 后端重扫后比对不上会返回 `PLAN_CHANGED:`（卡上内容在确认之后变了）。
  */
 export function planSourceSelection(
   volumeId: string,

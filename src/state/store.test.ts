@@ -223,6 +223,154 @@ describe("reducer", () => {
     ).toMatch(/本卡可格式化/);
   });
 
+  /**
+   * ★ 判据统一（E7）：`[""]` 是「只勾了卷根」——**部分拷贝**。
+   *
+   * 它长得像空、像「什么都没选」，但语义是「只拷卷根的直接子文件」，
+   * `DCIM/` 底下的素材一个都不会被拷走。这条判据此前在 store / audit /
+   * 拷卡屏各写一遍，任何一处把它读成整卷，那张卡就会被告知「可格式化」。
+   */
+  it("★ 只勾了卷根（sourceFolders 为 [\"\"]）也是部分拷贝，不许说可格式化", () => {
+    const rootOnly = { ...runningTask, sourceFolders: [""] };
+    const done = reducer(
+      { ...initialState, tasks: [rootOnly] },
+      { type: "taskProgress", event: progressEvent({ revision: 2, state: "done" }) },
+    );
+    const notice = done.notices.find((n) => n.code === "copy-task-done");
+    expect(notice?.message).toMatch(/请勿格式化/);
+    expect(notice?.message).not.toMatch(/本卡可格式化/);
+    // 范围要说得出口:直接 join 会写成一段空白,用户第二天对账时无从判断
+    expect(notice?.message).toContain("（卷根）");
+  });
+
+  it("★ 范围读不出（不是数组）时按最保守处理，绝不放绿灯", () => {
+    // 类型上不该发生,但 DTO 来自另一进程:读不懂时替它担保「整卷」正是要防的事
+    const broken = {
+      ...runningTask,
+      sourceFolders: "DCIM" as unknown as string[],
+    };
+    const done = reducer(
+      { ...initialState, tasks: [broken] },
+      { type: "taskProgress", event: progressEvent({ revision: 2, state: "done" }) },
+    );
+    const notice = done.notices.find((n) => n.code === "copy-task-done");
+    expect(notice?.message).toMatch(/请勿格式化/);
+    expect(notice?.message).not.toMatch(/本卡可格式化/);
+    // 也不能编一句「所选 0 个文件夹」
+    expect(notice?.message).not.toContain("0 个文件夹");
+  });
+
+  /**
+   * ★ 完成通知不许跨卡折叠。
+   *
+   * 折叠原本只比 `code + level`:任务 A、B 先后完成时,B 的正文覆盖了 A 的条目,
+   * 却保留着 A 的 taskId——用户看到 B 的「请勿格式化」,点「查看任务」进的是 A,
+   * 据此格式化的是另一张卡。不可逆。
+   */
+  it("★ 完成通知不跨卡折叠:正文与「查看任务」必须指向同一张卡", () => {
+    const wholeCard = { ...runningTask, id: "t-a", volumeName: "CFE-01" };
+    const partialCard = {
+      ...runningTask,
+      id: "t-b",
+      volumeName: "SD-06",
+      sourceFolders: ["DCIM/100MSDCF"],
+    };
+    const seeded = { ...initialState, tasks: [wholeCard, partialCard] };
+
+    const afterA = reducer(seeded, {
+      type: "taskProgress",
+      event: progressEvent({ taskId: "t-a", revision: 2, state: "done" }),
+    });
+    const afterB = reducer(afterA, {
+      type: "taskProgress",
+      event: progressEvent({ taskId: "t-b", revision: 2, state: "done" }),
+    });
+
+    const dones = afterB.notices.filter((n) => n.code === "copy-task-done");
+    expect(dones).toHaveLength(2);
+    // 每条通知的正文都必须说的是它自己指向的那张卡
+    for (const entry of dones) {
+      const task = afterB.tasks.find((t) => t.id === entry.taskId);
+      expect(task, `通知的 taskId=${entry.taskId} 找不到任务`).toBeDefined();
+      expect(entry.message).toContain(task!.volumeName);
+      const partial = (task!.sourceFolders?.length ?? 0) > 0;
+      expect(/请勿格式化/.test(entry.message)).toBe(partial);
+      // 各自成条,没有被折叠成 ×2
+      expect(entry.count).toBe(1);
+    }
+  });
+
+  /**
+   * 同一条的双投递靠 `code@occurredAt` 认；两张卡在同一秒拷完(并行拷卡是常态)
+   * 时这个键会撞车,第二张卡的完成通知会被整条当成重复丢掉。
+   */
+  it("★ 两张卡同一时刻拷完:两条通知都要在,不许被去重吞掉一条", () => {
+    const seeded = {
+      ...initialState,
+      tasks: [
+        { ...runningTask, id: "t-a", volumeName: "CFE-01" },
+        { ...runningTask, id: "t-b", volumeName: "SD-06" },
+      ],
+    };
+    const sameMoment = "2026-08-24T10:00:01+08:00";
+    const afterA = reducer(seeded, {
+      type: "taskProgress",
+      event: progressEvent({
+        taskId: "t-a",
+        revision: 2,
+        state: "done",
+        occurredAt: sameMoment,
+      }),
+    });
+    const afterB = reducer(afterA, {
+      type: "taskProgress",
+      event: progressEvent({
+        taskId: "t-b",
+        revision: 2,
+        state: "done",
+        occurredAt: sameMoment,
+      }),
+    });
+    const dones = afterB.notices.filter((n) => n.code === "copy-task-done");
+    expect(dones.map((n) => n.taskId).sort()).toEqual(["t-a", "t-b"]);
+  });
+
+  it("同一条通知的双投递仍然只算一条（去重没被上一条改坏）", () => {
+    const dto = {
+      level: "warning" as const,
+      code: "audit-outbox",
+      message: "审计日志暂存本机。",
+      occurredAt: "2026-08-24T10:00:00+08:00",
+    };
+    const once = reducer(initialState, { type: "noticeReceived", notice: dto });
+    const twice = reducer(once, { type: "noticeReceived", notice: dto });
+    expect(twice.notices).toHaveLength(1);
+    expect(twice.notices[0].count).toBe(1);
+  });
+
+  it("不带任务的同 code 告警照旧折叠计数，没被上一条改坏", () => {
+    const once = reducer(initialState, {
+      type: "noticeReceived",
+      notice: {
+        level: "warning",
+        code: "audit-outbox",
+        message: "审计日志暂存本机。",
+        occurredAt: "2026-08-24T10:00:00+08:00",
+      },
+    });
+    const twice = reducer(once, {
+      type: "noticeReceived",
+      notice: {
+        level: "warning",
+        code: "audit-outbox",
+        message: "审计日志暂存本机。",
+        occurredAt: "2026-08-24T10:00:30+08:00",
+      },
+    });
+    expect(twice.notices).toHaveLength(1);
+    expect(twice.notices[0].count).toBe(2);
+  });
+
   it("快照对账补出的终态同样出声,但新任务快照不算", () => {
     const seeded = { ...initialState, tasks: [runningTask] };
     const viaSnapshot = reducer(seeded, {
@@ -384,6 +532,69 @@ describe("reducer", () => {
     expect(started.tasks[0].copiedBytes).toBe(60);
     expect(started.tasks[0].progressRevision).toBe(6);
     expect(started.orphanProgress["t-1"]).toBeUndefined();
+    // 缓存里是 running,没跨越终态:不该无中生有地出声
+    expect(started.notices).toHaveLength(0);
+  });
+
+  /**
+   * ★ 拷得很快的卡:终态事件在 startCopy 返回前就到了,被存进 orphanProgress,
+   * 再在 taskStarted 里被安静消费掉——taskProgress 那条出声的路径整个被绕过,
+   * 全应用对「这张卡能不能格式化」一声不吭。
+   */
+  it("★ 终态事件早于 taskStarted 返回时,消费缓存也要出声", () => {
+    const buffered = reducer(initialState, {
+      type: "taskProgress",
+      event: progressEvent({ taskId: "t-1", revision: 6, state: "done", copiedBytes: 100 }),
+    });
+    // 这一刻还不认识这个任务,只能先缓存,没法出声
+    expect(buffered.notices).toHaveLength(0);
+
+    const started = reducer(buffered, { type: "taskStarted", task: runningTask });
+    expect(started.tasks[0].state).toBe("done");
+    const notice = started.notices.find((n) => n.code === "copy-task-done");
+    expect(notice).toBeDefined();
+    expect(notice?.taskId).toBe("t-1");
+    expect(notice?.projectId).toBe(runningTask.projectId);
+    expect(notice?.live).toBe(true);
+    expect(notice?.message).toMatch(/本卡可格式化/);
+  });
+
+  it("★ 同上,失败也要出声(error 级,须确认)", () => {
+    const buffered = reducer(initialState, {
+      type: "taskProgress",
+      event: progressEvent({ taskId: "t-1", revision: 6, state: "failed" }),
+    });
+    const started = reducer(buffered, { type: "taskStarted", task: runningTask });
+    const notice = started.notices.find((n) => n.code === "copy-task-failed");
+    expect(notice?.level).toBe("error");
+    expect(notice?.taskId).toBe("t-1");
+  });
+
+  it("★ 部分拷贝在这条路径上同样说「请勿格式化」", () => {
+    const buffered = reducer(initialState, {
+      type: "taskProgress",
+      event: progressEvent({ taskId: "t-1", revision: 6, state: "done" }),
+    });
+    const started = reducer(buffered, {
+      type: "taskStarted",
+      task: { ...runningTask, sourceFolders: ["DCIM/100MSDCF"] },
+    });
+    expect(
+      started.notices.find((n) => n.code === "copy-task-done")?.message,
+    ).toMatch(/请勿格式化/);
+  });
+
+  it("startCopy 返回时就已是终态(拷完才返回)同样出声", () => {
+    const started = reducer(initialState, {
+      type: "taskStarted",
+      task: { ...runningTask, state: "done" as const },
+    });
+    expect(started.notices.some((n) => n.code === "copy-task-done")).toBe(true);
+  });
+
+  it("正常发起的任务不会平白多出一条完成通知", () => {
+    const started = reducer(initialState, { type: "taskStarted", task: runningTask });
+    expect(started.notices).toHaveLength(0);
   });
 
   it("监听建立失败经通知中心呈现（不再是一次性横幅）", () => {

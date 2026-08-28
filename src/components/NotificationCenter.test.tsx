@@ -187,6 +187,74 @@ describe("通知中心", () => {
     ]);
   });
 
+  /**
+   * ★ 任务级通知按卡分桶。
+   *
+   * 折叠原本只比 `code + level`:任务 A、B 先后完成时,B 的正文覆盖到 A 的条目上,
+   * 但 taskId 留的还是 A。用户读到 B 的「请勿格式化」,点「查看任务」进的却是 A,
+   * 据此格式化的就是另一张卡——不可逆。同 code 不同卡本来就是两件事,不是刷屏。
+   */
+  it("★ 两张卡的完成通知各自成条，不会折叠成一条", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    send(
+      notice({
+        level: "info",
+        code: "copy-task-done",
+        message: "「CFE-01」校验 100% 通过，本卡可格式化（请在相机内格式化）。",
+        occurredAt: "2026-08-24T10:00:00+08:00",
+        taskId: "t-a",
+        projectId: mockProjects[0].id,
+      }),
+    );
+    send(
+      notice({
+        level: "info",
+        code: "copy-task-done",
+        message:
+          "「SD-06」所选 2 个文件夹校验 100% 通过。本次是部分拷贝，卡上其余内容尚未备份——请勿格式化。",
+        occurredAt: "2026-08-24T10:00:20+08:00",
+        taskId: "t-b",
+        projectId: mockProjects[0].id,
+      }),
+    );
+
+    await user.click(screen.getByTestId("notice-bell"));
+    const items = screen
+      .getAllByTestId("notice-item")
+      .filter((el) => el.getAttribute("data-code") === "copy-task-done");
+    expect(items).toHaveLength(2);
+    // 没有被折叠计数:两条都是 ×1(界面上不出现 ×2)
+    for (const item of items) {
+      expect(within(item).queryByTestId("notice-count")).toBeNull();
+      // 每条都带自己的「查看任务」入口
+      expect(within(item).getByTestId("notice-goto-task")).toBeDefined();
+    }
+    // 两张卡的结论一正一反,必须都还在
+    const text = items.map((el) => el.textContent ?? "").join("|");
+    expect(text).toContain("本卡可格式化");
+    expect(text).toContain("请勿格式化");
+  });
+
+  it("同一张卡的完成通知重复投递仍只算一条", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+    const dto = notice({
+      level: "info" as const,
+      code: "copy-task-done",
+      message: "「CFE-01」校验 100% 通过，本卡可格式化（请在相机内格式化）。",
+      occurredAt: "2026-08-24T10:00:00+08:00",
+      taskId: "t-a",
+    });
+    send(dto);
+    send(dto);
+
+    await user.click(screen.getByTestId("notice-bell"));
+    expect(screen.getAllByTestId("notice-item")).toHaveLength(1);
+    expect(screen.queryByTestId("notice-count")).toBeNull();
+  });
+
   it("error 用 role=alert，warning 用 aria-live=polite", async () => {
     render(<App preloaded={preloaded} />);
 

@@ -93,6 +93,128 @@ thread_local! {
     /// 而进程级全局计数会被并发的另一次扫描抢走——浏览文件夹时顺手偷走拷卡的
     /// 跳过数,拷卡那条告警就静默消失了,正是零静默要堵的洞。
     static SCAN_SYMLINKS_SKIPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// 扫描期排除的**系统项**(计数 + 前几条路径)。
+    ///
+    /// R11:排除口径已从「以点开头一律跳过」收紧成 [`SYSTEM_ITEM_NAMES`] 明确列举
+    /// (理由见那里)。但即便排除的东西再确定不是素材,也必须报到用户面前:
+    /// 配上「整卷 100% 完成 → 本卡可格式化」这句话,静默排除等于引导用户
+    /// 格式化掉没备份的东西。
+    static SCAN_SYSTEM_SKIPPED: std::cell::RefCell<(u64, Vec<String>)> =
+        const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
+/// 可见化告警里最多留几条样例路径(够用户认出「哦是系统残留」即可)。
+const SYSTEM_SAMPLE_CAP: usize = 5;
+
+/// 扫描时排除的**系统项**:明确列举,逐条给理由。
+///
+/// R11 裁决:这是**备份工具**。此前的「以点开头一律跳过」是形状判据,会把卡上
+/// 合法的素材(某些机型的 `.clip.mov`、被误设隐藏属性的素材、用户自建的隐藏
+/// 素材夹)整个挡在计划之外,而整卷任务照样报 100% 完成并给出「本卡可格式化」
+/// 的信号——**漏拷却报成功**是这个工具最不能接受的失败形态。可见告警只能缓解,
+/// 不能替代拷对。所以只排除下面这些「确定不是素材」的东西,其余点开头的条目照拷。
+///
+/// 每一项都写成 [`target_name_key`] 归一后的形态(NFC + 全小写):exFAT/APFS 上
+/// `.ds_store` 与 `.DS_Store` 是同一个文件,比对必须大小写不敏感,不能按字节比。
+/// `system_item_names_are_already_normalized` 这个测试守住这条不变式——写了个
+/// 大写条目却永不命中,是最难发现的一类失效。
+const SYSTEM_ITEM_NAMES: &[&str] = &[
+    // ---- macOS 在卷上留下的系统目录/文件:全是操作系统自己的记账,没有素材 ----
+    ".trashes",                // `.Trashes`:卷级废纸篓,里面是用户**已经删掉**的东西
+    ".fseventsd",              // `.fseventsd`:FSEvents 文件系统事件日志数据库
+    ".spotlight-v100",         // `.Spotlight-V100`:Spotlight 索引数据库
+    ".temporaryitems",         // `.TemporaryItems`:系统临时文件暂存区
+    ".documentrevisions-v100", // `.DocumentRevisions-V100`:文档版本(自动保存)数据库
+    ".ds_store",               // `.DS_Store`:Finder 记的窗口大小/图标位置,纯显示设置
+    // ---- Windows 在卡上留下的系统目录:不以点开头,但性质完全一样,同表维护 ----
+    "system volume information", // 卷影副本/索引服务的元数据;常带 ACL 读不动
+    "$recycle.bin",              // 回收站(Vista 之后)
+    "recycler",                  // 回收站(XP 时代;老卡格式化后还留着这个名字)
+    "thumbs.db",                 // 资源管理器的缩略图缓存
+    "desktop.ini",               // 文件夹显示设置(图标/名称),纯显示配置
+    // ---- NAS / 网络共享上的记账目录 ----
+    // 本名单同时被交付打包(`core::packaging`)复用,它扫的是 NAS 上的项目目录。
+    // 卡上不会有这些名字,NAS 上却遍地都是——不列举就会被打进交付包。
+    "@eadir",        // 群晖为每个文件建的元数据/缩略图目录
+    ".@__thumb",     // 群晖缩略图缓存目录
+    ".appledouble",  // netatalk(AFP/SMB 共享)存放资源分支的目录
+    ".appledb",      // netatalk 的 AFP 数据库
+    ".appledesktop", // netatalk 的 AFP 桌面数据库
+    ".apdisk",       // macOS 写在共享卷根的 AFP/Time Machine 卷配置
+];
+
+/// 前缀式的系统项:名字带可变尾巴,只能按前缀认。同样是归一后(NFC + 全小写)的形态。
+///
+/// 前缀是**不得已**才用的——它比精确列举更容易误伤,所以只有下面这几条,且每条的
+/// 命名空间都明确属于某个系统/本工具,不会和相机产出的文件名撞上。
+const SYSTEM_ITEM_PREFIXES: &[&str] = &[
+    // `._DSC0001.JPG`:AppleDouble 伴生文件。macOS 往非 HFS 卷(exFAT 卡)写文件时,
+    // 把资源分支与扩展属性拆出来存进 `._` + 原名 的文件里。它是**伴生元数据**、
+    // 不是素材本体,拷到目的地也没有对应语义,只会凭空多出一堆同名影子文件。
+    "._",
+    // `.ocard-volume-id`(卡身份指纹)、`.ocard`(项目元数据目录)——本工具自己的落盘。
+    // 不排除的话,同一张卡第二次拷会把上次写下的指纹当素材拷进目标夹。
+    ".ocard",
+    // `.Trash-1000`:freedesktop.org 规范的按 uid 分的回收站,Linux 机器在可移动卷上
+    // 删文件时生成。同样是「用户已经删掉的东西」。
+    ".trash-",
+    // `.smbdeleteAAA0f4a.4`:SMB 上删除一个仍被打开的文件时,服务端先把它改成这个
+    // 名字挂着。它是**已经被删掉**的东西的残骸,不是素材。
+    ".smbdelete",
+    // `.nfs0000000000e1a3`:NFS 的 silly-rename,语义同上。
+    ".nfs",
+];
+
+/// 后缀式的系统项:**本工具自己在 NAS 项目目录里落下的半截文件**。名字前半段是
+/// 用户的文件名或一个 uuid(可变),身份只写在尾巴上,只能按后缀认。
+///
+/// 为什么必须列进来(R12):这两种临时名是「写入先落临时名、回读校验通过再改名」
+/// 这套零覆盖写法的**设计产物**——NAS 断连/断电时它们**按设计**留在项目目录里,
+/// 内容是**不完整的**。而这份名单同时被交付打包(`core::packaging`)和分类计数
+/// (`core::sorting`)复用:不排除的话,一个半截文件会被算进分类计数,更糟的是
+/// 被原样打进交付包发给客户——**交付一个截断的文件**比漏掉它还坏。
+///
+/// 卡上不会出现这两种名字(相机只写 `.MP4`/`.JPG`/`.ARW`),所以放进共享名单
+/// 不会误伤拷卡侧;而落点占用这个命名空间本来就被规划期的保留字检查挡着
+/// (见 [`target_name_key`] 的注释),口径是一致的。
+const SYSTEM_ITEM_SUFFIXES: &[&str] = &[
+    // `CLIP0001.MP4.<task_tag>.ocardpart`:拷卡引擎的写入临时名(见 `PART_SUFFIX`)。
+    ".ocardpart",
+    // `.<uuid>.curatepart`:精选复制(`core::sorting::curate_assets`)的落地临时名。
+    // 它就落在「精选/待修」里,而「待修」正是分类计数与「待修→已修」流转提示
+    // 扫描的目录——不排除会让计数在复制过程中跳动、崩溃后永久多出一个幽灵。
+    ".curatepart",
+];
+
+/// 这个目录项是不是「确定不是素材」的系统项(见 [`SYSTEM_ITEM_NAMES`])。
+///
+/// 三处扫描(整卷递归 `walk`、列可勾选文件夹 `collect_folders`、列直接子文件
+/// `list_direct_files`)共用这**一份**口径:各写一份迟早会分叉,而分叉的后果是
+/// 「选择器里看得见、拷贝时却不拷」或反之,两种都是静默漏拷。
+///
+/// 交付打包(`core::packaging`)也复用它:拷卡既然把 `.clip.mov` 拷进了素材夹,
+/// 打包时再按别的口径把它筛掉,就是在交付环节静默漏掉一个素材。
+///
+/// R12 起 NAS 侧的三条路径也共用它——分类计数(`core::sorting::count_files`)、
+/// 转码取源(`commands::transcode_cmds`)、成片校验与流转提示
+/// (`commands::finalcut_cmds`)。它们此前各写一份「以点开头一律跳过」,
+/// 于是 `.clip.mov` 拷得进 NAS、在分类界面看得见、能被移进交付目录,
+/// 却转不了码、算不进计数、进不了成片校验——**看得见却处理不了**的静默不一致。
+///
+/// **判据是按「名字」比的,不是按路径。** 调用方必须把它用在**扫描起点的每一级
+/// 目录项名**上:项目自身的 `.ocard/`(清单、日志、回收站、分析缓存)不落在上面
+/// 那几条路径的扫描起点之下(它们分别扎在「N. 分类夹」「2. 原始素材」「6. 成片」
+/// 「精选/待修|已修」里,`.ocard` 是项目根的同级兄弟),这是第一道保证;
+/// 万一将来有人把扫描起点上提到项目根,`SYSTEM_ITEM_PREFIXES` 里的 `.ocard`
+/// 是第二道。两道都在,才敢说项目元数据不会被当素材打进交付包。
+pub(crate) fn is_system_item(name: &str) -> bool {
+    // 大小写/Unicode 归一走 target_name_key(与落点撞名判定同一把尺子):
+    // 卡上是 `.DS_Store` 还是 `.ds_store`,在 exFAT/APFS 上都是同一个东西
+    let key = target_name_key(name);
+    SYSTEM_ITEM_NAMES.contains(&key.as_str())
+        || SYSTEM_ITEM_PREFIXES.iter().any(|p| key.starts_with(p))
+        || SYSTEM_ITEM_SUFFIXES.iter().any(|s| key.ends_with(s))
 }
 
 fn note_symlink_skipped() {
@@ -102,6 +224,33 @@ fn note_symlink_skipped() {
 /// 取走本线程扫描期的符号链接跳过数(取走即清零)。
 pub fn take_scan_symlinks_skipped() -> u64 {
     SCAN_SYMLINKS_SKIPPED.with(|c| c.replace(0))
+}
+
+/// 记一条被排除的系统项(`rel` 相对卷根,目录也算一条)。
+fn note_system_item_skipped(rel: String) {
+    SCAN_SYSTEM_SKIPPED.with(|c| {
+        let mut c = c.borrow_mut();
+        c.0 += 1;
+        if c.1.len() < SYSTEM_SAMPLE_CAP {
+            c.1.push(rel);
+        }
+    });
+}
+
+/// 取走本线程扫描期排除的系统项(总数, 前几条路径);取走即清零。
+pub fn take_scan_system_skipped() -> (u64, Vec<String>) {
+    SCAN_SYSTEM_SKIPPED.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// 把取走的计数放回去(调用方需要先读一眼再由统一的告警出口取走时用)。
+/// 只在计数已被清空时放回,避免把两次扫描的数字叠加成假数。
+pub fn restore_scan_system_skipped(v: (u64, Vec<String>)) {
+    SCAN_SYSTEM_SKIPPED.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0 == 0 {
+            *c = v;
+        }
+    });
 }
 
 /// 源选择:整盘,或卡内若干文件夹(只取各自的**直接子文件**,不递归)。
@@ -153,6 +302,29 @@ impl SourceSelection {
     }
 }
 
+/// 扫描到的一个源文件。
+///
+/// `mtime_ns` 是「同大小、内容被替换」的唯一廉价判据(哈希要把整盘读一遍):
+/// 暂停期间有人换了卡或改了文件,尺寸常常一模一样,只有时间戳会动。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScannedFile {
+    /// 相对卷根,`/` 分隔
+    pub rel: String,
+    pub size: u64,
+    /// mtime 的纳秒表示;取不到按 0(退化为「无身份信息」,不阻断)
+    pub mtime_ns: u128,
+}
+
+impl ScannedFile {
+    fn new(rel: String, meta: &fs::Metadata) -> Self {
+        Self {
+            rel,
+            size: meta.len(),
+            mtime_ns: super::media::mtime_nanos(meta),
+        }
+    }
+}
+
 /// 一个待拷文件:源相对路径(相对卷根)与它在目标夹里的落点。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedFile {
@@ -161,6 +333,9 @@ pub struct PlannedFile {
     /// 目标夹内的相对落点。扁平化后通常就是文件名;重名时按下述规则加前缀
     pub target_rel: String,
     pub size: u64,
+    /// 规划时刻源文件的 mtime(纳秒;0 = 未知/老清单)。持久化后用于发现
+    /// 「同大小但内容被换掉」——只比 size 的话这种替换完全无声。
+    pub source_mtime_ns: u128,
 }
 
 /// 因重名而被改写落点的文件(必须让用户看见——系统改了文件名,不许静默)
@@ -171,15 +346,213 @@ pub struct RenamedFile {
 }
 
 /// 整卷清单 → 计划项:源即目标,保留原目录结构(历史行为)。
-pub fn plan_whole_volume(files: &[(String, u64)]) -> Vec<PlannedFile> {
+pub fn plan_whole_volume(files: &[ScannedFile]) -> Vec<PlannedFile> {
     files
         .iter()
-        .map(|(rel, size)| PlannedFile {
-            source_rel: rel.clone(),
-            target_rel: rel.clone(),
-            size: *size,
+        .map(|f| PlannedFile {
+            source_rel: f.rel.clone(),
+            target_rel: f.rel.clone(),
+            size: f.size,
+            source_mtime_ns: f.mtime_ns,
         })
         .collect()
+}
+
+/// 计划摘要的版本前缀。口径变了就换版本号:老令牌会被判成「无法识别」并要求
+/// 重新确认(fail-closed),而不是被误判成「没变」。
+const PLAN_DIGEST_PREFIX: &str = "ocard-plan-v2";
+
+/// 计划摘要:把「用户在双确认屏批准的到底是哪一份计划」压成一个可回传的短串。
+///
+/// R5:批准的是 L1、执行的是重扫得到的 L2,窗口内换卡/别的进程写入/文件被删
+/// 都会让两者不同——被删的已确认文件从新计划里消失后,剩下的照样能
+/// `all_verified = true`。
+///
+/// **形态是分段的**(`ocard-plan-v2:<卷>:<文件集>:<修改时间>`),对前端仍是一个
+/// 不透明字符串原样回传,但后端比对时能按段定位**变化原因**:
+/// - `<卷>` = 卷身份(挂载点 + 卷名 + 卡指纹)——识别「换了一张卡」;
+/// - `<文件集>` = 规范化并排序后的源选择 + 排序后的 `(source_rel, target_rel, size)`
+///   三元组——识别「增删/改大小/落点被重新规划/勾选范围变了」;
+/// - `<修改时间>` = 排序后的 `(source_rel, source_mtime_ns)`——识别
+///   **同大小、内容被替换**,这正是 size-only 摘要漏掉的那一类,而它在换卡场景里
+///   完全可能发生。令牌的全部意义是「你批准的就是将要执行的」,漏掉这一类就白立了。
+///
+/// 分段不是为了让前端解析,而是为了让报错说得出**对的**原因:
+/// 「多了 3 个文件」和「有 2 个文件被改动过」指向完全不同的排查方向。
+pub fn plan_digest(
+    selection: &SourceSelection,
+    plan: &[PlannedFile],
+    volume_identity: &str,
+) -> String {
+    let mut vol = xxhash_rust::xxh3::Xxh3::new();
+    vol.update(b"volume\0");
+    vol.update(volume_identity.as_bytes());
+
+    let mut set = xxhash_rust::xxh3::Xxh3::new();
+    // 选择排序后再喂:同一批夹子换个勾选顺序不该判成「计划变了」
+    let mut folders = selection.to_folders();
+    folders.sort();
+    set.update(b"selection\0");
+    for f in &folders {
+        set.update(f.as_bytes());
+        set.update(b"\0");
+    }
+    set.update(b"\nfiles\0");
+    let mut items: Vec<(&str, &str, u64)> = plan
+        .iter()
+        .map(|p| (p.source_rel.as_str(), p.target_rel.as_str(), p.size))
+        .collect();
+    items.sort();
+    for (src, dst, size) in items {
+        set.update(src.as_bytes());
+        set.update(b"\0");
+        set.update(dst.as_bytes());
+        set.update(b"\0");
+        set.update(size.to_string().as_bytes());
+        set.update(b"\n");
+    }
+
+    // mtime 原值(含「取不到 = 0」)照喂:两次扫描相隔几秒、走的是同一段代码同一个
+    // 文件系统,取不到就两次都取不到,不会因此抖动。`diff_plans` 那边逐条比对时
+    // 才需要「一侧为 0 就不算数」的保守判据(点名一个其实没变的文件是纯误报)。
+    let mut mt = xxhash_rust::xxh3::Xxh3::new();
+    mt.update(b"mtimes\0");
+    let mut times: Vec<(&str, u128)> = plan
+        .iter()
+        .map(|p| (p.source_rel.as_str(), p.source_mtime_ns))
+        .collect();
+    times.sort();
+    for (src, ns) in times {
+        mt.update(src.as_bytes());
+        mt.update(b"\0");
+        mt.update(ns.to_string().as_bytes());
+        mt.update(b"\n");
+    }
+
+    format!(
+        "{PLAN_DIGEST_PREFIX}:{:016x}:{:016x}:{:016x}",
+        vol.digest(),
+        set.digest(),
+        mt.digest()
+    )
+}
+
+/// 令牌对不上时的**原因**定性。报错必须说对原因——说错原因比不说更糟,
+/// 会把人引向错误的排查方向(去数文件 vs 去找是谁动了卡)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanChange {
+    /// 两份摘要逐段相同
+    None,
+    /// 令牌不是本版本的形态:老客户端缓存的旧令牌,或回传路上被改写
+    Unrecognized,
+    /// 源卷身份变了 = 不是确认时的那张卡(优先级最高:换卡能解释后面所有差异)
+    Volume,
+    /// 文件集变了:增/删/大小变/落点重新规划/勾选范围变了
+    FileSet,
+    /// 文件集一模一样,只有修改时间变了 = 同大小、内容被替换
+    ContentReplaced,
+}
+
+/// 逐段比对两份摘要,定位变化原因。`approved` 是前端回传的、`fresh` 是现算的。
+pub fn classify_plan_change(approved: &str, fresh: &str) -> PlanChange {
+    let parse = |s: &str| -> Option<[String; 3]> {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() != 4 || parts[0] != PLAN_DIGEST_PREFIX {
+            return None;
+        }
+        Some([
+            parts[1].to_string(),
+            parts[2].to_string(),
+            parts[3].to_string(),
+        ])
+    };
+    // 任一侧形态不对都判「无法识别」:现算的那份形态不对说明代码自身出了问题,
+    // 这种时候更不能放行(fail-closed)
+    let (Some(a), Some(b)) = (parse(approved), parse(fresh)) else {
+        return PlanChange::Unrecognized;
+    };
+    if a[0] != b[0] {
+        PlanChange::Volume
+    } else if a[1] != b[1] {
+        PlanChange::FileSet
+    } else if a[2] != b[2] {
+        PlanChange::ContentReplaced
+    } else {
+        PlanChange::None
+    }
+}
+
+/// 两份计划的逐条差异(全部以 `source_rel` 点名——用户要在卡上找的是它)。
+///
+/// 只有摘要的话,报错只能说出「哪一类变了」;要说出「多了哪几个」还得有确认时
+/// 的那份计划。差异分类彼此互斥,一个文件只会落进一个桶。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PlanDiff {
+    /// 确认之后卡上多出来的
+    pub added: Vec<String>,
+    /// 确认时有、现在从卡上消失了的
+    pub removed: Vec<String>,
+    /// 还在,但大小变了
+    pub resized: Vec<String>,
+    /// 还在、大小也一样,但落点被重新规划了(多半是新出现的同名文件改了前缀)
+    pub retargeted: Vec<String>,
+    /// 还在、大小一样、落点一样,只有修改时间变了 —— 同大小内容被替换
+    pub retimed: Vec<String>,
+}
+
+impl PlanDiff {
+    /// 文件集层面有没有变(增/删/大小/落点)。
+    pub fn file_set_changed(&self) -> bool {
+        !self.added.is_empty()
+            || !self.removed.is_empty()
+            || !self.resized.is_empty()
+            || !self.retargeted.is_empty()
+    }
+
+    /// 一处差异都没有(此时摘要若仍不同,差异只可能来自卷身份或勾选范围)。
+    pub fn is_empty(&self) -> bool {
+        !self.file_set_changed() && self.retimed.is_empty()
+    }
+}
+
+/// 逐条比对「确认时的计划」与「现在重扫出来的计划」。
+pub fn diff_plans(approved: &[PlannedFile], fresh: &[PlannedFile]) -> PlanDiff {
+    use std::collections::{HashMap, HashSet};
+    let old: HashMap<&str, &PlannedFile> = approved
+        .iter()
+        .map(|p| (p.source_rel.as_str(), p))
+        .collect();
+    let mut d = PlanDiff::default();
+    for f in fresh {
+        match old.get(f.source_rel.as_str()) {
+            None => d.added.push(f.source_rel.clone()),
+            Some(o) if o.size != f.size => d.resized.push(f.source_rel.clone()),
+            Some(o) if o.target_rel != f.target_rel => d.retargeted.push(f.source_rel.clone()),
+            // mtime 只在两侧都取得到时才算数:取不到按 0,把「读不到时间」判成
+            // 「内容被换了」是纯误报
+            Some(o)
+                if o.source_mtime_ns != 0
+                    && f.source_mtime_ns != 0
+                    && o.source_mtime_ns != f.source_mtime_ns =>
+            {
+                d.retimed.push(f.source_rel.clone())
+            }
+            Some(_) => {}
+        }
+    }
+    let now: HashSet<&str> = fresh.iter().map(|p| p.source_rel.as_str()).collect();
+    for o in approved {
+        if !now.contains(o.source_rel.as_str()) {
+            d.removed.push(o.source_rel.clone());
+        }
+    }
+    // 报文里的样例必须稳定可复现(同一次拒绝重试两遍不该点名不同的文件)
+    d.added.sort();
+    d.removed.sort();
+    d.resized.sort();
+    d.retargeted.sort();
+    d.retimed.sort();
+    d
 }
 
 /// 一个可勾选的源文件夹(相对卷根,`/` 分隔;空串 = 卷根自身)。
@@ -191,6 +564,15 @@ pub struct SourceFolder {
     pub total_bytes: u64,
     /// 是否还有子目录(子目录自身另有独立条目)
     pub has_subfolders: bool,
+}
+
+/// 把父目录相对路径与条目名拼成相对卷根的路径(父为空串 = 卷根)。
+fn join_rel(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
 }
 
 /// 把 `/` 分隔的相对路径接到根上(空串 = 根自身)。
@@ -229,9 +611,11 @@ fn dir_error(rel: &str, dir: &Path, e: &std::io::Error) -> super::CoreError {
     super::CoreError::Invalid(msg)
 }
 
-/// 列文件夹时读不动的目录(相机卡上常见:Windows 格式化留下的
-/// `System Volume Information`/`$RECYCLE.BIN` 带 ACL)。
-/// 不让它废掉整个选择器,但**必须**逐条报到用户面前。
+/// 列文件夹时读不动的目录(权限/ACL 问题)。不让它废掉整个选择器,但**必须**
+/// 逐条报到用户面前——残缺的文件夹列表比报错更危险。
+///
+/// (Windows 格式化留下的 `System Volume Information`/`$RECYCLE.BIN` 从 R11 起
+/// 由系统项白名单在打开之前就排除,不会走到这里变成噪声告警。)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadableFolder {
     pub rel_path: String,
@@ -241,11 +625,10 @@ pub struct UnreadableFolder {
 /// 列出卷内可勾选的文件夹(含卷根 `""`)。排序:`rel_path` 字典序,卷根恒第一。
 /// 只列**含直接子文件**或**含已列出子目录**的,纯空目录树不列——勾了也拷不出
 /// 东西,还会把真正的素材夹淹在噪声里。
-/// 隐藏项与符号链接与拷贝口径一致:一律跳过,链接计数供上层告警。
+/// 系统项与符号链接与拷贝口径一致:一律跳过(见 [`is_system_item`]),计数供上层告警。
 ///
 /// 卷根读不动 = 硬错(吞成空列表会被读成「卡是空的」);**子目录**读不动只跳过
-/// 该子树,连同原因一起回给调用方去告警——一个带 ACL 的
-/// `System Volume Information` 不该让整张卡选不了。
+/// 该子树,连同原因一起回给调用方去告警——一个带 ACL 的目录不该让整张卡选不了。
 pub fn list_source_folders(root: &Path) -> Result<(Vec<SourceFolder>, Vec<UnreadableFolder>)> {
     let mut out = Vec::new();
     let mut bad = Vec::new();
@@ -273,7 +656,8 @@ fn collect_folders(
         let entry = entry.map_err(|e| dir_error(rel, &dir, &e))?;
         let name = entry.file_name();
         let name = name.to_string_lossy().to_string();
-        if name.starts_with('.') {
+        if is_system_item(&name) {
+            note_system_item_skipped(join_rel(rel, &name));
             continue;
         }
         let ft = entry.file_type().map_err(|e| dir_error(rel, &dir, &e))?;
@@ -283,11 +667,7 @@ fn collect_folders(
         }
         let meta = entry.metadata().map_err(|e| dir_error(rel, &dir, &e))?;
         if meta.is_dir() {
-            subs.push(if rel.is_empty() {
-                name
-            } else {
-                format!("{rel}/{name}")
-            });
+            subs.push(join_rel(rel, &name));
         } else if meta.is_file() {
             file_count += 1;
             total_bytes += meta.len();
@@ -317,15 +697,16 @@ fn collect_folders(
 }
 
 /// 列出某个文件夹下的**直接子文件**(不递归)。规则与 `walk` 一致:
-/// 跳过隐藏项与符号链接。
-fn list_direct_files(root: &Path, folder: &str) -> Result<Vec<(String, u64)>> {
+/// 跳过系统项([`is_system_item`])与符号链接。
+fn list_direct_files(root: &Path, folder: &str) -> Result<Vec<ScannedFile>> {
     let dir = rel_join(root, folder);
     let mut out = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|e| dir_error(folder, &dir, &e))? {
         let entry = entry.map_err(|e| dir_error(folder, &dir, &e))?;
         let name = entry.file_name();
         let name = name.to_string_lossy().to_string();
-        if name.starts_with('.') {
+        if is_system_item(&name) {
+            note_system_item_skipped(join_rel(folder, &name));
             continue;
         }
         let ft = entry.file_type().map_err(|e| dir_error(folder, &dir, &e))?;
@@ -337,12 +718,7 @@ fn list_direct_files(root: &Path, folder: &str) -> Result<Vec<(String, u64)>> {
         if !meta.is_file() {
             continue;
         }
-        let rel = if folder.is_empty() {
-            name
-        } else {
-            format!("{folder}/{name}")
-        };
-        out.push((rel, meta.len()));
+        out.push(ScannedFile::new(join_rel(folder, &name), &meta));
     }
     Ok(out)
 }
@@ -355,33 +731,36 @@ fn list_direct_files(root: &Path, folder: &str) -> Result<Vec<(String, u64)>> {
 /// 与 `101MSDCF_DSC1.JPG`;若两侧目录名也相同则继续向上取一段。
 /// 加完前缀仍与**别的组**撞名时补 `_2`、`_3`(见函数内的全局唯一性兜底)。
 ///
-/// 撞名判定按 [`fold_key`] 大小写不敏感:目的地常是 APFS/exFAT/SMB,
-/// `DSC1.JPG` 与 `dsc1.jpg` 在那儿是同一个文件——按字节比较会规划出两个
-/// 「不冲突」的落点,拷到第二个时才炸(或同内容时静默并成一个)。
+/// 撞名判定按 [`target_name_key`](大小写 + Unicode NFC 归一):目的地常是
+/// APFS/exFAT/SMB,`DSC1.JPG` 与 `dsc1.jpg`、NFC 的 `é.mov` 与 NFD 的 `é.mov`
+/// 在那儿都是同一个文件——按字节比较会规划出两个「不冲突」的落点,拷到第二个
+/// 时才炸(或同内容时静默并成一个,两个源最终只剩一个目录项)。
 ///
 /// 排序稳定(按 source_rel),保证同一次选择的规划结果可复现——
 /// manifest 与断点续传依赖 target_rel 稳定。
-pub fn plan_flat_targets(files: &[(String, u64)]) -> (Vec<PlannedFile>, Vec<RenamedFile>) {
+pub fn plan_flat_targets(files: &[ScannedFile]) -> (Vec<PlannedFile>, Vec<RenamedFile>) {
     use std::collections::{HashMap, HashSet};
 
-    let mut by_name: HashMap<String, Vec<&String>> = HashMap::new();
-    for (rel, _) in files {
+    let mut by_name: HashMap<String, Vec<&str>> = HashMap::new();
+    for f in files {
         by_name
-            .entry(fold_key(base_name(rel)))
+            .entry(target_name_key(base_name(&f.rel)))
             .or_default()
-            .push(rel);
+            .push(&f.rel);
     }
 
     let mut planned = Vec::with_capacity(files.len());
 
-    for (rel, size) in files {
+    for f in files {
+        let rel = &f.rel;
         let base = base_name(rel);
-        let group = &by_name[&fold_key(base)];
+        let group = &by_name[&target_name_key(base)];
         if group.len() == 1 {
             planned.push(PlannedFile {
                 source_rel: rel.clone(),
                 target_rel: base.to_string(),
-                size: *size,
+                size: f.size,
+                source_mtime_ns: f.mtime_ns,
             });
             continue;
         }
@@ -398,7 +777,7 @@ pub fn plan_flat_targets(files: &[(String, u64)]) -> (Vec<PlannedFile>, Vec<Rena
                 if odirs.len() < depth {
                     return true;
                 }
-                fold_key(&odirs[odirs.len() - depth..].join("_")) != fold_key(&prefix)
+                target_name_key(&odirs[odirs.len() - depth..].join("_")) != target_name_key(&prefix)
             });
             target = candidate;
             if unique {
@@ -408,27 +787,38 @@ pub fn plan_flat_targets(files: &[(String, u64)]) -> (Vec<PlannedFile>, Vec<Rena
         planned.push(PlannedFile {
             source_rel: rel.clone(),
             target_rel: target,
-            size: *size,
+            size: f.size,
+            source_mtime_ns: f.mtime_ns,
         });
     }
 
     planned.sort_by(|a, b| a.source_rel.cmp(&b.source_rel));
 
-    // 全局唯一性兜底:同名分组各自算前缀,**跨组**仍可能撞车——
-    // 例如卡根本来就有个 `100MSDCF_DSC1.JPG`,而 `100MSDCF/DSC1.JPG`
-    // 恰好被改写成同一个名字。两个源规划到同一落点 = 后者覆盖前者,
-    // 绝不允许。先把「一个字没改」的原名占住(不冲突的名字优先级最高),
-    // 被改写的再撞上就补 `_2`、`_3`。
-    let mut taken: HashSet<String> = planned
-        .iter()
-        .filter(|p| p.target_rel == base_name(&p.source_rel))
-        .map(|p| fold_key(&p.target_rel))
-        .collect();
-    for p in planned.iter_mut() {
-        if p.target_rel == base_name(&p.source_rel) {
-            continue;
+    // ---- 全局唯一性兜底 ----
+    // 分组各自算前缀只保证**组内**唯一,跨组仍可能撞车(卡根本来就有个
+    // `100MSDCF_DSC1.JPG`,而 `100MSDCF/DSC1.JPG` 恰好被改写成同名);
+    // 更隐蔽的是**没有目录层级可加**的那些(卷根下的 `DSC1.JPG` 与 `dsc1.jpg`):
+    // 它们分在同一组、`for depth in 1..=0` 一次都不跑,两者都保留原名 → 折叠后同键。
+    //
+    // 因此兜底必须覆盖**全部**项,不能像旧实现那样把「一个字没改」的直接 continue
+    // ——那些项永不参与冲突消解,规划器会安静地产出两个同键落点,任务开拷即被
+    // 引擎预检 Err 掉(还报成「清单被篡改」,把规划器的锅甩给用户)。
+    //
+    // 优先级:先让「一个字没改」的原名占位(素材名是相机连号,能不改就不改),
+    // 同名多个时按 source_rel 序第一个留名;其余(含让位者)统一补 `_2`、`_3`,
+    // 并且**必须**进 renamed_files——系统改了名就得明示。
+    let mut taken: HashSet<String> = HashSet::with_capacity(planned.len());
+    let mut needs_suffix: Vec<usize> = Vec::new();
+    for (i, p) in planned.iter().enumerate() {
+        if p.target_rel == base_name(&p.source_rel) && taken.insert(target_name_key(&p.target_rel))
+        {
+            continue; // 原名占位成功,这一项定案
         }
-        if taken.insert(fold_key(&p.target_rel)) {
+        needs_suffix.push(i);
+    }
+    for i in needs_suffix {
+        let p = &mut planned[i];
+        if taken.insert(target_name_key(&p.target_rel)) {
             continue;
         }
         let (stem, ext) = split_ext(&p.target_rel);
@@ -438,7 +828,7 @@ pub fn plan_flat_targets(files: &[(String, u64)]) -> (Vec<PlannedFile>, Vec<Rena
             } else {
                 format!("{stem}_{n}.{ext}")
             };
-            if taken.insert(fold_key(&candidate)) {
+            if taken.insert(target_name_key(&candidate)) {
                 p.target_rel = candidate;
                 break;
             }
@@ -462,11 +852,26 @@ pub(crate) fn base_name(rel: &str) -> &str {
     rel.rsplit('/').next().unwrap_or(rel)
 }
 
-/// 落点撞名比较键:目的地文件系统(APFS/exFAT/SMB)通常大小写不敏感,
-/// 判重必须按同一把尺子,否则「不冲突」的规划会在盘上变成同一个文件。
-/// (Unicode 等价形式 NFC/NFD 的归一未做——没引入依赖;见交回说明。)
-pub(crate) fn fold_key(name: &str) -> String {
-    name.to_lowercase()
+/// 落点身份键(TargetNameKey):判断「这两个落点在目的地上是不是同一个文件」的
+/// **唯一**一把尺子。规划、全计划预检、目标占用检查、`.ocardpart` 保留字检查
+/// 四处必须用同一个函数,任何一处用别的口径都会漏出一个静默覆盖/静默合并的洞。
+///
+/// 两层归一,缺一不可:
+/// - **Unicode NFC**:macOS 上 `é.mov` 可能是 NFC(U+00E9)也可能是 NFD
+///   (`e` + U+0301),两串字节不同,APFS/HFS+ 却视为同一个文件名。不归一就会
+///   规划出两个「不冲突」的落点,内容相同时第二个直接复用第一个的物理文件并
+///   报 all_verified——**两个源最终只剩一个目录项,用户以为都备份了**。
+/// - **大小写折叠**:目的地常是 APFS/exFAT/SMB,`DSC1.JPG` 与 `dsc1.jpg` 同名。
+///
+/// 先 NFC 再小写,末尾再 NFC 一次:少数字符小写后会产生新的可合成序列
+/// (如 `İ` → `i` + U+0307),不补这一步键就不稳定。
+///
+/// 方向:宁可**多判成撞名**(多一次可见改名)也不漏判(静默合并)——
+/// 目的地是字节敏感的 ext4 时会多加一个前缀,代价只是清单上多一行,可接受。
+pub(crate) fn target_name_key(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let nfc: String = name.nfc().collect();
+    nfc.to_lowercase().nfc().collect()
 }
 
 /// 拆主名与扩展名(无扩展名或以点开头时 ext 为空)。
@@ -486,7 +891,7 @@ pub fn scan_selection(
     match selection {
         SourceSelection::WholeVolume => {
             let files = scan_source(root)?;
-            let total = files.iter().map(|(_, s)| *s).sum();
+            let total = files.iter().map(|f| f.size).sum();
             Ok((plan_whole_volume(&files), Vec::new(), total))
         }
         SourceSelection::Folders(folders) => {
@@ -503,7 +908,7 @@ pub fn scan_selection(
             }
             files.sort();
             files.dedup();
-            let total = files.iter().map(|(_, s)| *s).sum();
+            let total = files.iter().map(|f| f.size).sum();
             let (planned, renamed) = plan_flat_targets(&files);
             Ok((planned, renamed, total))
         }
@@ -511,21 +916,33 @@ pub fn scan_selection(
 }
 
 /// 扫描源:递归列出全部普通文件(相对路径统一 `/` 分隔)。
-/// 跳过点开头的隐藏项(存储卡上的 .Trashes/.fseventsd 等系统残留);
-/// 符号链接不跟随(存储卡不产生合法链接),跳过并计数供上层告警。
-pub fn scan_source(root: &Path) -> Result<Vec<(String, u64)>> {
+/// 只跳过明确列举的系统项([`is_system_item`]:`.Trashes`/`.fseventsd`/
+/// `System Volume Information` …),**其余点开头的条目照拷**——卡上的 `.clip.mov`
+/// 是素材,不是垃圾;符号链接不跟随(存储卡不产生合法链接),跳过并计数供上层告警。
+pub fn scan_source(root: &Path) -> Result<Vec<ScannedFile>> {
     let mut out = Vec::new();
     walk(root, root, &mut out)?;
     out.sort();
     Ok(out)
 }
 
-fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> Result<()> {
+/// 把 `dir` 下的条目相对 `root` 表述成 `/` 分隔的相对路径。
+fn rel_of(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn walk(root: &Path, dir: &Path, out: &mut Vec<ScannedFile>) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with('.') {
+        if is_system_item(&name) {
+            note_system_item_skipped(rel_of(root, &entry.path()));
             continue;
         }
         let path = entry.path();
@@ -539,14 +956,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> Result<()> {
         if meta.is_dir() {
             walk(root, &path, out)?;
         } else if meta.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .expect("walk 始终在 root 之下")
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            out.push((rel, meta.len()));
+            out.push(ScannedFile::new(rel_of(root, &path), &meta));
         }
     }
     Ok(())
@@ -643,15 +1053,18 @@ pub fn run_copy(
     // ② 落点不许占用引擎内部的 `.ocardpart` 命名空间:临时文件与正式文件同目录,
     //    别人的正式文件正好叫某项的 part 名时,会被那项的残留清理删掉。
     {
+        // 保留字与判重都走同一把尺子 [`target_name_key`]:目的地大小写/NFC 不敏感时,
+        // `FOO.OCARDPART` 与 `foo.ocardpart` 是同一个名字,只按字节比会漏。
+        let part_key = target_name_key(PART_SUFFIX);
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for p in plan {
-            if p.target_rel.ends_with(PART_SUFFIX) {
+            if target_name_key(&p.target_rel).ends_with(&part_key) {
                 return Err(super::CoreError::Invalid(format!(
                     "清单落点占用了引擎内部临时后缀 {PART_SUFFIX},拒绝执行: {}",
                     p.target_rel
                 )));
             }
-            if !seen.insert(fold_key(&p.target_rel)) {
+            if !seen.insert(target_name_key(&p.target_rel)) {
                 return Err(super::CoreError::Invalid(format!(
                     "清单里有两个文件规划到同一个落点,拒绝执行(会互相覆盖): {}",
                     p.target_rel
@@ -1002,8 +1415,12 @@ fn rel_to_native(rel: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
 
-    fn f(rel: &str) -> (String, u64) {
-        (rel.to_string(), 1)
+    fn f(rel: &str) -> ScannedFile {
+        ScannedFile {
+            rel: rel.to_string(),
+            size: 1,
+            mtime_ns: 0,
+        }
     }
 
     #[test]
@@ -1127,11 +1544,11 @@ mod tests {
     }
 
     #[test]
-    fn scan_skips_hidden_and_sorts() {
+    fn scan_skips_system_items_and_sorts() {
         let tmp = tempdir().unwrap();
         make_card(tmp.path());
         let files = scan_source(tmp.path()).unwrap();
-        let names: Vec<&str> = files.iter().map(|(r, _)| r.as_str()).collect();
+        let names: Vec<&str> = files.iter().map(|f| f.rel.as_str()).collect();
         assert_eq!(
             names,
             vec![
@@ -1501,7 +1918,11 @@ mod review_regression_tests {
         // 复核 P0:计划内文件从源消失(续传场景)必须显式失败,绝不 all_verified
         let (_tmp, req, mut m, project) = setup();
         let mut files = scan_source(&req.source_root).unwrap();
-        files.push(("GONE.MP4".to_string(), 4242));
+        files.push(ScannedFile {
+            rel: "GONE.MP4".to_string(),
+            size: 4242,
+            mtime_ns: 0,
+        });
         files.sort();
 
         let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
@@ -1573,7 +1994,7 @@ mod review_regression_tests {
             .unwrap();
         let files = scan_source(tmp.path()).unwrap();
         assert!(
-            files.iter().all(|(r, _)| !r.contains("LINK")),
+            files.iter().all(|f| !f.rel.contains("LINK")),
             "符号链接不得进入拷贝清单: {files:?}"
         );
         assert!(take_scan_symlinks_skipped() >= 2, "跳过必须计数");
@@ -1590,7 +2011,11 @@ mod review_regression_tests {
         // card/../escape.bin = tmp/escape.bin,真实存在(与清单里的 size 一致)
         fs::write(tmp.path().join("escape.bin"), b"boom").unwrap();
         let mut files = scan_source(&req.source_root).unwrap();
-        files.push(("../escape.bin".into(), 4));
+        files.push(ScannedFile {
+            rel: "../escape.bin".into(),
+            size: 4,
+            mtime_ns: 0,
+        });
         let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
             CopyControl::Continue
         })
@@ -1646,8 +2071,12 @@ mod review_regression_tests {
         )
         .unwrap();
         let mut files = scan_source(&req.source_root).unwrap();
-        assert!(files.iter().all(|(r, _)| r != "ALIAS.MP4"), "扫描已跳过");
-        files.push(("ALIAS.MP4".into(), 9000));
+        assert!(files.iter().all(|f| f.rel != "ALIAS.MP4"), "扫描已跳过");
+        files.push(ScannedFile {
+            rel: "ALIAS.MP4".into(),
+            size: 9000,
+            mtime_ns: 0,
+        });
         let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
             CopyControl::Continue
         })
@@ -1779,7 +2208,11 @@ mod review_regression_tests {
         // 卡上放一个指向卡外的目录链接,清单项穿过它
         std::os::unix::fs::symlink(&outside, req.source_root.join("LINKED")).unwrap();
         let mut files = scan_source(&req.source_root).unwrap();
-        files.push(("LINKED/EVIL.MP4".into(), 64));
+        files.push(ScannedFile {
+            rel: "LINKED/EVIL.MP4".into(),
+            size: 64,
+            mtime_ns: 0,
+        });
         let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
             CopyControl::Continue
         })
@@ -1962,6 +2395,7 @@ mod folder_selection_tests {
             source_rel: "DCIM/101MSDCF/DSC1.JPG".into(),
             target_rel: "偷渡.JPG".into(),
             size: 3000,
+            source_mtime_ns: 0,
         });
         let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
         assert!(
@@ -1983,6 +2417,7 @@ mod folder_selection_tests {
             source_rel: "ROOT.MP4".into(),
             target_rel: "改过的名字.MP4".into(),
             size: 4000,
+            source_mtime_ns: 0,
         }];
         let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
         assert!(matches!(out.files[0].status, FileStatus::Failed(_)));
@@ -1999,6 +2434,7 @@ mod folder_selection_tests {
             source_rel: "ROOT.MP4".into(),
             target_rel: "../逃逸.MP4".into(),
             size: 4000,
+            source_mtime_ns: 0,
         }];
         let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
         assert!(matches!(out.files[0].status, FileStatus::Failed(_)));
@@ -2041,7 +2477,11 @@ mod folder_selection_tests {
     /// 两个源规划到同一落点 = 后者覆盖前者,必须补序号错开。
     #[test]
     fn cross_group_target_collision_never_lands_on_one_file() {
-        let f = |rel: &str| (rel.to_string(), 1u64);
+        let f = |rel: &str| ScannedFile {
+            rel: rel.to_string(),
+            size: 1,
+            mtime_ns: 0,
+        };
         let (planned, renamed) = plan_flat_targets(&[
             f("100MSDCF/DSC1.JPG"),
             f("101MSDCF/DSC1.JPG"),
@@ -2072,7 +2512,11 @@ mod folder_selection_tests {
     ///  「DSC1.JPG → DSC1.JPG」这种没意义还吓人的条目)。
     #[test]
     fn unchanged_name_is_never_reported_as_renamed() {
-        let f = |rel: &str| (rel.to_string(), 1u64);
+        let f = |rel: &str| ScannedFile {
+            rel: rel.to_string(),
+            size: 1,
+            mtime_ns: 0,
+        };
         // 卡根的 DSC1.JPG 与 100MSDCF/DSC1.JPG 同名:根那个没有目录可加,保持原名
         let (planned, renamed) = plan_flat_targets(&[f("DSC1.JPG"), f("100MSDCF/DSC1.JPG")]);
         let root = planned.iter().find(|p| p.source_rel == "DSC1.JPG").unwrap();
@@ -2086,7 +2530,11 @@ mod folder_selection_tests {
     /// 按字节判重会规划出两个「不冲突」的落点,拷到第二个时才炸。
     #[test]
     fn case_only_difference_counts_as_a_clash() {
-        let f = |rel: &str| (rel.to_string(), 1u64);
+        let f = |rel: &str| ScannedFile {
+            rel: rel.to_string(),
+            size: 1,
+            mtime_ns: 0,
+        };
         let (planned, renamed) = plan_flat_targets(&[f("A/DSC1.JPG"), f("B/dsc1.jpg")]);
         let targets: Vec<&str> = planned.iter().map(|p| p.target_rel.as_str()).collect();
         assert_eq!(
@@ -2107,11 +2555,13 @@ mod folder_selection_tests {
                 source_rel: "DCIM/100MSDCF/DSC1.JPG".into(),
                 target_rel: "X.JPG".into(),
                 size: 1000,
+                source_mtime_ns: 0,
             },
             PlannedFile {
                 source_rel: "DCIM/101MSDCF/DSC1.JPG".into(),
                 target_rel: "x.jpg".into(), // 大小写不同 = 同一个落点
                 size: 3000,
+                source_mtime_ns: 0,
             },
         ];
         let e = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap_err();
@@ -2128,6 +2578,7 @@ mod folder_selection_tests {
             source_rel: "ROOT.MP4".into(),
             target_rel: format!("ROOT.MP4.{}{}", req.task_tag, PART_SUFFIX),
             size: 4000,
+            source_mtime_ns: 0,
         }];
         let e = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap_err();
         assert!(e.to_string().contains(PART_SUFFIX), "{e}");
@@ -2142,6 +2593,7 @@ mod folder_selection_tests {
             source_rel: "ROOT.MP4".into(),
             target_rel: r"..\逃逸.MP4".into(),
             size: 4000,
+            source_mtime_ns: 0,
         }];
         assert!(
             req.selection.allows("ROOT.MP4", r"..\逃逸.MP4"),
@@ -2155,23 +2607,32 @@ mod folder_selection_tests {
         );
     }
 
-    /// 零静默 + 可用性:相机卡上常有 Windows 留下的受限目录
-    /// (`System Volume Information`),它不该让整个文件夹选择器不可用,
-    /// 但被跳过的目录必须逐条报出来。
+    /// 零静默 + 可用性:卡上一个读不动的**素材**目录(权限/ACL 问题)不该让整个
+    /// 文件夹选择器不可用,但它必须逐条报出来——不报就等于用户看到一份残缺的
+    /// 文件夹列表却不知情。
+    ///
+    /// R11 起 `System Volume Information` 由系统项白名单在读之前就排除,不再走
+    /// 这条路径(顺带也就不会因为它的 ACL 而产生一条噪声告警),所以这里改用
+    /// 一个真实相机会用的目录名。
     #[cfg(unix)]
     #[test]
     fn unreadable_subdir_is_skipped_and_reported_not_fatal() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempdir().unwrap();
         make_card(tmp.path());
-        let locked = tmp.path().join("System Volume Information");
+        let locked = tmp.path().join("PRIVATE");
         fs::create_dir_all(&locked).unwrap();
         fs::write(locked.join("inside.bin"), b"x").unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // 白名单里的 Windows 目录:同样读不动,但压根不该被打开,更不该报成告警
+        let svi = tmp.path().join("System Volume Information");
+        fs::create_dir_all(&svi).unwrap();
+        fs::set_permissions(&svi, fs::Permissions::from_mode(0o000)).unwrap();
 
         let (list, unreadable) = list_source_folders(tmp.path()).unwrap();
         // 复原权限,别把不可删目录留给 TempDir
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&svi, fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
             list.iter().any(|f| f.rel_path == "DCIM/100MSDCF"),
@@ -2180,9 +2641,9 @@ mod folder_selection_tests {
         assert_eq!(
             unreadable.len(),
             1,
-            "读不动的目录必须报出来: {unreadable:?}"
+            "读不动的目录必须报出来,且白名单里的系统目录不该混进来: {unreadable:?}"
         );
-        assert_eq!(unreadable[0].rel_path, "System Volume Information");
+        assert_eq!(unreadable[0].rel_path, "PRIVATE");
         assert!(!unreadable[0].reason.is_empty());
     }
 
@@ -2193,6 +2654,478 @@ mod folder_selection_tests {
         make_card(tmp.path());
         let e = scan_selection(tmp.path(), &folders(&["../外面"])).unwrap_err();
         assert!(e.to_string().contains("源文件夹路径非法"), "{e}");
+    }
+
+    // ---------------- R3:全局唯一性兜底必须覆盖「没有目录可加」的项 ----------------
+
+    /// R3(必修):卷根下两个折叠后同名的文件(`DSC1.JPG` / `dsc1.jpg`)。
+    ///
+    /// 它们分在同一组、却一级目录都没有可加(`for depth in 1..=0` 一次都不跑),
+    /// 旧实现把「一个字没改」的项直接 `continue`,于是两者都保留原名 → 折叠后同键。
+    /// 后果:`plan_source_selection` 给双确认屏返回「0 个改名」,用户批准;
+    /// `start_copy_task` 写完 manifest、发完审计、起了 worker,`run_copy` 预检当场
+    /// Err,任务直接 failed、一个字节都没拷,报错还是「清单被篡改」——把规划器
+    /// 自己的 bug 甩锅给用户,续传只会再失败一次。
+    ///
+    /// (把兜底改回「原名项 continue」,本测试必红。)
+    #[test]
+    fn root_level_case_clash_gets_suffix_and_is_reported() {
+        let f = |rel: &str| ScannedFile {
+            rel: rel.to_string(),
+            size: 1,
+            mtime_ns: 0,
+        };
+        let (planned, renamed) = plan_flat_targets(&[f("DSC1.JPG"), f("dsc1.jpg")]);
+        let keys: std::collections::HashSet<String> = planned
+            .iter()
+            .map(|p| target_name_key(&p.target_rel))
+            .collect();
+        assert_eq!(
+            keys.len(),
+            planned.len(),
+            "折叠后仍同键 = 两个源规划到同一个落点: {:?}",
+            planned
+                .iter()
+                .map(|p| (&p.source_rel, &p.target_rel))
+                .collect::<Vec<_>>()
+        );
+        // 一个留原名,另一个补序号,并且**必须**出现在改名清单里(系统改了名就得明示)
+        assert_eq!(renamed.len(), 1, "被改名的必须进清单: {renamed:?}");
+        assert!(
+            renamed[0].target_rel.contains("_2"),
+            "让位的那个应补序号: {renamed:?}"
+        );
+    }
+
+    /// R3 同型:整批规划出来的落点**任何时候**都必须两两不同(否则引擎预检会
+    /// 当场 Err 掉整个任务)。这里一次覆盖三种撞法:根同名、跨组撞、连撞两次。
+    #[test]
+    fn planned_targets_are_globally_unique_under_the_name_key() {
+        let f = |rel: &str| ScannedFile {
+            rel: rel.to_string(),
+            size: 1,
+            mtime_ns: 0,
+        };
+        let (planned, renamed) = plan_flat_targets(&[
+            f("A.JPG"),
+            f("a.jpg"),
+            f("a.JPG"),
+            f("100MSDCF/DSC1.JPG"),
+            f("101MSDCF/DSC1.JPG"),
+            f("100MSDCF_DSC1.JPG"),
+            f("100msdcf_dsc1_2.jpg"),
+        ]);
+        let keys: std::collections::HashSet<String> = planned
+            .iter()
+            .map(|p| target_name_key(&p.target_rel))
+            .collect();
+        assert_eq!(
+            keys.len(),
+            planned.len(),
+            "落点必须两两不同: {:?}",
+            planned
+                .iter()
+                .map(|p| p.target_rel.as_str())
+                .collect::<Vec<_>>()
+        );
+        // 改名清单必须与「落盘名 != 原文件名」的集合逐字一致
+        let expected: Vec<&str> = planned
+            .iter()
+            .filter(|p| p.target_rel != base_name(&p.source_rel))
+            .map(|p| p.source_rel.as_str())
+            .collect();
+        let got: Vec<&str> = renamed.iter().map(|r| r.source_rel.as_str()).collect();
+        assert_eq!(got, expected, "改名清单不得漏项");
+    }
+
+    // ---------------- R4:Unicode NFC/NFD 归一 ----------------
+
+    /// `é` 的两种写法:NFC(U+00E9)与 NFD(`e` + U+0301)。
+    const E_NFC: &str = "é.mov";
+    const E_NFD: &str = "e\u{301}.mov";
+
+    /// R4(必修):同一目录下 NFC/NFD 等价的两个名字,在目的地文件系统上是
+    /// **同一个文件名**。不归一就会规划出两个「不冲突」的落点,内容相同时
+    /// 第二个直接复用第一个的物理文件并报 all_verified——两个源最终只剩一个
+    /// 目录项,用户以为都备份了。这是真丢文件。
+    ///
+    /// (把 `target_name_key` 里的 `.nfc()` 去掉,本测试必红。)
+    #[test]
+    fn nfc_and_nfd_equivalent_names_never_land_on_one_target() {
+        assert_ne!(E_NFC, E_NFD, "前置断言:两串字节确实不同");
+        let f = |rel: &str| ScannedFile {
+            rel: rel.to_string(),
+            size: 1,
+            mtime_ns: 0,
+        };
+        let (planned, renamed) = plan_flat_targets(&[f(E_NFC), f(E_NFD)]);
+        assert_eq!(planned.len(), 2);
+        assert_ne!(
+            target_name_key(&planned[0].target_rel),
+            target_name_key(&planned[1].target_rel),
+            "NFC/NFD 等价的两个落点在目的地上是同一个文件: {:?}",
+            planned
+                .iter()
+                .map(|p| p.target_rel.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(renamed.len(), 1, "让位的那个必须进改名清单: {renamed:?}");
+    }
+
+    /// R4:全计划预检也走同一把尺子——清单被改写成 NFC/NFD 两个「不同」落点时,
+    /// 必须在**任何写入之前**拒绝,而不是拷到第二个才静默并成一个。
+    #[test]
+    fn run_copy_precheck_refuses_nfc_nfd_duplicate_targets() {
+        let (_t, req, mut m, project) = setup(folders(&[""]));
+        let plan = vec![
+            PlannedFile {
+                source_rel: "ROOT.MP4".into(),
+                target_rel: E_NFC.into(),
+                size: 4000,
+                source_mtime_ns: 0,
+            },
+            PlannedFile {
+                source_rel: "ROOT.MP4".into(),
+                target_rel: E_NFD.into(),
+                size: 4000,
+                source_mtime_ns: 0,
+            },
+        ];
+        let e = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap_err();
+        assert!(e.to_string().contains("同一个落点"), "{e}");
+        assert!(!req.destinations[0].exists(), "拒绝要发生在任何写入之前");
+    }
+
+    /// R4 真实文件系统:卡上放 NFC/NFD 两个名字后完整跑一遍拷贝。
+    ///
+    /// 源文件系统若把两者视为同一个文件(macOS APFS 的归一不敏感比较),
+    /// 卡上本来就只有一个文件——那也没什么可丢的;只要**源上有几个目录项,
+    /// 目的地就得有几个**,且内容一一对上。旧实现在源可区分的文件系统上
+    /// (Linux ext4)会把两者规划到同一个落点。
+    #[test]
+    fn nfc_nfd_on_real_fs_lands_one_target_per_source_entry() {
+        let tmp = tempdir().unwrap();
+        let card = tmp.path().join("card");
+        fs::create_dir_all(&card).unwrap();
+        fs::write(card.join(E_NFC), vec![1u8; 100]).unwrap();
+        fs::write(card.join(E_NFD), vec![2u8; 100]).unwrap();
+        let source_entries = fs::read_dir(&card).unwrap().count();
+
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let req = CopyRequest {
+            source_root: card,
+            destinations: vec![tmp.path().join("nas/target")],
+            task_tag: "nfc".into(),
+            selection: SourceSelection::Folders(vec![String::new()]),
+        };
+        let mut m = CopyManifest::new("target", "card", "A7M4_A_ZS", "ZS", "");
+        let (plan, _renamed, _) = scan_selection(&req.source_root, &req.selection).unwrap();
+        assert_eq!(plan.len(), source_entries, "计划项数必须等于源目录项数");
+        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(out.all_verified, "{:?}", out.files);
+        assert_eq!(
+            fs::read_dir(&req.destinations[0]).unwrap().count(),
+            source_entries,
+            "源上有几个目录项,目的地就得有几个——少一个就是静默丢文件"
+        );
+    }
+
+    // ---------------- R5:计划摘要 ----------------
+
+    /// 计划摘要必须对「文件被删/被改大小/换了卡/换了勾选范围」全部敏感,
+    /// 对「勾选顺序」不敏感(同一批夹子换个顺序不是「计划变了」)。
+    #[test]
+    fn plan_digest_is_sensitive_to_every_thing_that_matters() {
+        let f = |rel: &str, size: u64| ScannedFile {
+            rel: rel.to_string(),
+            size,
+            mtime_ns: 0,
+        };
+        let sel = folders(&["A", "B"]);
+        let base = plan_flat_targets(&[f("A/x.jpg", 10), f("B/y.jpg", 20)]).0;
+        let d = plan_digest(&sel, &base, "vol-1");
+        assert_eq!(d, plan_digest(&sel, &base, "vol-1"), "同输入必须同摘要");
+        // 勾选顺序无关
+        assert_eq!(d, plan_digest(&folders(&["B", "A"]), &base, "vol-1"));
+        // 文件被删
+        let fewer = plan_flat_targets(&[f("A/x.jpg", 10)]).0;
+        assert_ne!(d, plan_digest(&sel, &fewer, "vol-1"), "少一个文件必须变");
+        // 大小变了(同名同路径)
+        let resized = plan_flat_targets(&[f("A/x.jpg", 11), f("B/y.jpg", 20)]).0;
+        assert_ne!(d, plan_digest(&sel, &resized, "vol-1"), "大小变了必须变");
+        // 换了卡
+        assert_ne!(d, plan_digest(&sel, &base, "vol-2"), "换卡必须变");
+        // 勾选范围变了
+        assert_ne!(
+            d,
+            plan_digest(&folders(&["A"]), &base, "vol-1"),
+            "范围变了必须变"
+        );
+    }
+
+    /// R11:同大小、内容被替换——只有 mtime 会动。这恰恰是 size-only 摘要漏掉的
+    /// 那一类,而它在换卡场景里完全可能发生。令牌的全部意义是「你批准的就是将要
+    /// 执行的」,漏掉这一类就白立了。
+    /// (把 `plan_digest` 里那段 mtime 拿掉,本测试必红。)
+    #[test]
+    fn plan_digest_catches_same_size_content_replacement() {
+        let f = |rel: &str, size: u64, ns: u128| ScannedFile {
+            rel: rel.to_string(),
+            size,
+            mtime_ns: ns,
+        };
+        let sel = folders(&["A"]);
+        let base = plan_flat_targets(&[f("A/x.jpg", 10, 1_000)]).0;
+        let touched = plan_flat_targets(&[f("A/x.jpg", 10, 2_000)]).0;
+        assert_ne!(
+            plan_digest(&sel, &base, "vol-1"),
+            plan_digest(&sel, &touched, "vol-1"),
+            "大小一样、修改时间变了 = 内容可能被换掉,摘要必须变"
+        );
+    }
+
+    /// 报错必须说对**原因**:说错原因比不说更糟,会把人引向错误的排查方向。
+    #[test]
+    fn plan_change_is_classified_by_cause() {
+        let f = |rel: &str, size: u64, ns: u128| ScannedFile {
+            rel: rel.to_string(),
+            size,
+            mtime_ns: ns,
+        };
+        let sel = folders(&["A"]);
+        let base = plan_flat_targets(&[f("A/x.jpg", 10, 1_000)]).0;
+        let d = plan_digest(&sel, &base, "vol-1");
+
+        assert_eq!(classify_plan_change(&d, &d), PlanChange::None);
+        // 换卡:优先于其它一切(换卡能解释后面所有差异)
+        assert_eq!(
+            classify_plan_change(&d, &plan_digest(&sel, &base, "vol-2")),
+            PlanChange::Volume
+        );
+        let more = plan_flat_targets(&[f("A/x.jpg", 10, 1_000), f("A/y.jpg", 20, 1_000)]).0;
+        assert_eq!(
+            classify_plan_change(&d, &plan_digest(&sel, &more, "vol-1")),
+            PlanChange::FileSet
+        );
+        // 只有 mtime 变:必须报「内容被替换」,不能报成「文件被增删」
+        let touched = plan_flat_targets(&[f("A/x.jpg", 10, 2_000)]).0;
+        assert_eq!(
+            classify_plan_change(&d, &plan_digest(&sel, &touched, "vol-1")),
+            PlanChange::ContentReplaced
+        );
+        // 勾选范围变了算文件集变化(报文里再按逐条差异细分)
+        assert_eq!(
+            classify_plan_change(&d, &plan_digest(&folders(&["A", "B"]), &base, "vol-1")),
+            PlanChange::FileSet
+        );
+        // 老版本令牌 / 被改写的令牌:fail-closed,且说得出「认不出这个令牌」
+        assert_eq!(
+            classify_plan_change("deadbeefdeadbeef", &d),
+            PlanChange::Unrecognized
+        );
+        assert_eq!(
+            classify_plan_change("ocard-plan-v1:a:b:c", &d),
+            PlanChange::Unrecognized
+        );
+    }
+
+    /// 逐条差异:每个文件只落进一个桶,报文才说得清「多了几个/少了几个/改了几个」。
+    #[test]
+    fn diff_plans_buckets_each_file_exactly_once() {
+        let p = |src: &str, dst: &str, size: u64, ns: u128| PlannedFile {
+            source_rel: src.to_string(),
+            target_rel: dst.to_string(),
+            size,
+            source_mtime_ns: ns,
+        };
+        let approved = vec![
+            p("A/keep.jpg", "keep.jpg", 1, 100),
+            p("A/gone.jpg", "gone.jpg", 2, 100),
+            p("A/big.jpg", "big.jpg", 3, 100),
+            p("A/moved.jpg", "moved.jpg", 4, 100),
+            p("A/touched.jpg", "touched.jpg", 5, 100),
+            p("A/blind.jpg", "blind.jpg", 6, 0),
+        ];
+        let fresh = vec![
+            p("A/keep.jpg", "keep.jpg", 1, 100),
+            p("A/big.jpg", "big.jpg", 30, 100),
+            p("A/moved.jpg", "A_moved.jpg", 4, 100),
+            p("A/touched.jpg", "touched.jpg", 5, 200),
+            p("A/blind.jpg", "blind.jpg", 6, 999),
+            p("A/new.jpg", "new.jpg", 7, 100),
+        ];
+        let d = diff_plans(&approved, &fresh);
+        assert_eq!(d.added, vec!["A/new.jpg"]);
+        assert_eq!(d.removed, vec!["A/gone.jpg"]);
+        assert_eq!(d.resized, vec!["A/big.jpg"]);
+        assert_eq!(d.retargeted, vec!["A/moved.jpg"]);
+        // blind.jpg 确认时 mtime 读不到(记 0):把「读不到时间」判成「内容被换了」
+        // 是纯误报,不能进桶
+        assert_eq!(d.retimed, vec!["A/touched.jpg"]);
+        assert!(d.file_set_changed());
+        assert!(!diff_plans(&approved, &approved).file_set_changed());
+        assert!(diff_plans(&approved, &approved).is_empty());
+    }
+
+    // ---------------- R11:系统项白名单(取代「点开头一律跳过」) ----------------
+
+    /// 白名单条目必须已经是 `target_name_key` 归一后的形态。
+    /// 写了个大写条目却永不命中,是最难发现的一类失效——那条排除会静默失效,
+    /// 卡上的 `.Trashes` 会被当素材拷进目标夹。
+    #[test]
+    fn system_item_names_are_already_normalized() {
+        for n in SYSTEM_ITEM_NAMES
+            .iter()
+            .chain(SYSTEM_ITEM_PREFIXES)
+            .chain(SYSTEM_ITEM_SUFFIXES)
+        {
+            assert_eq!(
+                &target_name_key(n),
+                n,
+                "白名单条目必须写成归一形态(NFC + 全小写): {n}"
+            );
+        }
+    }
+
+    /// 判据是**明确列举**,不是「以点开头」。
+    /// (把 `is_system_item` 改回 `name.starts_with('.')`,`.clip.mov` 那几条必红。)
+    #[test]
+    fn only_enumerated_system_items_are_excluded() {
+        // 明确列举的:排除
+        for name in [
+            ".Trashes",
+            ".fseventsd",
+            ".Spotlight-V100",
+            ".TemporaryItems",
+            ".DocumentRevisions-V100",
+            ".DS_Store",
+            "._DSC0001.JPG",
+            "System Volume Information",
+            "$RECYCLE.BIN",
+            "Thumbs.db",
+            "desktop.ini",
+            ".ocard-volume-id",
+            ".Trash-1000",
+            // NAS / 网络共享(打包路径复用同一份名单)
+            "@eaDir",
+            ".@__thumb",
+            ".AppleDouble",
+            ".apdisk",
+            ".smbdeleteAAA0f4a.4",
+            ".nfs0000000000e1a3",
+            // R12:本工具自己在 NAS 项目目录里落下的**半截文件**(后缀式)。
+            // 它们内容不完整,既不能算进分类计数,更不能被打进交付包。
+            "CLIP0001.MP4.t7f3a2.ocardpart",
+            ".9f1c0f6e-0000-4000-8000-000000000000.curatepart",
+        ] {
+            assert!(is_system_item(name), "系统项必须排除: {name}");
+        }
+        // 大小写不敏感:exFAT/APFS 上 `.ds_store` 与 `.DS_Store` 是同一个文件,
+        // 按字节比较会漏掉小写写法
+        for name in [
+            ".ds_store",
+            ".DS_STORE",
+            ".trashes",
+            "system volume information",
+            "$Recycle.Bin",
+        ] {
+            assert!(is_system_item(name), "白名单比对必须大小写不敏感: {name}");
+        }
+        // 点开头但**不在**名单上的:一律照拷。漏拷却报成功是这个工具最不能
+        // 接受的失败形态,可见告警替代不了拷对
+        for name in [
+            ".clip.mov",
+            ".DS_Store_backup.mov", // 只是前缀像,不是那个文件
+            ".hidden_素材",         // 用户自建的隐藏素材夹
+            ".Trashesque.mp4",      // 前缀像 .Trashes,但不是它
+            ".spotlight-notes.txt", // 前缀像 .Spotlight-V100,但不是它
+            "@eaDir_备份.mov",      // 只是以那个名字开头,不是那个目录
+            "DSC0001.JPG",
+            // 后缀判据只认结尾:名字里出现这几个词但不以它们收尾的,是素材
+            "ocardpart.mov",
+            "CLIP.ocardpart.MP4",
+            "curatepart.jpg",
+        ] {
+            assert!(!is_system_item(name), "这不是系统项,必须照拷: {name}");
+        }
+    }
+
+    /// 三处扫描共用同一份口径:选择器里看得见的、列直接子文件列得出的、
+    /// 整卷递归扫得到的,必须是同一套判据。分叉 = 「看得见却不拷」或反之。
+    #[test]
+    fn all_three_scans_share_one_whitelist() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("D")).unwrap();
+        fs::create_dir_all(root.join(".Trashes")).unwrap();
+        fs::create_dir_all(root.join(".素材夹")).unwrap();
+        fs::write(root.join(".Trashes/junk"), b"x").unwrap();
+        fs::write(root.join("D/.clip.mov"), b"legit hidden asset").unwrap();
+        fs::write(root.join("D/.DS_Store"), b"junk").unwrap();
+        fs::write(root.join(".素材夹/a.mov"), b"asset").unwrap();
+
+        // ① 整卷递归
+        let whole: Vec<String> = scan_source(root)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.rel)
+            .collect();
+        assert_eq!(
+            whole,
+            vec![".素材夹/a.mov".to_string(), "D/.clip.mov".to_string()],
+            "点开头的素材必须进计划,系统项必须不进"
+        );
+
+        // ② 列直接子文件
+        let direct: Vec<String> = list_direct_files(root, "D")
+            .unwrap()
+            .into_iter()
+            .map(|f| f.rel)
+            .collect();
+        assert_eq!(direct, vec!["D/.clip.mov".to_string()]);
+
+        // ③ 列可勾选文件夹
+        let (folders, _) = list_source_folders(root).unwrap();
+        let rels: Vec<&str> = folders.iter().map(|f| f.rel_path.as_str()).collect();
+        assert!(
+            rels.contains(&".素材夹"),
+            "点开头的素材夹必须能勾选: {rels:?}"
+        );
+        assert!(
+            !rels.contains(&".Trashes"),
+            "废纸篓不该出现在选择器里: {rels:?}"
+        );
+    }
+
+    /// 白名单命中的仍然计数并可见上报(零静默:排除了什么必须报到用户面前)。
+    #[test]
+    fn system_items_are_counted_and_sampled_not_just_silently_dropped() {
+        let tmp = tempdir().unwrap();
+        make_card(tmp.path());
+        fs::create_dir_all(tmp.path().join(".Trashes")).unwrap();
+        fs::write(tmp.path().join(".Trashes/junk"), b"x").unwrap();
+        fs::create_dir_all(tmp.path().join(".Spotlight-V100")).unwrap();
+        fs::write(tmp.path().join(".DS_Store"), b"x").unwrap();
+        fs::write(tmp.path().join(".clip.mov"), b"legit hidden asset").unwrap();
+        let _ = take_scan_system_skipped(); // 清干净上一轮
+        let files = scan_source(tmp.path()).unwrap();
+        assert!(
+            files.iter().any(|f| f.rel == ".clip.mov"),
+            "点开头的合法素材必须进计划: {files:?}"
+        );
+        let (n, samples) = take_scan_system_skipped();
+        // .Trashes(整个目录只算一条,不递归)、.Spotlight-V100、.DS_Store
+        assert_eq!(n, 3, "被排除的系统项必须计数: {n} / {samples:?}");
+        assert!(
+            samples.iter().any(|s| s == ".DS_Store"),
+            "样例里要点得出名字: {samples:?}"
+        );
+        assert!(
+            !samples.iter().any(|s| s == ".clip.mov"),
+            "没被排除的东西不许出现在排除样例里: {samples:?}"
+        );
+        assert_eq!(take_scan_system_skipped().0, 0, "取走即清零");
     }
 
     #[test]

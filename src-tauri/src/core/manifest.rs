@@ -30,6 +30,21 @@ pub struct PlannedFile {
     /// 这个字段,整卷任务也不写它,反序列化后行为与改造前逐字节一致。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_rel: String,
+    /// 规划(或最近一次续传复查)时源文件的 mtime,纳秒;0 = 未知/老清单。
+    ///
+    /// 只比 size 的话「同大小、内容被换掉」完全无声(换了卡、别人动了源文件),
+    /// 时间戳是唯一不用把整盘读一遍就能发现它的判据。老清单里没有这个字段,
+    /// 反序列化为 0 = 「没有基线可比」,只影响能不能发现,不改变拷贝行为。
+    #[serde(default, skip_serializing_if = "is_zero_u128")]
+    pub source_mtime_ns: u128,
+}
+
+fn is_zero_u128(v: &u128) -> bool {
+    *v == 0
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 impl PlannedFile {
@@ -44,6 +59,7 @@ impl PlannedFile {
             } else {
                 p.source_rel.clone()
             },
+            source_mtime_ns: p.source_mtime_ns,
         }
     }
 
@@ -62,6 +78,7 @@ impl PlannedFile {
             source_rel: self.source().to_string(),
             target_rel: self.rel_path.clone(),
             size: self.size,
+            source_mtime_ns: self.source_mtime_ns,
         }
     }
 }
@@ -94,6 +111,17 @@ pub struct CopyManifest {
     /// 事后必须查得到「这个文件原来叫什么、来自哪个文件夹」。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub renamed_files: Vec<super::copy::RenamedFile>,
+    /// 扫描时被**系统项名单**排除的条目数(R7 引入,R11 收紧口径)。
+    /// 现在只排除 `core::copy::SYSTEM_ITEM_NAMES` 明确列举的东西
+    /// (`.Trashes`/`.fseventsd`/`System Volume Information` …);点开头的素材
+    /// (`.clip.mov`、隐藏素材夹)已经不再排除,会照常拷贝。
+    /// 被排除的条目从未进入计划、任务却会报 100%,所以事后必须查得到排除了多少。
+    /// (字段名沿用 `hidden_*`:老清单的反序列化口径不能动。)
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub hidden_skipped: u64,
+    /// 上述条目的前几条路径(样例;完整列表不落盘,量可能很大)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_samples: Vec<String>,
     /// 源卡身份指纹(卡根 .ocard-volume-id);写保护卡为 None,退化为卷名匹配。
     #[serde(default)]
     pub source_uid: Option<String>,
@@ -132,6 +160,8 @@ impl CopyManifest {
             planned: Vec::new(),
             source_selection: Vec::new(),
             renamed_files: Vec::new(),
+            hidden_skipped: 0,
+            hidden_samples: Vec::new(),
             source_uid: None,
             created_at: Utc::now(),
             completed: false,
@@ -344,6 +374,7 @@ mod tests {
             source_rel: "DCIM/100/IMG_0001.JPG".into(),
             target_rel: "DCIM/100/IMG_0001.JPG".into(),
             size: 100,
+            source_mtime_ns: 0,
         })];
         let json = serde_json::to_string(&m).unwrap();
         for key in ["source_rel", "source_selection", "renamed_files"] {
@@ -366,6 +397,7 @@ mod tests {
             source_rel: "DCIM/101MSDCF/DSC1.JPG".into(),
             target_rel: "101MSDCF_DSC1.JPG".into(),
             size: 42,
+            source_mtime_ns: 0,
         })];
         save(tmp.path(), &m).unwrap();
         let loaded = load(tmp.path(), &m.id).unwrap();

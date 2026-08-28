@@ -27,6 +27,12 @@ import {
   IllStorageTarget,
 } from "../components/illustrations";
 import { Badge, EmptyState, Field, ProgressBar } from "../components/ui";
+// 「这次是不是部分拷贝」「范围怎么写」只有一份判据：见 lib/copyScope.ts
+import {
+  copyScopeFolderCount,
+  formatScopeFolders,
+  isPartialCopy,
+} from "../lib/copyScope";
 import {
   formatBytes,
   formatEta,
@@ -74,6 +80,63 @@ interface DestDraft {
   id: string;
   kind: DestinationKind;
   path: string;
+}
+
+/**
+ * 双确认屏的**不可变**草稿。
+ *
+ * 这屏此前直接读当前表单渲染、也直接读当前表单提交，于是有一条能毁素材的时序：
+ * 确认方案 A → 核算期间点「返回修改」→ 改成方案 B → 再进确认，A 那两个还在飞的
+ * `preview`/`plan` 后落地并覆盖 B 的；屏上展示 A 的目标夹、规模与改名清单，
+ * 按下「确认开始」提交的却是**当时的表单**，实际跑的是 B。
+ *
+ * 这直接推翻了本次改动自己的承诺——「加前缀等于系统替用户改了文件名，必须在
+ * 双确认屏明示」。展示的清单不是将要执行的清单，明示就是假的。
+ *
+ * 所以进确认屏的那一刻把表单**冻**成这份草稿：
+ *   ① 屏上渲染的每一项都来自草稿，不再读表单；
+ *   ② `preview`/`plan` 的响应带 `requestId`，对不上一律丢弃；
+ *   ③ 提交只能用草稿，读不到当前表单；
+ *   ④ 「返回修改」/切项目/换卷/预填一律作废旧 requestId，旧响应再也落不进来。
+ */
+interface ConfirmDraft {
+  /** 单调递增的请求版本号：草稿、preview、plan、提交四者靠它对齐 */
+  requestId: number;
+  projectId: string;
+  volumeId: string;
+  volumeName: string;
+  volumeMountPath: string;
+  /** 源卷是不是本机系统盘——确认屏那条红色拦截也必须按草稿说话 */
+  volumeIsSystem: boolean;
+  cameraId: string;
+  cameraCode: string;
+  tags: string[];
+  targetPrefix: string;
+  destinations: Array<{ kind: DestinationKind; path: string }>;
+  /** 空数组 = 整卷（与后端契约一致） */
+  sourceFolders: string[];
+  autoProxy: boolean;
+}
+
+/** preview / plan 的响应都要绑在发起它的那份草稿上 */
+interface Tagged<T> {
+  requestId: number;
+  value: T;
+}
+
+/**
+ * 卡内文件夹清单的扫描结果——**按卷归属**。
+ *
+ * 此前它是三个裸 state（`folders`/`foldersError`/`foldersLoading`）：扫卡 A 时
+ * 切到卡 B，A 的响应照样写进全局，用户在 B 底下看到并勾选的是 A 的目录；
+ * 更糟的是重新打开 B 时会因为 `folders !== null` 而**不再扫描**。
+ * 带上 `volumeId` 之后，属于别的卷的结果连渲染的机会都没有。
+ */
+interface FolderScan {
+  volumeId: string;
+  status: "loading" | "ready" | "error";
+  items: SourceFolder[];
+  error: string | null;
 }
 
 /** 文件明细每页条数 */
@@ -192,13 +255,17 @@ export function CopyTaskScreen() {
    */
   const [sourceMode, setSourceMode] = useState<"whole" | "folders">("whole");
   const [selectedFolders, setSelectedFolders] = useState<string[]>([]);
-  const [folders, setFolders] = useState<SourceFolder[] | null>(null);
-  const [foldersLoading, setFoldersLoading] = useState(false);
-  const [foldersError, setFoldersError] = useState<string | null>(null);
+  /** 文件夹清单按卷归属：别的卷的结果不渲染、也不冒充「已扫过」 */
+  const [folderScan, setFolderScan] = useState<FolderScan | null>(null);
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
-  /** 双确认屏的规模与改名清单（planSourceSelection 的结果） */
-  const [plan, setPlan] = useState<SourcePlan | null>(null);
-  const [planFailed, setPlanFailed] = useState(false);
+  /** 双确认屏的规模与改名清单（planSourceSelection 的结果），绑在草稿上 */
+  const [plan, setPlan] = useState<Tagged<SourcePlan> | null>(null);
+  /** 核算失败的是哪份草稿（失败也会过期：旧草稿的失败不该盖住新草稿的成功） */
+  const [planFailedFor, setPlanFailedFor] = useState<number | null>(null);
+  /** 后端回了 PLAN_CHANGED：卡上内容在确认之后变了，确认屏要显式说明 */
+  const [planChangedFor, setPlanChangedFor] = useState<number | null>(null);
+  /** 后端在 `PLAN_CHANGED:` 后给的具体原因,原样展示(见提交失败处的说明) */
+  const [planChangedCause, setPlanChangedCause] = useState<string>("");
   const [renamesExpanded, setRenamesExpanded] = useState(false);
 
   /**
@@ -224,9 +291,12 @@ export function CopyTaskScreen() {
     if (draft.cameraId && state.cameras.some((c) => c.id === draft.cameraId)) {
       setCameraId(draft.cameraId);
     }
-    setConfirming(false);
+    // 作废在飞的确认请求:预填换了卷,旧草稿的 preview/plan 一律不许再落地
+    nextConfirmId();
+    setConfirmDraft(null);
     setPreview(null);
-    setPreviewFailed(false);
+    setPreviewFailedFor(null);
+    setPlanChangedFor(null);
     setSubmitted(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.copyDraft]);
@@ -251,15 +321,43 @@ export function CopyTaskScreen() {
   const [submitted, setSubmitted] = useState(false);
   /** 工况 A：拷完自动派发代理转码作业（PRD §5.6） */
   const [autoProxy, setAutoProxy] = useState(false);
-  const [confirming, setConfirming] = useState(false);
+  /**
+   * 进入确认屏 = 把表单冻成一份草稿。`null` 就是「不在确认屏」——
+   * 不再另有一个 `confirming` 布尔值,省掉「confirming 为真但草稿是空」这种
+   * 根本不该存在的中间态。
+   */
+  const [confirmDraft, setConfirmDraft] = useState<ConfirmDraft | null>(null);
+  const confirming = confirmDraft !== null;
   const [busy, setBusy] = useState(false);
+  /** 暂停/继续/单文件重试正在飞:按钮置灰,避免连点堆叠 IPC */
+  const [controlBusy, setControlBusy] = useState(false);
 
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
 
   // 后端解析出的真实落盘位置（双确认屏只显示这个，不显示用户填的路径）
-  const [preview, setPreview] = useState<CopyTaskPreview | null>(null);
-  /** 落盘预览失败:面板给静态提示 + 返回修改;具体原因走 toast */
-  const [previewFailed, setPreviewFailed] = useState(false);
+  const [preview, setPreview] = useState<Tagged<CopyTaskPreview> | null>(null);
+  /** 落盘预览失败的是哪份草稿:面板给静态提示 + 返回修改;具体原因走 toast */
+  const [previewFailedFor, setPreviewFailedFor] = useState<number | null>(null);
+
+  /**
+   * 请求版本号的唯一来源。**同步**自增(在事件处理/effect 里,不在 await 之后),
+   * 于是「作废旧请求」这件事在 React 的一次提交内就完成了,不会有窗口期。
+   */
+  const confirmSeqRef = useRef(0);
+  /** 作废当前所有在飞的确认请求;返回新的版本号供新草稿使用 */
+  const nextConfirmId = useCallback(() => {
+    confirmSeqRef.current += 1;
+    return confirmSeqRef.current;
+  }, []);
+
+  /* 展示层只认「属于当前草稿」的响应:过期的既落不进来(写入前校验),
+     万一落进来了(比如先到的是新的、后到的是旧的)也渲染不出去。两道闸。 */
+  const draftId = confirmDraft?.requestId ?? -1;
+  const activePreview = preview?.requestId === draftId ? preview.value : null;
+  const activePlan = plan?.requestId === draftId ? plan.value : null;
+  const previewFailed = previewFailedFor === draftId;
+  const planFailed = planFailedFor === draftId;
+  const planChanged = planChangedFor === draftId;
 
   // 文件明细分页拉取：list_copy_tasks 按契约不带 files
   const [files, setFiles] = useState<CopyFileItem[]>([]);
@@ -334,9 +432,11 @@ export function CopyTaskScreen() {
     prevVolumeRef.current = volumeId;
     setSourceMode("whole");
     setSelectedFolders([]);
-    setFolders(null);
-    setFoldersError(null);
+    setFolderScan(null);
     setFolderPickerOpen(false);
+    /* 换卷也必须作废在飞的确认请求。确认屏虽然锁着源卷选择,但「快捷拷卡预填」
+       和程序化的清空(拷下一张卡)都会走到这里,旧草稿的响应不许再落地。 */
+    nextConfirmId();
     if (hadSelection) {
       pushNotice(
         "info",
@@ -344,7 +444,15 @@ export function CopyTaskScreen() {
         "源卷已更换，文件夹选择重置为「整卷」——文件夹路径是属于上一张卡的，请重新勾选。",
       );
     }
-  }, [volumeId, sourceMode, selectedFolders, pushNotice]);
+  }, [volumeId, sourceMode, selectedFolders, pushNotice, nextConfirmId]);
+
+  /* 扫描结果的展示口径:只有属于当前卷的才算数。
+     属于别的卷的结果既不渲染,也不冒充「已经扫过了」——后者会让重新打开
+     选择器时直接跳过扫描,把上一张卡的目录当成这张卡的。 */
+  const scan = folderScan?.volumeId === volumeId ? folderScan : null;
+  const folders = scan?.status === "ready" ? scan.items : null;
+  const foldersLoading = scan?.status === "loading";
+  const foldersError = scan?.status === "error" ? scan.error : null;
 
   const camera = cameras.find((c) => c.id === cameraId) ?? null;
   const targetPrefix = project
@@ -383,11 +491,14 @@ export function CopyTaskScreen() {
   // 留着旧项目的确认预览会出现「对着 A 的预览确认,任务落进 B」
   const projectKey = project?.id ?? null;
   useEffect(() => {
-    setConfirming(false);
+    // 先作废在飞的请求,再清状态：顺序反了会留出一个「已清空但旧响应还能落地」的窗口
+    nextConfirmId();
+    setConfirmDraft(null);
     setPreview(null);
-    setPreviewFailed(false);
+    setPreviewFailedFor(null);
     setPlan(null);
-    setPlanFailed(false);
+    setPlanFailedFor(null);
+    setPlanChangedFor(null);
     setSubmitted(false);
     setTags([]);
     setSettings(null);
@@ -411,7 +522,7 @@ export function CopyTaskScreen() {
         : [newDest("nas")],
     );
     setAutoProxy(saved.autoProxy ?? false);
-  }, [projectKey]);
+  }, [projectKey, nextConfirmId]);
 
   // 项目设置(标签库 + 备份盘预设)随项目加载;预设盘预填进目的地行
   useEffect(() => {
@@ -487,23 +598,61 @@ export function CopyTaskScreen() {
 
   /* ---------------- 源「按文件夹多选」 ---------------- */
 
-  /** 拉卡内文件夹清单。失败给就地报错 + 重试，具体原因另走 toast（零静默） */
+  /**
+   * 拉卡内文件夹清单。失败给就地报错 + 重试，具体原因另走 toast（零静默）。
+   *
+   * 结果**按卷归属**：扫 A 的过程中切到 B，A 的响应(成功或失败)一律不许写进
+   * 状态——用户在 B 底下看到并勾选 A 的目录，会拷出完全不同的一批文件。
+   * 丢弃也不许静悄悄：用户当时正等着这个清单，得告诉他为什么它没出现。
+   */
   const loadFolders = useCallback(async () => {
-    if (!volumeId) return;
-    setFoldersLoading(true);
-    setFoldersError(null);
+    const forVolume = volumeId;
+    if (!forVolume) return;
+    const forName = volumes.find((v) => v.id === forVolume)?.name ?? forVolume;
+    setFolderScan({
+      volumeId: forVolume,
+      status: "loading",
+      items: [],
+      error: null,
+    });
+    /** 落地前的归属校验：只有「当前正显示的还是这张卡」才准写 */
+    const stillCurrent = () => prevVolumeRef.current === forVolume;
     try {
-      const list = await api.listSourceFolders(volumeId);
-      setFolders(list);
+      const list = await api.listSourceFolders(forVolume);
+      if (!stillCurrent()) {
+        pushNotice(
+          "info",
+          "source-folders-stale",
+          `「${forName}」的文件夹清单读回来时你已经切到别的卡了，这份结果已丢弃（它只对那张卡有效）。请对当前这张卡重新点「选择文件夹」。`,
+        );
+        return;
+      }
+      setFolderScan({
+        volumeId: forVolume,
+        status: "ready",
+        items: list,
+        error: null,
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      setFolders(null);
-      setFoldersError(message);
+      if (!stillCurrent()) {
+        // 旧卷的失败不该冒充当前卡的失败,但也不能一声不吭
+        pushNotice(
+          "warning",
+          "source-folders-stale",
+          `「${forName}」的文件夹清单读取失败（${message}）。你已经切到别的卡，这条错误与当前卡无关，当前卡尚未扫描。`,
+        );
+        return;
+      }
+      setFolderScan({
+        volumeId: forVolume,
+        status: "error",
+        items: [],
+        error: message,
+      });
       pushNotice("error", "source-folders-failed", `读取卡内文件夹失败：${message}`);
-    } finally {
-      setFoldersLoading(false);
     }
-  }, [volumeId, pushNotice]);
+  }, [volumeId, volumes, pushNotice]);
 
   function toggleFolderPicker() {
     const next = !folderPickerOpen;
@@ -544,22 +693,36 @@ export function CopyTaskScreen() {
   /** 文件明细触底哨兵:进入视口即自动续拉下一页 */
   const filesEndRef = useRef<HTMLDivElement | null>(null);
 
+  /**
+   * 文件明细的请求版本号（epoch）。
+   *
+   * 明细列表是**当前这个任务**的账:文件名、大小、xxHash3、逐条状态。切任务时
+   * 上一个任务的分页/节流刷新还在飞,落地后会把另一张卡的文件与哈希填进这张卡
+   * 的表里——一张看起来正常、实则张冠李戴的对账表,比空表危险得多。
+   * 切任务即自增,过期响应一律丢弃。
+   */
+  const filesEpochRef = useRef(0);
+
   /** 追加下一页 */
   const loadMoreFiles = useCallback(
     async (taskId: string, offset: number) => {
+      const epoch = filesEpochRef.current;
       setFilesLoading(true);
       try {
         const page = await api.listCopyFiles(taskId, offset, PAGE_SIZE);
+        // 过期响应直接丢:此刻的 files 已经是另一个任务的,append 上去就是混表
+        if (epoch !== filesEpochRef.current) return;
         setFileTotal(page.total);
         setFiles((prev) => [...prev, ...page.items]);
       } catch (err) {
+        if (epoch !== filesEpochRef.current) return;
         pushNotice(
           "error",
           "copy-files-load-failed",
           `加载文件明细失败：${err instanceof Error ? err.message : String(err)}`,
         );
       } finally {
-        setFilesLoading(false);
+        if (epoch === filesEpochRef.current) setFilesLoading(false);
       }
     },
     [pushNotice],
@@ -571,13 +734,19 @@ export function CopyTaskScreen() {
    */
   const refreshLoadedFiles = useCallback(
     async (taskId: string) => {
+      const epoch = filesEpochRef.current;
       const limit = Math.max(loadedCountRef.current, PAGE_SIZE);
       lastRefreshRef.current = Date.now();
       try {
         const page = await api.listCopyFiles(taskId, 0, limit);
+        if (epoch !== filesEpochRef.current) return;
         setFiles(page.items);
         setFileTotal(page.total);
       } catch (err) {
+        /* 过期的失败也不报:那句「列表可能滞后」说的是**当前**这张表,而当前
+           这张表正由新任务自己的加载负责。为一个用户已经离开的任务弹一条
+           针对当前任务的警告,才是真的误导。 */
+        if (epoch !== filesEpochRef.current) return;
         // 节流刷新失败：状态列可能滞后,必须让用户知道显示的不是最新
         pushNotice(
           "warning",
@@ -592,24 +761,26 @@ export function CopyTaskScreen() {
   // 切换任务：重置并拉第一页（只认 taskId，不受进度事件影响）
   const taskId = task?.id ?? null;
   useEffect(() => {
+    // 上一个任务的所有在飞请求就此作废（含节流刷新与「加载更多」）
+    filesEpochRef.current += 1;
+    const epoch = filesEpochRef.current;
     if (!taskId) {
       setFiles([]);
       setFileTotal(0);
       loadedCountRef.current = 0;
       return;
     }
-    let cancelled = false;
     setFiles([]);
     loadedCountRef.current = 0;
     void (async () => {
       try {
         const page = await api.listCopyFiles(taskId, 0, PAGE_SIZE);
-        if (cancelled) return;
+        if (epoch !== filesEpochRef.current) return;
         setFiles(page.items);
         setFileTotal(page.total);
         lastRefreshRef.current = Date.now();
       } catch (err) {
-        if (cancelled) return;
+        if (epoch !== filesEpochRef.current) return;
         pushNotice(
           "error",
           "copy-files-load-failed",
@@ -617,9 +788,6 @@ export function CopyTaskScreen() {
         );
       }
     })();
-    return () => {
-      cancelled = true;
-    };
   }, [taskId, pushNotice]);
 
   // 进度推进时刷新状态列，但按 REFRESH_MIN_MS 节流并保住已加载的页数
@@ -640,24 +808,35 @@ export function CopyTaskScreen() {
     loadedCountRef.current = files.length;
   }, [files.length]);
 
-  /** 真正提交；confirmExisting 为 true 时表示用户已在对话框里同意继续 */
-  async function submitStart(confirmExisting: boolean) {
-    if (!project) return;
+  /**
+   * 真正提交；confirmExisting 为 true 时表示用户已在对话框里同意继续。
+   *
+   * **只读草稿,不读表单**。这是 E1 的要害:屏上展示的是草稿,提交的也必须是
+   * 同一份草稿,否则「双确认」确认的东西和执行的东西就不是一回事。
+   */
+  async function submitStart(draft: ConfirmDraft, confirmExisting: boolean) {
+    // 用户批准的那份计划的令牌:plan 只有在属于这份草稿时才作数
+    const approvedPlan = plan?.requestId === draft.requestId ? plan.value : null;
     setBusy(true);
     try {
       const input: StartCopyInput = {
-        projectId: project.id,
-        volumeId,
-        cameraId,
+        projectId: draft.projectId,
+        volumeId: draft.volumeId,
+        cameraId: draft.cameraId,
         // note 是标签拼串的兼容形态:manifest 与审计日志保持人可读
-        note: joinTagsAsNote(tags),
-        tags,
-        targetPrefix,
-        destinations: dests.map(({ kind, path }) => ({ kind, path })),
+        note: joinTagsAsNote(draft.tags),
+        tags: draft.tags,
+        targetPrefix: draft.targetPrefix,
+        destinations: draft.destinations.map(({ kind, path }) => ({ kind, path })),
         // 整卷时干脆不带这个字段：与老客户端的请求体逐字节一致
-        ...(effectiveFolders.length > 0 ? { sourceFolders: effectiveFolders } : {}),
+        ...(draft.sourceFolders.length > 0
+          ? { sourceFolders: draft.sourceFolders }
+          : {}),
+        // 用户在确认屏批准的是**这一份**计划。令牌原样回传，后端重扫后对不上
+        // 就返回 PLAN_CHANGED，而不是照着一份已经不成立的批准开跑
+        ...(approvedPlan?.planDigest ? { planDigest: approvedPlan.planDigest } : {}),
         // 仅工况 A 有代理转码概念，工况 B 不传这个标志
-        ...(project.scenario === "A" ? { autoProxy } : {}),
+        ...(project?.scenario === "A" ? { autoProxy: draft.autoProxy } : {}),
         ...(confirmExisting ? { confirmExistingTarget: true } : {}),
       };
       const started = await api.startCopyTask(input);
@@ -666,24 +845,64 @@ export function CopyTaskScreen() {
       void refreshTask(started.id);
       setTags([]);
       // 成功即记忆(评审 1.2/1.6):目的地/转代理预填给下一张卡
-      savePref(`copy:${project.id}`, {
-        dests: dests.map(({ kind, path }) => ({ kind, path })),
-        autoProxy,
+      savePref(`copy:${draft.projectId}`, {
+        dests: draft.destinations.map(({ kind, path }) => ({ kind, path })),
+        autoProxy: draft.autoProxy,
       });
       setSubmitted(false);
-      setConfirming(false);
+      // 这份草稿到此作废,连同它可能还在飞的 preview/plan
+      nextConfirmId();
+      setConfirmDraft(null);
       setPreview(null);
       setPlan(null);
+      setPlanChangedFor(null);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (message.startsWith("TARGET_EXISTS:")) {
-        // 目标夹已存在且非空：极可能是同名重复拷卡，必须让人明示
+      if (message.startsWith("PLAN_CHANGED:")) {
+        /*
+         * 卡上的内容在双确认之后变了（换卡、别的进程写入、文件被删）。
+         * 用户批准的那份清单已经不成立：**绝不自动重试**——重试等于替他
+         * 批准了一份他没看过的清单。
+         *
+         * 这里换一份**新的 requestId**（表单内容原样照搬，变的是卡上的内容）：
+         * 旧 requestId 下所有在飞的响应就此作废，新的规模/改名清单与新的
+         * planDigest 必然出自同一次核算，用户重新过目、重新按「确认开始」，
+         * 提交的才是他刚看过的那一份。这是知情同意，不是重试。
+         */
+        const renewed: ConfirmDraft = { ...draft, requestId: nextConfirmId() };
+        setConfirmDraft(renewed);
+        setPreview(null);
+        setPreviewFailedFor(null);
+        setPlan(null);
+        setPlanFailedFor(null);
+        setPlanChangedFor(renewed.requestId);
+        void fetchPreview(renewed);
+        void fetchPlan(renewed);
+        /*
+         * 后端在冒号后面给的是**定性到具体原因**的那句话：换卡了 / 多了文件 /
+         * 少了文件 / 大小变了 / 只有 mtime 变了 / 令牌认不出,各有各的措辞,
+         * 有的还点名到文件。原样透传,不许自己套一句笼统的「计划变了」——
+         * 那等于把后端这一轮的全部价值抹掉,还会把人引向错误的排查方向
+         * (例如实际是「文件被改过」,却让人去翻读卡器)。
+         */
+        const cause = message.slice("PLAN_CHANGED:".length).trim();
+        setPlanChangedCause(cause);
+        pushNotice(
+          "error",
+          "copy-plan-changed",
+          cause
+            ? `${cause}本次没有开跑。已重新核算，请重新核对范围与改名清单后再确认。`
+            : "卡上的内容在你确认之后变了，本次没有开跑。已重新核算，请重新核对范围与改名清单后再确认。",
+        );
+      } else if (message.startsWith("TARGET_EXISTS:")) {
+        // 目标夹已存在且非空：极可能是同名重复拷卡，必须让人明示。
+        // 重发时仍然带**同一份**草稿：用户在对话框里同意的是他看过的那一份
         setConfirm({
           title: "目标夹已存在",
           message:
             "目标夹已存在且非空，可能是同名重复拷卡。确认继续将只补缺失文件、绝不覆盖已有文件。",
           confirmLabel: "继续拷卡",
-          onConfirm: () => void submitStart(true),
+          onConfirm: () => void submitStart(draft, true),
         });
       } else {
         // 提交后失败统一走 toast(UX 波三)
@@ -694,30 +913,36 @@ export function CopyTaskScreen() {
     }
   }
 
-  async function confirmAndStart() {
-    if (!canSubmit || !project || busy) return;
-    await submitStart(false);
+  function confirmAndStart() {
+    // 只认草稿:没有草稿就没有「已确认的内容」,不许提交
+    if (!confirmDraft || busy) return;
+    void submitStart(confirmDraft, false);
   }
 
-  /** 落盘预览拉取:独立出来供确认屏内「重试解析」复用(评审 1.6)——
-      NAS 偶发失败时不必退回第一步重走整表 */
-  async function fetchPreview() {
-    if (!project) return;
+  /**
+   * 落盘预览拉取:独立出来供确认屏内「重试解析」复用(评审 1.6)——
+   * NAS 偶发失败时不必退回第一步重走整表。
+   * 入参是草稿:请求内容与落地校验都按草稿走,不读当前表单。
+   */
+  async function fetchPreview(draft: ConfirmDraft) {
     setPreview(null);
-    setPreviewFailed(false);
+    setPreviewFailedFor(null);
     try {
       const result = await api.previewCopyTask({
-        projectId: project.id,
-        volumeId,
-        cameraId,
-        note: joinTagsAsNote(tags),
-        tags,
-        targetPrefix,
-        destinations: dests.map(({ kind, path }) => ({ kind, path })),
+        projectId: draft.projectId,
+        volumeId: draft.volumeId,
+        cameraId: draft.cameraId,
+        note: joinTagsAsNote(draft.tags),
+        tags: draft.tags,
+        targetPrefix: draft.targetPrefix,
+        destinations: draft.destinations.map(({ kind, path }) => ({ kind, path })),
       });
-      setPreview(result);
+      // 过期响应一律丢弃：它属于一份已经被作废的草稿
+      if (confirmSeqRef.current !== draft.requestId) return;
+      setPreview({ requestId: draft.requestId, value: result });
     } catch (err) {
-      setPreviewFailed(true);
+      if (confirmSeqRef.current !== draft.requestId) return;
+      setPreviewFailedFor(draft.requestId);
       pushNotice(
         "error",
         "copy-preview-failed",
@@ -733,16 +958,21 @@ export function CopyTaskScreen() {
    * X GB」这条真值。失败时**只报错不放行**：拿不到改名清单就开跑，等于系统
    * 替用户改了文件名而用户不知情——这正是本项目最不许发生的事。
    */
-  async function fetchPlan() {
-    if (!volumeId) return;
+  async function fetchPlan(draft: ConfirmDraft) {
     setPlan(null);
-    setPlanFailed(false);
+    setPlanFailedFor(null);
     setRenamesExpanded(false);
     try {
-      const result = await api.planSourceSelection(volumeId, effectiveFolders);
-      setPlan(result);
+      const result = await api.planSourceSelection(
+        draft.volumeId,
+        draft.sourceFolders,
+      );
+      // 过期响应一律丢弃:方案 A 的规模与改名清单绝不许出现在方案 B 的确认屏上
+      if (confirmSeqRef.current !== draft.requestId) return;
+      setPlan({ requestId: draft.requestId, value: result });
     } catch (err) {
-      setPlanFailed(true);
+      if (confirmSeqRef.current !== draft.requestId) return;
+      setPlanFailedFor(draft.requestId);
       pushNotice(
         "error",
         "copy-plan-failed",
@@ -754,9 +984,42 @@ export function CopyTaskScreen() {
   /** 进入第二步前，先问后端「实际会写到哪、到底拷多少」，确认屏只展示真值 */
   async function requestConfirm() {
     setSubmitted(true);
-    if (!canSubmit || !project) return;
-    setConfirming(true);
-    await Promise.all([fetchPreview(), fetchPlan()]);
+    if (!canSubmit || !project || !volume) return;
+    // 把表单**冻**成一份不可变草稿:从这一刻起,屏上展示的、提交出去的,
+    // 都只来自它。中途改表单也只影响下一份草稿。
+    const draft: ConfirmDraft = {
+      requestId: nextConfirmId(),
+      projectId: project.id,
+      volumeId,
+      volumeName: volume.name,
+      volumeMountPath: volume.mountPath,
+      volumeIsSystem: volume.isSystem,
+      cameraId,
+      cameraCode: camera?.code ?? "",
+      tags: [...tags],
+      targetPrefix,
+      destinations: dests.map(({ kind, path }) => ({ kind, path })),
+      sourceFolders: [...effectiveFolders],
+      autoProxy,
+    };
+    setConfirmDraft(draft);
+    setPreview(null);
+    setPreviewFailedFor(null);
+    setPlan(null);
+    setPlanFailedFor(null);
+    setPlanChangedFor(null);
+    await Promise.all([fetchPreview(draft), fetchPlan(draft)]);
+  }
+
+  /** 「返回修改」：作废这份草稿与它所有在飞的请求 */
+  function leaveConfirm() {
+    nextConfirmId();
+    setConfirmDraft(null);
+    setPreview(null);
+    setPreviewFailedFor(null);
+    setPlan(null);
+    setPlanFailedFor(null);
+    setPlanChangedFor(null);
   }
 
   /** 拷完一张接着拷下一张(评审 1.6):清源卷,保留相机/标签库/目的地 */
@@ -765,12 +1028,8 @@ export function CopyTaskScreen() {
     // 前缀回到「本机今天 + 当前时段」(日期/时段选择器已取代手敲前缀)
     setPrefixIso(compactToIso(todayCompactDate()));
     setSlot(currentTimeSlot());
-    setConfirming(false);
     setSubmitted(false);
-    setPreview(null);
-    setPreviewFailed(false);
-    setPlan(null);
-    setPlanFailed(false);
+    leaveConfirm();
     void refreshVolumes();
   }
 
@@ -837,6 +1096,60 @@ export function CopyTaskScreen() {
     }
   }, [task, retryingAll, refreshTask, refreshLoadedFiles, pushNotice]);
 
+  /**
+   * 暂停 / 继续。
+   *
+   * 此前是裸的 `void api.pauseCopyTask(...).then(...)`：IPC 被拒时没有 catch，
+   * 于是「按了没反应」——按钮弹回原样、任务照跑，用户只会再按几下。
+   * 与任务中心的 `pauseOrResume` 同一套口径：busy 期间置灰，失败发通知。
+   */
+  const pauseOrResume = useCallback(
+    async (id: string, action: "pause" | "resume") => {
+      if (controlBusy) return;
+      setControlBusy(true);
+      try {
+        if (action === "resume") await api.resumeCopyTask(id);
+        else await api.pauseCopyTask(id);
+        await refreshTask(id);
+      } catch (err) {
+        pushNotice(
+          "warning",
+          "copy-pause-failed",
+          `${action === "resume" ? "继续" : "暂停"}拷卡失败：${
+            err instanceof Error ? err.message : String(err)
+          }。任务仍保持原状态。`,
+        );
+      } finally {
+        setControlBusy(false);
+      }
+    },
+    [controlBusy, refreshTask, pushNotice],
+  );
+
+  /** 单文件重试：同上，被拒时必须出声，否则那一行会永远停在「失败」而没人知道为什么 */
+  const retryOneFile = useCallback(
+    async (id: string, file: CopyFileItem) => {
+      if (controlBusy) return;
+      setControlBusy(true);
+      try {
+        await api.retryCopyFile(id, file.id);
+        await refreshTask(id);
+        await refreshLoadedFiles(id);
+      } catch (err) {
+        pushNotice(
+          "error",
+          "copy-file-retry-failed",
+          `重试「${file.name}」未能发起：${
+            err instanceof Error ? err.message : String(err)
+          }。该文件仍是失败状态。`,
+        );
+      } finally {
+        setControlBusy(false);
+      }
+    },
+    [controlBusy, refreshTask, refreshLoadedFiles, pushNotice],
+  );
+
   /** 校验阶段总进度(评审 2.2):所有目的地合计的已回读字节 */
   const verifying = task?.state === "verifying";
   const verifiedSum = task
@@ -846,8 +1159,28 @@ export function CopyTaskScreen() {
   const verifySpeed = useVerifySpeed(task?.id ?? null, verifiedSum, Boolean(verifying));
 
   const volume = volumes.find((v) => v.id === volumeId) ?? null;
+  /* 确认屏里一切与源卷有关的展示都走草稿:表单虽然在确认期间锁着源卷选择,
+     但「同名卷他机在拷」这类提示如果还读当前表单,就又打开了一条
+     「展示的不是将要执行的」的口子。 */
+  const confirmVolumeName = confirmDraft?.volumeName ?? volume?.name;
   // 同名卷提示：只警告不阻断——这是协作提示，不是锁
-  const remoteSameVolume = remoteActivityForVolume(remoteActivities, volume?.name);
+  const remoteSameVolume = remoteActivityForVolume(
+    remoteActivities,
+    confirmVolumeName,
+  );
+
+  /* ---------------- 完成后的范围口径（判据只有 copyScope 一份） ---------------- */
+
+  /**
+   * 「这次是不是部分拷贝」。口径只认后端回填的 `task.sourceFolders`,
+   * 不看屏内表单状态——拷贝期间表单可能已经被改成别的方案了。
+   */
+  const taskPartial = task ? isPartialCopy(task.sourceFolders) : false;
+  const taskFolderCount = task ? copyScopeFolderCount(task.sourceFolders) : 0;
+  /** 完成屏/hero 共用的范围文案：`[""]`（卷根）会写成「（卷根）」而不是空白 */
+  const taskScopeText = task
+    ? formatScopeFolders(task.sourceFolders).text
+    : "";
 
   /* ---------------- hero 管道的状态与数值 ---------------- */
 
@@ -865,7 +1198,14 @@ export function CopyTaskScreen() {
   const flowValue = task ? (verifying ? verifiedSum : task.copiedBytes) : 0;
   const flowTotal = task ? (verifying ? verifyTotal : task.totalBytes) : 0;
   const flowPercent = Math.round(ratio(flowValue, flowTotal) * 100);
-  /** 管道下方那行字：动画被关掉时，状态全靠它说清楚 */
+  /**
+   * 管道下方那行字：动画被关掉时，状态全靠它说清楚。
+   *
+   * 完成态必须与完成提示、终态通知、审计日志同一口径分叉。这行字在屏幕最上方、
+   * 管道正下方，主语是**整张卡**：部分拷贝时写「{卷名} 校验 100% 通过」，
+   * 等于在最显眼的位置替一张还留着未备份素材的卡背书——而 `prefers-reduced-motion`
+   * 下它是唯一的状态来源，下面那条 warning 用户可能根本不会往下滚。
+   */
   const flowCaption = !task
     ? `源读一次，并行写 ${dests.length} 个目的地。选好卡与目的地后按「开始拷卡」。`
     : flowState === "running"
@@ -873,7 +1213,12 @@ export function CopyTaskScreen() {
       : flowState === "paused"
         ? `${task.volumeName} 已挂起，按 manifest 可续传。`
         : flowState === "done"
-          ? `${task.volumeName} 校验 100% 通过。`
+          ? taskPartial
+            ? taskFolderCount > 0
+              ? `${task.volumeName} 所选 ${taskFolderCount} 个文件夹（${taskScopeText}）校验 100% 通过——部分拷贝，卡上其余内容尚未备份，请勿格式化。`
+              : /* 范围读不出:不许说「整卷通过」,也不能编一个条数 */
+                `${task.volumeName} 校验 100% 通过，但本次的拷贝范围读不出来——请勿格式化，详见下方说明。`
+            : `${task.volumeName} 校验 100% 通过。`
           : flowState === "failed"
             ? `${task.volumeName} 拷卡失败，详见下方文件明细。`
             : `${task.volumeName} 等待开始。`;
@@ -1091,25 +1436,36 @@ export function CopyTaskScreen() {
 
                           {folders && folders.length > 0 ? (
                             <div className="folder-list" data-testid="copy-folder-list">
-                              {folders.map((f) => (
-                                <Checkbox
-                                  key={f.relPath}
-                                  className="folder-row"
-                                  checked={selectedFolders.includes(f.relPath)}
-                                  disabled={confirming}
-                                  ariaLabel={`选择文件夹 ${f.relPath || "卷根"}`}
-                                  onChange={(next) => toggleFolder(f.relPath, next)}
-                                >
-                                  <span className="folder-row__path">
-                                    {f.relPath || "（卷根）"}
-                                  </span>
-                                  <span className="folder-row__meta">
-                                    {f.fileCount} 个文件 ·{" "}
-                                    {formatBytes(f.totalBytes, 0)}
-                                    {f.hasSubfolders ? " · 含子目录（另有条目）" : ""}
-                                  </span>
-                                </Checkbox>
-                              ))}
+                              {folders.map((f) => {
+                                /* 可见 meta 必须一并进读屏名。
+                                   `aria-label` 会**覆盖**可见文字,此前这一行
+                                   读出来只有「选择文件夹 DCIM」——被吃掉的恰恰是
+                                   「含子目录（另有条目）」这句:本功能最容易误解的
+                                   规则(子目录不递归)就藏在这里,读屏用户完全听不到。 */
+                                const meta = `${f.fileCount} 个文件，${formatBytes(
+                                  f.totalBytes,
+                                  0,
+                                )}${f.hasSubfolders ? "，含子目录（子目录不在本条内，是列表里另一条独立条目）" : ""}`;
+                                return (
+                                  <Checkbox
+                                    key={f.relPath}
+                                    className="folder-row"
+                                    checked={selectedFolders.includes(f.relPath)}
+                                    disabled={confirming}
+                                    ariaLabel={`选择文件夹 ${f.relPath || "卷根"}，${meta}`}
+                                    onChange={(next) => toggleFolder(f.relPath, next)}
+                                  >
+                                    <span className="folder-row__path">
+                                      {f.relPath || "（卷根）"}
+                                    </span>
+                                    <span className="folder-row__meta">
+                                      {f.fileCount} 个文件 ·{" "}
+                                      {formatBytes(f.totalBytes, 0)}
+                                      {f.hasSubfolders ? " · 含子目录（另有条目）" : ""}
+                                    </span>
+                                  </Checkbox>
+                                );
+                              })}
                             </div>
                           ) : null}
 
@@ -1282,8 +1638,11 @@ export function CopyTaskScreen() {
               </section>
             ) : null}
 
-            {confirming && project ? (
-              /* ---------- 第二步：双确认（通栏，改名清单要地方） ---------- */
+            {confirmDraft && project ? (
+              /* ---------- 第二步：双确认（通栏，改名清单要地方） ----------
+                 这一整块**只读 confirmDraft 与绑定在它上面的 preview/plan**。
+                 一旦有一处退回去读当前表单，「展示的清单 = 将要执行的清单」
+                 这条承诺就破了，而双确认屏的全部价值就是这条承诺。 */
               <div className="copy-confirm">
                 <div className="card">
                   <div className="card__head">
@@ -1295,10 +1654,10 @@ export function CopyTaskScreen() {
                       <div className="stack stack--lg">
                         {/* 流程辅助图：把「源读一次、多目的地、双端校验」画成实物流向。
                             目的地取真实落盘清单（几路画几路），等 preview 解析出来 */}
-                        {preview ? (
+                        {activePreview ? (
                           <div className="copy-flow">
                             <IllCopyFlow
-                              destinations={preview.destinations.map((d) => ({
+                              destinations={activePreview.destinations.map((d) => ({
                                 kind: d.kind,
                                 label: DESTINATION_KIND_LABEL[d.kind],
                               }))}
@@ -1313,7 +1672,7 @@ export function CopyTaskScreen() {
                           <div className="dl__row">
                             <span className="dl__key">源卷</span>
                             <span className="dl__val mono">
-                              {volume?.name}（{volume?.mountPath}）
+                              {confirmDraft.volumeName}（{confirmDraft.volumeMountPath}）
                             </span>
                           </div>
                           <div className="dl__row">
@@ -1322,18 +1681,17 @@ export function CopyTaskScreen() {
                               className="dl__val"
                               data-testid="confirm-source-scope"
                             >
-                              {effectiveFolders.length === 0 ? (
+                              {confirmDraft.sourceFolders.length === 0 ? (
                                 "整卷（保留卡内原有层级）"
                               ) : (
                                 <>
                                   <span>
-                                    {effectiveFolders.length}{" "}
+                                    {confirmDraft.sourceFolders.length}{" "}
                                     个文件夹，扁平化落盘（不保留文件夹名与层级）
                                   </span>
                                   <span className="copy-confirm__folders mono">
-                                    {effectiveFolders
-                                      .map((p) => p || "（卷根）")
-                                      .join("、")}
+                                    {/* 卷根是空串,直接 join 会渲染成一段空白 */}
+                                    {formatScopeFolders(confirmDraft.sourceFolders).text}
                                   </span>
                                 </>
                               )}
@@ -1341,7 +1699,9 @@ export function CopyTaskScreen() {
                           </div>
                           <div className="dl__row">
                             <span className="dl__key">相机</span>
-                            <span className="dl__val mono">{camera?.code}</span>
+                            <span className="dl__val mono">
+                              {confirmDraft.cameraCode}
+                            </span>
                           </div>
                           <div className="dl__row">
                             <span className="dl__key">目标夹</span>
@@ -1349,14 +1709,14 @@ export function CopyTaskScreen() {
                               className="dl__val mono"
                               data-testid="confirm-target-folder"
                             >
-                              {preview ? preview.targetFolder : "解析中…"}
+                              {activePreview ? activePreview.targetFolder : "解析中…"}
                             </span>
                           </div>
                           <div className="dl__row">
                             <span className="dl__key">内容标签</span>
                             <span className="dl__val">
                               <span className="tag-row" data-testid="confirm-tags">
-                                {tags.map((name) => (
+                                {confirmDraft.tags.map((name) => (
                                   <TagChip
                                     key={name}
                                     name={name}
@@ -1370,7 +1730,9 @@ export function CopyTaskScreen() {
                             <div className="dl__row">
                               <span className="dl__key">拷完转代理</span>
                               <span className="dl__val" data-testid="confirm-auto-proxy">
-                                {autoProxy ? "是，拷完自动派发转码作业" : "否"}
+                                {confirmDraft.autoProxy
+                                  ? "是，拷完自动派发转码作业"
+                                  : "否"}
                               </span>
                             </div>
                           ) : null}
@@ -1384,13 +1746,13 @@ export function CopyTaskScreen() {
                                     type="button"
                                     className="btn btn--sm"
                                     data-testid="copy-preview-retry"
-                                    onClick={() => void fetchPreview()}
+                                    onClick={() => void fetchPreview(confirmDraft)}
                                   >
                                     重试解析
                                   </button>
                                 </span>
-                              ) : preview ? (
-                                preview.destinations.map((d) => (
+                              ) : activePreview ? (
+                                activePreview.destinations.map((d) => (
                                   <span key={d.id} className="dest-line__path">
                                     {DESTINATION_KIND_LABEL[d.kind]} · {d.path}
                                     <br />
@@ -1406,6 +1768,31 @@ export function CopyTaskScreen() {
 
                       {/* ---- 规模 + 改名清单：零静默的主战场 ---- */}
                       <div className="stack stack--lg">
+                        {planChanged ? (
+                          /* 后端拒了这次提交：卡上内容在双确认之后变了。
+                             绝不自动重试——重试等于替用户批准一份他没看过的
+                             清单。这里重新核算，让他重新过一遍。 */
+                          <div
+                            className="notice notice--danger"
+                            role="alert"
+                            data-testid="copy-plan-changed"
+                          >
+                            <strong>
+                              {planChangedCause
+                                ? "本次提交被拒：批准的那份计划已经不成立"
+                                : "卡上的内容在你确认之后变了"}
+                            </strong>
+                            <span>
+                              {/* 后端点名到具体原因(甚至具体文件)的那句话原样展示。
+                                  笼统的「内容变了」会把人引向错误的排查方向——
+                                  实际是「文件被改过」却让人去翻读卡器。 */}
+                              {planChangedCause ||
+                                "可能是换了卡、文件被增删，或有别的程序在写这张卡。"}
+                              {" "}这次<strong>没有</strong>开跑。
+                              下面是重新核算出的范围与改名清单，请重新核对后再确认。
+                            </span>
+                          </div>
+                        ) : null}
                         {planFailed ? (
                           <div
                             className="notice notice--danger"
@@ -1423,13 +1810,13 @@ export function CopyTaskScreen() {
                                 type="button"
                                 className="btn btn--sm"
                                 data-testid="copy-plan-retry"
-                                onClick={() => void fetchPlan()}
+                                onClick={() => void fetchPlan(confirmDraft)}
                               >
                                 重试核算
                               </button>
                             </div>
                           </div>
-                        ) : plan ? (
+                        ) : activePlan ? (
                           <>
                             <div className="copy-plan">
                               <span className="copy-plan__label">本次将拷</span>
@@ -1437,11 +1824,12 @@ export function CopyTaskScreen() {
                                 className="copy-plan__value"
                                 data-testid="confirm-plan-scale"
                               >
-                                {plan.fileCount} 个文件 · {formatBytes(plan.totalBytes)}
+                                {activePlan.fileCount} 个文件 ·{" "}
+                                {formatBytes(activePlan.totalBytes)}
                               </span>
                             </div>
 
-                            {plan.fileCount === 0 ? (
+                            {activePlan.fileCount === 0 ? (
                               /* 只勾了「只有子目录、没有直接子文件」的父目录时
                                  会走到这:照跑只会建一个空目标夹,而用户以为
                                  卡已经拷完了。这是最容易踩的规则,必须拦住。 */
@@ -1459,7 +1847,37 @@ export function CopyTaskScreen() {
                               </div>
                             ) : null}
 
-                            {plan.renamedFiles.length === 0 ? (
+                            {activePlan.hiddenSkipped > 0 ? (
+                              /* 被排除的东西不进计划，任务却照样报 100%。配上
+                                 「本卡可格式化」那句话就是引导用户格式化掉没备份
+                                 的东西——必须在确认前说出来。
+
+                                 口径已变(2026-08-28):曾经是「以点开头一律跳过」,
+                                 那会把 `.clip.mov` 这类合法素材静默漏掉;现在只排除
+                                 明确列举的系统项。文案跟着改准——说成「点开头的都不拷」
+                                 会让人白白去给素材改名。 */
+                              <div
+                                className="notice notice--warn"
+                                role="alert"
+                                data-testid="confirm-hidden-skipped"
+                              >
+                                <strong>
+                                  {activePlan.hiddenSkipped} 个系统项不在本次范围内
+                                </strong>
+                                <span>
+                                  指废纸篓、索引数据库、`.DS_Store` 这类由操作系统或
+                                  NAS 自己生成的记账文件。它们不会被拷贝，也不计入
+                                  「全部校验通过」
+                                  {activePlan.hiddenSamples.length > 0
+                                    ? `——例如：${activePlan.hiddenSamples.join("、")}。`
+                                    : "。"}
+                                  你的素材不受影响：以点开头的素材文件（如
+                                  `.clip.mov`）现在会照常拷贝，不必改名。
+                                </span>
+                              </div>
+                            ) : null}
+
+                            {activePlan.renamedFiles.length === 0 ? (
                               <p
                                 className="text-xs dim"
                                 data-testid="confirm-renames-none"
@@ -1473,7 +1891,7 @@ export function CopyTaskScreen() {
                                 data-testid="confirm-renames"
                               >
                                 <strong>
-                                  {plan.renamedFiles.length} 个文件将被系统自动改名
+                                  {activePlan.renamedFiles.length} 个文件将被系统自动改名
                                 </strong>
                                 <span>
                                   扁平化后这些文件名会撞车，
@@ -1482,8 +1900,8 @@ export function CopyTaskScreen() {
                                 </span>
                                 <ul className="copy-renames">
                                   {(renamesExpanded
-                                    ? plan.renamedFiles
-                                    : plan.renamedFiles.slice(0, RENAME_PREVIEW)
+                                    ? activePlan.renamedFiles
+                                    : activePlan.renamedFiles.slice(0, RENAME_PREVIEW)
                                   ).map((r) => (
                                     <li
                                       key={r.sourceRel}
@@ -1500,7 +1918,7 @@ export function CopyTaskScreen() {
                                     </li>
                                   ))}
                                 </ul>
-                                {plan.renamedFiles.length > RENAME_PREVIEW &&
+                                {activePlan.renamedFiles.length > RENAME_PREVIEW &&
                                 !renamesExpanded ? (
                                   <div>
                                     <button
@@ -1509,7 +1927,7 @@ export function CopyTaskScreen() {
                                       data-testid="confirm-renames-expand"
                                       onClick={() => setRenamesExpanded(true)}
                                     >
-                                      展开查看全部 {plan.renamedFiles.length} 条
+                                      展开查看全部 {activePlan.renamedFiles.length} 条
                                     </button>
                                   </div>
                                 ) : null}
@@ -1526,9 +1944,10 @@ export function CopyTaskScreen() {
                           确认后开始读卡。校验全部通过前请勿拔卡，OCard 不会代为格式化。
                         </p>
 
-                        {volume?.isSystem ? (
+                        {confirmDraft.volumeIsSystem ? (
                           /* 过滤只是「藏」,这里是「拦」:用户显式打开开关选了
-                             系统盘,确认屏必须再敲一次警钟(opus 评审 P2) */
+                             系统盘,确认屏必须再敲一次警钟(opus 评审 P2)。
+                             判据也走草稿:这条警告说的是**将要拷的那个卷** */
                           <div
                             className="notice notice--danger"
                             role="alert"
@@ -1536,7 +1955,8 @@ export function CopyTaskScreen() {
                           >
                             <strong>源卷是系统内置盘</strong>
                             <span>
-                              「{volume.name}（{volume.mountPath}）」是本机系统盘,
+                              「{confirmDraft.volumeName}（{confirmDraft.volumeMountPath}
+                              ）」是本机系统盘,
                               不是相机存储卡。把整台电脑的磁盘当卡拷几乎肯定是误选,
                               请返回重选源卷。
                             </span>
@@ -1562,7 +1982,9 @@ export function CopyTaskScreen() {
                           <button
                             type="button"
                             className="btn"
-                            onClick={() => setConfirming(false)}
+                            /* 返回即作废这份草稿:它那两个还在飞的请求落地后
+                               再也写不进任何状态(E1 的时序就是从这里被打开的) */
+                            onClick={leaveConfirm}
                           >
                             返回修改
                           </button>
@@ -1572,8 +1994,15 @@ export function CopyTaskScreen() {
                             className="btn copy-stage__start"
                             onClick={confirmAndStart}
                             /* 没有 plan 就没有改名清单可看——此时开跑就是静默改名;
-                               核算出 0 个文件也不放行,那只会建一个空目标夹 */
-                            disabled={busy || !preview || !plan || plan.fileCount === 0}
+                               核算出 0 个文件也不放行,那只会建一个空目标夹。
+                               这里判的是 activePlan/activePreview:属于**这份草稿**
+                               的那两份,别的草稿的结果一律不算数 */
+                            disabled={
+                              busy ||
+                              !activePreview ||
+                              !activePlan ||
+                              activePlan.fileCount === 0
+                            }
                           >
                             {busy ? "正在建立任务…" : "确认开始"}
                           </button>
@@ -1879,15 +2308,21 @@ export function CopyTaskScreen() {
                   {task.state === "done" ? (
                     /* 「可格式化」只在整卷时成立:按文件夹拷时卡上还有没拷的内容,
                        这句话会直接导致用户格式化掉未备份素材。范围口径以后端
-                       回填的 sourceFolders 为准,不用屏内表单状态(可能已被改过)。 */
-                    (task.sourceFolders?.length ?? 0) > 0 ? (
+                       回填的 sourceFolders 为准,不用屏内表单状态(可能已被改过);
+                       判据本身走 copyScope,与终态通知/审计/hero 大字同一份。 */
+                    taskPartial ? (
                     <div className="notice notice--warn" role="status" data-testid="copy-partial-done">
                       <strong>
-                        所选 {task.sourceFolders?.length} 个文件夹校验 100% 通过——但这是部分拷贝，请勿格式化。
+                        {taskFolderCount > 0
+                          ? `所选 ${taskFolderCount} 个文件夹校验 100% 通过——但这是部分拷贝，请勿格式化。`
+                          : "校验 100% 通过，但本次的拷贝范围读不出来——请勿格式化。"}
                       </strong>
                       <span>
-                        本次只拷了：{task.sourceFolders?.join("、")}。
-                        卡上其余内容尚未备份，格式化会连同它们一起抹掉。
+                        {taskFolderCount > 0
+                          ? /* 卷根是空串,直接 join 会写成「本次只拷了：。」——
+                               安全结论还在,备份范围却没说清 */
+                            `本次只拷了：${taskScopeText}。卡上其余内容尚未备份，格式化会连同它们一起抹掉。`
+                          : "后端回填的范围不是一份文件夹清单，无法断定卡上还剩什么没备份。请对照审计日志核实后再决定。"}
                       </span>
                       <div>
                         <button
@@ -1968,26 +2403,22 @@ export function CopyTaskScreen() {
                           <button
                             type="button"
                             className="btn btn--sm"
-                            onClick={() => {
-                              void api
-                                .pauseCopyTask(task.id)
-                                .then(() => refreshTask(task.id));
-                            }}
+                            data-testid="copy-pause"
+                            disabled={controlBusy}
+                            onClick={() => void pauseOrResume(task.id, "pause")}
                           >
-                            暂停
+                            {controlBusy ? "处理中…" : "暂停"}
                           </button>
                         ) : null}
                         {task.state === "paused" ? (
                           <button
                             type="button"
                             className="btn btn--sm"
-                            onClick={() => {
-                              void api
-                                .resumeCopyTask(task.id)
-                                .then(() => refreshTask(task.id));
-                            }}
+                            data-testid="copy-resume"
+                            disabled={controlBusy}
+                            onClick={() => void pauseOrResume(task.id, "resume")}
                           >
-                            继续
+                            {controlBusy ? "处理中…" : "继续"}
                           </button>
                         ) : null}
                       </div>
@@ -2157,12 +2588,8 @@ export function CopyTaskScreen() {
                                   type="button"
                                   className="btn btn--ghost btn--icon btn--sm"
                                   aria-label={`重试 ${f.name}`}
-                                  onClick={() => {
-                                    void api
-                                      .retryCopyFile(task.id, f.id)
-                                      .then(() => refreshTask(task.id))
-                                      .then(() => refreshLoadedFiles(task.id));
-                                  }}
+                                  disabled={controlBusy}
+                                  onClick={() => void retryOneFile(task.id, f)}
                                 >
                                   <IconRetry />
                                 </button>

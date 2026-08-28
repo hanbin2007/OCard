@@ -467,6 +467,9 @@ export function mockSourcePlan(_volumeId: string, folders: string[]): SourcePlan
       fileCount: all.length,
       totalBytes: all.reduce((sum, f) => sum + f.sizeBytes, 0),
       renamedFiles: [],
+      hiddenSkipped: 0,
+      hiddenSamples: [],
+      planDigest: mockPlanDigest(folders, all.map((f) => f.name)),
     };
   }
 
@@ -504,7 +507,27 @@ export function mockSourcePlan(_volumeId: string, folders: string[]): SourcePlan
     fileCount: picked.length,
     totalBytes: picked.reduce((sum, f) => sum + f.sizeBytes, 0),
     renamedFiles,
+    hiddenSkipped: 0,
+    hiddenSamples: [],
+    planDigest: mockPlanDigest(
+      folders,
+      picked.map((f) => `${f.dir}/${f.name}:${f.sizeBytes}`),
+    ),
   };
+}
+
+/**
+ * 计划绑定令牌的 mock：只要「勾了哪些夹子 + 扫到哪些文件」变了，令牌就得变。
+ * 真值由 Rust 侧的 xxh3 生成，这里只需要一个同语义的稳定字符串。
+ */
+function mockPlanDigest(folders: string[], items: string[]): string {
+  const key = [...folders].sort().join("|") + "#" + [...items].sort().join("|");
+  let h = 0x811c9dc5;
+  for (let i = 0; i < key.length; i += 1) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
 }
 
 export const mockCopyTasks: CopyTask[] = [

@@ -74,7 +74,7 @@ pub fn start_analysis<R: tauri::Runtime>(
     }
     let nas = super::nas_root(&app, &state)?;
     let stats = super::find_project(&nas, &project_id)?;
-    let files = super::sorting_cmds::inbox_files_for_analysis(&stats.root)?;
+    let files = super::sorting_cmds::inbox_files_for_analysis(&app, &stats.root)?;
     let root = stats.root.clone();
     let machine_id = state.machine_id.clone();
     // 人脸模型:资源目录解析(测试/E2E 用 OCARD_MODELS_DIR 覆盖);

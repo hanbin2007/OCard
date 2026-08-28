@@ -44,6 +44,12 @@ libc = "0.2.189"
 tauri-plugin-log = "2"
 tauri-plugin-dialog = "2"
 log = "0.4"
+# 落点撞名判定必须做 Unicode NFC 归一:macOS 相机卡上的 `é.mov` 可能是 NFC,
+# 也可能是 NFD(两串字节不同、目的地文件系统却视为同一个文件名)。不归一就会
+# 把两个源规划成两个「不冲突」的落点,内容相同时第二个直接复用第一个的物理文件
+# 并报 all_verified——两个源最终只剩一个目录项。NFC 需要完整 UCD 分解/合成表
+# (数千行数据),自己实现既大又易错,故引入这个只做归一、无传递重依赖的小库。
+unicode-normalization = "0.1.25"
 
 [dev-dependencies]
 tempfile = "3"

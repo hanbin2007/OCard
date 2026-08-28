@@ -13,6 +13,8 @@
 
 import type { AuditEventDto, KnownAuditKind } from "../api/types";
 import type { BadgeTone } from "../components/ui";
+// 拷贝范围的判据与文案只有一份：见 copyScope.ts 顶部那段「为什么」
+import { classifyCopyScope, formatScopeFolders } from "./copyScope";
 import { formatBytes, formatDuration, formatTimestamp } from "./format";
 
 /** 事件所属的业务环节，对应顶部过滤 chips */
@@ -51,6 +53,9 @@ export interface AuditKindMeta {
  * 关于 `trash_emptied` 取 danger 而不是 ok：它是全应用**唯一**真正物理删除的
  * 动作，在一份用于事后追责的日志里，它比"绿色的完成"更该被一眼看见。
  * 它不是失败，所以 abnormal 仍为 false，不会混进失败过滤。
+ *
+ * 这张表只按 kind 取色。有些事件光看 kind 定不了性（`copy_completed` 的整卷
+ * 与部分拷贝是两件事），那部分由 `auditEventMeta` 结合 data 再压一道。
  */
 const KIND_META: Record<KnownAuditKind, Omit<AuditKindMeta, "known">> = {
   copy_started: { label: "开始拷卡", tone: "neutral", group: "copy", abnormal: false },
@@ -146,6 +151,38 @@ export function auditKindMeta(kind: unknown): AuditKindMeta {
   };
 }
 
+/**
+ * 取一条记录的呈现口径——**连 data 一起看**。
+ *
+ * `auditKindMeta` 只认 kind，够用了很久：一个 kind 对应一种语气色。
+ * 但"拷卡完成"不是这样的事件——同一个 kind 下,整卷意味着"这张卡可以格式化",
+ * 部分拷贝意味着"卡上还有没备份的素材"。只按 kind 取色,两者在日志里
+ * 逐字相同、同为绿色,而这条日志正是事后判断能否格式化的唯一权威记录。
+ *
+ * `trash_emptied` 取 danger 已经立下了原则:**语气色服务于"这件事有多需要
+ * 被看见"**,不是机械地按成功/失败上色。这里把它从 kind 推广到 data。
+ *
+ * 降级只朝一个方向:绿/中性 → 琥珀;已经是 danger 的不会被调轻。
+ */
+export function auditEventMeta(kind: unknown, data: unknown): AuditKindMeta {
+  const meta = auditKindMeta(kind);
+  const record = asRecord(data);
+  if (!record || !Object.prototype.hasOwnProperty.call(record, "sourceFolders")) {
+    /* 没有这个字段 = 按文件夹多选这个特性上线之前的旧记录,当时只可能是整卷。
+       不额外标注,也不擅自改色——替旧记录编一个"范围"同样是替后端背书。 */
+    return meta;
+  }
+  const scope = classifyCopyScope(record.sourceFolders);
+  if (scope === "whole") return meta;
+  return {
+    ...meta,
+    /* 颜色不是信息:灰度、色觉障碍、截图转发之后都只剩文字。
+       抬头本身要说清这次只拷了一部分,不能只靠把绿改成琥珀。 */
+    label: meta.known && scope === "partial" ? `${meta.label}（部分）` : meta.label,
+    tone: meta.tone === "danger" ? "danger" : "warn",
+  };
+}
+
 /* ------------------------------------------------------------------ *
  * 关键明细：从 unknown data 里挑一行人能读的东西
  * ------------------------------------------------------------------ */
@@ -162,7 +199,18 @@ export const MAX_AUDIT_DETAILS = 4;
 /** 单个文本值的最大长度：路径与错误原文都可能很长，截断但保留头部信息 */
 const MAX_TEXT_LEN = 72;
 
-type ValueKind = "count" | "bytes" | "seconds" | "text" | "mode" | "tier" | "bool";
+type ValueKind =
+  | "count"
+  | "bytes"
+  | "seconds"
+  | "text"
+  | "mode"
+  | "tier"
+  | "bool"
+  /** `sourceFolders`：整卷 / 部分拷贝 / 读不懂——决定这张卡能不能格式化 */
+  | "scope"
+  /** `allVerified`：值本身要带上范围口径，避免被读成"整卡都校验过了" */
+  | "verifyScope";
 
 /**
  * 已知字段的取用顺序 = 重要性顺序。排在前面的先占掉那 4 个位置。
@@ -175,6 +223,17 @@ const KNOWN_FIELDS: ReadonlyArray<{
   kind: ValueKind;
 }> = [
   { keys: ["message", "error", "reason"], label: "原因", kind: "text" },
+  /*
+   * 范围紧跟在"原因"之后,排在一切计数之前。
+   *
+   * 它是事后判断"这张卡能不能格式化"的**唯一**权威线索:屏内提示会被下一张卡
+   * 冲掉、toast 会消失、铃铛会被确认清掉,第二天回来对账的人只剩这一行。
+   * 排后面会被 `bytesCopied` 之类的计数挤出那 4 个位置,于是部分拷贝在界面上
+   * 与整卷**逐字相同**——一条绿色的"拷卡完成 · 容量 39.1 GB",足以让人去
+   * 相机里格式化掉没备份的素材。
+   */
+  { keys: ["sourceFolders"], label: "范围", kind: "scope" },
+  { keys: ["allVerified"], label: "校验", kind: "verifyScope" },
   { keys: ["rel", "fileName", "file", "path"], label: "文件", kind: "text" },
   { keys: ["succeeded"], label: "成功", kind: "count" },
   { keys: ["failed", "failures"], label: "失败", kind: "count" },
@@ -239,9 +298,66 @@ function formatLoose(value: unknown): string | null {
   return null;
 }
 
+/* ------------------------------------------------------------------ *
+ * 拷贝范围（sourceFolders）：本文件里唯一一个"读错了会毁素材"的字段
+ * ------------------------------------------------------------------ */
+
+/**
+ * 预览里最多列几个文件夹名，其余用省略号带过（完整内容仍在 title 里）。
+ * 判据（`classifyCopyScope`）与卷根文案都在 `copyScope.ts`——这里只管排版。
+ */
+const SCOPE_PREVIEW_LIMIT = 2;
+
+function formatScope(value: unknown): string | null {
+  switch (classifyCopyScope(value)) {
+    case "whole":
+      return "整卷";
+    case "partial": {
+      const { text, truncated, count } = formatScopeFolders(value, {
+        limit: SCOPE_PREVIEW_LIMIT,
+        // 外层已经有一对括号了，卷根在这里写成光秃秃的「卷根」
+        bare: true,
+        // 数组里混进非字符串时沿用本文件那套通用兜底（数组→「N 项」等）
+        fallback: formatLoose,
+      });
+      return `部分拷贝：${count} 个文件夹（${collapse(text)}${truncated ? "…" : ""}）`;
+    }
+    default: {
+      // 有字段却读不懂:如实说"读不出来"并把原值摆上,别假装这次是整卷
+      const loose = formatLoose(value);
+      return loose ? `范围读不出（${loose}）` : "范围读不出";
+    }
+  }
+}
+
+/**
+ * `allVerified` 的呈现要带上范围口径。
+ * 部分拷贝下它**只覆盖所选的那几个文件夹**，写成光秃秃的"校验 是"，
+ * 会被读成"整卡都校验过了"——那是这条记录里第二危险的误读。
+ */
+function formatVerifyScope(
+  value: unknown,
+  record: Record<string, unknown>,
+): string | null {
+  if (typeof value !== "boolean") return formatLoose(value);
+  const partial =
+    Object.prototype.hasOwnProperty.call(record, "sourceFolders") &&
+    classifyCopyScope(record.sourceFolders) !== "whole";
+  const subject = partial ? "所选范围" : "全部";
+  return value ? `${subject}通过` : `${subject}存在未通过`;
+}
+
 /** 按字段语义格式化；类型对不上就退回通用兜底，绝不抛 */
-function formatField(value: unknown, kind: ValueKind): string | null {
+function formatField(
+  value: unknown,
+  kind: ValueKind,
+  record: Record<string, unknown>,
+): string | null {
   switch (kind) {
+    case "scope":
+      return formatScope(value);
+    case "verifyScope":
+      return formatVerifyScope(value, record);
     case "count":
       if (Array.isArray(value)) return String(value.length);
       if (typeof value === "number" && Number.isFinite(value)) return String(value);
@@ -288,7 +404,7 @@ export function auditDetails(data: unknown, limit = MAX_AUDIT_DETAILS): AuditDet
     if (picked.length >= limit) break;
     for (const key of field.keys) {
       if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
-      const value = formatField(record[key], field.kind);
+      const value = formatField(record[key], field.kind, record);
       if (value === null) continue;
       picked.push({ label: field.label, value });
       break; // 同义 key 只取第一个命中的
@@ -359,7 +475,8 @@ export function toAuditRow(raw: unknown, index: number): AuditRow {
     machine: asText(record.machine, UNKNOWN_MACHINE),
     operator: asText(record.operator, UNKNOWN_OPERATOR),
     kind,
-    meta: auditKindMeta(kind),
+    // 连 data 一起看:同一个 copy_completed,整卷与部分拷贝不是同一件事
+    meta: auditEventMeta(kind, record.data),
     details,
     detailText: auditDetailText(details),
   };

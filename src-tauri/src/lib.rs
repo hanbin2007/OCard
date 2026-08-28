@@ -160,6 +160,7 @@ pub fn run() {
                 tasks: Default::default(),
                 notices: Default::default(),
                 ops: Default::default(),
+                approved_plans: Default::default(),
             });
             // 卷插拔监视(快捷拷卡):2s 轮询本地挂载表(不碰 NAS/登记表),
             // 有插拔即发 volumes://changed;前端收到后再拉带卡匹配的完整列表。

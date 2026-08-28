@@ -16,6 +16,12 @@ import {
   type ReactNode,
 } from "react";
 import * as api from "../api";
+// 「这次是不是部分拷贝」只有一份判据：见 lib/copyScope.ts 顶部那段「为什么」
+import {
+  copyScopeFolderCount,
+  formatScopeFolders,
+  isPartialCopy,
+} from "../lib/copyScope";
 import { loadPref, savePref } from "../lib/prefs";
 import type {
   CameraReg,
@@ -249,15 +255,26 @@ function terminalNotice(before: CopyTask, after: CopyTask): NoticeDto | null {
   if (after.state === "done") {
     /* 「可格式化」只在整卷时成立。按文件夹拷时卡上还留着没拷的内容,
        照旧说那句话会直接引导用户格式化掉未备份素材——这是本项目里
-       后果最重的一句文案,宁可啰嗦也不能省(后端另发 copy-partial-scope-done)。 */
-    const partial = (after.sourceFolders?.length ?? 0) > 0;
+       后果最重的一句文案,宁可啰嗦也不能省(后端另发 copy-partial-scope-done)。
+       判据统一走 copyScope:`[""]`(只勾了卷根)也是部分拷贝,不能因为它
+       「看着像整卷」就在这里放行。 */
+    const partial = isPartialCopy(after.sourceFolders);
+    // 铃铛里这条通知常常是第二天回来对账时唯一还在的东西:范围要写清楚,
+    // 只说「所选 N 个文件夹」而不说是哪几个,等于让人自己猜
+    const count = copyScopeFolderCount(after.sourceFolders);
+    const { text: scopeText } = formatScopeFolders(after.sourceFolders);
     return {
       level: "info",
       code: "copy-task-done",
-      message: partial
-        ? `「${after.volumeName}」所选 ${after.sourceFolders?.length} 个文件夹校验 100% 通过。` +
-          `本次是部分拷贝，卡上其余内容尚未备份——请勿格式化。`
-        : `「${after.volumeName}」校验 100% 通过，本卡可格式化（请在相机内格式化）。`,
+      message: !partial
+        ? `「${after.volumeName}」校验 100% 通过，本卡可格式化（请在相机内格式化）。`
+        : count > 0
+          ? `「${after.volumeName}」所选 ${count} 个文件夹（${scopeText}）校验 100% 通过。` +
+            `本次是部分拷贝，卡上其余内容尚未备份——请勿格式化。`
+          : /* 范围读不出(不是一份文件夹清单):不许替它担保「整卷」,
+               也不能编一句「所选 0 个文件夹」。如实说读不出并按最保守处理。 */
+            `「${after.volumeName}」校验 100% 通过，但本次的拷贝范围读不出来。` +
+            `无法断定卡上是否还有未备份的素材——请勿格式化，请对照审计日志核实。`,
       occurredAt: after.finishedAt ?? new Date().toISOString(),
       taskId: after.id,
       projectId: after.projectId,
@@ -342,7 +359,12 @@ function ingestNotice(
   notice: NoticeDto,
   options: { live: boolean },
 ): NoticeBucket {
-  const key = `${notice.code}@${notice.occurredAt}`;
+  /*
+   * 去重键要带上 taskId:两张卡同一秒拷完(并行拷卡是常态)时,
+   * `code@occurredAt` 会撞在一起,第二张卡的完成通知被当成"同一条的重复投递"
+   * 整条丢掉——那张卡从此没有任何广播说过它能不能格式化。
+   */
+  const key = `${notice.code}@${notice.occurredAt}#${notice.taskId ?? ""}`;
   // 同一条通知无论从哪条路径先到，都只摄入一次
   if (bucket.noticeKeys[key]) return bucket;
 
@@ -356,9 +378,19 @@ function ingestNotice(
   const repeats = notice.repeats;
   // 只比对最新一条会在「A,B,A」这种交错序列里把同 code 拆成两条，
   // repeats 也会因此重复计入。改为回看最近 FOLD_LOOKBACK 条。
+  //
+  // 但**任务级通知必须按任务分桶**：折叠只换正文、保留头一条的 taskId/projectId，
+  // 于是「任务 A 完成、任务 B 完成」会折成一条——正文写着 B 的「请勿格式化」，
+  // 「查看任务」却跳到 A。用户据此格式化的是另一张卡,而且是不可逆的。
+  // 同 code 不同卡本来就是两件事,不是刷屏,不该折叠。
   const foldIndex = bucket.notices
     .slice(0, FOLD_LOOKBACK)
-    .findIndex((n) => n.code === notice.code && n.level === notice.level);
+    .findIndex(
+      (n) =>
+        n.code === notice.code &&
+        n.level === notice.level &&
+        (n.taskId ?? null) === (notice.taskId ?? null),
+    );
   const head = foldIndex >= 0 ? bucket.notices[foldIndex] : undefined;
   if (head) {
     // 回放拿到的是**更旧**的同 code 告警时，只加计数、把窗口向前延伸，
@@ -574,12 +606,28 @@ export function reducer(state: AppState, action: AppAction): AppState {
       const started = buffered ? applyProgress(action.task, buffered) : action.task;
       const rest = { ...state.orphanProgress };
       delete rest[action.task.id];
-      return {
+      const next = {
         ...state,
         tasks: [started, ...state.tasks],
         selectedTaskId: started.id,
         orphanProgress: rest,
       };
+      /*
+       * 拷得极快的卡会在 startCopy 还没返回时就跑完:终态事件先到、被存进
+       * orphanProgress,再在上面这行被安静地消费掉——taskProgress 里那条出声的
+       * 路径整个被绕过,全应用对"这张卡能不能格式化"一声不吭。而这恰恰是
+       * 全应用唯一的那声广播。
+       *
+       * 起点固定取 confirming:taskStarted 只在本机刚发起拷卡时派发一次
+       * (CopyTaskScreen 拿到 startCopy 的返回值),此刻这个任务对用户来说必然
+       * 还没结束。所以只要落地时已是终态,就是"刚刚结束的",一律出声——
+       * 包括后端返回时就已经是终态的情况。
+       */
+      const notice = terminalNotice(
+        { ...action.task, state: "confirming" },
+        started,
+      );
+      return notice ? { ...next, ...ingestNotice(next, notice, { live: true }) } : next;
     }
 
     case "taskProgress": {

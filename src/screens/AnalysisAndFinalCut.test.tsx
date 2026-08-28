@@ -78,6 +78,10 @@ function analyzeJob(over: Partial<AnalyzeJob> = {}): AnalyzeJob {
 async function renderSorting() {
   render(<App preloaded={sorting} />);
   await screen.findAllByTestId("asset-cell");
+  // 光标自动落位在 effect 里做:不等它落定,用例的第一下方向键会少走一格
+  await waitFor(() =>
+    expect(document.querySelector(".asset--focused")).not.toBeNull(),
+  );
 }
 
 describe("★ PRD 底线：AI 只标注，不动文件", () => {
@@ -910,5 +914,213 @@ describe("交付状态勾选", () => {
     const toast = await screen.findByTestId("notice-toast-error");
     expect(toast.textContent).toContain("NAS 只读");
     spy.mockRestore();
+  });
+});
+
+/* ================================================================== *
+ * 组全屏层：焦点管理与键盘契约（两路评审交叉收敛的必修项）
+ * ================================================================== */
+
+async function openLayer(user: ReturnType<typeof userEvent.setup>) {
+  await renderSorting();
+  const group = (await screen.findAllByTestId("asset-group"))[0];
+  await user.click(within(group).getByTestId("group-expand"));
+  return screen.findByTestId("group-overlay");
+}
+
+function gridWrap() {
+  return screen.getByTestId("sorting-grid-wrap");
+}
+
+function cursorAsset(): string | null {
+  return (
+    document.querySelector(".sorting__grid .asset--focused")?.getAttribute(
+      "data-asset",
+    ) ?? null
+  );
+}
+
+/**
+ * 这一组用例**刻意不用** `fireEvent.keyDown(具体元素, …)`。
+ * 那种写法把事件直接打在元素上，绕过了真实的焦点链——组层关闭后焦点掉到
+ * body、键盘流整条断掉这个 bug，正是因此逃过了此前所有测试。
+ * 这里一律走 `user.keyboard(...)`（派发到 `document.activeElement`）
+ * 并直接断言 `document.activeElement`。
+ */
+describe("B3 组层收起后焦点必须回到网格", () => {
+  it("★ Esc 退出：焦点回网格（不是 body），方向键立刻还能用", async () => {
+    const user = userEvent.setup();
+    const layer = await openLayer(user);
+    expect(document.activeElement).toBe(layer);
+
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByTestId("group-overlay")).toBeNull());
+
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(gridWrap());
+
+    // 焦点不只是"在那儿"，键盘流得真的活着
+    const before = cursorAsset();
+    await user.keyboard("{ArrowRight}");
+    await waitFor(() => {
+      const after = cursorAsset();
+      expect(after).toBeTruthy();
+      expect(after).not.toBe(before);
+    });
+  });
+
+  it("★ 点「关闭」按钮退出：焦点同样回网格，而不是随按钮一起消失", async () => {
+    const user = userEvent.setup();
+    const layer = await openLayer(user);
+
+    await user.click(within(layer).getByTestId("group-close"));
+    await waitFor(() => expect(screen.queryByTestId("group-overlay")).toBeNull());
+
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(gridWrap());
+
+    const before = cursorAsset();
+    await user.keyboard("{ArrowRight}");
+    await waitFor(() => expect(cursorAsset()).not.toBe(before));
+  });
+
+  it("大图从组层里退回来时，焦点归组层（层级还在，不该越级还给网格）", async () => {
+    const user = userEvent.setup();
+    const layer = await openLayer(user);
+
+    await user.keyboard(" ");
+    await screen.findByTestId("asset-lightbox");
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByTestId("asset-lightbox")).toBeNull());
+
+    expect(screen.queryByTestId("group-overlay")).not.toBeNull();
+    expect(document.activeElement).toBe(layer);
+  });
+});
+
+describe("B2 组层里的 U 只撤回标删", () => {
+  it("★ 对未标记项按 U：待删清单不许凭空多出一条，并且要说明为什么没反应", async () => {
+    const user = userEvent.setup();
+    const layer = await openLayer(user);
+    expect(within(layer).getByTestId("group-pending-empty")).toBeTruthy();
+
+    fireEvent.keyDown(layer, { key: "u" });
+
+    const toast = await screen.findByTestId("notice-toast-warning");
+    expect(toast.getAttribute("data-code")).toBe("sorting-action-not-marked");
+    expect(toast.textContent).toContain("要标删请按 D");
+    // 旧行为：这里会变成「已标记 1 个待删除」，而且组层把屏底那条整个盖住，
+    // 用户完全看不到自己刚把要保留的那张标成了待删
+    expect(screen.queryByTestId("sorting-pending-delete")).toBeNull();
+    expect(
+      within(screen.getByTestId("group-overlay")).getByTestId("group-pending-empty"),
+    ).toBeTruthy();
+  });
+
+  it("D 标了之后 U 照常撤回（撤回本职不能被上面那道防线误伤）", async () => {
+    const user = userEvent.setup();
+    const layer = await openLayer(user);
+
+    fireEvent.keyDown(layer, { key: "d" });
+    await screen.findByTestId("sorting-pending-delete");
+
+    fireEvent.keyDown(screen.getByTestId("group-overlay"), { key: "u" });
+    await waitFor(() =>
+      expect(screen.queryByTestId("sorting-pending-delete")).toBeNull(),
+    );
+  });
+
+  it("组层底部速查条把 U 写出来了（键位存在却学不到 = 没有）", async () => {
+    const user = userEvent.setup();
+    const layer = await openLayer(user);
+    expect(within(layer).getByTestId("group-hint-mark").textContent).toContain(
+      "只取消标删",
+    );
+  });
+});
+
+describe("B6 组失效后自动退回网格，不留锁死键盘的空壳", () => {
+  it("★ 两张的组移走一张后不再成组：退回网格 + 明确告知 + 键盘继续可用", async () => {
+    const user = userEvent.setup();
+    // 3 张单件 + 2 张同组：移走一张，这一组就不再构成连拍组
+    const items = mockPendingAssets.slice(0, 5).map((a, i) => ({
+      ...a,
+      id: `B6/${i}.JPG`,
+      fileName: `B6-${i}.JPG`,
+      groupId: i >= 3 ? "burst-b6" : undefined,
+      judgement: undefined,
+    }));
+    vi.spyOn(api, "listPendingAssets").mockResolvedValue({
+      items,
+      total: items.length,
+    });
+
+    render(<App preloaded={sorting} />);
+    await screen.findAllByTestId("asset-cell");
+    const group = (await screen.findAllByTestId("asset-group"))[0];
+    await user.click(within(group).getByTestId("group-expand"));
+    const layer = await screen.findByTestId("group-overlay");
+    expect(within(layer).getAllByTestId("group-item")).toHaveLength(2);
+
+    // 把光标那张分类走 → 组只剩一张 → 浮层卸载
+    fireEvent.keyDown(layer, { key: "1" });
+    await waitFor(() => expect(screen.queryByTestId("group-overlay")).toBeNull());
+
+    // 旧行为：openGroup 仍非空，网格 handler 永久提前 return，键盘彻底失效且无提示
+    const toast = await screen.findByTestId("notice-toast-warning");
+    expect(toast.getAttribute("data-code")).toBe("sorting-group-gone");
+    expect(toast.textContent).toContain("已退回网格");
+
+    expect(document.activeElement).toBe(gridWrap());
+    const before = cursorAsset();
+    await user.keyboard("{ArrowRight}");
+    await waitFor(() => {
+      const after = cursorAsset();
+      expect(after).toBeTruthy();
+      expect(after).not.toBe(before);
+    });
+  }, 15000);
+});
+
+describe("B7 / B9 组层的按钮与焦点圈定", () => {
+  it("★ Tab 到「全选」按回车：执行的是按钮，不会被解释成「看大图」", async () => {
+    const user = userEvent.setup();
+    const layer = await openLayer(user);
+
+    const selectAll = within(layer).getByTestId("group-select-all");
+    selectAll.focus();
+    expect(document.activeElement).toBe(selectAll);
+
+    await user.keyboard("{Enter}");
+
+    // 旧行为：空格/Enter 被当成 preview，大图弹出来、按钮根本没执行
+    expect(screen.queryByTestId("asset-lightbox")).toBeNull();
+    await waitFor(() => {
+      const items = within(screen.getByTestId("group-overlay")).getAllByTestId(
+        "group-item",
+      );
+      expect(items.every((i) => i.getAttribute("aria-selected") === "true")).toBe(
+        true,
+      );
+    });
+  });
+
+  it("★ Tab 圈在层内：最后一个可聚焦元素再按 Tab 回到第一个，焦点跑不到层背后", async () => {
+    const user = userEvent.setup();
+    const layer = await openLayer(user);
+
+    const focusables = Array.from(
+      layer.querySelectorAll<HTMLElement>("button:not([disabled])"),
+    );
+    expect(focusables.length).toBeGreaterThan(1);
+
+    focusables[focusables.length - 1].focus();
+    await user.keyboard("{Tab}");
+    expect(layer.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(focusables[0]);
+
+    // 反向同理
+    await user.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(document.activeElement).toBe(focusables[focusables.length - 1]);
   });
 });

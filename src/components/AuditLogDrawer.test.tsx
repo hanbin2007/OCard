@@ -199,6 +199,88 @@ describe("事件列表", () => {
   });
 });
 
+/**
+ * ★ 部分拷贝必须与整卷长得不一样。
+ *
+ * 这份日志是事后判断"这张卡能不能格式化"的**唯一**权威记录:屏内提示会被
+ * 下一张卡冲掉、toast 会消失、铃铛会被确认清掉。评审实测里,部分拷贝在这里
+ * 显示成一条与整卷**逐字相同**的绿色"拷卡完成 · 容量 39.1 GB"——第二天回来
+ * 对账的 DIT 据此去相机里格式化,卡上没备份的素材就没了。
+ */
+describe("★ 部分拷贝在日志里的呈现", () => {
+  /** 后端 `COPY_COMPLETED` 的真实载荷形状（src-tauri/src/commands/tasks.rs） */
+  function completed(ts: string, sourceFolders: string[]) {
+    return {
+      ts,
+      machine: mockWorkstation.machineId,
+      operator: mockWorkstation.operator,
+      kind: "copy_completed",
+      data: {
+        taskId: "t-1",
+        manifestId: "m-1",
+        allVerified: true,
+        bytesCopied: 42 * 1024 ** 3,
+        sourceFolders,
+      },
+    };
+  }
+
+  async function openWithBothKinds() {
+    vi.spyOn(api, "listAuditLog").mockResolvedValue([
+      completed("2026-08-24T11:00:00+08:00", [
+        "DCIM/100MSDCF",
+        "PRIVATE/M4ROOT/CLIP",
+      ]),
+      completed("2026-08-24T10:00:00+08:00", []),
+    ] as unknown as AuditReply);
+    await openDrawer();
+    const [partial, whole] = items();
+    return { partial, whole };
+  }
+
+  it("★ 两行不能逐字相同,颜色也不能同为绿", async () => {
+    const { partial, whole } = await openWithBothKinds();
+    const detailOf = (el: HTMLElement) =>
+      within(el).getByTestId("audit-detail").textContent;
+
+    expect(detailOf(partial)).not.toBe(detailOf(whole));
+    expect(partial.getAttribute("data-tone")).toBe("warn");
+    expect(whole.getAttribute("data-tone")).toBe("ok");
+  });
+
+  it("部分拷贝写明范围与文件夹名，抬头也不再是光秃秃的「拷卡完成」", async () => {
+    const { partial } = await openWithBothKinds();
+    const detail = within(partial).getByTestId("audit-detail");
+    expect(detail.textContent).toContain(
+      "部分拷贝：2 个文件夹（DCIM/100MSDCF、PRIVATE/M4ROOT/CLIP）",
+    );
+    // 颜色不是信息:灰度/色觉障碍/截图转发之后只剩文字
+    expect(partial.textContent).toContain("拷卡完成（部分）");
+    expect(partial.querySelector(".badge--warn")).not.toBeNull();
+    expect(partial.querySelector(".badge--ok")).toBeNull();
+    // 校验范围也说清楚,不给人"整卡都校验过了"的错觉
+    expect(detail.textContent).toContain("所选范围通过");
+  });
+
+  it("整卷仍是绿色的「拷卡完成」，并明说整卷", async () => {
+    const { whole } = await openWithBothKinds();
+    expect(whole.textContent).toContain("拷卡完成");
+    expect(whole.textContent).not.toContain("部分");
+    expect(whole.querySelector(".badge--ok")).not.toBeNull();
+    expect(within(whole).getByTestId("audit-detail").textContent).toContain("整卷");
+  });
+
+  it("选了卷根显示成「卷根」，不是一对空括号", async () => {
+    vi.spyOn(api, "listAuditLog").mockResolvedValue([
+      completed("2026-08-24T11:00:00+08:00", [""]),
+    ] as unknown as AuditReply);
+    await openDrawer();
+    const detail = within(items()[0]).getByTestId("audit-detail");
+    expect(detail.textContent).toContain("卷根");
+    expect(detail.textContent).not.toContain("（）");
+  });
+});
+
 describe("防御性渲染", () => {
   it("未收录的 kind 照常显示原始值，不消失也不炸", async () => {
     await openDrawer();

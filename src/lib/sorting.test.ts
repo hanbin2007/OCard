@@ -8,6 +8,7 @@ import {
   resolveEntryIds,
   clickSelection,
   emptySelection,
+  gateAction,
   groupBurst,
   initialPendingDelete,
   moveCursor,
@@ -17,7 +18,9 @@ import {
   rangeBetween,
   resolveShortcut,
   selectAll,
+  shouldYieldShortcut,
   toggleSelection,
+  trapTabFocus,
   type PendingDeleteState,
 } from "./sorting";
 
@@ -577,5 +580,170 @@ describe("快捷键新增映射(评审 3.8/3.9)", () => {
       type: "confirmDelete",
     });
     expect(resolveShortcut({ key: "d" }, [])).toEqual({ type: "markDelete" });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 动作受理闸门（B1 / B2 的判据）
+ * ------------------------------------------------------------------ */
+
+describe("动作受理闸门 gateAction", () => {
+  const ok = {
+    hasProject: true,
+    busy: false,
+    deliveryWorking: false,
+    committing: false,
+    targetCount: 1,
+  };
+
+  it("一切正常时受理", () => {
+    expect(gateAction("assign", ok)).toEqual({ accepted: true });
+  });
+
+  it("没有目标时被拒,并说清「先选中再打标」", () => {
+    const out = gateAction("assign", { ...ok, targetCount: 0 });
+    expect(out.accepted).toBe(false);
+    if (out.accepted) throw new Error("unreachable");
+    expect(out.code).toBe("sorting-action-no-target");
+    expect(out.reason).toContain("先用方向键");
+  });
+
+  it("★ 上一批还在飞时必须被拒:调用方据此不前进光标(否则界面伪装成成功)", () => {
+    const out = gateAction("assign", { ...ok, busy: true });
+    expect(out.accepted).toBe(false);
+    if (out.accepted) throw new Error("unreachable");
+    expect(out.code).toBe("sorting-action-busy");
+    // 关键在于说清「没做成」,而不是含糊的「请稍候」
+    expect(out.reason).toContain("没有被接受");
+  });
+
+  it("打包期间禁分类/精选/标删,但**放行**取消标删(否则误标了撤不掉)", () => {
+    const locked = { ...ok, deliveryWorking: true };
+    expect(gateAction("assign", locked).accepted).toBe(false);
+    expect(gateAction("curate", locked).accepted).toBe(false);
+    expect(gateAction("mark", locked).accepted).toBe(false);
+    expect(gateAction("unmark", { ...locked, markedCount: 1 })).toEqual({
+      accepted: true,
+    });
+  });
+
+  it("待删清单正在提交时不许改标记", () => {
+    const out = gateAction("mark", { ...ok, committing: true });
+    expect(out.accepted).toBe(false);
+    if (out.accepted) throw new Error("unreachable");
+    expect(out.code).toBe("sorting-action-commit-busy");
+  });
+
+  it("★ U 打在一张都没标过的目标上:明说「本来就没标删」,绝不反手标上", () => {
+    const out = gateAction("unmark", { ...ok, markedCount: 0 });
+    expect(out.accepted).toBe(false);
+    if (out.accepted) throw new Error("unreachable");
+    expect(out.code).toBe("sorting-action-not-marked");
+    expect(out.reason).toContain("要标删请按 D");
+  });
+
+  it("只标记的批量工具遇上「已经全标过了」也要出声,不是默默无事发生", () => {
+    const out = gateAction("mark", { ...ok, targetCount: 3, markedCount: 3 });
+    expect(out.accepted).toBe(false);
+    if (out.accepted) throw new Error("unreachable");
+    expect(out.code).toBe("sorting-action-already-marked");
+  });
+
+  it("busy 不挡标删:待删标记是本地状态,不打 IPC", () => {
+    expect(gateAction("mark", { ...ok, busy: true, markedCount: 0 })).toEqual({
+      accepted: true,
+    });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 键盘可达性
+ * ------------------------------------------------------------------ */
+
+describe("快捷键让路 shouldYieldShortcut", () => {
+  function el(html: string): HTMLElement {
+    const host = document.createElement("div");
+    host.innerHTML = html;
+    return host.firstElementChild as HTMLElement;
+  }
+
+  it("★ 焦点在按钮上时 Enter / 空格归按钮自己(否则「重试」永远按不动)", () => {
+    const button = el("<button>重试</button>");
+    expect(shouldYieldShortcut(button, "Enter")).toBe(true);
+    expect(shouldYieldShortcut(button, " ")).toBe(true);
+  });
+
+  it("按钮上按数字/字母仍走快捷键:键盘流不该因为焦点在按钮上就整条停摆", () => {
+    const button = el("<button>重试</button>");
+    expect(shouldYieldShortcut(button, "1")).toBe(false);
+    expect(shouldYieldShortcut(button, "d")).toBe(false);
+  });
+
+  it("role=button 的复合控件同样让路", () => {
+    expect(shouldYieldShortcut(el('<div role="button"></div>'), "Enter")).toBe(true);
+    expect(shouldYieldShortcut(el('<a href="#x"></a>'), " ")).toBe(true);
+  });
+
+  it("输入类目标让路的是**所有**键,不只是 Enter/空格", () => {
+    for (const html of ["<input />", "<textarea></textarea>", "<select></select>"]) {
+      expect(shouldYieldShortcut(el(html), "1")).toBe(true);
+      expect(shouldYieldShortcut(el(html), "Escape")).toBe(true);
+    }
+  });
+
+  it("普通容器/格子不让路", () => {
+    expect(shouldYieldShortcut(el('<div role="gridcell"></div>'), "Enter")).toBe(false);
+    expect(shouldYieldShortcut(el("<div></div>"), " ")).toBe(false);
+    expect(shouldYieldShortcut(null, "Enter")).toBe(false);
+  });
+});
+
+describe("焦点圈定 trapTabFocus", () => {
+  function layer(): { box: HTMLElement; buttons: HTMLButtonElement[] } {
+    const box = document.createElement("div");
+    box.tabIndex = -1;
+    box.innerHTML = "<button>a</button><button>b</button><button>c</button>";
+    document.body.appendChild(box);
+    return {
+      box,
+      buttons: Array.from(box.querySelectorAll("button")),
+    };
+  }
+
+  it("末项按 Tab 回到首项,首项 Shift+Tab 回到末项——焦点出不去这一层", () => {
+    const { box, buttons } = layer();
+    buttons[2].focus();
+    expect(trapTabFocus(box, { key: "Tab" })).toBe(true);
+    expect(document.activeElement).toBe(buttons[0]);
+
+    buttons[0].focus();
+    expect(trapTabFocus(box, { key: "Tab", shiftKey: true })).toBe(true);
+    expect(document.activeElement).toBe(buttons[2]);
+    box.remove();
+  });
+
+  it("中间位置原样交给浏览器原生 Tab 顺序", () => {
+    const { box, buttons } = layer();
+    buttons[1].focus();
+    expect(trapTabFocus(box, { key: "Tab" })).toBe(false);
+    box.remove();
+  });
+
+  it("焦点在层外(例如刚从背后那层跑过来)时收回层内首项", () => {
+    const { box, buttons } = layer();
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+    expect(trapTabFocus(box, { key: "Tab" })).toBe(true);
+    expect(document.activeElement).toBe(buttons[0]);
+    outside.remove();
+    box.remove();
+  });
+
+  it("非 Tab 键一律不接管", () => {
+    const { box } = layer();
+    expect(trapTabFocus(box, { key: "Escape" })).toBe(false);
+    expect(trapTabFocus(null, { key: "Tab" })).toBe(false);
+    box.remove();
   });
 });

@@ -1481,19 +1481,31 @@
 }
 
 /*
+ * 全屏浮层的 z 轴阶梯（本屏这一段是权威口径）：
+ *   .overlay(50) < .group-layer(55) < .lightbox(60) < .overlay--keyhelp(65)
+ *   < .select-pop(70) < .overlay--gate(80) < .overlay--elevated(90)
+ * 「网格 → 组层 → 大图」三层在 z 轴上的先后与用户心里的先后一致。
+ *
+ * 速查表（`?`）必须压过组层与大图：它此前用的是普通 .overlay(50)，于是在
+ * 组层/大图里按 `?` 看似毫无反应，退出去之后它才突然冒出来。但仍排在
+ * 会话门(80)之下——门没确认之前一切都不该有旁路，速查表也不例外。
+ */
+.overlay--keyhelp {
+  z-index: 65;
+}
+
+/*
  * 连拍组全屏层。
  *
- * 视觉与 .lightbox 同源（满屏遮罩 + 顶栏 + 主体 + 底栏），层级排在它下面一档：
- * .overlay(50) < .group-layer(55) < .lightbox(60)，
- * 于是「网格 → 组层 → 大图」这三层在 z 轴上的先后与用户心里的先后一致。
+ * 视觉与 .lightbox 同源（满屏遮罩 + 顶栏 + 主体 + 底栏），层级排在它下面一档。
  *
  * 有界与内部滚动是这一层的命门（组内可能几十张）。刚踩过的坑：.overlay 是
  * display:grid 且没写 grid-template-rows，隐式行是 auto —— 内容超过视口时
  * 行被撑大，子元素的 height/max-height:100% 随之失去约束，内部滚动条永远
  * 不出现、内容跑出窗口下沿。这里改用最不容易出错的组合：
  *   固定定位的 flex 列容器（高度 = 视口）
- *   + 滚动区 flex:1 1 auto 且 min-height:0（flex 子项默认 min-height:auto，
- *     不写 0 的话内容一多同样会把行撑破，症状与上面那条一模一样）。
+ *   + 滚动区 flex:1 1 auto 且 overflow-y:auto（**承重的是 overflow-y**，
+ *     见下面 .group-layer__grid 里那条实测口径）。
  * 顶栏/工具条/底栏一律 flex:0 0 auto，绝不参与瓜分剩余高度。
  */
 .group-layer {
@@ -1541,7 +1553,19 @@
 }
 
 .group-layer__grid {
-  /* min-height:0 是这层能滚的前提，删掉它就回到「内容跑出窗口下沿」那个 bug */
+  /*
+   * 承重的是下面那条 `overflow-y: auto`，不是 `min-height: 0`。
+   *
+   * 实测口径（此前这里写的是「min-height:0 是这层能滚的前提，删掉它就回到
+   * 内容跑出窗口下沿那个 bug」——不成立）：flex 子项的 `min-height: auto`
+   * 只在 `overflow` 为 `visible` 时才解析成「自动最小尺寸」；同一条规则里
+   * 既然已经有 `overflow-y: auto`，它本来就解析成 0。所以 min-height:0
+   * 在这里是**冗余**的，留着无害（将来若把 overflow 改回 visible 它就重新
+   * 承重），但绝不是这层能滚的原因。真要验证「内容跑出窗口下沿」，
+   * 拿掉的必须是 overflow-y。
+   *
+   * 本项目吃过大亏：把没验证的猜想写成事实的注释，直接导致后来连续四轮误诊。
+   */
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;

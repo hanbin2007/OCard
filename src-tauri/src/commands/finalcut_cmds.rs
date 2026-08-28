@@ -8,7 +8,7 @@
 //!   last-write-wins(勾选状态,声明语义),跨机可见。
 
 use super::notify;
-use crate::core::{ffmpeg, naming, paths, project, transcode};
+use crate::core::{copy, ffmpeg, naming, paths, project, transcode};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -75,7 +75,12 @@ pub fn check_final_cuts<R: tauri::Runtime>(
         match e {
             Ok(e) => {
                 let name = e.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') {
+                // R12:排除口径收口到共享名单(不再「点开头一律跳过」)。
+                // 这一处判的是**要不要给用户看这条命名意见**:漏掉一个成片,
+                // 用户就以为它合规,交付时才发现名字不对。点开头的成片本来就
+                // 会被 grammar 判成不合规并**标黄可见**,而不是被悄悄拿掉。
+                // 起点是「6. 成片」(不递归),`.ocard/` 不在这一层。
+                if copy::is_system_item(&name) {
                     continue;
                 }
                 match e.file_type() {
@@ -168,10 +173,13 @@ pub fn curated_flow_hints<R: tauri::Runtime>(
     // R2 P1:中间段符号链接闸(canonical 只读断言)
     paths::assert_within(&stats.root, &todo_dir)?;
     paths::assert_within(&stats.root, &done_dir)?;
-    let stem = |n: &str| {
-        n.rsplit_once('.')
-            .map(|(s, _)| s.to_string())
-            .unwrap_or_else(|| n.to_string())
+    // 主名 = 去掉最后一个扩展名。分割点必须在**下标 > 0** 处:R12 放行点开头的
+    // 素材之后,`.clip`(点开头、只有这一个点)按旧写法主名会变成空串,于是
+    // 「待修/.alpha」和「已修/.beta」两个毫不相干的文件主名都是 ""、被判成同一件,
+    // 提示用户删掉一份还没修完的原稿。口径与 `core::copy` 的 `split_ext` 一致。
+    let stem = |n: &str| match n.rfind('.') {
+        Some(i) if i > 0 => n[..i].to_string(),
+        _ => n.to_string(),
     };
     let list = |d: &PathBuf| -> Vec<String> {
         match std::fs::read_dir(d) {
@@ -185,8 +193,15 @@ pub fn curated_flow_hints<R: tauri::Runtime>(
                     };
                     match e.file_type() {
                         Ok(t) if t.is_file() => {
+                            // R12:排除口径收口到共享名单。点开头的原稿(`.clip.mov`)
+                            // 拷得进 NAS、在分类界面看得见、能被精选进「待修」——
+                            // 这里再按「点开头」把它筛掉,它就永远拿不到流转提示,
+                            // 用户以为已修完的东西还压着一份原稿。
+                            // 起点是「精选/待修」「精选/已修」,`.ocard/` 不在这两层;
+                            // 而精选复制的落地临时名 `.<uuid>.curatepart` 就落在
+                            // 「待修」里,由共享名单的后缀项挡住。
                             let n = e.file_name().to_string_lossy().to_string();
-                            if !n.starts_with('.') {
+                            if !copy::is_system_item(&n) {
                                 names.push(n);
                             }
                         }

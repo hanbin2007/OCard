@@ -321,6 +321,24 @@ export interface SourcePlan {
   totalBytes: number;
   /** **只含被改写的**；没有重名时为空数组 */
   renamedFiles: RenamedFile[];
+  /**
+   * 因「.」开头被排除的条目数。它们从未进入计划，任务却照样报 100%——
+   * 多是 `.Trashes` 这类系统残留，但卡上也可能有合法的 `.clip.mov`。
+   * 大于 0 时确认屏必须说出来，否则「本卡可格式化」就是错的。
+   */
+  hiddenSkipped: number;
+  /** 上述条目的前几条路径（样例） */
+  hiddenSamples: string[];
+  /**
+   * 本次计划的绑定令牌，发起拷卡时原样回传给 `startCopyTask`。
+   *
+   * 用户在双确认屏批准的是**这一刻**的清单；后端真正执行的是重扫得到的另一份。
+   * 窗口内换卡、别的进程写入、文件被删都会让两者不同（被删的已确认文件直接
+   * 从新计划里消失，剩下的照样能报全部校验通过）。令牌对不上时后端返回
+   * `PLAN_CHANGED:` 开头的错误，前端必须重新拉计划并**退回双确认屏**，
+   * 不许自动重试——这是知情同意。
+   */
+  planDigest: string;
 }
 
 /** 发起拷卡任务的提交体 */
@@ -344,6 +362,14 @@ export interface StartCopyInput {
    * 空 / 省略 = 整卷（向后兼容：老客户端与老 manifest 行为逐字节不变）。
    */
   sourceFolders?: string[];
+  /**
+   * 双确认屏拿到的 `SourcePlan.planDigest`，原样回传。
+   *
+   * **`sourceFolders` 非空时必须带**：没有令牌就无法确认「用户批准的范围与
+   * 改名清单还成立」，后端会拒绝而不是放行成整卷。整卷（`sourceFolders` 空 /
+   * 省略）保留原层级、不改名，向后兼容豁免。
+   */
+  planDigest?: string;
   /** 拷完自动转代理（工况 A，PRD §5.6） */
   autoProxy?: boolean;
   /**

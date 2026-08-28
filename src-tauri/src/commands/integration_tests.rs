@@ -43,6 +43,7 @@ fn mock_app() -> (
         tasks: Default::default(),
         notices: Default::default(),
         ops: Default::default(),
+        approved_plans: Default::default(),
     });
     let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
         .build()
@@ -497,6 +498,7 @@ fn resume_rejects_tampered_manifest_through_real_handler() {
         rel_path: "DCIM/IMG_0001.JPG".into(),
         size: 64,
         source_rel: String::new(),
+        source_mtime_ns: 0,
     });
     crate::core::manifest::save(&project_root, &m).unwrap();
     // ……随后在 NAS 上被篡改:planned 注入逃逸项
@@ -1266,6 +1268,8 @@ fn source_folder_commands_wired_through_real_handler() {
     std::fs::write(card.join("DCIM/101MSDCF/DSC1.JPG"), vec![2u8; 2000]).unwrap();
     std::fs::write(card.join("ROOT.MP4"), vec![3u8; 3000]).unwrap();
     let vid = card.display().to_string();
+    // R9:源卷必须先解析到权威卷清单——测试里把这张「卡」登记进去
+    let _mounted = crate::commands::TestVolumeGuard::mount(&card);
 
     let list =
         invoke(&window, "list_source_folders", json!({"volumeId": vid})).expect("列文件夹应成功");
@@ -1320,6 +1324,26 @@ fn source_folder_commands_wired_through_real_handler() {
         "{e}"
     );
 
+    // R9:存在、可读,但**不是挂载卷**的目录不许当拷卡源——
+    // 否则能拿它读到卡外的目录树、文件计数与部分文件名
+    let outside = tmp.path().join("卡外目录");
+    std::fs::create_dir_all(outside.join("私人")).unwrap();
+    std::fs::write(outside.join("私人/机密.txt"), b"x").unwrap();
+    for cmd in ["list_source_folders", "plan_source_selection"] {
+        let e = invoke(
+            &window,
+            cmd,
+            json!({"volumeId": outside.display().to_string(), "folders": []}),
+        )
+        .unwrap_err();
+        assert!(
+            e.as_str()
+                .unwrap_or_default()
+                .contains("不是当前挂载的存储卷"),
+            "{cmd}: {e}"
+        );
+    }
+
     // 路径逃逸:拒绝
     let e = invoke(
         &window,
@@ -1345,6 +1369,9 @@ fn resume_plan_refresh_locks_targets_for_folder_selection() {
     std::fs::create_dir_all(card.join("D")).unwrap();
     std::fs::write(card.join("D/a.jpg"), vec![1u8; 10]).unwrap();
     std::fs::write(card.join("D/新来的.jpg"), vec![2u8; 20]).unwrap();
+    // R8:刷新出来的计划要原子写回清单,所以需要一个真的项目根
+    let project_root = tmp.path().join("proj");
+    std::fs::create_dir_all(&project_root).unwrap();
 
     // 整卷:重扫到的新文件照旧带上,计划内已消失的文件也留着(引擎会记失败)
     let mut whole = CopyManifest::new("t", "card", "A7M4_A_ZS", "ZS", "");
@@ -1353,14 +1380,16 @@ fn resume_plan_refresh_locks_targets_for_folder_selection() {
             rel_path: "D/a.jpg".into(),
             size: 10,
             source_rel: String::new(),
+            source_mtime_ns: 0,
         },
         PlannedFile {
             rel_path: "D/没了.jpg".into(),
             size: 99,
             source_rel: String::new(),
+            source_mtime_ns: 0,
         },
     ];
-    let plan = crate::commands::refresh_resume_plan(app, &whole, &card).unwrap();
+    let plan = crate::commands::refresh_resume_plan(app, &mut whole, &project_root, &card).unwrap();
     let mut rels: Vec<&str> = plan.iter().map(|p| p.target_rel.as_str()).collect();
     rels.sort();
     assert_eq!(rels, vec!["D/a.jpg", "D/新来的.jpg", "D/没了.jpg"]);
@@ -1376,8 +1405,10 @@ fn resume_plan_refresh_locks_targets_for_folder_selection() {
         rel_path: "a.jpg".into(),
         size: 10,
         source_rel: "D/a.jpg".into(),
+        source_mtime_ns: 0,
     }];
-    let plan = crate::commands::refresh_resume_plan(app, &folder, &card).unwrap();
+    let plan =
+        crate::commands::refresh_resume_plan(app, &mut folder, &project_root, &card).unwrap();
     assert_eq!(plan.len(), 1, "新增文件不得改动锁定的清单: {plan:?}");
     assert_eq!(plan[0].source_rel, "D/a.jpg");
     assert_eq!(plan[0].target_rel, "a.jpg");
@@ -1393,8 +1424,11 @@ fn resume_plan_refresh_locks_targets_for_folder_selection() {
 
     // 暂停期间源文件被改写:尺寸必须取当前实际值(沿用旧 size 会让 manifest
     // 记下与内容不符的长度、进度也失真),并且这件事要说出来
+    folder.completed = true; // 模拟「上一轮跑完标了完成」的清单
+    crate::core::manifest::save(&project_root, &folder).unwrap();
     std::fs::write(card.join("D/a.jpg"), vec![9u8; 25]).unwrap();
-    let plan = crate::commands::refresh_resume_plan(app, &folder, &card).unwrap();
+    let plan =
+        crate::commands::refresh_resume_plan(app, &mut folder, &project_root, &card).unwrap();
     assert_eq!(plan[0].size, 25, "尺寸必须跟上源文件的实际变化");
     assert_eq!(plan[0].target_rel, "a.jpg", "落点仍沿用锁定值");
     let notices = invoke(&window, "list_notices", json!({})).unwrap();
@@ -1406,21 +1440,146 @@ fn resume_plan_refresh_locks_targets_for_folder_selection() {
             .any(|n| n["code"] == "copy-resume-size-changed"),
         "源文件变了必须可见告警: {notices}"
     );
+
+    // R8(必修):刷新出来的尺寸必须**原子地**同时落到内存与磁盘上的 planned。
+    // 只改内存会留下 `planned.size = 旧值` / `entry.size = 新值` /
+    // `completed = true` 的自相矛盾清单。
+    assert_eq!(folder.planned[0].size, 25, "内存里的 planned 要跟上");
+    assert!(!folder.completed, "计划变了就还没跑完,completed 必须回落");
+    assert_ne!(
+        folder.planned[0].source_mtime_ns, 0,
+        "要记下源文件身份/mtime"
+    );
+    let saved = crate::core::manifest::load(&project_root, &folder.id).unwrap();
+    assert_eq!(
+        saved.planned[0].size, 25,
+        "持久化的 planned 必须跟着更新,否则清单自相矛盾"
+    );
+    assert!(!saved.completed);
+
+    // 同大小、内容被换掉(只有 mtime 会动):此前完全没有告警
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    std::fs::write(card.join("D/a.jpg"), vec![7u8; 25]).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(card.join("D/a.jpg"))
+        .unwrap();
+    f.set_times(
+        std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)),
+    )
+    .unwrap();
+    drop(f);
+    crate::commands::refresh_resume_plan(app, &mut folder, &project_root, &card).unwrap();
+    let notices = invoke(&window, "list_notices", json!({})).unwrap();
+    assert!(
+        notices
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["code"] == "copy-resume-content-replaced"),
+        "同大小但内容被替换必须可见告警: {notices}"
+    );
 }
 
-/// 卡多是 exFAT(大小写不敏感):`DCIM` 与 `dcim` 是同一个夹子,
-/// 当成两项会把同一批文件规划两遍(内容重复、落点还不一样)。
+/// R11 影响面:排除口径收紧后续传**升级前**建的任务,会凭空冒出一批点开头的文件。
+/// 用户看到「卡上多了文件」的第一反应是有人动过这张卡——那是完全错误的排查方向。
+/// 两条续传路径都必须说清楚:这是 OCard 改了口径,不是卡被动过。
+/// (把两条告警里解释口径变化的那句话删掉,本测试必红。)
 #[test]
-fn selection_dedupe_is_case_insensitive() {
-    let sel = crate::commands::parse_selection(&[
+fn resume_explains_files_that_appeared_because_the_scan_policy_widened() {
+    use crate::core::manifest::{CopyManifest, PlannedFile};
+    let (window, tmp, _nas) = mock_app();
+    let app = window.app_handle();
+    let card = tmp.path().join("card-widened");
+    std::fs::create_dir_all(card.join("D")).unwrap();
+    std::fs::write(card.join("D/a.jpg"), vec![1u8; 10]).unwrap();
+    // 升级前这个文件因为「点开头」被排除,所以不在老任务锁定的清单里
+    std::fs::write(card.join("D/.clip.mov"), vec![2u8; 20]).unwrap();
+    let project_root = tmp.path().join("proj-widened");
+    std::fs::create_dir_all(&project_root).unwrap();
+
+    // ① 按文件夹:落点已锁定,新冒出来的不进清单,但要说清为什么会冒出来
+    let mut folder = CopyManifest::new("t", "card", "A7M4_A_ZS", "ZS", "");
+    folder.source_selection = vec!["D".into()];
+    folder.planned = vec![PlannedFile {
+        rel_path: "a.jpg".into(),
+        size: 10,
+        source_rel: "D/a.jpg".into(),
+        source_mtime_ns: 0,
+    }];
+    let plan =
+        crate::commands::refresh_resume_plan(app, &mut folder, &project_root, &card).unwrap();
+    assert_eq!(plan.len(), 1, "锁定的清单不受影响: {plan:?}");
+    let notices = invoke(&window, "list_notices", json!({})).unwrap();
+    let msg = notices
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["code"] == "copy-resume-new-files")
+        .map(|n| n["message"].as_str().unwrap_or_default().to_string())
+        .unwrap_or_else(|| panic!("必须发新增文件告警: {notices}"));
+    assert!(msg.contains("D/.clip.mov"), "新增的要点名: {msg}");
+    assert!(
+        msg.contains("OCard 升级") && msg.contains("不是这张卡被人动过"),
+        "必须说清是口径变了,而不是卡被人动过: {msg}"
+    );
+
+    // ② 整卷:新冒出来的会被**真的拷贝**,任务完成度也会回退——更要说清楚
+    let mut whole = CopyManifest::new("t", "card", "A7M4_A_ZS", "ZS", "");
+    whole.planned = vec![PlannedFile {
+        rel_path: "D/a.jpg".into(),
+        size: 10,
+        source_rel: String::new(),
+        source_mtime_ns: 0,
+    }];
+    let plan = crate::commands::refresh_resume_plan(app, &mut whole, &project_root, &card).unwrap();
+    assert_eq!(plan.len(), 2, "整卷续传会把它带上: {plan:?}");
+    let notices = invoke(&window, "list_notices", json!({})).unwrap();
+    let msg = notices
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["code"] == "copy-resume-scope-widened")
+        .map(|n| n["message"].as_str().unwrap_or_default().to_string())
+        .unwrap_or_else(|| panic!("整卷续传纳入新条目必须可见: {notices}"));
+    assert!(msg.contains("D/.clip.mov"), "新纳入的要点名: {msg}");
+    assert!(
+        msg.contains("会被拷贝") && msg.contains("不是这张卡被人动过"),
+        "要说清会被拷贝、且是口径变了: {msg}"
+    );
+}
+
+/// R1(必修):请求层去重**只按字节完全相同**。
+///
+/// 此前拿目的地的大小写口径(`fold_key`)给**源侧**选择去重:源卷大小写敏感时
+/// (大小写敏感 APFS / Linux ext4 导出 / 部分 SMB·NFS / 磁盘映像)`DCIM` 与
+/// `dcim` 是两个真实存在的不同目录,`list_source_folders` 会两条都列出来让用户勾,
+/// 勾了之后第二个被**无声丢弃**——漏拷一整个文件夹,任务却报 all_verified。
+/// (把去重改回大小写不敏感,本测试必红。)
+#[test]
+fn selection_keeps_case_distinct_folders_and_dedupes_only_exact_bytes() {
+    let parsed = crate::commands::parse_selection(&[
         "DCIM/100MSDCF".to_string(),
         "dcim/100msdcf".to_string(),
+        // 字节完全相同的重复项才去重(重复本身无害:scan_selection 的
+        // sort+dedup 会按真实 rel 收敛)
+        "DCIM/100MSDCF".to_string(),
     ])
     .unwrap();
-    match sel {
-        crate::core::copy::SourceSelection::Folders(f) => assert_eq!(f.len(), 1, "{f:?}"),
+    match &parsed.selection {
+        crate::core::copy::SourceSelection::Folders(f) => {
+            assert_eq!(
+                f,
+                &vec!["DCIM/100MSDCF".to_string(), "dcim/100msdcf".to_string()],
+                "只差大小写的两项是源卷上两个真实目录,一个都不许丢"
+            );
+        }
         other => panic!("应为 Folders: {other:?}"),
     }
+    // 不合并,但要点名告警(源卷若其实大小写不敏感,用户有权知道这两项会各扫一遍)
+    assert_eq!(parsed.aliases.len(), 1, "{:?}", parsed.aliases);
+    assert!(parsed.aliases[0].contains("DCIM/100MSDCF"));
 }
 
 /// 契约字段名是前后端唯一的约定面:`sourceFolders` 拼错一个字母就会被
@@ -1466,6 +1625,7 @@ fn resume_rejects_manifest_with_contradictory_scope() {
         rel_path: "IMG_0001.JPG".into(),
         size: 64,
         source_rel: "DCIM/100MSDCF/IMG_0001.JPG".into(),
+        source_mtime_ns: 0,
     });
     crate::core::manifest::save(&project_root, &m).unwrap();
 
@@ -1519,5 +1679,624 @@ fn resume_rejects_manifest_with_contradictory_scope() {
     assert!(
         e.as_str().unwrap_or_default().contains("口径自相矛盾"),
         "报文要点名口径问题: {e}"
+    );
+}
+
+// ============ 双路评审收敛出的必修项:命令层回归网 ============
+
+/// 端到端拷卡:一次钉住 R2(DTO 报的是引擎口径的 selection)、
+/// R5(计划绑定令牌)、R7/R11(系统项被排除且可见、点开头的素材照拷)三条接线。
+#[test]
+fn start_copy_binds_the_approved_plan_and_reports_engine_selection() {
+    let (window, tmp, nas) = mock_app();
+    let pid = create_b_project(&window);
+    let project_root = nas.join(&pid);
+    let cam = invoke(
+        &window,
+        "create_camera",
+        json!({"input": {"model": "A7M4", "position": "A", "operatorAlias": "ZS"}}),
+    )
+    .expect("登记相机应成功");
+    let cam_id = cam["id"].as_str().unwrap().to_string();
+
+    let card = tmp.path().join("card-e2e");
+    std::fs::create_dir_all(card.join("D")).unwrap();
+    std::fs::write(card.join("D/a.jpg"), vec![1u8; 10]).unwrap();
+    std::fs::write(card.join("D/b.jpg"), vec![2u8; 20]).unwrap();
+    // R11:合法但点开头的素材**必须**进计划(漏拷却报成功是最不能接受的失败形态)
+    std::fs::write(card.join("D/.clip.mov"), vec![3u8; 30]).unwrap();
+    // R7/R11:明确列举的系统项仍然排除,且必须被数出来告诉用户
+    std::fs::write(card.join("D/.DS_Store"), vec![4u8; 40]).unwrap();
+    let _mounted = crate::commands::TestVolumeGuard::mount(&card);
+    let vid = card.display().to_string();
+
+    let plan = invoke(
+        &window,
+        "plan_source_selection",
+        json!({"volumeId": vid, "folders": ["D"]}),
+    )
+    .expect("规划应成功");
+    assert_eq!(plan["fileCount"], 3, "点开头的素材必须在计划里: {plan}");
+    assert_eq!(plan["hiddenSkipped"], 1, "系统项必须报出来: {plan}");
+    assert_eq!(plan["hiddenSamples"][0], "D/.DS_Store");
+    let digest = plan["planDigest"].as_str().unwrap().to_string();
+    assert!(!digest.is_empty(), "计划必须带绑定令牌: {plan}");
+
+    let dest = tmp.path().join("backup");
+    let input = |extra: Value| -> Value {
+        let mut base = json!({
+            "projectId": pid, "volumeId": vid, "cameraId": cam_id,
+            "note": "", "tags": ["开幕式"], "targetPrefix": "0824上午",
+            "destinations": [{"kind": "local", "path": dest.display().to_string()}],
+            // 故意传一份**未规范化**的输入:字节重复项
+            "sourceFolders": ["D", "D"],
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        json!({ "input": base })
+    };
+
+    // R5-①:按文件夹拷却没带令牌 → 拒绝。**绝不许 fail-open 成整卷**
+    let e = invoke(&window, "start_copy_task", input(json!({}))).unwrap_err();
+    assert!(
+        e.as_str().unwrap_or_default().contains("planDigest"),
+        "缺令牌必须点名说清楚: {e}"
+    );
+
+    // R5-②:双确认之后卡上内容变了 → PLAN_CHANGED,且**任何副作用之前**就拒
+    std::fs::write(card.join("D/c.jpg"), vec![4u8; 40]).unwrap();
+    let e = invoke(
+        &window,
+        "start_copy_task",
+        input(json!({"planDigest": digest})),
+    )
+    .unwrap_err();
+    let msg = e.as_str().unwrap_or_default().to_string();
+    assert!(msg.starts_with("PLAN_CHANGED:"), "{msg}");
+    assert!(msg.contains("重新核对"), "要告诉用户去重新核对: {msg}");
+    // R11:原因必须说对且点得出名字——说错原因会把人引向错误的排查方向
+    assert!(
+        msg.contains("新增 1 个") && msg.contains("D/c.jpg"),
+        "增删必须说清是什么、多少个: {msg}"
+    );
+    assert_eq!(
+        crate::core::manifest::list(&project_root)
+            .unwrap()
+            .manifests
+            .len(),
+        0,
+        "被拒的任务不许留下清单"
+    );
+    assert!(
+        !card.join(crate::core::volumes::VOLUME_UID_FILE).exists(),
+        "被拒的任务不许往卡上写指纹"
+    );
+    assert!(!dest.exists(), "被拒的任务不许创建目的地");
+
+    // R5-③:重新拉计划拿到新令牌 → 放行
+    let plan2 = invoke(
+        &window,
+        "plan_source_selection",
+        json!({"volumeId": vid, "folders": ["D"]}),
+    )
+    .unwrap();
+    let task = invoke(
+        &window,
+        "start_copy_task",
+        input(json!({"planDigest": plan2["planDigest"].clone()})),
+    )
+    .expect("新令牌必须能开跑");
+
+    // R2:DTO 报的是**引擎真正采用的** selection(去重后的 ["D"]),不是原始输入
+    assert_eq!(
+        task["sourceFolders"],
+        json!(["D"]),
+        "sourceFolders 必须与 manifest / 引擎同源: {task}"
+    );
+    let m = &crate::core::manifest::list(&project_root)
+        .unwrap()
+        .manifests[0];
+    assert_eq!(m.source_selection, vec!["D".to_string()], "三边同源");
+    assert_eq!(m.hidden_skipped, 1, "排除的条目要落进清单供事后核对");
+    // R11:点开头的素材必须真的在锁定清单里(不是只统计了事)
+    assert!(
+        m.planned.iter().any(|p| p.source() == "D/.clip.mov"),
+        "点开头的素材必须进锁定清单: {:?}",
+        m.planned
+    );
+
+    // R7/R11:开拷前必须发过可见告警
+    let notices = invoke(&window, "list_notices", json!({})).unwrap();
+    assert!(
+        notices
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["code"] == "copy-hidden-skipped"),
+        "系统项被排除必须可见: {notices}"
+    );
+}
+
+/// R11:令牌对不上时,**三类原因必须各说各的**——说错原因比不说更糟,
+/// 会把人引向错误的排查方向(去数文件 vs 去查是谁动了卡)。
+/// (把 `plan_changed_message` 换回一句笼统的「计划变了」,本测试必红。)
+#[test]
+fn plan_changed_message_names_the_actual_cause() {
+    let (window, tmp, _nas) = mock_app();
+    let card = tmp.path().join("card-why");
+    std::fs::create_dir_all(card.join("D")).unwrap();
+    std::fs::write(card.join("D/a.jpg"), vec![1u8; 10]).unwrap();
+    std::fs::write(card.join("D/b.jpg"), vec![2u8; 20]).unwrap();
+    let _mounted = crate::commands::TestVolumeGuard::mount(&card);
+    let vid = card.display().to_string();
+    let ask = |state: &crate::commands::AppState, approved: &str| -> String {
+        let (plan, _, _) = crate::core::copy::scan_selection(
+            &card,
+            &crate::core::copy::SourceSelection::from_folders(vec!["D".into()]),
+        )
+        .unwrap();
+        let _ = crate::core::copy::take_scan_system_skipped();
+        let identity = crate::commands::volume_identity(&card);
+        let fresh = crate::core::copy::plan_digest(
+            &crate::core::copy::SourceSelection::from_folders(vec!["D".into()]),
+            &plan,
+            &identity,
+        );
+        crate::commands::plan_changed_message(state, approved, &fresh, &plan, &identity)
+    };
+
+    let plan = invoke(
+        &window,
+        "plan_source_selection",
+        json!({"volumeId": vid, "folders": ["D"]}),
+    )
+    .expect("规划应成功");
+    let approved = plan["planDigest"].as_str().unwrap().to_string();
+    let app = window.app_handle();
+    let state: tauri::State<crate::commands::AppState> = app.state();
+
+    // ① 同大小、内容被替换(只有 mtime 会动):不能报成「文件被增删」
+    std::fs::write(card.join("D/a.jpg"), vec![9u8; 10]).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(card.join("D/a.jpg"))
+        .unwrap();
+    f.set_times(
+        std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)),
+    )
+    .unwrap();
+    drop(f);
+    let msg = ask(&state, &approved);
+    assert!(
+        msg.contains("被改动过") && msg.contains("大小没变") && msg.contains("D/a.jpg"),
+        "同大小内容被换掉要说对原因并点名: {msg}"
+    );
+    assert!(!msg.contains("新增"), "别把「被改动」说成「增删」: {msg}");
+
+    // ② 文件集变了:说清增删了什么、多少个
+    std::fs::remove_file(card.join("D/b.jpg")).unwrap();
+    std::fs::write(card.join("D/c.jpg"), vec![3u8; 30]).unwrap();
+    let msg = ask(&state, &approved);
+    assert!(
+        msg.contains("新增 1 个") && msg.contains("D/c.jpg"),
+        "新增要点名: {msg}"
+    );
+    assert!(
+        msg.contains("少了 1 个") && msg.contains("D/b.jpg"),
+        "删除要点名: {msg}"
+    );
+
+    // ③ 令牌根本认不出来(旧版本客户端 / 被改写):fail-closed 且说得对
+    let msg = ask(&state, "deadbeefdeadbeef");
+    assert!(
+        msg.contains("无法识别") && msg.starts_with("PLAN_CHANGED:"),
+        "认不出的令牌要说认不出,别乱扣「卡被人动过」: {msg}"
+    );
+
+    // ④ 记不住确认时那份计划(应用重启/被挤掉)时,必须**明说**说不出是哪几个,
+    //    不许含糊其辞假装说得出
+    let msg = ask(
+        &state,
+        &crate::core::copy::plan_digest(
+            &crate::core::copy::SourceSelection::from_folders(vec!["D".into()]),
+            &[],
+            &crate::commands::volume_identity(&card),
+        ),
+    );
+    assert!(
+        msg.contains("已不在内存中"),
+        "拿不到明细就明说拿不到: {msg}"
+    );
+
+    // ⑤ 卷身份变了,但变的是**OCard 自己后写上去的指纹**:这不是换卡。
+    //    报「你换了一张卡」是彻头彻尾的假警报,会让人去翻读卡器而不是看真正的
+    //    失败原因(首拷在写完指纹之后失败、用同一个令牌重试时正好撞上这一种)。
+    let plan2 = invoke(
+        &window,
+        "plan_source_selection",
+        json!({"volumeId": vid, "folders": ["D"]}),
+    )
+    .expect("规划应成功");
+    let approved2 = plan2["planDigest"].as_str().unwrap().to_string();
+    crate::core::volumes::ensure_volume_uid(&card).expect("写指纹应成功");
+    let msg = ask(&state, &approved2);
+    assert!(
+        msg.contains("身份指纹是在你确认之后才写上去的") && msg.contains("源卷本身没换"),
+        "指纹从无到有不是换卡,别报成换卡: {msg}"
+    );
+    assert!(
+        !msg.contains("不是你确认时的那一张卡"),
+        "这不是换卡,不许这么说: {msg}"
+    );
+}
+
+/// R2 单元级:`build_task` 必须照传进来的 selection 填 DTO,不许回头读
+/// `input.source_folders`。这个字段是「拷完能不能说本卡可格式化」的唯一判据。
+/// (把 `source_folders: source_folders.to_vec()` 改回 `input.source_folders.clone()`,
+///  本测试必红。)
+#[test]
+fn build_task_reports_the_engine_selection_not_the_raw_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input: crate::commands::dto::StartCopyInput = serde_json::from_value(json!({
+        "projectId": "p", "volumeId": "/Volumes/CARD", "cameraId": "c",
+        "targetPrefix": "0824上午",
+        "destinations": [{"kind": "local", "path": tmp.path().display().to_string()}],
+        // 原始输入:重复项(引擎会去重成一条)
+        "sourceFolders": ["DCIM/100MSDCF", "DCIM/100MSDCF"],
+    }))
+    .unwrap();
+    let engine_selection = vec!["DCIM/100MSDCF".to_string()];
+    let (dto, _) = crate::commands::tasks::build_task(
+        &input,
+        tmp.path(),
+        crate::core::project::Scenario::B,
+        "CARD",
+        "A7M4_A_ZS",
+        "ZS",
+        &[],
+        "mid",
+        &engine_selection,
+    )
+    .unwrap();
+    assert_eq!(dto.source_folders, engine_selection);
+    assert_ne!(
+        dto.source_folders, input.source_folders,
+        "前置断言:两者必须真的不同,否则这条测不出东西"
+    );
+}
+
+/// R6:目标夹读不动 ≠ 空。`NotFound` 才能解释成「还没创建」,
+/// 其余(NAS 断了 / 无权限)必须在开拷前返回 Err——否则撞名预警整段消失,
+/// 而扁平化模式下这条预警恰恰是最该有的。
+#[cfg(unix)]
+#[test]
+fn unreadable_target_dir_is_an_error_not_an_empty_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let (window, tmp, _nas) = mock_app();
+    let app = window.app_handle();
+    let plan = vec![crate::core::copy::PlannedFile {
+        source_rel: "A/DSC1.JPG".into(),
+        target_rel: "DSC1.JPG".into(),
+        size: 1,
+        source_mtime_ns: 0,
+    }];
+
+    let locked = tmp.path().join("dest-locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::write(locked.join("DSC1.JPG"), b"x").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let clash_err =
+        crate::commands::notice_target_name_clashes(app, &plan, std::slice::from_ref(&locked));
+    let exists_err = crate::commands::check_existing_target(std::slice::from_ref(&locked), false);
+    // 先复原权限,别把不可删目录留给 TempDir
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        clash_err.unwrap_err().contains("无法读取目标夹"),
+        "读不动的目标夹不许当成「没有可撞的东西」"
+    );
+    assert!(
+        exists_err.unwrap_err().contains("无法读取目标夹"),
+        "读不动的目标夹不许当成「空目录」而跳过人工确认闸"
+    );
+
+    // 不存在 = 还没创建,照旧放行
+    let missing = tmp.path().join("还没建");
+    assert!(crate::commands::notice_target_name_clashes(
+        app,
+        &plan,
+        std::slice::from_ref(&missing)
+    )
+    .is_ok());
+    assert!(crate::commands::check_existing_target(&[missing], false).is_ok());
+}
+
+/// R6:撞名判定必须是 `HashSet` 而非 Vec 线性查找。重复拷进同一目标夹时每个
+/// 文件都撞名,5 万文件 = 十亿量级比较,而本函数在起 worker **之前同步跑**,
+/// UI 会卡死几十秒。(改回 `clashes.contains(..)`,本测试会超时必红。)
+#[test]
+fn target_clash_scan_is_not_quadratic() {
+    let (window, tmp, _nas) = mock_app();
+    let app = window.app_handle();
+    const N: usize = 30_000;
+    let dest = tmp.path().join("dest-big");
+    std::fs::create_dir_all(&dest).unwrap();
+    let plan: Vec<crate::core::copy::PlannedFile> = (0..N)
+        .map(|i| {
+            let name = format!("DSC{i:05}.JPG");
+            std::fs::write(dest.join(&name), b"x").unwrap();
+            crate::core::copy::PlannedFile {
+                source_rel: format!("A/{name}"),
+                target_rel: name,
+                size: 1,
+                source_mtime_ns: 0,
+            }
+        })
+        .collect();
+    let t0 = std::time::Instant::now();
+    crate::commands::notice_target_name_clashes(app, &plan, &[dest]).unwrap();
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "全部撞名的 {N} 个文件必须线性处理完,实际耗时 {elapsed:?}"
+    );
+}
+
+/// R10:扫描期的跳过计数在**失败出口**也必须被取走。
+/// 计数留着会算到下一次操作头上,报数失真(`notice_scan_skips` 的不变式)。
+#[cfg(unix)]
+#[test]
+fn scan_skip_counters_are_drained_on_failure_paths() {
+    use crate::core::copy;
+    let (window, tmp, _nas) = mock_app();
+    let app = window.app_handle();
+    let card = tmp.path().join("card-drain");
+    std::fs::create_dir_all(card.join("A")).unwrap();
+    std::fs::write(card.join("A/real.jpg"), b"x").unwrap();
+    std::os::unix::fs::symlink(card.join("A/real.jpg"), card.join("A/link.jpg")).unwrap();
+    let project_root = tmp.path().join("proj-drain");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let _ = copy::take_scan_symlinks_skipped();
+    let _ = copy::take_scan_system_skipped();
+
+    // 按文件夹续传:先扫到 A(数出 1 个链接),再撞上不存在的 GONE → 复扫失败
+    let mut m = crate::core::manifest::CopyManifest::new("t", "card", "A7M4_A_ZS", "ZS", "");
+    m.source_selection = vec!["A".into(), "GONE".into()];
+    m.planned = vec![crate::core::manifest::PlannedFile {
+        rel_path: "real.jpg".into(),
+        size: 1,
+        source_rel: "A/real.jpg".into(),
+        source_mtime_ns: 0,
+    }];
+    crate::commands::refresh_resume_plan(app, &mut m, &project_root, &card).unwrap();
+    assert_eq!(
+        copy::take_scan_symlinks_skipped(),
+        0,
+        "复扫失败的出口也必须取走链接计数"
+    );
+
+    // 整卷续传:根目录下有链接,子目录读不动 → scan_source 数完链接才失败
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(card.join("A"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut whole = crate::core::manifest::CopyManifest::new("t", "card", "A7M4_A_ZS", "ZS", "");
+    let r = crate::commands::refresh_resume_plan(app, &mut whole, &project_root, &card);
+    std::fs::set_permissions(card.join("A"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(r.is_err(), "读不动的子目录必须让整卷复扫失败");
+    assert_eq!(
+        copy::take_scan_symlinks_skipped(),
+        0,
+        "整卷复扫的失败出口同样必须取走计数"
+    );
+
+    // inbox 扫描也要取(此前从不取,会把计数算到下一次拷卡头上)
+    let inbox = project_root.join(crate::core::project::PENDING_DIR_B);
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::write(inbox.join("x.jpg"), b"x").unwrap();
+    std::os::unix::fs::symlink(inbox.join("x.jpg"), inbox.join("y.jpg")).unwrap();
+    crate::commands::sorting_cmds::inbox_files_for_analysis(app, &project_root).unwrap();
+    assert_eq!(
+        copy::take_scan_symlinks_skipped(),
+        0,
+        "inbox 扫描必须取走计数并告警"
+    );
+    let notices = invoke(&window, "list_notices", json!({})).unwrap();
+    assert!(
+        notices
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["code"] == "copy-symlinks-skipped"),
+        "跳过链接必须有可见告警: {notices}"
+    );
+}
+
+// ---------- R12:NAS 侧三条路径与拷卡共用同一份系统项名单 ----------
+
+/// 成片校验(`check_final_cuts`)扫「6. 成片」。
+///
+/// R12 之前这里是「以点开头一律跳过」:一个点开头的成片**根本不出现在报告里**,
+/// 用户就以为它合规,交付当天才发现名字不对。收口后它照样进报告——按 grammar
+/// 判成不合规、**标黄可见**,而不是被悄悄拿掉。系统项则必须仍被排除。
+///
+/// 变异:把判据改回 `name.starts_with('.')` → `.20260824_...` 从 items 消失,本测试红。
+#[test]
+fn final_cut_check_reports_dot_prefixed_files_and_hides_system_items() {
+    let (window, _tmp, nas) = mock_app();
+    let pid = create_a_project(&window);
+    let dir = nas.join(&pid).join("6. 成片");
+    std::fs::write(dir.join("20260824_校运会_4K_交付_V1.mp4"), b"m").unwrap();
+    // 点开头的成片:必须可见(它会被判成「日期段不是有效的 YYYYMMDD」)
+    std::fs::write(dir.join(".20260824_校运会_4K_交付_V1.mp4"), b"m").unwrap();
+    // 系统项 / 本工具自己的落盘:一个都不许进报告
+    std::fs::write(dir.join(".DS_Store"), b"junk").unwrap();
+    std::fs::write(dir.join("._20260824_校运会_4K_交付_V1.mp4"), b"junk").unwrap();
+    std::fs::write(dir.join(".ocard-notes.txt"), b"junk").unwrap();
+    std::fs::write(dir.join("Thumbs.db"), b"junk").unwrap();
+    std::fs::write(dir.join("成片.mp4.tag.ocardpart"), b"half").unwrap();
+    std::fs::create_dir_all(dir.join(".ocard/journal")).unwrap();
+    std::fs::write(dir.join(".ocard/journal/j.jsonl"), b"{}").unwrap();
+
+    let report = invoke(&window, "check_final_cuts", json!({"projectId": pid})).unwrap();
+    let mut names: Vec<String> = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["fileName"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            ".20260824_校运会_4K_交付_V1.mp4".to_string(),
+            "20260824_校运会_4K_交付_V1.mp4".to_string(),
+        ],
+        "点开头的成片必须进报告(标黄可见),系统项必须不进"
+    );
+    // 可见 = 带上人话理由,而不是静默消失
+    let dotted = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["fileName"] == ".20260824_校运会_4K_交付_V1.mp4")
+        .unwrap();
+    assert_eq!(dotted["valid"], false);
+    assert!(!dotted["issues"].as_array().unwrap().is_empty());
+}
+
+/// 「待修→已修」流转提示(`curated_flow_hints`)扫「精选/待修」「精选/已修」。
+///
+/// 点开头的原稿拷得进 NAS、在分类界面看得见、能被精选进「待修」——这里再按
+/// 「点开头」把它筛掉,它就永远拿不到流转提示,用户以为修完的东西还压着一份原稿。
+///
+/// 同时守两条不许放进来的:
+/// - 精选复制的落地临时名 `.<uuid>.curatepart` 是**半截文件**;
+/// - 主名切分必须在下标 > 0 处——否则 `.alpha` 与 `.beta` 的主名都是空串,
+///   会被判成同一件,提示用户删掉一份毫不相干的原稿。
+///
+/// 变异:把判据改回 `n.starts_with('.')` → `.raw.mov` 那条提示消失,本测试红。
+#[test]
+fn curated_flow_hints_see_dot_prefixed_assets_but_not_system_items() {
+    let (window, _tmp, nas) = mock_app();
+    let pid = create_b_project(&window);
+    let curated = nas.join(&pid).join("3. 精选");
+    let (todo, done) = (curated.join("待修"), curated.join("已修"));
+    // 点开头的原稿修完了:必须给出流转提示
+    std::fs::write(todo.join(".raw.mov"), b"a").unwrap();
+    std::fs::write(done.join(".raw.mp4"), b"b").unwrap();
+    // 普通原稿:原有行为不变
+    std::fs::write(todo.join("a.jpg"), b"a").unwrap();
+    std::fs::write(done.join("a.png"), b"b").unwrap();
+    // 系统项两边都有,不许配成一条提示
+    std::fs::write(todo.join(".DS_Store"), b"junk").unwrap();
+    std::fs::write(done.join(".DS_Store"), b"junk").unwrap();
+    // 半截文件(精选复制的临时名):不许出现
+    std::fs::write(todo.join(".9f1c-0000.curatepart"), b"half").unwrap();
+    std::fs::write(done.join(".9f1c-0001.curatepart"), b"half").unwrap();
+    // 两个毫不相干的「点开头且只有这一个点」的文件:主名不许都塌成空串
+    std::fs::write(todo.join(".alpha"), b"a").unwrap();
+    std::fs::write(done.join(".beta"), b"b").unwrap();
+
+    let hints = invoke(&window, "curated_flow_hints", json!({"projectId": pid})).unwrap();
+    let mut ids: Vec<String> = hints
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["todoAssetId"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "3. 精选/待修/.raw.mov".to_string(),
+            "3. 精选/待修/a.jpg".to_string(),
+        ],
+        "点开头的原稿必须拿到提示;系统项/半截文件/无关的点开头文件都不许配对"
+    );
+}
+
+/// **`.ocard/` 及其内容绝不许出现在 NAS 侧任何一条素材路径上。**
+/// 把项目自己的清单/日志/回收站当成素材,轻则计数说谎,重则顺着同一份口径被打进
+/// 交付包发给客户。这条测试从**命令层**(前端真正调用的入口)正面钉住它。
+#[test]
+fn ocard_state_dir_never_leaks_into_any_nas_material_path() {
+    let (window, _tmp, nas) = mock_app();
+    let pid = create_b_project(&window);
+    let root = nas.join(&pid);
+
+    // 项目状态目录里放满诱饵:清单、日志、设置、回收站里已删除的素材
+    std::fs::create_dir_all(root.join(".ocard/trash")).unwrap();
+    std::fs::write(root.join(".ocard/settings.json"), b"{}").unwrap();
+    std::fs::write(root.join(".ocard/manifests/m.json"), b"{}").unwrap();
+    std::fs::write(root.join(".ocard/journal/j.jsonl"), b"{}").unwrap();
+    std::fs::write(root.join(".ocard/trash/uuid_已删.jpg"), b"deleted").unwrap();
+    // 再在素材夹**内部**种一份同名目录,正面考共享名单的 `.ocard` 前缀项
+    for cat in ["1. 待分类", "2. 开幕式", "3. 精选/待修", "3. 精选/已修"] {
+        std::fs::create_dir_all(root.join(cat).join(".ocard/trash")).unwrap();
+        std::fs::write(root.join(cat).join(".ocard/trash/诱饵.jpg"), b"x").unwrap();
+        std::fs::write(root.join(cat).join(".ocard-volume-id"), b"id").unwrap();
+    }
+    std::fs::write(root.join("1. 待分类/真素材.jpg"), b"real").unwrap();
+    // 交付只取「已分类夹 + 精选/已修」(待分类不交付),真素材得放在这两处
+    std::fs::write(root.join("2. 开幕式/待交付.jpg"), b"real").unwrap();
+
+    // ① 分类计数:只数得到真素材
+    let cats = invoke(&window, "list_categories", json!({"projectId": pid})).unwrap();
+    let inbox = &cats.as_array().unwrap()[0];
+    assert_eq!(inbox["count"], 1, "`.ocard` 里的东西绝不许算进分类计数");
+
+    // ② 素材列表:`.ocard` 一条都不许出现
+    let page = invoke(
+        &window,
+        "list_pending_assets",
+        json!({"projectId": pid, "offset": 0, "limit": 200}),
+    )
+    .unwrap();
+    let ids: Vec<String> = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, vec!["1. 待分类/真素材.jpg".to_string()]);
+
+    // ③ 流转提示:两边都有 `.ocard/trash/诱饵.jpg`,绝不许配成一条提示
+    let hints = invoke(&window, "curated_flow_hints", json!({"projectId": pid})).unwrap();
+    assert!(
+        hints.as_array().unwrap().is_empty(),
+        "`.ocard` 绝不许进流转提示: {hints}"
+    );
+
+    // ④ 交付打包:包里一个 `.ocard` 都不许有(把项目元数据发给客户是灾难)
+    let snap = invoke(&window, "start_delivery", json!({"projectId": pid})).unwrap();
+    let job_id = snap["id"].as_str().unwrap().to_string();
+    let mut last = json!(null);
+    for _ in 0..300 {
+        last = invoke(&window, "get_job", json!({"jobId": job_id})).unwrap();
+        if ["done", "failed", "cancelled"].contains(&last["state"].as_str().unwrap_or_default()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(last["state"], "done", "{last}");
+    let mut packaged = Vec::new();
+    let mut stack = vec![root.join("交付")];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                packaged.push(p.strip_prefix(&root).unwrap().display().to_string());
+            }
+        }
+    }
+    assert!(
+        !packaged.iter().any(|p| p.contains(".ocard")),
+        "`.ocard` 绝不许被打进交付包: {packaged:?}"
+    );
+    assert!(
+        packaged.iter().any(|p| p.contains("待交付.jpg")),
+        "真素材必须进包: {packaged:?}"
     );
 }

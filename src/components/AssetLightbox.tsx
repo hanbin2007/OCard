@@ -10,7 +10,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { SortingAsset, SortingCategory } from "../api/types";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import { animateOnce } from "../lib/motion";
-import { resolveShortcut } from "../lib/sorting";
+import { resolveShortcut, shouldYieldShortcut, trapTabFocus } from "../lib/sorting";
 import { IconArrowLeft, IconChevronRight, IconClose } from "./Icon";
 import { JudgementBadges } from "./JudgementBadges";
 import { Badge, Kbd } from "./ui";
@@ -34,6 +34,8 @@ export function AssetLightbox({
   onAssign,
   onCurate,
   onToggleDelete,
+  onUnmarkDelete,
+  actionsBlockedReason,
 }: {
   asset: SortingAsset;
   index: number;
@@ -59,8 +61,21 @@ export function AssetLightbox({
   onAssign?: (categoryId: string) => void;
   /** 把当前预览项复制进精选 */
   onCurate?: () => void;
-  /** 切换当前预览项的待删标记 */
+  /** D：切换当前预览项的待删标记（开关） */
   onToggleDelete?: () => void;
+  /**
+   * U：**只取消**当前预览项的待删标记。
+   * 与 D 共用一个回调曾经导致：对未标记的那张按 U，它反而被标进待删清单，
+   * 大图还自动翻到下一张——用户看不到自己刚刚把要保留的那张标成了待删。
+   */
+  onUnmarkDelete?: () => void;
+  /**
+   * 非空 = 分类/精选这类动作**当前被锁住**的原因（例如交付打包进行中）。
+   * 按钮据此禁用并把原因写在脸上：一排看起来能按、按下去却什么都不发生的
+   * 按钮，就是「界面伪装成操作成功」的另一种形态。
+   * 标删按钮不在此列——打包期间「撤回标删」仍然放行，方向由闸门自己判。
+   */
+  actionsBlockedReason?: string;
 }) {
   // thumb:// 取图可能 404：转占位而不是留一个碎图
   const [failed, setFailed] = useState(false);
@@ -71,6 +86,7 @@ export function AssetLightbox({
     setZoomed(false);
   }, [asset.id]);
 
+  const rootRef = useRef<HTMLDivElement>(null);
   const mediaRef = useRef<HTMLElement | null>(null);
   /** 上一次换图的方向：+1 下一张、−1 上一张 */
   const directionRef = useRef(1);
@@ -116,9 +132,39 @@ export function AssetLightbox({
     );
   }, [asset.id]);
 
+  /*
+   * 开屏就把焦点收进来。
+   *
+   * 少了这一步，焦点还留在背后的网格（或组层）上：Tab 一按就在**看不见的
+   * 那一层**里游走，读屏也仍然在念背景内容——`aria-modal` 只是声明，
+   * 不会替我们做圈定。收进来之后 Tab 才有可圈定的起点；关闭时的焦点还原
+   * 由 SortingScreen 那一侧负责（modalAbove 的还原 effect）。
+   */
+  useEffect(() => {
+    rootRef.current?.focus();
+  }, []);
+
   // 预览态的键盘处理独立于网格：这里是模态，别让按键穿透回去
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      /*
+       * Tab 圈在本层内。层里有「上一张 / 下一张 / 关闭 / 分类 / 精选 / 标删」
+       * 一整排按钮，不圈定的话 Tab 会一路走到背后的网格里去，
+       * 而此时 Esc 又被本层吃掉——用户被困住。
+       */
+      if (e.key === "Tab") {
+        if (trapTabFocus(rootRef.current, e)) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+        return;
+      }
+      /*
+       * 焦点在本层某个按钮上时，Enter / 空格是**激活那个按钮**。
+       * 抢过来的实测后果：Tab 到「上一张」按回车，我们把它当成「收起大图」
+       * 并 preventDefault，按钮完全不执行。
+       */
+      if (shouldYieldShortcut(e.target, e.key)) return;
       if (e.key === "Escape") onClose();
       else if (e.key === "ArrowRight") goNext();
       else if (e.key === "ArrowLeft") goPrev();
@@ -139,11 +185,12 @@ export function AssetLightbox({
           const other = categories.find((c) => c.kind === "other");
           if (other) onAssign(other.id);
         } else if (action.type === "curate" && onCurate) onCurate();
-        else if (
-          (action.type === "markDelete" || action.type === "unmarkDelete") &&
-          onToggleDelete
-        ) {
+        else if (action.type === "markDelete" && onToggleDelete) {
           onToggleDelete();
+        } else if (action.type === "unmarkDelete" && onUnmarkDelete) {
+          // U 只撤回标删。此前它与 D 共用 onToggleDelete，于是对一张
+          // 未标记的素材按 U 反而把它标进了待删清单，大图还自动前进
+          onUnmarkDelete();
         } else if (action.type === "preview") {
           // 空格再按一次 = 收起大图(Quick Look 语义:同一个键开、同一个键关)。
           // onClose 由调用方决定退回哪一层——从连拍组进来的退回组层
@@ -161,13 +208,24 @@ export function AssetLightbox({
     // capture 阶段接管:网格 wrap 可能仍持有焦点,不能让同一击键双处生效
     document.addEventListener("keydown", onKey, { capture: true });
     return () => document.removeEventListener("keydown", onKey, { capture: true });
-  }, [onClose, goPrev, goNext, categories, onAssign, onCurate, onToggleDelete]);
+  }, [
+    onClose,
+    goPrev,
+    goNext,
+    categories,
+    onAssign,
+    onCurate,
+    onToggleDelete,
+    onUnmarkDelete,
+  ]);
 
   const customCategories = categories.filter((c) => c.kind === "custom");
   const hasActions = Boolean(onAssign || onCurate || onToggleDelete);
 
   return (
     <div className="lightbox" data-testid="asset-lightbox" role="dialog" aria-modal="true"
+      ref={rootRef}
+      tabIndex={-1}
       aria-label={`预览 ${asset.fileName}`}>
       <div className="lightbox__bar">
         <span className="mono text-sm truncate" title={asset.id}>
@@ -287,6 +345,8 @@ export function AssetLightbox({
                   className="btn btn--sm"
                   data-testid="lightbox-assign"
                   data-category={c.id}
+                  disabled={Boolean(actionsBlockedReason)}
+                  title={actionsBlockedReason ?? `移入「${c.name}」（快捷键 ${c.hotkey}）`}
                   onClick={() => onAssign(c.id)}
                 >
                   {c.hotkey ? <Kbd>{c.hotkey}</Kbd> : null}
@@ -299,7 +359,10 @@ export function AssetLightbox({
               type="button"
               className="btn btn--sm"
               data-testid="lightbox-curate"
-              title="复制一份进「精选/待修」,原件留在待分类"
+              disabled={Boolean(actionsBlockedReason)}
+              title={
+                actionsBlockedReason ?? "复制一份进「精选/待修」,原件留在待分类"
+              }
               onClick={onCurate}
             >
               <Kbd>P</Kbd>精选
@@ -310,6 +373,8 @@ export function AssetLightbox({
               type="button"
               className="btn btn--sm"
               data-testid="lightbox-other"
+              disabled={Boolean(actionsBlockedReason)}
+              title={actionsBlockedReason ?? "移入「其他」（快捷键 O）"}
               onClick={() => {
                 const other = categories.find((c) => c.kind === "other");
                 if (other) onAssign(other.id);
@@ -323,11 +388,22 @@ export function AssetLightbox({
               type="button"
               className={`btn btn--sm${marked ? "" : " btn--danger"}`}
               data-testid="lightbox-toggle-delete"
+              title={
+                marked
+                  ? "取消这张的待删标记（快捷键 D 或 U）"
+                  : "把这张标进待删清单（快捷键 D；按错了用 U 撤回，U 永远只撤回）"
+              }
               onClick={onToggleDelete}
             >
               <Kbd>D</Kbd>
               {marked ? "取消标删" : "标删"}
             </button>
+          ) : null}
+          {/* 按钮为什么是灰的,当面说清——只留一排点不动的按钮等于让人猜 */}
+          {actionsBlockedReason ? (
+            <span className="text-2xs" data-testid="lightbox-actions-blocked">
+              {actionsBlockedReason}
+            </span>
           ) : null}
           <span className="text-2xs dim push-right">
             操作后自动看下一张 · <Kbd>空格</Kbd>/<Kbd>Esc</Kbd> 退一层

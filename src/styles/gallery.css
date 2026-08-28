@@ -28,7 +28,7 @@
   outline-offset: 2px;
 }
 
-/* 聚焦项被移走后的回退提示：降级必须可见（零静默） */
+/* 聚焦项被移走后的回退提示 / 按键落空的回执：降级必须可见（零静默） */
 .gallery__alert {
   display: flex;
   align-items: center;
@@ -41,6 +41,15 @@
   color: var(--text-primary);
   font-size: var(--text-xs);
   line-height: var(--leading-normal);
+}
+
+/*
+ * 信息级回执（按键在画廊里不适用、到边了、已加载到尽头）。
+ * 用 --notice-info 而不是自己挑颜色：提示级别色全 App 只有那一个出口。
+ */
+.gallery__alert--info {
+  border-color: var(--notice-info);
+  background: var(--accent-soft);
 }
 
 /* ---------- 大图 + 详情 ---------- */
@@ -276,6 +285,38 @@ img.gallery__image {
 
 .gallery__shot-flag--curated + .gallery__shot-flag--delete {
   right: var(--space-6);
+}
+
+/*
+ * 窗口化的占位块：只出宽度，替没渲染的那一段撑住滚动条。
+ * 宽度由 JS 按 `格数 × 跨距 − 一个 gap` 算好写在 style 上（见 GalleryView 的
+ * spacerWidth），这里只保证它不参与交互、也不被 flex 拉伸变形。
+ */
+.gallery__strip-spacer {
+  align-self: stretch;
+  min-width: 0;
+  pointer-events: none;
+}
+
+/* 胶片条的尽头写清「已加载到这里」，不许让人以为库里就这些 */
+.gallery__strip-more {
+  align-self: center;
+  flex: 0 0 auto;
+  padding: 0 var(--space-2);
+  font-size: var(--text-2xs);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+/*
+ * 画廊自己的键位表。网格那套（X 选中 / Shift+方向 连选 / ⌘A 全选）在这里
+ * 没有落脚点，照抄等于把用户往空处引，所以这一条只写画廊真有的键。
+ */
+.gallery__hints {
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  /* .hint-bar 自带 margin-top，而画廊靠 flex gap 排版，归零免得双份间距 */
+  margin-top: 0;
 }
 
 /* ---------- 空态 ---------- */

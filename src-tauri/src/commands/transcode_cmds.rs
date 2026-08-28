@@ -207,8 +207,17 @@ fn is_video(p: &Path) -> bool {
 /// 递归收集相机夹下全部视频(R2 P0:真实相机结构是嵌套的——
 /// 典型 `PRIVATE/M4ROOT/CLIP/*.MP4`;只读第一层会把整夹判成零素材,
 /// auto_proxy 反复触顶后错误放弃)。规则与拷卡扫描同源:
-/// 点开头隐藏项跳过;符号链接不跟随(进 skipped,可见);
-/// 目录/目录项读取错误进 errors(零静默,阻止 intent 标完成)。
+/// 系统项跳过([`crate::core::copy::is_system_item`]);符号链接不跟随
+/// (进 skipped,可见);目录/目录项读取错误进 errors(零静默,阻止 intent 标完成)。
+///
+/// R12:此前这里是「点开头一律跳过」,与拷卡扫描已经分叉——拷卡会把 `.clip.mov`
+/// 真的拷进「2. 原始素材」,转码却取不到它的源,于是**素材在 NAS 上、界面上都在,
+/// 却永远没有代理**,而且没有任何提示。收口后反向也变好了:群晖的 `@eaDir`
+/// 不以点开头,旧判据放行,它里面的 `SYNOPHOTO_FILM_*.mp4` 会被当成源素材去转码;
+/// 共享名单把它列进去了。
+///
+/// 起点是「2. 原始素材/<相机夹>」,`.ocard/` 不在这棵树里;而拷卡断连留下的
+/// `<名字>.<tag>.ocardpart` 半截文件就落在这棵树里,由共享名单的后缀项挡住。
 fn collect_videos_recursive(
     dir: &Path,
     rel_dir: &str,
@@ -232,7 +241,7 @@ fn collect_videos_recursive(
             }
         };
         let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
+        if crate::core::copy::is_system_item(&name) {
             continue;
         }
         let child_rel = format!("{rel_dir}/{name}");
@@ -368,6 +377,14 @@ impl<R: tauri::Runtime> Drop for TranscodeExitGuard<R> {
 /// 顶层相机夹枚举(R4 终审 P0-8:`.flatten()`+`unwrap_or(false)` 会把
 /// 读不出的条目静默当不存在,整夹漏转)。错误逐条收进 errors,由调用方
 /// 转失败清单(并阻止 auto_proxy intent 标完成)。
+///
+/// R12:排除口径收口到 [`crate::core::copy::is_system_item`]。旧的「点开头一律
+/// 跳过」在这里两头都错:被误设隐藏属性的相机夹(`.A7M4_A`)整夹漏转,而群晖的
+/// `@eaDir` 因为不以点开头反倒被当成一个「相机夹」递归进去。
+///
+/// 起点是「2. 原始素材」,`.ocard/` 是项目根的同级兄弟,不会出现在这一层。
+/// 枚举结果随后还要过 `sorting::resolve_asset_a_in_project` 的命名空间闸,
+/// 那道闸只认「2. 原始素材」「3. 特别素材」两个首段,是第二层保证。
 fn list_camera_folders(
     raw_root: &Path,
     raw_dir: &str,
@@ -384,7 +401,7 @@ fn list_camera_folders(
             }
         };
         let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
+        if crate::core::copy::is_system_item(&name) {
             continue;
         }
         match e.file_type() {
@@ -1585,8 +1602,12 @@ mod scan_tests {
         std::fs::create_dir_all(cam.join("PRIVATE/M4ROOT/CLIP")).unwrap();
         std::fs::write(cam.join("PRIVATE/M4ROOT/CLIP/C0001.MP4"), b"v").unwrap();
         std::fs::write(cam.join("TOP.MOV"), b"v").unwrap();
+        // R12:被误设隐藏属性的素材夹/素材是**素材**,必须取得到源。
+        // (旧口径「以点开头一律跳过」把它们整个挡在转码之外,而它们在
+        // 分类界面上看得见——看得见却转不了码,还没有任何提示。)
         std::fs::create_dir_all(cam.join(".hidden")).unwrap();
         std::fs::write(cam.join(".hidden/x.mp4"), b"v").unwrap();
+        std::fs::write(cam.join(".clip.mov"), b"v").unwrap();
         std::fs::write(cam.join("note.txt"), b"t").unwrap();
         let mut out = Vec::new();
         let mut errs = Vec::new();
@@ -1597,12 +1618,123 @@ mod scan_tests {
         assert_eq!(
             rels,
             vec![
+                "2. 原始素材/A7M4_A/.clip.mov",
+                "2. 原始素材/A7M4_A/.hidden/x.mp4",
                 "2. 原始素材/A7M4_A/PRIVATE/M4ROOT/CLIP/C0001.MP4",
                 "2. 原始素材/A7M4_A/TOP.MOV",
             ]
         );
         assert!(errs.is_empty(), "{errs:?}");
         assert!(links.is_empty());
+    }
+
+    /// R12:转码取源与拷卡/分类同一份口径([`crate::core::copy::is_system_item`])。
+    ///
+    /// 两个方向都要守住:
+    /// - 点开头的**素材**(`.clip.mov`)必须取得到源——它拷得进 NAS、在分类
+    ///   界面上看得见,取不到源就是「看得见却处理不了」的静默不一致;
+    /// - 系统项必须仍被排除,尤其是**群晖 `@eaDir`**:它不以点开头,旧判据放行,
+    ///   于是它里面的 `SYNOPHOTO_FILM_*.mp4`(NAS 自己生成的低码率预览)
+    ///   会被当成源素材去转码,生成一份根本不是原片的代理。
+    /// - 拷卡断连留下的 `<名字>.<tag>.ocardpart` 是**半截文件**,不是源。
+    ///
+    /// 变异:把判据改回 `name.starts_with('.')` → `.clip.mov` 取不到,本测试红。
+    #[test]
+    fn transcode_source_scan_shares_the_copy_whitelist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cam = tmp.path().join("A7M4_A");
+        std::fs::create_dir_all(&cam).unwrap();
+        std::fs::write(cam.join(".clip.mov"), b"v").unwrap();
+        std::fs::create_dir_all(cam.join(".隐藏素材夹")).unwrap();
+        std::fs::write(cam.join(".隐藏素材夹/C0002.MP4"), b"v").unwrap();
+        // 系统项:一个都不许成为转码源
+        std::fs::create_dir_all(cam.join("@eaDir")).unwrap();
+        std::fs::write(cam.join("@eaDir/SYNOPHOTO_FILM_H264.mp4"), b"v").unwrap();
+        std::fs::create_dir_all(cam.join(".@__thumb")).unwrap();
+        std::fs::write(cam.join(".@__thumb/t.mp4"), b"v").unwrap();
+        std::fs::create_dir_all(cam.join(".Trashes")).unwrap();
+        std::fs::write(cam.join(".Trashes/已删.mp4"), b"v").unwrap();
+        std::fs::write(cam.join("._C0001.MP4"), b"v").unwrap();
+        std::fs::write(cam.join("C0003.MP4.tag.ocardpart"), b"half").unwrap();
+
+        let mut out = Vec::new();
+        let (mut errs, mut links) = (Vec::new(), Vec::new());
+        collect_videos_recursive(&cam, "2. 原始素材/A7M4_A", &mut out, &mut errs, &mut links);
+        let mut rels: Vec<&str> = out.iter().map(|(_, r)| r.as_str()).collect();
+        rels.sort();
+        assert_eq!(
+            rels,
+            vec![
+                "2. 原始素材/A7M4_A/.clip.mov",
+                "2. 原始素材/A7M4_A/.隐藏素材夹/C0002.MP4",
+            ]
+        );
+    }
+
+    /// **`.ocard/` 及其内容绝不许成为转码源。** 生产布局里 `.ocard` 是项目根的
+    /// 兄弟、够不到「2. 原始素材」;这里把它直接种进相机夹和素材根,是为了正面
+    /// 考共享名单的 `.ocard` 前缀项——两道保证都在,才敢说项目自己的清单、日志、
+    /// 回收站不会被 ffmpeg 当成素材读进去、更不会顺着流水线进交付包。
+    #[test]
+    fn ocard_state_dir_is_never_a_transcode_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = tmp.path().join("2. 原始素材");
+        std::fs::create_dir_all(raw.join("A7M4_A")).unwrap();
+        std::fs::write(raw.join("A7M4_A/C0001.MP4"), b"v").unwrap();
+        // 项目状态目录(清单 / 日志 / 回收站 / 分析缓存),内含 .mp4 诱饵
+        for d in [".ocard/manifests", ".ocard/journal", ".ocard/trash"] {
+            std::fs::create_dir_all(raw.join(d)).unwrap();
+            std::fs::create_dir_all(raw.join("A7M4_A").join(d)).unwrap();
+            std::fs::write(raw.join(d).join("诱饵.mp4"), b"v").unwrap();
+            std::fs::write(raw.join("A7M4_A").join(d).join("诱饵.mp4"), b"v").unwrap();
+        }
+        std::fs::write(raw.join(".ocard/settings.json"), b"{}").unwrap();
+
+        // ① 顶层相机夹枚举:`.ocard` 不许被当成相机夹
+        let (folders, errs) = list_camera_folders(&raw, "2. 原始素材").unwrap();
+        assert_eq!(folders, vec!["A7M4_A".to_string()]);
+        assert!(errs.is_empty(), "{errs:?}");
+
+        // ② 递归取源:相机夹内部的 `.ocard` 也不许被下钻
+        let mut out = Vec::new();
+        let (mut errs, mut links) = (Vec::new(), Vec::new());
+        collect_videos_recursive(
+            &raw.join("A7M4_A"),
+            "2. 原始素材/A7M4_A",
+            &mut out,
+            &mut errs,
+            &mut links,
+        );
+        let rels: Vec<&str> = out.iter().map(|(_, r)| r.as_str()).collect();
+        assert_eq!(rels, vec!["2. 原始素材/A7M4_A/C0001.MP4"]);
+        assert!(
+            !rels.iter().any(|r| r.contains(".ocard")),
+            "`.ocard` 绝不许进转码源: {rels:?}"
+        );
+    }
+
+    /// 相机夹枚举同样收口:被误设隐藏属性的相机夹(`.A7M4_A`)整夹漏转是
+    /// 「一整张卡的素材没有代理」;而 `@eaDir` 不以点开头,旧判据会把它当成
+    /// 一个相机夹递归进去。两个方向都在这条测试里。
+    ///
+    /// 变异:改回 `name.starts_with('.')` → `.A7M4_A` 消失、`@eaDir` 冒出来,必红。
+    #[test]
+    fn camera_folder_enumeration_shares_the_copy_whitelist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = tmp.path().join("2. 原始素材");
+        for d in [
+            "A7M4_A",
+            ".A7M4_B",
+            "@eaDir",
+            ".@__thumb",
+            ".Trashes",
+            ".AppleDouble",
+        ] {
+            std::fs::create_dir_all(raw.join(d)).unwrap();
+        }
+        let (folders, errs) = list_camera_folders(&raw, "2. 原始素材").unwrap();
+        assert_eq!(folders, vec![".A7M4_B".to_string(), "A7M4_A".to_string()]);
+        assert!(errs.is_empty(), "{errs:?}");
     }
 
     /// 符号链接不追踪:进 links(上层转可见 skipped/failure),不入清单。

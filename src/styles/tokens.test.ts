@@ -40,6 +40,8 @@ const STYLESHEETS = [
   "tokens",
   // 欢迎/向导窗口的样式此前不在守卫扫描内,违规能静悄悄过 CI(评审 P1)
   "welcome",
+  // 画廊模式同理:漏一张表 = 那张表可以随便过渡 width、随便写 to{}
+  "gallery",
 ] as const;
 const sheets = Object.fromEntries(
   STYLESHEETS.map((name) => [
@@ -192,6 +194,172 @@ describe("主题令牌", () => {
     expect(mono).toContain("ui-monospace");
     expect(mono).toContain("SF Mono");
     expect(mono).toContain("Consolas");
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 对比度契约（评审 D4）
+ *
+ * 病历：`--text-tertiary` 在最沉的面 `--bg-sunken` 上只有 4.12:1，而它承载的
+ * 恰恰是"索引中 / 预览不可用 / 还有 N 张未加载"这类**零静默文案**——看不清
+ * 等于没写；`--border-strong` 是未勾选复选框的边框，浅色 1.56:1 / 深色 1.48:1，
+ * 而拷卡屏的文件夹多选面板是个高密度决策列表，"勾没勾中"直接决定拷什么。
+ *
+ * 这条闸门的意义在于：tokens.css 是全局文件，任何人调一次灰阶都可能把某个
+ * 前景/背景组合推到线下，而这种退化在界面上"看着还行"，只有算一遍才知道。
+ * ------------------------------------------------------------------ */
+
+/** WCAG 相对亮度 */
+function relLuminance(rgb: [number, number, number]): number {
+  const [r, g, b] = rgb.map((v) => {
+    const s = v / 255;
+    return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function parseHex(value: string): [number, number, number] {
+  const v = value.replace("#", "").trim();
+  return [0, 2, 4].map((i) => parseInt(v.slice(i, i + 2), 16)) as [
+    number,
+    number,
+    number,
+  ];
+}
+
+function parseRgba(value: string): [number, number, number, number] {
+  const m = /rgba?\(([^)]+)\)/.exec(value);
+  if (!m) throw new Error(`不是 rgba() 值：${value}`);
+  const parts = m[1].split(",").map((x) => Number(x.trim()));
+  return [parts[0], parts[1], parts[2], parts[3] ?? 1];
+}
+
+function contrast(fg: [number, number, number], bg: [number, number, number]): number {
+  const [hi, lo] = [relLuminance(fg), relLuminance(bg)].sort((a, b) => b - a);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/** 半透明叠加层压在容器面上之后的**实际**底色 */
+function composite(
+  overlay: [number, number, number, number],
+  base: [number, number, number],
+): [number, number, number] {
+  return [0, 1, 2].map((i) =>
+    Math.round(overlay[i] * overlay[3] + base[i] * (1 - overlay[3])),
+  ) as [number, number, number];
+}
+
+/** 所有会当"底"用的面 */
+const SURFACE_TOKENS = [
+  "--surface-shell",
+  "--bg-subtle",
+  "--bg",
+  "--bg-sunken",
+  "--panel",
+  "--panel-raised",
+  "--field",
+];
+
+/**
+ * 只有**容器面**需要合成叠加层。
+ * `.btn:hover` 不是「panel-raised + hover」——它把自己的底色换成了半透明的
+ * --hover，压在按钮所在的容器（panel / 画布 / 侧栏）上。
+ */
+const CONTAINER_TOKENS = ["--panel", "--bg", "--bg-subtle"];
+/** :active 是"按住那一瞬"的态，只做参考不做闸门；hover / selected 是能停住的态 */
+const PERSISTENT_OVERLAYS = ["--hover", "--selected"];
+
+function backgroundsOf(theme: Record<string, string>) {
+  const out: Array<{ name: string; rgb: [number, number, number] }> = [];
+  for (const token of SURFACE_TOKENS) {
+    out.push({ name: token, rgb: parseHex(theme[token]) });
+  }
+  for (const token of CONTAINER_TOKENS) {
+    for (const overlay of PERSISTENT_OVERLAYS) {
+      out.push({
+        name: `${token} + ${overlay}`,
+        rgb: composite(parseRgba(theme[overlay]), parseHex(theme[token])),
+      });
+    }
+  }
+  return out;
+}
+
+describe("对比度契约", () => {
+  const THEMES = [
+    ["浅色", light],
+    ["深色", systemDark],
+  ] as const;
+
+  it("解析器自身有产出（扫不到面 = 这一组断言全部落空）", () => {
+    for (const [name, theme] of THEMES) {
+      const bgs = backgroundsOf(theme);
+      expect(bgs.length, `${name}: 背景组合一个都没算出来`).toBe(
+        SURFACE_TOKENS.length + CONTAINER_TOKENS.length * PERSISTENT_OVERLAYS.length,
+      );
+      // 白底黑字必须算出 21:1，算错了下面的数就全是假的
+      expect(contrast([0, 0, 0], [255, 255, 255])).toBeCloseTo(21, 1);
+    }
+  });
+
+  it("正文文字对所有面 ≥ 4.5:1（AA）", () => {
+    for (const [name, theme] of THEMES) {
+      for (const token of ["--text-primary", "--text-secondary", "--text-tertiary"]) {
+        const fg = parseHex(theme[token]);
+        for (const bg of backgroundsOf(theme)) {
+          expect(
+            contrast(fg, bg.rgb),
+            `${name} ${token} 压在 ${bg.name} 上只有 ` +
+              `${contrast(fg, bg.rgb).toFixed(2)}:1——"索引中/预览不可用"这类` +
+              `零静默文案看不清，等于没写`,
+          ).toBeGreaterThanOrEqual(4.5);
+        }
+      }
+    }
+  });
+
+  it("控件边界对所有面 ≥ 3:1（非文本对比，WCAG 1.4.11）", () => {
+    for (const [name, theme] of THEMES) {
+      for (const token of ["--border-strong", "--border-focus"]) {
+        const fg = parseHex(theme[token]);
+        for (const bg of backgroundsOf(theme)) {
+          expect(
+            contrast(fg, bg.rgb),
+            `${name} ${token} 压在 ${bg.name} 上只有 ` +
+              `${contrast(fg, bg.rgb).toFixed(2)}:1——未勾选的复选框就是靠这圈边框` +
+              `告诉人"这条没选中"，看不清就只能靠猜`,
+          ).toBeGreaterThanOrEqual(3);
+        }
+      }
+    }
+  });
+
+  it("边框三档必须一档比一档重，不许倒挂", () => {
+    // hover 用 strong、选中/焦点用 focus：strong 一旦超过 focus，
+    // 就会出现"悬停比选中还显眼"，复选框 hover 反而更看不清
+    for (const [name, theme] of THEMES) {
+      const on = parseHex(theme["--panel"]);
+      const weak = contrast(parseHex(theme["--border"]), on);
+      const strong = contrast(parseHex(theme["--border-strong"]), on);
+      const focus = contrast(parseHex(theme["--border-focus"]), on);
+      expect(strong, `${name}: --border-strong 应比 --border 重`).toBeGreaterThan(weak);
+      expect(focus, `${name}: --border-focus 应比 --border-strong 重`).toBeGreaterThan(
+        strong,
+      );
+    }
+  });
+
+  it("强调色/状态色上的文字也过 AA（这些按钮点下去就动真格）", () => {
+    for (const [name, theme] of THEMES) {
+      for (const [fgToken, bgToken] of [
+        ["--on-accent", "--accent"],
+        ["--on-ok", "--ok"],
+        ["--on-danger", "--danger"],
+      ] as const) {
+        const r = contrast(parseHex(theme[fgToken]), parseHex(theme[bgToken]));
+        expect(r, `${name} ${fgToken} on ${bgToken} = ${r.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
+      }
+    }
   });
 });
 

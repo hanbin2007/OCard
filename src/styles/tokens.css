@@ -117,16 +117,34 @@
   --field: #f7f7f8;
 
   --border: #e0e1e2;
-  --border-strong: #cdcfd1;
-  --border-focus: #adb0b3;
+  /*
+   * 「强边框」是**控件边界**用的（未勾选的复选框、hover 收边、虚线占位框），
+   * 按 WCAG 1.4.11 非文本对比要对相邻底色 ≥3:1。原值 #cdcfd1 在白面上只有
+   * 1.56:1 —— 拷卡屏那张文件夹多选表里，"这一条到底勾没勾"全靠这圈边框，
+   * 看不清就等于让人凭猜决定拷什么。收到 #7b7e82：对最沉的面 --bg-sunken
+   * 也有 3.29:1，对 --panel 4.08:1（核算见 tokens.test.ts 的对比度契约）。
+   *
+   * 连带调 --border-focus：它是比 strong 更重的一档（选中态、复选框 hover）。
+   * strong 变重之后若不跟着走，就会出现「hover 比选中还显眼」的倒挂——
+   * 复选框 hover 反而更看不清，是把一处修好、另一处弄坏。
+   */
+  --border-strong: #7b7e82;
+  --border-focus: #666a6e;
   /* 卡片顶边：浅色与普通边框同色；深色略亮一线，充当"接光的上棱"——
      深色下四个灰阶台阶拉不开时，用 1px 顶棱补层次，而不是引入装饰阴影 */
   --border-panel-top: #e0e1e2;
 
   --text-primary: #0d0d0d;
   --text-secondary: #5d5d5d;
-  /* #8f8f8f 在白底上只有 3.2:1，达不到 AA 4.5:1；收到 #6e6e6e（4.9:1） */
-  --text-tertiary: #6e6e6e;
+  /*
+   * 三级文字（提示条、元信息、"索引中"/"预览不可用"这类零静默文案）。
+   * 只按白底校准是不够的：它同样落在最沉的面上（--bg-sunken 的缩略图占位、
+   * code-preview），#6e6e6e 在 #e6e7e8 上只有 4.12:1、在侧栏 #f0f0f1 上 4.48:1，
+   * 两处都差一口气。收到 #646464 后最差一格（侧栏选中行 #e2e2e3）仍有 4.57:1。
+   * 代价要说破：它与 --text-secondary(#5d5d5d) 只差 7 阶，浅色下三档文字实际
+   * 只剩两档可辨——要恢复层级得整体重排文字灰阶，不在本次范围内。
+   */
+  --text-tertiary: #646464;
   --text-inverse: #ffffff;
 
   --hover: rgba(13, 13, 13, 0.04);
@@ -243,13 +261,15 @@
     --field: #191919;
 
     --border: #2f2f2f;
-    --border-strong: #3d3d3d;
-    --border-focus: #565656;
+    /* 与浅色同一口径：控件边界要 ≥3:1。#3d3d3d 在 #212121 上只有 1.48:1 */
+    --border-strong: #7f8286;
+    --border-focus: #a5a8ac;
     --border-panel-top: #404040;
 
     --text-primary: #ececec;
     --text-secondary: #b4b4b4;
-    --text-tertiary: #8f8f8f;
+    /* #8f8f8f 在按钮面 #2a2a2a 上 4.44:1、在选中行 #313131 上 4.11:1，差一口气 */
+    --text-tertiary: #9c9c9c;
     --text-inverse: #0d0d0d;
 
     --hover: rgba(255, 255, 255, 0.05);
@@ -322,13 +342,15 @@
   --field: #191919;
 
   --border: #2f2f2f;
-  --border-strong: #3d3d3d;
-  --border-focus: #565656;
+  /* 与浅色同一口径：控件边界要 ≥3:1。#3d3d3d 在 #212121 上只有 1.48:1 */
+  --border-strong: #7f8286;
+  --border-focus: #a5a8ac;
   --border-panel-top: #404040;
 
   --text-primary: #ececec;
   --text-secondary: #b4b4b4;
-  --text-tertiary: #8f8f8f;
+  /* #8f8f8f 在按钮面 #2a2a2a 上 4.44:1、在选中行 #313131 上 4.11:1，差一口气 */
+  --text-tertiary: #9c9c9c;
   --text-inverse: #0d0d0d;
 
   --hover: rgba(255, 255, 255, 0.05);

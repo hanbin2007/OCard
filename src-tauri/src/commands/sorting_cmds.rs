@@ -385,24 +385,33 @@ fn ensure_indexing<R: tauri::Runtime>(
 
 // ---------- 命令 ----------
 
-pub(crate) fn inbox_files_for_analysis(project_root: &Path) -> CmdResult<Vec<InboxFile>> {
-    inbox_rel_files(project_root)
+pub(crate) fn inbox_files_for_analysis<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    project_root: &Path,
+) -> CmdResult<Vec<InboxFile>> {
+    inbox_rel_files(app, project_root)
 }
 
-fn inbox_rel_files(project_root: &Path) -> CmdResult<Vec<InboxFile>> {
+fn inbox_rel_files<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    project_root: &Path,
+) -> CmdResult<Vec<InboxFile>> {
     let inbox = project_root.join(project::PENDING_DIR_B);
-    let mut files: Vec<InboxFile> = copy::scan_source(&inbox)
+    let scanned = copy::scan_source(&inbox);
+    // R10:扫描期跳过的链接/隐藏项必须取走并告警——这里此前从不取,
+    // 计数会留到下一次拷卡操作头上,把别人的告警数字算错
+    super::notice_scan_skips(app);
+    let mut files: Vec<InboxFile> = scanned
         .map_err(err)?
         .into_iter()
-        .map(|(rel, size)| {
+        .map(|f| {
             // 相对路径补上「1. 待分类/」前缀,作为项目内稳定 id;
-            // mtime 在此一次取齐(指纹/缩略图缓存键共用)
-            let rel = format!("{}/{}", project::PENDING_DIR_B, rel);
-            let abs = project_root.join(rel.split('/').collect::<PathBuf>());
-            let mtime = std::fs::metadata(&abs)
-                .map(|m| media::mtime_nanos(&m))
-                .unwrap_or(0);
-            (rel, size, mtime)
+            // mtime 由扫描一次取齐(指纹/缩略图缓存键共用)
+            (
+                format!("{}/{}", project::PENDING_DIR_B, f.rel),
+                f.size,
+                f.mtime_ns,
+            )
         })
         .collect();
     files.sort();
@@ -466,7 +475,7 @@ pub fn list_pending_assets<R: tauri::Runtime>(
 ) -> CmdResult<AssetPageDto> {
     let nas = nas_root(&app, &state)?;
     let stats = find_project(&nas, &project_id)?;
-    let mut files = inbox_rel_files(&stats.root)?;
+    let mut files = inbox_rel_files(&app, &stats.root)?;
     ensure_indexing(&app, &project_id, &stats.root, &files);
 
     // 客观分析判定:特征缓存 + 查询时确定性聚类(计划 C5)。

@@ -34,6 +34,7 @@ import {
   clickSelection,
   filterByJudgement,
   flattenEntries,
+  gateAction,
   resolveEntryIds,
   emptySelection,
   initialPendingDelete,
@@ -46,9 +47,13 @@ import {
   removedEntryIds,
   resolveShortcut,
   selectAll,
+  shouldYieldShortcut,
   toggleSelection,
+  trapTabFocus,
+  type ActionOutcome,
   type JudgementFilter,
   type Selection,
+  type SortingActionKind,
 } from "../lib/sorting";
 import {
   selectDeliveryWorking,
@@ -169,6 +174,22 @@ export function SortingScreen() {
   const gridWrapRef = useRef<HTMLDivElement>(null);
   const loadedCountRef = useRef(0);
   const lastRefreshRef = useRef(0);
+  /**
+   * 项目 epoch。切项目就 ++，所有 `await` 回来之后都要拿它对一次账。
+   *
+   * 侧栏切项目不会卸载本屏，于是「旧项目的响应」会落进「新项目的界面」：
+   * 旧素材灌进新网格，接着按数字键——移动的是**另一个项目里的同名文件**。
+   * `cancelled` 只挡得住 effect 那一路，回调里的 await 一路必须靠这个令牌。
+   */
+  const epochRef = useRef(0);
+  /** refreshLoadedAssets 的请求序号：两次重拉并发时，晚发的赢，早发的整批丢弃 */
+  const refreshSeqRef = useRef(0);
+  /**
+   * busy 的**同步**镜像。state 要等下一次渲染才更新，连打数字键时
+   * 第二下拿到的还是 busy=false 的旧闭包——闸门会放它过去，然后被
+   * 后端串行拒掉，用户只看到「按了没反应」。
+   */
+  const busyRef = useRef(false);
   /** 上一条索引事件的快照，用于判定「增长 / 重启 / 完成」；随 projectId 重置 */
   const lastEventRef = useRef<{
     indexed: number;
@@ -383,12 +404,74 @@ export function SortingScreen() {
     if (openGroup === null) gridWrapRef.current?.focus();
   }, [modalAbove, openGroup]);
 
+  /**
+   * 组全屏层收起时的焦点还原——与上面那条**对称**的另一半。
+   *
+   * 少了这一半的实测后果：组层无论按 Esc 还是点关闭按钮退出，
+   * `document.activeElement` 都落到 `body`（层节点连同焦点一起卸载了），
+   * 回到网格后方向键 / 1–9 / D / Shift+D 全部无响应，必须先用鼠标点一下
+   * 网格才能继续——键盘流整条断掉，而且屏上没有任何迹象说明为什么。
+   * 关组层不改变 `modalAbove`，所以上面那条 effect 一次都不会触发。
+   */
+  const hadGroupRef = useRef(false);
+  useEffect(() => {
+    const had = hadGroupRef.current;
+    hadGroupRef.current = openGroup !== null;
+    if (!had || openGroup !== null) return;
+    // 组层之上还压着大图/确认框时先不抢：等它们收起时由上面那条负责
+    if (!modalAbove) gridWrapRef.current?.focus();
+  }, [openGroup, modalAbove]);
+
+  /**
+   * 组失效兜底：浮层没了，`openGroup` 却还锁着主网格。
+   *
+   * 组只剩 1 张（`buildGridEntries` 不再把它折成组）、成员被移走、
+   * 或筛选把整组排除掉时，`openGroupItems` 变空 → 浮层卸载，
+   * 但 `openGroup` 仍非空 → 网格的键盘处理器在第一行就 `return`，
+   * **键盘彻底失效且屏上没有任何迹象**。必须原子地退回网格并说明原因。
+   */
+  useEffect(() => {
+    if (openGroup === null || openGroupItems.length > 0) return;
+    setOpenGroup(null);
+    setGroupCursorId(null);
+    notifyRef.current(
+      "warning",
+      "sorting-group-gone",
+      "刚才展开的连拍组已不存在（成员被移走、只剩一张，或被当前筛选排除），已退回网格。" +
+        "键盘光标仍在网格里，可以继续。",
+    );
+  }, [openGroup, openGroupItems.length]);
+
+  /**
+   * 首批素材到位时把光标落在第一项。
+   *
+   * 键盘优先是本屏的默认路径，可此前刚进屏（还没点过任何格子）时
+   * `selection.cursor` 是 null，`actionTargets` 返回空数组——空格 / 1–9 /
+   * P / D 四类键**全部静默无反应**，用户分不清是没聚焦、没选中还是坏了。
+   * 选片工具（Photo Mechanic / Lightroom / Finder）一律在列表载入后就把
+   * 焦点放在首项，这里照做。只落 cursor 不落 selected：下一次打标默认
+   * 只作用于光标格，与既有的「无选区时按光标办事」口径一致。
+   */
+  useEffect(() => {
+    const first = entries[0];
+    if (!first) return;
+    setSelection((prev) =>
+      prev.cursor === null ? { ...prev, cursor: first.id, anchor: first.id } : prev,
+    );
+  }, [entries]);
+
   /* ---------------- 数据加载 ---------------- */
 
   // 切项目把旧项目的资产/选择/预览/待删标记全部清零(codex 评审 P1):
   // 侧栏切项目页面不再卸载,旧相对路径 + 新 projectId 组合起来
-  // 可能移动/删除新项目里的同名文件
+  // 可能移动/删除新项目里的同名文件。
+  //
+  // 注意:清零只挡得住**同步**那一路。上一轮把这条注释写成「已修」,
+  // 实际 refreshLoadedAssets / loadMore / moveAssets 里 await 之后的 setState
+  // 全都没有守卫,旧项目的响应照样会落进新项目的网格——所以这里同时把
+  // epoch 推进一格,那些异步路径回来后都要对账(见 epochRef 的说明)。
   useEffect(() => {
+    epochRef.current += 1;
     setAssets([]);
     setTotal(0);
     setSelection(emptySelection);
@@ -446,6 +529,16 @@ export function SortingScreen() {
     if (!projectId) return;
     const want = Math.max(loadedCountRef.current, PAGE_SIZE);
     lastRefreshRef.current = Date.now();
+    /*
+     * 两道守卫，缺一不可：
+     * epoch —— 切项目后旧项目的分页结果一律作废（否则旧素材灌进新网格，
+     *          接着按数字键移动的就是另一个项目里的同名文件）；
+     * seq   —— 同一项目内两次重拉并发时只认最后发出的那次，
+     *          否则先发的慢响应会把新的整批覆盖回旧状态。
+     */
+    const epoch = epochRef.current;
+    const seq = (refreshSeqRef.current += 1);
+    const stale = () => epochRef.current !== epoch || refreshSeqRef.current !== seq;
     try {
       const collected: SortingAsset[] = [];
       let latestTotal = 0;
@@ -455,13 +548,17 @@ export function SortingScreen() {
           collected.length,
           PAGE_SIZE,
         );
+        if (stale()) return;
         latestTotal = page.total;
         collected.push(...page.items);
         if (page.items.length < PAGE_SIZE) break;
       }
+      if (stale()) return;
       setAssets(collected);
       setTotal(latestTotal);
     } catch (err) {
+      // 过期请求的失败不该打扰用户：那批数据本来就已经作废了
+      if (stale()) return;
       // 保留当前列表，但绝不静默：用户得知道看到的可能是旧状态
       notifyRef.current(
         "warning",
@@ -526,14 +623,20 @@ export function SortingScreen() {
     if (!projectId || loading || assets.length >= total) return;
     setLoading(true);
     setPageError(null);
+    // 与 refreshLoadedAssets 同一条理由：翻页响应回来时项目可能已经换了，
+    // 直接 append 会把旧项目的素材接到新项目的列表尾巴上
+    const epoch = epochRef.current;
     try {
       const page = await api.listPendingAssets(projectId, assets.length, PAGE_SIZE);
+      if (epochRef.current !== epoch) return;
       setAssets((prev) => [...prev, ...page.items]);
       setTotal(page.total);
     } catch (err) {
+      if (epochRef.current !== epoch) return;
       // 翻页失败不能吞：已加载的保留，错误显式可见并可重试
       setPageError(err instanceof Error ? err.message : String(err));
     } finally {
+      // loading 一定要放掉：卡在 true 会让「加载更多」永久禁用
       setLoading(false);
     }
   }, [projectId, loading, assets.length, total]);
@@ -750,25 +853,67 @@ export function SortingScreen() {
 
   /* ---------------- 动作 ---------------- */
 
-  // runCurate 定义在下面，用 ref 打通引用（两者都是稳定回调）
-  const runCurateRef = useRef<(targetsOverride?: string[]) => Promise<void>>(
-    async () => {},
+  /**
+   * 「这一下能不能被接受」——**纯查询，不产生副作用**。
+   *
+   * 大图/画廊的打标是「先把光标推到下一张，再把当前张发出去」，所以它们
+   * 必须能在推光标**之前**问一句「这一下会被接受吗」。答案为否时既不推光标
+   * 也不发请求，改为亮出原因。这就是 B1 那类「界面伪装成操作成功」的根治点。
+   */
+  const canAct = useCallback(
+    (kind: SortingActionKind, targets: string[], markedCount?: number) =>
+      gateAction(kind, {
+        hasProject: projectId !== null,
+        busy: busyRef.current,
+        deliveryWorking,
+        committing: pendingDelete.phase === "working",
+        targetCount: targets.length,
+        markedCount,
+      }),
+    [projectId, deliveryWorking, pendingDelete.phase],
   );
 
+  /** 被拒必须看得见：进通知中心 + 弹 toast（同 code 会自动折叠，连打不会刷屏） */
+  const announceRejected = useCallback(
+    (outcome: ActionOutcome) => {
+      if (outcome.accepted) return;
+      notifyRef.current("warning", outcome.code, outcome.reason);
+    },
+    [],
+  );
+
+  // runCurate 定义在下面，用 ref 打通引用（两者都是稳定回调）
+  const runCurateRef = useRef<
+    (targetsOverride?: string[]) => Promise<ActionOutcome>
+  >(async () => ({ accepted: true }));
+
   const runAssign = useCallback(
-    async (categoryId: string, targetsOverride?: string[]) => {
+    async (
+      categoryId: string,
+      targetsOverride?: string[],
+    ): Promise<ActionOutcome> => {
       // override 是预览/组浮层传来的**已解析** assetId(评审 3.2)
       const targets =
         targetsOverride ?? resolveEntryIds(entries, actionTargets(selection));
-      if (!projectId || targets.length === 0 || busy || deliveryWorking) return;
       // 精选永远是复制语义，move 到 curated 会让素材卡在没有流程的位置
-      if (categories.find((c) => c.id === categoryId)?.kind === "curated") {
-        await runCurateRef.current(targetsOverride);
-        return;
+      const isCurated =
+        categories.find((c) => c.id === categoryId)?.kind === "curated";
+      const gate = canAct(isCurated ? "curate" : "assign", targets);
+      if (!gate.accepted) {
+        // 曾经这里是一句光秃秃的 return：调用方已经把光标推走了,
+        // 用户于是相信刚才那张分好了类——被拒必须说出来(零静默)
+        announceRejected(gate);
+        return gate;
       }
+      if (isCurated) return runCurateRef.current(targetsOverride);
+      if (!projectId) return gate;
+      busyRef.current = true;
       setBusy(true);
+      const epoch = epochRef.current;
       try {
         const result = await api.moveAssets(projectId, targets, categoryId);
+        // 切项目后回来的结果一律作废：否则旧项目的成功列表会去裁剪新项目的网格
+        if (epochRef.current !== epoch) return gate;
         applyBulk(result, "移动");
         // 撤销窗口(评审 3.5):只对真正移走的部分开;移入待分类的撤销没有意义
         const cat = categories.find((c) => c.id === categoryId);
@@ -777,20 +922,23 @@ export function SortingScreen() {
         }
         void refreshCategories();
       } catch (err) {
+        if (epochRef.current !== epoch) return gate;
         notify(
           "error",
           "sorting-move-failed",
           `移动失败：${err instanceof Error ? err.message : String(err)}`,
         );
       } finally {
+        busyRef.current = false;
         setBusy(false);
       }
+      return gate;
     },
     [
       projectId,
       selection,
-      busy,
-      deliveryWorking,
+      canAct,
+      announceRejected,
       entries,
       categories,
       applyBulk,
@@ -803,9 +951,25 @@ export function SortingScreen() {
   const undoLastMove = useCallback(async () => {
     const inbox = categories.find((c) => c.kind === "inbox");
     if (!projectId || !lastMove || undoing || !inbox) return;
+    /*
+     * 撤销同样是在动文件，打包期间一律不许下发（此前这条路是敞开的：
+     * 分类被锁着，撤销却能把同一批文件挪回去，正好绕过互斥）。
+     * 按钮已经禁用，这里是第二道且必须**说出来**。
+     */
+    if (deliveryWorking) {
+      notifyRef.current(
+        "warning",
+        "sorting-undo-blocked",
+        "交付打包进行中，暂不能撤销移动（撤销也是在动同一批文件）。撤销入口会保留到打包结束。",
+      );
+      return;
+    }
     setUndoing(true);
+    const epoch = epochRef.current;
     try {
       const result = await api.moveAssets(projectId, lastMove.assetIds, inbox.id);
+      // 切项目后回来的撤销结果不能拿去动新项目的界面
+      if (epochRef.current !== epoch) return;
       if (result.failed.length > 0) {
         notify(
           "error",
@@ -817,6 +981,7 @@ export function SortingScreen() {
       await refreshLoadedAssets();
       void refreshCategories();
     } catch (err) {
+      if (epochRef.current !== epoch) return;
       notify(
         "error",
         "sorting-undo-failed",
@@ -829,6 +994,7 @@ export function SortingScreen() {
     projectId,
     lastMove,
     undoing,
+    deliveryWorking,
     categories,
     refreshLoadedAssets,
     refreshCategories,
@@ -836,13 +1002,21 @@ export function SortingScreen() {
   ]);
 
   const runCurate = useCallback(
-    async (targetsOverride?: string[]) => {
+    async (targetsOverride?: string[]): Promise<ActionOutcome> => {
       const actedEntries = targetsOverride ?? actionTargets(selection);
       const targets = targetsOverride ?? resolveEntryIds(entries, actedEntries);
-      if (!projectId || targets.length === 0 || busy || deliveryWorking) return;
+      const gate = canAct("curate", targets);
+      if (!gate.accepted) {
+        announceRejected(gate);
+        return gate;
+      }
+      if (!projectId) return gate;
+      busyRef.current = true;
       setBusy(true);
+      const epoch = epochRef.current;
       try {
         const result = await api.curateAssets(projectId, targets);
+        if (epochRef.current !== epoch) return gate;
         // 精选是「复制一份进待修」，原件留在待分类，所以格子不会离开网格；
         // 正因为不会离开，才必须在格子上给一次"收到了"的回弹（§13 causality）
         if (result.succeeded.length > 0) {
@@ -859,20 +1033,23 @@ export function SortingScreen() {
         }
         void refreshCategories();
       } catch (err) {
+        if (epochRef.current !== epoch) return gate;
         notify(
           "error",
           "sorting-curate-failed",
           `加入精选失败：${err instanceof Error ? err.message : String(err)}`,
         );
       } finally {
+        busyRef.current = false;
         setBusy(false);
       }
+      return gate;
     },
     [
       projectId,
       selection,
-      busy,
-      deliveryWorking,
+      canAct,
+      announceRejected,
       entries,
       refreshCategories,
       notify,
@@ -883,14 +1060,56 @@ export function SortingScreen() {
 
   runCurateRef.current = runCurate;
 
-  /** D 是开关(评审 3.8):目标全部已标记 → 取消,否则标记 */
-  const toggleMark = useCallback(
-    (ids: string[]) => {
-      if (deliveryWorking || ids.length === 0) return;
-      const allMarked = ids.every((id) => markedSet.has(id));
-      dispatchDelete({ type: allMarked ? "unmark" : "mark", assetIds: ids });
+  /**
+   * 待删标记的**唯一**入口，三种语义显式分开。
+   *
+   * 分开的理由是一次实测事故：`U` 走的是 toggle，于是在组层 / 画廊 / 大图里
+   * 对一张**未标记**的素材按 U，待删条从「无」变成「已标记 1 个待删除」，
+   * 而且无声。用户按 U 的动机恰恰是「我按错了，撤回」，结果反而把它标进了
+   * 待删清单，画廊/大图还自动前进，他根本看不到刚才那张被标了。
+   *
+   * - `toggle`：D 键。目标全已标记 → 取消，否则标记。
+   * - `unmark`：U 键。**只取消**，永不新增标记；目标里一张都没标记过时，
+   *   不是默默什么都不做，而是明说「本来就没标删」。
+   * - `mark`  ：批量工具（如「保留推荐，其余标删」）。只标记，不反悔。
+   */
+  const changeMark = useCallback(
+    (ids: string[], mode: "toggle" | "unmark" | "mark"): ActionOutcome => {
+      const markedCount = ids.filter((id) => markedSet.has(id)).length;
+      // 先算出这一下**实际**是标还是取消，再据此过闸门：
+      // 否则「全已标记时按 D」（其实是取消）会被当成新增标记而在打包期被拒
+      const effective =
+        mode === "toggle"
+          ? ids.length > 0 && markedCount === ids.length
+            ? "unmark"
+            : "mark"
+          : mode;
+      const gate = canAct(effective, ids, markedCount);
+      if (!gate.accepted) {
+        announceRejected(gate);
+        return gate;
+      }
+      dispatchDelete({
+        type: effective,
+        // 取消时只下发真正标记过的那些，清单语义更干净
+        assetIds: effective === "unmark" ? ids.filter((id) => markedSet.has(id)) : ids,
+      });
+      return gate;
     },
-    [deliveryWorking, markedSet],
+    [markedSet, canAct, announceRejected],
+  );
+
+  const toggleMark = useCallback(
+    (ids: string[]) => changeMark(ids, "toggle"),
+    [changeMark],
+  );
+  const unmarkOnly = useCallback(
+    (ids: string[]) => changeMark(ids, "unmark"),
+    [changeMark],
+  );
+  const markOnly = useCallback(
+    (ids: string[]) => changeMark(ids, "mark"),
+    [changeMark],
   );
 
   /* ---------------- 预览内打标(评审 3.2):作用于眼前这张,操作后自动前进 ---------------- */
@@ -898,9 +1117,21 @@ export function SortingScreen() {
   /* 自动前进也走 previewScope:从组层进来的大图,「下一张」是组内的下一张 */
   const previewAsset = previewIndex >= 0 ? (previewScope[previewIndex] ?? null) : null;
 
+  /*
+   * 前进的**唯一**前提：这一下真的被受理了。
+   *
+   * 从前是无条件前进：打包锁住 / 上一批还没落定时底层直接 return，
+   * 大图却已经翻到下一张——用户看见的是一次成功的分类，实际什么都没发生。
+   * 现在一律先问 canAct，被拒就原地不动并亮出原因。
+   */
   const previewAssign = useCallback(
     (categoryId: string) => {
       if (!previewAsset) return;
+      const gate = canAct("assign", [previewAsset.id]);
+      if (!gate.accepted) {
+        announceRejected(gate);
+        return;
+      }
       // 先站到下一张再移走当前张:大图不闪断,失败时素材还在、toast 会说话
       const nextId =
         previewScope[previewIndex + 1]?.id ??
@@ -909,22 +1140,50 @@ export function SortingScreen() {
       setPreviewId(nextId);
       void runAssign(categoryId, [previewAsset.id]);
     },
-    [previewAsset, previewScope, previewIndex, runAssign],
+    [
+      previewAsset,
+      previewScope,
+      previewIndex,
+      runAssign,
+      canAct,
+      announceRejected,
+    ],
   );
 
   const previewCurate = useCallback(() => {
     if (!previewAsset) return;
+    const gate = canAct("curate", [previewAsset.id]);
+    if (!gate.accepted) {
+      announceRejected(gate);
+      return;
+    }
     void runCurate([previewAsset.id]);
     const nextId = previewScope[previewIndex + 1]?.id ?? null;
     if (nextId) setPreviewId(nextId);
-  }, [previewAsset, previewScope, previewIndex, runCurate]);
+  }, [
+    previewAsset,
+    previewScope,
+    previewIndex,
+    runCurate,
+    canAct,
+    announceRejected,
+  ]);
 
   const previewToggleDelete = useCallback(() => {
     if (!previewAsset) return;
-    toggleMark([previewAsset.id]);
+    // changeMark 被拒时自己已经发过通知，这里只负责「不前进」
+    if (!toggleMark([previewAsset.id]).accepted) return;
     const nextId = previewScope[previewIndex + 1]?.id ?? null;
     if (nextId) setPreviewId(nextId);
   }, [previewAsset, previewScope, previewIndex, toggleMark]);
+
+  /** U：只撤回标删。未标记时不静默、也不前进——用户按 U 是想撤回，不是想标 */
+  const previewUnmarkDelete = useCallback(() => {
+    if (!previewAsset) return;
+    if (!unmarkOnly([previewAsset.id]).accepted) return;
+    const nextId = previewScope[previewIndex + 1]?.id ?? null;
+    if (nextId) setPreviewId(nextId);
+  }, [previewAsset, previewScope, previewIndex, unmarkOnly]);
 
   /* ---------------- 画廊模式(接线):聚焦项在 assetId 空间里走 ---------------- */
 
@@ -957,23 +1216,40 @@ export function SortingScreen() {
   const galleryAssign = useCallback(
     (categoryId: string) => {
       if (!galleryCursor) return;
+      const gate = canAct("assign", [galleryCursor]);
+      if (!gate.accepted) {
+        announceRejected(gate);
+        return;
+      }
       advanceGalleryCursor();
       void runAssign(categoryId, [galleryCursor]);
     },
-    [galleryCursor, advanceGalleryCursor, runAssign],
+    [galleryCursor, advanceGalleryCursor, runAssign, canAct, announceRejected],
   );
 
   const galleryCurate = useCallback(() => {
     if (!galleryCursor) return;
+    const gate = canAct("curate", [galleryCursor]);
+    if (!gate.accepted) {
+      announceRejected(gate);
+      return;
+    }
     void runCurate([galleryCursor]);
     advanceGalleryCursor();
-  }, [galleryCursor, advanceGalleryCursor, runCurate]);
+  }, [galleryCursor, advanceGalleryCursor, runCurate, canAct, announceRejected]);
 
   const galleryToggleDelete = useCallback(() => {
     if (!galleryCursor) return;
-    toggleMark([galleryCursor]);
+    if (!toggleMark([galleryCursor]).accepted) return;
     advanceGalleryCursor();
   }, [galleryCursor, advanceGalleryCursor, toggleMark]);
+
+  /** U：画廊里也必须只撤回标删（此前这里与 D 共用 toggle，等于把 U 变成了标删） */
+  const galleryUnmarkDelete = useCallback(() => {
+    if (!galleryCursor) return;
+    if (!unmarkOnly([galleryCursor]).accepted) return;
+    advanceGalleryCursor();
+  }, [galleryCursor, advanceGalleryCursor, unmarkOnly]);
 
   const galleryOpenFullscreen = useCallback(() => {
     if (galleryCursor) openPreview(galleryCursor);
@@ -983,8 +1259,20 @@ export function SortingScreen() {
     // 双保险：即使对话框以某种方式被触发，打包期间也绝不下发删除
     if (!projectId || deliveryWorkingRef.current) return;
     dispatchDelete({ type: "commitStarted" });
+    const epoch = epochRef.current;
+    const marked = pendingDelete.marked;
+    /*
+     * 切项目后回来的删除结果不能拿去裁剪新项目的网格。
+     * 但也不能一走了之：清单此刻停在 "working"，而 `clear` 在 working 态
+     * 是空操作——不收尾的话新项目会顶着一份旧项目的待删清单且再也改不动。
+     * 所以照样收尾（旧项目的标记随之清空），只是不去动新项目的列表。
+     */
+    const abandon = () => {
+      dispatchDelete({ type: "commitFinished", succeeded: marked, failed: [] });
+    };
     try {
-      const result = await api.trashAssets(projectId, pendingDelete.marked);
+      const result = await api.trashAssets(projectId, marked);
+      if (epochRef.current !== epoch) return abandon();
       dispatchDelete({
         type: "commitFinished",
         succeeded: result.succeeded,
@@ -992,6 +1280,7 @@ export function SortingScreen() {
       });
       applyBulk(result, "移入回收站");
     } catch (err) {
+      if (epochRef.current !== epoch) return abandon();
       dispatchDelete({
         type: "commitFinished",
         succeeded: [],
@@ -1074,6 +1363,12 @@ export function SortingScreen() {
       // 组全屏层同理:它有自己的光标与自己的键盘流,不能让同一击键
       // 在背后的网格里也作用一遍(网格光标停在组格上,展开成整组)
       if (previewId !== null || openGroup !== null) return;
+      /*
+       * 焦点落在网格里的按钮（如组格上的「展开」）或任何输入控件上时，
+       * 那一击键属于它自己。抢过来的实测后果：Tab 到按钮上按回车，
+       * 我们把它解释成「预览」并 preventDefault，按钮根本不执行。
+       */
+      if (shouldYieldShortcut(event.target, event.key)) return;
       const action = resolveShortcut(
         {
           key: event.key,
@@ -1145,10 +1440,8 @@ export function SortingScreen() {
           toggleMark(resolveEntryIds(entries, actionTargets(selection)));
           return;
         case "unmarkDelete":
-          dispatchDelete({
-            type: "unmark",
-            assetIds: resolveEntryIds(entries, actionTargets(selection)),
-          });
+          // U 只撤回；一张都没标过时由 changeMark 明说，不再默默无事发生
+          unmarkOnly(resolveEntryIds(entries, actionTargets(selection)));
           return;
         case "confirmDelete":
           // Shift+D:标完直接进入确认,不必伸手摸鼠标(评审 3.9)
@@ -1174,6 +1467,7 @@ export function SortingScreen() {
       runAssign,
       runCurate,
       toggleMark,
+      unmarkOnly,
       openPreview,
       closePreview,
       openGroupOverlay,
@@ -1190,6 +1484,7 @@ export function SortingScreen() {
   const handleGalleryKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLDivElement>) => {
       if (previewId !== null) return;
+      if (shouldYieldShortcut(event.target, event.key)) return;
       const action = resolveShortcut(
         {
           key: event.key,
@@ -1215,8 +1510,13 @@ export function SortingScreen() {
           galleryCurate();
           break;
         case "markDelete":
-        case "unmarkDelete":
           galleryToggleDelete();
+          break;
+        case "unmarkDelete":
+          // 正常路径是 GalleryView 自己接（`onUnmarkDelete` prop）并吞掉。
+          // 这里是焦点停在 wrap 本身（还没进到画廊里）时的兜底，
+          // 两条路走的是同一个「只撤回」实现，不会打架。
+          galleryUnmarkDelete();
           break;
         case "preview":
           galleryOpenFullscreen();
@@ -1237,6 +1537,7 @@ export function SortingScreen() {
       galleryAssign,
       galleryCurate,
       galleryToggleDelete,
+      galleryUnmarkDelete,
       galleryOpenFullscreen,
     ],
   );
@@ -1332,13 +1633,19 @@ export function SortingScreen() {
                   title={
                     category.kind === "inbox"
                       ? category.name
-                      : !hasTargets
-                        ? "先在网格里选中素材，再点击移入该分类"
-                        : category.kind === "curated"
-                          ? "把选中素材复制一份进「精选/待修」，原件留在待分类（快捷键 P）"
-                          : category.kind === "other"
-                            ? `把选中素材移入「${category.name}」（快捷键 O）`
-                            : `把选中素材移入「${category.name}」（快捷键 ${category.hotkey}）`
+                      : /* 按钮为什么按不动,一律写在它自己身上——
+                           只留一个灰按钮等于让人猜(零静默) */
+                        deliveryWorking
+                        ? "交付打包进行中，已暂停分类操作，避免同一批文件边打包边被挪走"
+                        : busy
+                          ? "上一批分类还没落定，等格子刷新后再按"
+                          : !hasTargets
+                            ? "先在网格里选中素材，再点击移入该分类"
+                            : category.kind === "curated"
+                              ? "把选中素材复制一份进「精选/待修」，原件留在待分类（快捷键 P）"
+                              : category.kind === "other"
+                                ? `把选中素材移入「${category.name}」（快捷键 O）`
+                                : `把选中素材移入「${category.name}」（快捷键 ${category.hotkey}）`
                   }
                 >
                   {category.hotkey ? <Kbd>{category.hotkey}</Kbd> : null}
@@ -1569,7 +1876,15 @@ export function SortingScreen() {
                  与全屏预览共用同一个下标空间,翻页不会错位 */
               <GalleryView
                 assets={previewAssets}
-                cursorId={galleryCursor}
+                /*
+                 * 传**原始**光标 id，哪怕它已经失效。
+                 *
+                 * 从前这里传的是父层 sanitize 过的 galleryCursor（失效即静默
+                 * 回退成第一项），于是 GalleryView 里那条「原先聚焦的 XX 已不在
+                 * 列表里」的告警在真实接线下**永远不触发**——只在它自己的单测里
+                 * 活着。检测/告警/回退的责任整个归组件，父层不再抢先抹平。
+                 */
+                cursorId={galleryCursorId}
                 onCursorChange={(id) => setGalleryCursorId(id)}
                 categories={categories}
                 markedSet={markedSet}
@@ -1577,6 +1892,9 @@ export function SortingScreen() {
                 onAssign={(categoryId) => galleryAssign(categoryId)}
                 onCurate={galleryCurate}
                 onToggleDelete={galleryToggleDelete}
+                /* D 与 U 分两个回调下去：共用一个的话 U 会退化成开关，
+                   对未标记项按 U 反而把它标进待删清单（组层/大图同一条口径） */
+                onUnmarkDelete={galleryUnmarkDelete}
                 onOpenFullscreen={galleryOpenFullscreen}
                 onThumbError={onThumbError}
                 onThumbLoad={onThumbLoad}
@@ -1711,7 +2029,12 @@ export function SortingScreen() {
                   type="button"
                   className="btn btn--sm push-right"
                   data-testid="sorting-undo"
-                  disabled={undoing || busy}
+                  disabled={undoing || busy || deliveryWorking}
+                  title={
+                    deliveryWorking
+                      ? "交付打包进行中，暂不能撤销移动（撤销也是在动同一批文件）"
+                      : "把刚才那批文件移回「待分类」"
+                  }
                   onClick={() => void undoLastMove()}
                 >
                   {undoing ? "撤销中…" : "撤销"}
@@ -1818,6 +2141,10 @@ export function SortingScreen() {
           onAssign={(ids, categoryId) => void runAssign(categoryId, ids)}
           onCurate={(ids) => void runCurate(ids)}
           onToggleDelete={toggleMark}
+          /* U 与 D 必须分开：共用 toggle 会让 U 把未标记项标进待删清单 */
+          onUnmarkDelete={unmarkOnly}
+          /* 「保留推荐，其余标删」是只标记，不是开关——余量已全标时再按不该反转 */
+          onMarkDelete={markOnly}
           onConfirmDelete={requestDeleteConfirm}
           pendingCount={pendingDelete.marked.length}
           deliveryWorking={deliveryWorking}
@@ -1857,6 +2184,13 @@ export function SortingScreen() {
           onAssign={previewAssign}
           onCurate={previewCurate}
           onToggleDelete={previewToggleDelete}
+          onUnmarkDelete={previewUnmarkDelete}
+          /* 打包期间分类/精选一律不生效——按钮就该是灰的,并写明为什么 */
+          actionsBlockedReason={
+            deliveryWorking
+              ? "交付打包进行中，已暂停分类与精选（标删标记仍可撤回）"
+              : undefined
+          }
         />
       ) : null}
 
@@ -2132,6 +2466,8 @@ function GroupLayer({
   onAssign,
   onCurate,
   onToggleDelete,
+  onUnmarkDelete,
+  onMarkDelete,
   onConfirmDelete,
   pendingCount,
   deliveryWorking,
@@ -2152,7 +2488,12 @@ function GroupLayer({
   onSelect: (id: string, modifiers: { shift?: boolean; meta?: boolean }) => void;
   onAssign: (assetIds: string[], categoryId: string) => void;
   onCurate: (assetIds: string[]) => void;
+  /** D：开关（全已标记→取消，否则标记） */
   onToggleDelete: (assetIds: string[]) => void;
+  /** U：只撤回标删，永不新增——与 D 共用一个回调会让 U 变成「标删」 */
+  onUnmarkDelete: (assetIds: string[]) => void;
+  /** 只标记（批量工具用），不做开关反转 */
+  onMarkDelete: (assetIds: string[]) => void;
   /** Shift+D：提交待删清单（与主屏同一条确认流） */
   onConfirmDelete: () => void;
   /** 全局待删清单条数——底部那条状态栏被本层整个盖住，所以要在这里复述 */
@@ -2235,6 +2576,19 @@ function GroupLayer({
   }, [items, selectedSet, cursorIdx]);
 
   const handleLayerKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    /*
+     * 焦点圈定。本层声明了 aria-modal="true"，但那只是**说**自己是模态——
+     * 浏览器不会因此拦住 Tab。不圈定的实测后果：Tab 几下焦点就落到层背后的
+     * 网格与按钮上，而此时 Esc 又被本层的键盘流吃掉，用户被困在一个
+     * 看得见却操作不了的界面里。
+     */
+    if (trapTabFocus(boxRef.current, event)) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    // 焦点在本层的按钮（关闭 / 全选 / 反选 / 保留推荐…）上时，Enter/空格归它自己
+    if (shouldYieldShortcut(event.target, event.key)) return;
     const action = resolveShortcut(
       {
         key: event.key,
@@ -2281,8 +2635,12 @@ function GroupLayer({
         onCurate(layerTargets());
         break;
       case "markDelete":
-      case "unmarkDelete":
         onToggleDelete(layerTargets());
+        break;
+      case "unmarkDelete":
+        // 组层里按 U 曾经走 toggle：对未标记项按 U 反而把它标进待删清单，
+        // 而且无声（底部待删条被本层整个盖住，用户根本看不到多了一条）
+        onUnmarkDelete(layerTargets());
         break;
       case "confirmDelete":
         // Shift+D 与主屏同一语义:标完直接进确认流,不必先退出组层。
@@ -2301,7 +2659,8 @@ function GroupLayer({
   const keepRecommended = () => {
     const keep = new Set(suggested.map((i) => i.id));
     const rest = items.filter((i) => !keep.has(i.id)).map((i) => i.id);
-    if (rest.length > 0) onToggleDelete(rest);
+    // 语义是「其余标删」，不是开关：余量恰好已全标时再按一次不该把它们全撤回
+    if (rest.length > 0) onMarkDelete(rest);
   };
   const selectedCount = items.filter((i) => selectedSet.has(i.id)).length;
 
@@ -2350,11 +2709,17 @@ function GroupLayer({
           type="button"
           className="btn btn--sm"
           data-testid="group-keep-recommended"
-          disabled={suggested.length === 0 || suggested.length === items.length}
+          disabled={
+            deliveryWorking ||
+            suggested.length === 0 ||
+            suggested.length === items.length
+          }
           title={
-            suggested.length === 0
-              ? "本组还没有「建议保留」——先跑一次 AI 选片分析"
-              : `保留 ${suggested.length} 张建议项,其余 ${items.length - suggested.length} 张标删(仍需底部确认才移入回收站)`
+            deliveryWorking
+              ? "交付打包进行中，暂不能新增待删标记"
+              : suggested.length === 0
+                ? "本组还没有「建议保留」——先跑一次 AI 选片分析"
+                : `保留 ${suggested.length} 张建议项,其余 ${items.length - suggested.length} 张标删(仍需底部确认才移入回收站)`
           }
           onClick={keepRecommended}
         >
@@ -2454,9 +2819,10 @@ function GroupLayer({
             <Kbd>空格</Kbd>/<Kbd>Enter</Kbd> 看大图 · <Kbd>X</Kbd> 选中 ·{" "}
             <Kbd>⌘A</Kbd> 全选
           </span>
-          <span>
+          <span data-testid="group-hint-mark">
             <Kbd>1</Kbd>–<Kbd>9</Kbd> 分类 · <Kbd>P</Kbd> 精选 · <Kbd>O</Kbd> 其他 ·{" "}
-            <Kbd>D</Kbd> 标删/取消 · <Kbd>Shift+D</Kbd> 提交
+            <Kbd>D</Kbd> 标删/取消 · <Kbd>U</Kbd> 只取消标删 ·{" "}
+            <Kbd>Shift+D</Kbd> 提交
           </span>
           <span data-testid="group-esc-hint">
             <Kbd>Esc</Kbd> 退一层（大图 → 组 → 网格）

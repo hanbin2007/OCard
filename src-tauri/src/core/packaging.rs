@@ -65,15 +65,19 @@ pub struct DeliveryOutcome {
     pub cancelled: bool,
 }
 
+/// 打包时排除的条目。口径必须与拷卡扫描**同一份**([`super::copy::is_system_item`]):
+/// R11 之后拷卡会把 `.clip.mov` 这类点开头的合法素材真的拷进素材夹,打包时再按
+/// 「点开头」把它筛掉,就是在交付环节静默漏掉一个素材——而包清单照样报完整。
 fn is_hidden(name: &str) -> bool {
-    name.starts_with('.')
+    super::copy::is_system_item(name)
 }
 
 fn out_push_entry_err(warnings: &mut Vec<String>, dir: &Path, err: std::io::Error) {
     warnings.push(format!("目录 {} 中有条目读取失败: {err}", dir.display()));
 }
 
-/// 收集一个目录下的全部文件(递归,忽略隐藏);不可读目录计入警告,不静默。
+/// 收集一个目录下的全部文件(递归,只排除系统项,见 [`is_hidden`]);
+/// 不可读目录计入警告,不静默。
 /// **不跟随符号链接**(复验轮二 P0:链接目录会把收集范围递归到项目外),
 /// 链接条目跳过并警告。
 fn collect(dir: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf> {

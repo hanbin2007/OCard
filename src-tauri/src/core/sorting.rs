@@ -13,7 +13,7 @@
 
 use super::journal::{self, Event};
 use super::project::{self, Scenario, STATE_DIR};
-use super::{fsx, paths, CoreError, Result};
+use super::{copy, fsx, paths, CoreError, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -236,6 +236,16 @@ pub fn curated_todo_dir(project_root: &Path, meta: &project::ProjectMeta) -> Opt
     Some(project_root.join(curated).join(project::CURATED_TODO))
 }
 
+/// 分类夹里的素材计数(递归)。
+///
+/// 排除口径必须与**列表本身**同源([`copy::is_system_item`]):列表走
+/// `copy::scan_source`(R11 起只排除明确列举的系统项),这里若还按「以点开头
+/// 一律跳过」,`.clip.mov` 就会**在列表里看得见、却不算进角标计数**——
+/// 用户看到「待分类 12」却数出 13 张,而两个数字都出自 OCard 自己。
+///
+/// 起点是**分类夹**(`project_root.join(folder)`,folder 出自
+/// `scenario_b_dirs`),不是项目根:`.ocard/`(清单、日志、回收站、分析缓存)
+/// 是项目根的同级兄弟,永远不在这棵树里,不可能被计数。
 fn count_files(dir: &Path) -> usize {
     let mut n = 0usize;
     let mut stack = vec![dir.to_path_buf()];
@@ -245,7 +255,7 @@ fn count_files(dir: &Path) -> usize {
         };
         for e in entries.flatten() {
             let name = e.file_name();
-            if name.to_string_lossy().starts_with('.') {
+            if copy::is_system_item(&name.to_string_lossy()) {
                 continue;
             }
             let p = e.path();
@@ -473,10 +483,17 @@ pub fn list_trash(project_root: &Path) -> Result<TrashList> {
     }
     out.records.sort_by_key(|r| std::cmp::Reverse(r.trashed_at));
     // 孤儿扫描:索引写失败且回滚失败的文件不能凭空消失(评审 H2)
+    //
+    // 排除口径同样收口到 [`copy::is_system_item`](R12)。这一处的方向与别处相反
+    // 但结论一致:孤儿扫描存在的意义就是**不让回收站里的文件凭空隐身**,所以判据
+    // 越窄越好。按「以点开头」跳过,会让一个被手工丢进 `.ocard/trash` 的 `.clip.mov`
+    // 既不在索引里、也不上报为孤儿——用户永远看不到它,直到清空回收站把它删掉。
+    // (扫的是 `.ocard/trash` 的**直接子项**,名字形如 `<uuid>_<原名>`;
+    // `.ocard` 本身是这个目录的祖先而非子项,不需要也轮不到这条判据来挡。)
     if let Ok(entries) = fs::read_dir(&dir) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if name == TRASH_INDEX || name.starts_with('.') || !e.path().is_file() {
+            if name == TRASH_INDEX || copy::is_system_item(&name) || !e.path().is_file() {
                 continue;
             }
             if !referenced.contains(&name) {
@@ -1157,6 +1174,89 @@ mod tests {
         fs::write(trash_dir(&root).join("孤儿_x.jpg"), b"data").unwrap();
         let list = list_trash(&root).unwrap();
         assert_eq!(list.orphans, vec!["孤儿_x.jpg".to_string()]);
+    }
+
+    // ---------- R12:NAS 侧三条路径统一到 copy::is_system_item ----------
+
+    /// 分类计数与列表必须同一把尺子:列表(`copy::scan_source`)会列出
+    /// `.clip.mov`,角标计数就必须把它算进去,否则用户看到「12」却数出 13。
+    /// 反过来,系统项(`.DS_Store`、群晖 `@eaDir`)不许把计数灌水。
+    ///
+    /// **`.ocard` 这条比什么都重要**:项目自己的元数据被当成素材,轻则计数说谎,
+    /// 重则顺着同一份口径被打进交付包发给客户。这里把 `.ocard` 直接种进分类夹
+    /// 内部(生产布局里它是项目根的兄弟,种进来是为了直接考共享名单的前缀项),
+    /// 断言一个都数不出来。
+    ///
+    /// 变异:把 `count_files` 的判据改回 `name.starts_with('.')` → `.clip.mov`
+    /// 与 `.素材夹/b.jpg` 数不到(11 != 13),本测试红。
+    #[test]
+    fn category_count_matches_the_listing_and_never_counts_ocard() {
+        let (_t, root, meta) = setup_project();
+        let inbox = root.join("1. 待分类");
+        // 点开头的合法素材:必须算进计数。
+        // 数量刻意多于下面「不以点开头的系统项」,两种错误才不会正好抵消
+        // (变异验证跑出来过一次:漏数 2 个素材 + 多数 2 个垃圾 = 总数不变)
+        fs::write(inbox.join(".clip.mov"), b"legit").unwrap();
+        fs::write(inbox.join(".DSC0002.ARW"), b"legit").unwrap();
+        fs::create_dir_all(inbox.join(".素材夹")).unwrap();
+        fs::write(inbox.join(".素材夹/b.jpg"), b"legit").unwrap();
+        // 系统项:不许算进计数
+        fs::write(inbox.join(".DS_Store"), b"junk").unwrap();
+        fs::write(inbox.join("._.clip.mov"), b"junk").unwrap();
+        fs::create_dir_all(inbox.join("@eaDir")).unwrap();
+        fs::write(inbox.join("@eaDir/SYNOPHOTO_THUMB_M.jpg"), b"junk").unwrap();
+        fs::create_dir_all(inbox.join(".Trashes")).unwrap();
+        fs::write(inbox.join(".Trashes/deleted.jpg"), b"junk").unwrap();
+        // 本工具自己落下的半截文件:内容不完整,不是素材
+        fs::write(inbox.join("C0001.MP4.tag.ocardpart"), b"half").unwrap();
+        // 项目元数据:一个都不许数出来
+        fs::create_dir_all(inbox.join(".ocard/manifests")).unwrap();
+        fs::write(inbox.join(".ocard/manifests/m.json"), b"{}").unwrap();
+        fs::write(inbox.join(".ocard/settings.json"), b"{}").unwrap();
+        fs::create_dir_all(inbox.join(".ocard/trash")).unwrap();
+        fs::write(inbox.join(".ocard/trash/已删.jpg"), b"deleted").unwrap();
+        fs::write(inbox.join(".ocard-volume-id"), b"id").unwrap();
+
+        let cats = list_categories(&root, &meta).unwrap();
+        // setup 的 3 张 + `.clip.mov` + `.DSC0002.ARW` + `.素材夹/b.jpg`
+        assert_eq!(cats[0].count, 6, "点开头的素材必须算进计数,系统项不许算");
+
+        // 与列表口径一致:同一棵树用 copy::scan_source 数出来必须是同一个数
+        let listed = copy::scan_source(&inbox).unwrap();
+        let _ = copy::take_scan_system_skipped();
+        assert_eq!(
+            listed.len(),
+            cats[0].count,
+            "角标计数与列表必须同源: {:?}",
+            listed.iter().map(|f| &f.rel).collect::<Vec<_>>()
+        );
+        assert!(
+            !listed.iter().any(|f| f.rel.contains(".ocard")),
+            "`.ocard` 绝不许出现在素材列表里: {:?}",
+            listed.iter().map(|f| &f.rel).collect::<Vec<_>>()
+        );
+    }
+
+    /// 回收站孤儿扫描:方向与别处相反但结论一致——判据越窄越好。
+    /// 被手工丢进 `.ocard/trash` 的 `.clip.mov` 既不在索引里、也不上报为孤儿,
+    /// 就等于让它凭空隐身,直到清空回收站把它删掉(零静默要堵的正是这个)。
+    ///
+    /// 变异:改回 `name.starts_with('.')` → `.clip.mov` 不再上报,本测试红。
+    #[test]
+    fn trash_orphan_scan_surfaces_dot_prefixed_files_but_not_system_items() {
+        let (_t, root, _m) = setup_project();
+        let dir = trash_dir(&root);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".clip.mov"), b"legit").unwrap();
+        fs::write(dir.join(".DS_Store"), b"junk").unwrap();
+        fs::write(dir.join("._孤儿_x.jpg"), b"junk").unwrap();
+        fs::write(dir.join(".9f1c-0000.curatepart"), b"half").unwrap();
+        let list = list_trash(&root).unwrap();
+        assert_eq!(
+            list.orphans,
+            vec![".clip.mov".to_string()],
+            "点开头的素材必须以孤儿身份可见,系统项/半截文件不许刷屏"
+        );
     }
 
     #[test]
