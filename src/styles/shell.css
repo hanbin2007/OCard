@@ -481,8 +481,9 @@
 /* 屏间过渡动画只落在滚动**内容**(.content__inner)上,不落在滚动容器
    (.content)上:给滚动容器本身做 transform 动画会让它掉出合成器异步
    滚动,退回主线程滚动。这条本身是对的,值得保留——
-   但它**不是**2026-08 那次「滚动条与内容不同步」的病因:真因是嵌套滚动
-   容器(见 fb64afa)。别再从渲染引擎方向找这个症状。 */
+   但它**不是**2026-08 那次「滚动条与内容不同步」的病因。真因是单列布局下
+   侧栏 position:sticky 没取消(见 865efe0);嵌套滚动容器(fb64afa)是
+   途中修掉的另一个真问题,同样不是那个症状的病因。 */
 .shell[data-nav="forward"] .content__inner {
   animation: screen-in-below var(--dur-spring-fast) var(--spring);
 }
@@ -545,15 +546,18 @@
 }
 
 /* 列表 + 详情 双栏 */
+/* mobile-first:单列是基础形态,宽屏才双列。配套的侧栏吸顶在
+   screens.css 的 .detail(同一断点)——跨文件是因为基础规则在那边,
+   但两边都用 min-width 开启,任一失效都只退回单列,不会退回病态。 */
 .split {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 336px;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-5);
   align-items: start;
 }
 
-@media (max-width: 1080px) {
+@media (min-width: 1081px) {
   .split {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) 336px;
   }
 }

@@ -1,106 +1,144 @@
 /**
- * 「侧栏 sticky 必须在单列断点下取消」的静态契约。
+ * 「侧栏 sticky 只许在双列断点内开启」的静态契约。
  *
- * 这条规则用了三轮误诊才找到:双列布局里侧栏 `position: sticky` 是对的,
- * 但窗口变窄、布局塌成**单列**之后,sticky 会把上半部分粘在视口顶端不动,
- * 下半部分从它身下滚过去——用户看到的就是「内容不动、滚动条照走,
- * 停下来也对不上、拖条也对不上」。用户 1280 宽的窗口正好落在断点内侧,
- * 而项目屏的断点更低(1080)所以唯独它正常,更把人往错误方向带。
+ * 病灶(865efe0):双列布局的侧栏 `position: sticky` 在窗口变窄、布局塌成
+ * 单列后没有取消。堆叠布局里 sticky 的约束矩形是 grid **容器**而不是它自己
+ * 那一格,于是它能在整屏行程里粘住不动、让后面的内容从身下滚过 ——
+ * 用户看到的就是「内容不动、滚动条照走,停下来也对不上、拖条也对不上」。
+ * (WKWebView 与 Chrome 实测行为一致,不是 WebKit 独有。)
  *
- * 第一版修复还栽了第二跤:覆盖规则写在了基础规则**前面**,同特指度下
- * 媒体查询不加权,被后面的 sticky 覆盖,等于没写。所以这里连**源序**
- * 一起钉死。
+ * 致病与否取决于**它是不是堆叠后的首个子元素**,不是断点值:排在最后的
+ * 侧栏 sticky 没有行程、看着正常。所以这里不按「谁看起来正常」放行,
+ * 一律要求 sticky 只出现在 `min-width` 查询里。
  *
- * jsdom 没有布局也不解析媒体查询,这类问题只能按 CSS 文本钉。
+ * 采用 mobile-first 之后,基础形态(窄屏)天然是单列 + 静态定位,
+ * 「双列」与「吸顶」焊在同一条 `@media (min-width: …)` 里 ——
+ * 任何一条查询失效都只会退回单列,不会退回病态。本测试因此只需守一件事:
+ * **没有裸露在基础层的 sticky**。
+ *
+ * jsdom 无布局、不解析媒体查询,这类问题只能按 CSS 文本钉。
  */
 
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import process from "node:process";
 import { describe, expect, it } from "vitest";
 
-const SHEETS = ["screens", "shell", "components", "welcome"] as const;
-const css = Object.fromEntries(
-  SHEETS.map((n) => [
-    n,
-    readFileSync(resolve(process.cwd(), `src/styles/${n}.css`), "utf8"),
-  ]),
-) as Record<(typeof SHEETS)[number], string>;
-const all = Object.values(css).join("\n");
+const DIR = resolve(process.cwd(), "src/styles");
 
 /**
- * 受本规则约束的「双列布局 + sticky 侧栏」清单。
- * 新增同型布局时把它加进来——漏加不会被自动发现,这是本表存在的理由。
+ * 剥注释,但用等量空白填回去——源序/位置断言依赖下标不变。
+ * (上一版直接在原文上跑正则:把真规则整段换成同内容的注释,测试照样绿。)
  */
-const STICKY_SIDEBARS = [
-  { selector: ".copy__form", collapseAt: 1312 },
-  { selector: ".devices__form", collapseAt: 1312 },
-  { selector: ".wizard__preview", collapseAt: 1312 },
-  { selector: ".detail", collapseAt: 1080 },
-];
+function stripComments(css: string): string {
+  return css.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "));
+}
 
-/** 某选择器声明 position 的位置(返回全部出现处的下标与值) */
-function positionDecls(sheet: string, selector: string) {
-  const out: Array<{ index: number; value: string }> = [];
-  const re = new RegExp(
-    `(^|[\\s,}])${selector.replace(".", "\\.")}\\s*\\{([^}]*)\\}`,
-    "g",
-  );
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(sheet))) {
-    const pos = /position:\s*([a-z-]+)/.exec(m[2]);
-    if (pos) out.push({ index: m.index, value: pos[1] });
+/** 全量扫描 src/styles 下每一张表,不维护手抄清单(漏表 = 漏防线) */
+const SHEETS = readdirSync(DIR)
+  .filter((f) => f.endsWith(".css"))
+  .map((f) => ({ name: f, css: stripComments(readFileSync(resolve(DIR, f), "utf8")) }));
+
+/**
+ * 与内容同处一个滚动容器内的表头吸顶,不受本规则约束:
+ * 它粘的是自己所在列表的表头,没有「把后续内容从身下放过」的语义。
+ */
+const EXEMPT = [".files__scroll .list__head"];
+
+interface StickyDecl {
+  sheet: string;
+  selector: string;
+  /** 包裹它的媒体查询条件(没有则为 null = 裸露在基础层) */
+  media: string | null;
+}
+
+/** 逐规则块解析:能看见缩进的、后代的、逗号列表里的每一个选择器 */
+function findSticky(): StickyDecl[] {
+  const out: StickyDecl[] = [];
+  for (const { name, css } of SHEETS) {
+    // 记录每个 @media 块的字符区间与条件
+    const medias: Array<{ start: number; end: number; cond: string }> = [];
+    const mediaRe = /@media([^{]+)\{/g;
+    let mm: RegExpExecArray | null;
+    while ((mm = mediaRe.exec(css))) {
+      // 花括号配对找块尾
+      let depth = 1;
+      let i = mediaRe.lastIndex;
+      while (i < css.length && depth > 0) {
+        if (css[i] === "{") depth++;
+        else if (css[i] === "}") depth--;
+        i++;
+      }
+      medias.push({ start: mm.index, end: i, cond: mm[1].trim() });
+    }
+
+    const ruleRe = /([^{}]+)\{([^{}]*)\}/g;
+    let rm: RegExpExecArray | null;
+    while ((rm = ruleRe.exec(css))) {
+      if (!/position:\s*sticky/.test(rm[2])) continue;
+      const at = rm.index;
+      const wrap = medias.find((x) => at > x.start && at < x.end);
+      for (const sel of rm[1].split(",").map((x) => x.trim()).filter(Boolean)) {
+        if (!sel.startsWith(".")) continue;
+        out.push({ sheet: name, selector: sel, media: wrap ? wrap.cond : null });
+      }
+    }
   }
   return out;
 }
 
-describe("侧栏 sticky 与单列断点", () => {
-  for (const { selector, collapseAt } of STICKY_SIDEBARS) {
-    it(`${selector}: 单列(≤${collapseAt}px)下必须取消 sticky`, () => {
-      const sheet = Object.values(css).find((s) =>
-        positionDecls(s, selector).some((d) => d.value === "sticky"),
-      );
-      expect(sheet, `${selector} 应当在某张样式表里声明 position:sticky`).toBeDefined();
+describe("侧栏 sticky 契约", () => {
+  const decls = findSticky();
 
-      const decls = positionDecls(sheet!, selector);
-      const sticky = decls.find((d) => d.value === "sticky");
-      const staticDecl = decls.find((d) => d.value === "static");
+  it("扫描确实抓到了 sticky 声明(解析器自身不许静默失效)", () => {
+    // 解析器一旦被 CSS 写法绕过就会退化成「零发现 → 全绿」,先钉住它有产出
+    expect(decls.length).toBeGreaterThanOrEqual(4);
+  });
 
-      expect(
-        staticDecl,
-        `${selector} 在单列布局下必须还原为 position:static,` +
-          `否则堆叠布局里它会粘住不动、下半部分从身下滚过(读作「滚动条与内容不同步」)`,
-      ).toBeDefined();
-
-      // 源序:覆盖必须在基础规则之后,否则同特指度下被覆盖回去(等于没写)
-      expect(
-        staticDecl!.index,
-        `${selector} 的 position:static 必须写在 position:sticky **之后**——` +
-          `媒体查询不提升特指度,写在前面会被后面的 sticky 盖掉`,
-      ).toBeGreaterThan(sticky!.index);
-
-      // 覆盖必须包在对应断点的媒体查询里
-      const around = sheet!.slice(Math.max(0, staticDecl!.index - 400), staticDecl!.index);
-      expect(
-        around,
-        `${selector} 的 static 覆盖应当位于 @media (max-width: ${collapseAt}px) 内`,
-      ).toContain(`max-width: ${collapseAt}px`);
-    });
-  }
-
-  it("没有遗漏:每个 position:sticky 的侧栏都在清单里(表头等吸顶元素除外)", () => {
-    const stickySelectors = [...all.matchAll(/(^|\n)(\.[a-z0-9_-]+)\s*\{[^}]*position:\s*sticky/gi)]
-      .map((m) => m[2])
-      .filter((s, i, arr) => arr.indexOf(s) === i);
-    // 表头吸顶是「同一个滚动容器内」的合法用法,不受本规则约束
-    const exempt = [".list__head", ".files__head", ".topbar"];
-    const unlisted = stickySelectors.filter(
-      (s) => !STICKY_SIDEBARS.some((x) => x.selector === s) && !exempt.includes(s),
+  it("每一处 sticky 要么在 min-width 查询内,要么是豁免的表头吸顶", () => {
+    const bad = decls.filter(
+      (d) => !EXEMPT.includes(d.selector) && !/min-width/.test(d.media ?? ""),
     );
     expect(
-      unlisted,
-      `这些 sticky 元素既不在受管清单里也不在豁免名单里,` +
-        `请确认它们所在布局塌单列时不会粘住:${unlisted.join(", ")}`,
+      bad.map((d) => `${d.sheet} ${d.selector} @${d.media ?? "基础层(裸露)"}`),
+      "侧栏 sticky 必须只在双列(min-width)时开启:单列下它会粘住不动、" +
+        "让后面的内容从身下滚过,读作「滚动条与内容不同步」(865efe0)。" +
+        "若确为「同一滚动容器内的表头吸顶」,请加入 EXEMPT 并写明理由",
     ).toEqual([]);
+  });
+
+  it("双列与吸顶必须写在同一条查询里(不靠手抄的断点数字同步)", () => {
+    // 断点漂移是上一版测试的假绿来源:容器的双列断点改了、侧栏的覆盖没跟着改,
+    // 中间那段区间就是病灶原样复活。焊在同一个块里,结构上无从漂移。
+    const PAIRS = [
+      { side: ".wizard__preview", container: ".wizard" },
+      { side: ".devices__form", container: ".devices" },
+      { side: ".copy__form", container: ".copy" },
+    ];
+    for (const { side, container } of PAIRS) {
+      const sheet = SHEETS.find((s) => s.css.includes(`${side} {`));
+      expect(sheet, `${side} 应当存在`).toBeDefined();
+      const css = sheet!.css;
+      const mq = new RegExp(
+        `@media \\(min-width: \\d+px\\) \\{[^@]*?${container.replace(".", "\\.")} \\{[^}]*grid-template-columns[^}]*\\}[^@]*?${side.replace(".", "\\.")} \\{[^}]*position:\\s*sticky[^}]*\\}`,
+        "s",
+      );
+      expect(
+        mq.test(css),
+        `${container} 的双列与 ${side} 的吸顶必须在同一条 @media (min-width) 块里`,
+      ).toBe(true);
+    }
+  });
+
+  it("基础形态是单列(降级方向安全)", () => {
+    const sheet = SHEETS.find((s) => s.name === "screens.css")!.css;
+    for (const c of [".wizard", ".devices", ".copy"]) {
+      const m = new RegExp(`\\n${c.replace(".", "\\.")} \\{([^}]*)\\}`).exec(sheet);
+      expect(m, `${c} 应当存在基础规则`).not.toBeNull();
+      expect(
+        /grid-template-columns:\s*minmax\(0,\s*1fr\);/.test(m![1]),
+        `${c} 的基础形态必须是单列——查询失效时要退回安全态,而不是病态`,
+      ).toBe(true);
+    }
   });
 });

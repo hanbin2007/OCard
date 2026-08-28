@@ -90,15 +90,55 @@ describe("OCard M1 冒烟", () => {
           const over = el.scrollHeight - el.clientHeight;
           if (over <= 1) continue;
           if (/(auto|scroll|overlay)/.test(cs.overflowY)) live.push(name(el));
-          else if (cs.overflowY === "hidden") trapped.push(name(el));
+          else if (cs.overflowY === "hidden" || cs.overflowY === "clip")
+            trapped.push(name(el));
         }
         return { live, trapped };
       });
 
       // 至多一个活跃滚动容器:两个就意味着滚轮落点决定滚谁,用户看到的条对不上
       expect(probe.live.length).toBeLessThanOrEqual(1);
-      // 有溢出却被 hidden 裁掉 = 内容够不着且无提示
+      // 有溢出却被 hidden/clip 裁掉 = 内容够不着且无提示
       expect(probe.trapped).toEqual([]);
+    }
+  });
+
+  /**
+   * 侧栏必须跟着内容滚(布局回归防线之二)。
+   *
+   * 上一条不变式盯的是「有几个容器在滚」,而 865efe0 那个病灶——单列下
+   * 侧栏 sticky 粘住不动——**不改变任何容器的 scrollHeight/overflow**,
+   * 整个在上一条的盲区里。这里直接量几何:滚 N 像素,侧栏就得位移 N。
+   * 窗口先压到单列断点内侧(1200),那正是用户报障时的宽度。
+   */
+  it("单列宽度下侧栏跟随内容滚动(不粘住)", async () => {
+    await browser.setWindowRect(null, null, 1200, 800);
+    await browser.pause(600);
+
+    for (const [nav, side] of [
+      ["nav-copy", ".copy__form"],
+      ["nav-devices", ".devices__form"],
+    ]) {
+      await $(`[data-testid="${nav}"]`).click();
+      await browser.pause(500);
+
+      const r = await browser.execute((sel) => {
+        const sc = document.querySelector(".content");
+        const el = document.querySelector(sel);
+        if (!sc || !el) return null;
+        if (sc.scrollHeight - sc.clientHeight < 200) return { skip: true };
+        sc.scrollTop = 0;
+        const a = el.getBoundingClientRect().top;
+        sc.scrollTop = 148;
+        const b = el.getBoundingClientRect().top;
+        const moved = a - b;
+        sc.scrollTop = 0;
+        return { moved: Math.round(moved), scrolled: Math.round(sc.scrollTop) || 148 };
+      }, side);
+
+      if (!r || r.skip) continue;
+      // 位移必须 1:1 跟随;粘住时 moved≈0,正是报障时的形态
+      expect(Math.abs(r.moved - 148)).toBeLessThan(4);
     }
   });
 });

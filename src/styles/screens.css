@@ -96,19 +96,17 @@
   gap: var(--space-1);
 }
 
-/* 详情侧栏（吸顶） */
+/* 详情侧栏:基础不吸顶(单列下 sticky 会粘住不动,见 .copy__form) */
 .detail {
-  position: sticky;
-  top: var(--space-5);
   display: grid;
   gap: var(--space-4);
 }
 
-/* 单列下取消 sticky(.split 在 shell.css 的 1080 断点塌单列)。
-   写在这里而不是 shell.css:跨文件源序不可靠,同文件紧跟基础规则最稳 */
-@media (max-width: 1080px) {
+/* 与 shell.css 的 .split 双列同断点开启 */
+@media (min-width: 1081px) {
   .detail {
-    position: static;
+    position: sticky;
+    top: var(--space-5);
   }
 }
 
@@ -116,30 +114,29 @@
 
 .wizard {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 400px;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-6);
   align-items: start;
 }
 
 /* 1080 内容宽 + 232 侧栏 */
-@media (max-width: 1312px) {
-  .wizard {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
 
 .wizard__preview {
-  position: sticky;
-  top: var(--space-5);
 }
 
-/* 单列下取消 sticky:塌成上下堆叠后,sticky 会把上半部分粘在顶部不动、
-   让下半部分从它身下滚过去——用户读作「内容不动但滚动条在走、停下也
-   对不上」。**必须放在基础规则之后**:同特指度下媒体查询不加权,
-   写在前面会被后面的 sticky 覆盖(第一版修复就栽在这)。 */
-@media (max-width: 1312px) {
+/* 宽屏才双列 + 侧栏吸顶:两者是同一个决策的两半,焊在同一条查询里,
+   结构上不可能再漂移。基础(窄屏)是单列 + 静态定位——单列下 sticky 会
+   把侧栏粘在视口顶端不动、让下半部分从身下滚过去,读作「内容不动但
+   滚动条照走」(865efe0 的病灶)。降级方向是安全的:任何一条查询失效
+   都只会退回单列,不会退回病态。 */
+@media (min-width: 1313px) {
+  .wizard {
+    grid-template-columns: minmax(0, 1fr) 400px;
+  }
+
   .wizard__preview {
-    position: static;
+    position: sticky;
+    top: var(--space-5);
   }
 }
 
@@ -183,29 +180,31 @@
 
 .devices {
   display: grid;
-  grid-template-columns: 360px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-6);
   align-items: start;
 }
 
 /* 1080 内容宽 + 232 侧栏 */
-@media (max-width: 1312px) {
-  .devices {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
 
 .devices__form {
-  position: sticky;
-  top: var(--space-5);
   display: grid;
   gap: var(--space-4);
 }
 
-/* 单列下取消 sticky,理由与位置要求同 .wizard__preview */
-@media (max-width: 1312px) {
+/* 宽屏才双列 + 侧栏吸顶:两者是同一个决策的两半,焊在同一条查询里,
+   结构上不可能再漂移。基础(窄屏)是单列 + 静态定位——单列下 sticky 会
+   把侧栏粘在视口顶端不动、让下半部分从身下滚过去,读作「内容不动但
+   滚动条照走」(865efe0 的病灶)。降级方向是安全的:任何一条查询失效
+   都只会退回单列,不会退回病态。 */
+@media (min-width: 1313px) {
+  .devices {
+    grid-template-columns: 360px minmax(0, 1fr);
+  }
+
   .devices__form {
-    position: static;
+    position: sticky;
+    top: var(--space-5);
   }
 }
 
@@ -250,31 +249,31 @@
 
 .copy {
   display: grid;
-  grid-template-columns: 380px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-6);
   align-items: start;
 }
 
 /* 1080 内容宽 + 232 侧栏 */
-@media (max-width: 1312px) {
-  .copy {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
 
 .copy__form {
-  position: sticky;
-  top: var(--space-5);
   display: grid;
   gap: var(--space-4);
 }
 
-/* 单列下取消 sticky——这就是「滚动条与内容不同步」的真因:
-   1200~1312 宽的窗口正好落进单列,表单粘住不动、任务区从它身下滚过去,
-   于是内容视觉上不动而滑块照走。理由与位置要求同 .wizard__preview */
-@media (max-width: 1312px) {
+/* 宽屏才双列 + 侧栏吸顶:两者是同一个决策的两半,焊在同一条查询里,
+   结构上不可能再漂移。基础(窄屏)是单列 + 静态定位——单列下 sticky 会
+   把侧栏粘在视口顶端不动、让下半部分从身下滚过去,读作「内容不动但
+   滚动条照走」(865efe0 的病灶)。降级方向是安全的:任何一条查询失效
+   都只会退回单列,不会退回病态。 */
+@media (min-width: 1313px) {
+  .copy {
+    grid-template-columns: 380px minmax(0, 1fr);
+  }
+
   .copy__form {
-    position: static;
+    position: sticky;
+    top: var(--space-5);
   }
 }
 
@@ -517,10 +516,11 @@
   color: var(--danger);
 }
 
-/* 文件明细**不再**是独立滚动区(实测定位:嵌套滚动容器让鼠标位置决定
-   滚的是内层还是外层,而用户眼睛盯的是主区右缘那根条——内层滚时它纹丝
-   不动,内层到底后才突然接管,读作「滚动条和内容不同步、还会跳」。
-   一屏之内只允许一个滚动容器,列表整体展开,由 .content 统一滚。) */
+/* 文件明细**不再**是独立滚动区:嵌套滚动容器让鼠标落点决定滚内层还是
+   外层,而用户盯的是主区右缘那根条——这是一个真问题,值得修。
+   但它不是「滚动条与内容不同步」那个报障的病因(真因见 865efe0:
+   单列下侧栏 sticky)。守的不变式是「同一片区域、同一时刻只有一个容器
+   响应滚轮/出条」。 */
 .files__scroll {
   max-height: none;
   overflow: visible;
@@ -955,16 +955,20 @@
   grid-template-columns: 28px minmax(0, 1fr) minmax(0, 1.4fr) 108px 80px 64px;
 }
 
+/* 窄宽保留「勾选框 + 文件名 + 删除时间 + 恢复」,藏掉原位置与大小。
+   此前藏的是第 2(文件名)与第 4(删除时间)列 —— 既把最该看的文件名
+   藏了、只剩一条截断的原路径,又让 4 个可见元素挤进 3 条轨道,
+   「恢复」按钮被挤到第二行(评审 P1)。轨道数必须等于可见元素数。 */
 @media (max-width: 1180px) {
   .trash__head,
   .trash__row {
-    grid-template-columns: minmax(0, 1fr) 108px 64px;
+    grid-template-columns: 28px minmax(0, 1fr) 108px 64px;
   }
 
-  .trash__head > :nth-child(2),
-  .trash__head > :nth-child(4),
-  .trash__row > :nth-child(2),
-  .trash__row > :nth-child(4) {
+  .trash__head > :nth-child(3),
+  .trash__head > :nth-child(5),
+  .trash__row > :nth-child(3),
+  .trash__row > :nth-child(5) {
     display: none;
   }
 }
