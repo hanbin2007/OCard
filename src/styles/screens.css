@@ -323,20 +323,29 @@
   color: var(--text-tertiary);
 }
 
+/* 目的地类型列宽:实测「NAS 主备份」文字 74px + 触发器内边距 36px
+   (左 12 + 右 24,右侧给折叠箭头留位)= 110px。原来的 96px 放不下,
+   下拉按钮和菜单项都被截成「NAS ...」。120px 留 10px 余量。
+   三处共用同一变量,改一处即可,不会再漂移。 */
+.dest-row,
 .dest-row__error {
-  padding: var(--space-1) 0 0 calc(96px + var(--space-2));
+  --dest-kind-col: 120px;
+}
+
+.dest-row__error {
+  padding: var(--space-1) 0 0 calc(var(--dest-kind-col) + var(--space-2));
 }
 
 .dest-row {
   display: grid;
-  grid-template-columns: 96px minmax(0, 1fr) 32px;
+  grid-template-columns: var(--dest-kind-col) minmax(0, 1fr) 32px;
   gap: var(--space-2);
   align-items: center;
 }
 
 /* 非 NAS 目的地多一列「选盘…」快捷选择(评审 1.2) */
 .dest-row:has(> :nth-child(4)) {
-  grid-template-columns: 96px minmax(0, 1fr) 116px 32px;
+  grid-template-columns: var(--dest-kind-col) minmax(0, 1fr) 116px 32px;
 }
 
 /* ---- 拷卡仪表区：百分比与速度是这块屏的主角 ---- */

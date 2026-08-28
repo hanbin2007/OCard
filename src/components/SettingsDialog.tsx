@@ -312,9 +312,11 @@ export function SettingsDialog() {
           </Field>
 
           {/* 高频(换人)与一次性/排障配置分区(评审 6.5):
-              诊断与更新默认收起,换个操作人不必滚过一整屏技术信息 */}
+              转码能力诊断默认收起,换个操作人不必滚过一整屏技术信息。
+              更新**不在**折叠里:装没装新版是用户主动来设置里找的事,
+              藏进「高级」等于让人猜它在哪(用户点名拿出来)。 */}
           <details className="settings-advanced" data-testid="settings-advanced">
-            <summary className="text-sm">高级 · 转码能力与更新</summary>
+            <summary className="text-sm">高级 · 转码能力诊断</summary>
 
           <div className="settings-about" data-testid="settings-transcode">
             <div className="settings-about__head">
@@ -413,6 +415,8 @@ export function SettingsDialog() {
             ) : null}
           </div>
 
+          </details>
+
           <div className="settings-about">
             <div className="settings-about__head">
               <span className="field__label">关于与更新</span>
@@ -470,7 +474,6 @@ export function SettingsDialog() {
               </span>
             ) : null}
           </div>
-          </details>
 
           <div className="dialog__actions">
             <button
