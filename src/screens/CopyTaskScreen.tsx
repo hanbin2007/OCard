@@ -370,6 +370,9 @@ export function CopyTaskScreen() {
   const loadedCountRef = useRef(0);
   const lastRefreshRef = useRef(0);
 
+  /** 文件明细触底哨兵:进入视口即自动续拉下一页 */
+  const filesEndRef = useRef<HTMLDivElement | null>(null);
+
   /** 追加下一页 */
   const loadMoreFiles = useCallback(
     async (taskId: string, offset: number) => {
@@ -578,6 +581,29 @@ export function CopyTaskScreen() {
 
   // 总数以后端为准（task.fileCount），列表接口的 total 兜底
   const totalFiles = task?.fileCount ?? fileTotal;
+
+  /**
+   * 触底自动续拉:哨兵进入视口就取下一页。滚动源是外层 .content(本屏
+   * 唯一的滚动容器),IntersectionObserver 默认以视口为 root,正好对上。
+   * 老内核没有 IO 时静默跳过——按钮仍在,不影响功能。
+   */
+  useEffect(() => {
+    const el = filesEndRef.current;
+    if (!el || typeof IntersectionObserver === "undefined") return;
+    if (filesLoading || files.length >= totalFiles) return;
+    const taskId = task?.id;
+    if (!taskId) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          void loadMoreFiles(taskId, files.length);
+        }
+      },
+      { rootMargin: "200px" },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [files.length, totalFiles, filesLoading, task?.id, loadMoreFiles]);
   /** 明细是否已全部加载 */
   const fullyLoaded = totalFiles > 0 && files.length >= totalFiles;
   /**
@@ -1453,7 +1479,9 @@ export function CopyTaskScreen() {
                         </Checkbox>
                       ) : null}
                     </div>
-                    <div className="list">
+                    {/* --files:这层是文件明细的外框,需要 overflow:clip 让
+                        里面的 sticky 表头绑到 .content 而不是被这层截胡 */}
+                    <div className="list list--files">
                       <div className="files__scroll">
                         <div className="list__head files__head">
                           <span>文件名</span>
@@ -1509,7 +1537,11 @@ export function CopyTaskScreen() {
                     </div>
 
                     {files.length < totalFiles ? (
-                      <div className="hint-bar">
+                      /* 列表不再自滚(与外层嵌套)后,「加载更多」会被自己推到
+                         几千像素之外:每点一次列表就长一页,下次还得先滚回来找。
+                         改成触底自动续拉(与选片屏 onEndReached 同一范式),
+                         按钮保留为哨兵没触发时的手动出口。 */
+                      <div className="hint-bar" ref={filesEndRef}>
                         <button
                           type="button"
                           className="btn btn--sm"

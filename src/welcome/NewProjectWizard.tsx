@@ -323,7 +323,8 @@ export function NewProjectWizard({ onExit }: { onExit: () => void }) {
 
   return (
     <div className="npw" data-testid="new-project-wizard">
-      <ol className="npw__steps" aria-label="引导步骤">
+      {/* base.css 去掉了 list-style,VoiceOver 会丢列表语义,显式补 role */}
+      <ol className="npw__steps" role="list" aria-label="引导步骤">
         {STEPS.map((s, i) => (
           <li
             key={s.key}
@@ -337,7 +338,15 @@ export function NewProjectWizard({ onExit }: { onExit: () => void }) {
               </span>
             ) : null}
             <span className="npw__step-index">
-              {i < stepIndex ? <IconCheck size={11} /> : i + 1}
+              {i < stepIndex ? (
+                <>
+                  <IconCheck size={11} />
+                  {/* 勾号是装饰,读屏得从这里拿到序号与完成状态 */}
+                  <span className="sr-only">{i + 1}(已完成)</span>
+                </>
+              ) : (
+                i + 1
+              )}
             </span>
             {s.label}
           </li>

@@ -145,10 +145,14 @@ export function WelcomeHome({
               </span>
               <span className="welcome-recent__meta">
                 <span className="welcome-recent__name">{recent.name}</span>
+                {/* 文件夹名在前(mono,技术信息),工况在后:窄宽下先被截掉的
+                    应该是冗余的工况标签(徽标已经显示 A/B),不是文件夹名 */}
                 <span className="welcome-recent__folder">
-                  <span>{SCENARIO_SHORT[recent.scenario]}</span>
+                  <span className="welcome-recent__folder-name mono">
+                    {recent.folderName}
+                  </span>
                   <span aria-hidden="true"> · </span>
-                  <span className="truncate">{recent.folderName}</span>
+                  <span>{SCENARIO_SHORT[recent.scenario]}</span>
                 </span>
               </span>
               <span className="welcome-recent__time">

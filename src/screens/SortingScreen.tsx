@@ -1075,6 +1075,10 @@ export function SortingScreen() {
       />
 
       <div className="content content--flush">
+        {/* flush 屏同样要有 .content__inner:屏间进场动画挂在它身上
+            (挂滚动容器会掉出合成器异步滚动);缺了这层,本屏从 af39168
+            起就没有进场动画,--flush 的样式也成了死规则(评审 P1) */}
+        <div className="content__inner">
         <div className="sorting">
           {/* 分类条：计数 + 数字键提示。chip 是「把选中素材移入」的动作,
               不是筛选器(评审 3.10)——无选中目标时禁用并说明,而不是静默无事发生 */}
@@ -1499,6 +1503,7 @@ export function SortingScreen() {
               </button>
             </div>
           ) : null}
+        </div>
         </div>
       </div>
 

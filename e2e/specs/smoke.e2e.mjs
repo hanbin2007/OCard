@@ -51,4 +51,54 @@ describe("OCard M1 冒烟", () => {
     // 登记表落在 NAS 共享目录
     expect(existsSync(path.join(nasRoot, ".ocard-registry"))).toBe(true);
   });
+
+  /**
+   * 滚动不变式(布局回归防线)。
+   *
+   * 「滚动条与内容不同步」被误诊两轮(先怪 ::-webkit-scrollbar,再怪滚动
+   * 容器上的过渡动画),真因是嵌套滚动容器:鼠标在内层上滚,内层吃掉滚动,
+   * 而用户盯着外层的条——它纹丝不动。这类问题 jsdom 一律测不出(无布局),
+   * 只能在真实内核里按几何断言,所以钉在 E2E。
+   *
+   * 两条不变式:
+   *  1) 同一屏、同一时刻,正文区最多只有一个**真的能滚**的容器;
+   *  2) 不许存在「能滚却不给滚」的裁剪容器(overflow:hidden 且有溢出)
+   *     —— 那等于内容被静默吞掉,违反零静默铁律。
+   */
+  it("每屏滚动不变式:正文区至多一个活跃滚动容器,且没有被裁掉的可滚内容", async () => {
+    const screens = [
+      ["nav-copy", "copy-start"],
+      ["nav-devices", "dev-model"],
+      ["nav-sorting", "sorting-categories"],
+      ["nav-transcode", null],
+      ["nav-trash", null],
+    ];
+    for (const [nav, anchor] of screens) {
+      await $(`[data-testid="${nav}"]`).click();
+      if (anchor) await $(`[data-testid="${anchor}"]`).waitForExist({ timeout: 15000 });
+      await browser.pause(400);
+
+      const probe = await browser.execute(() => {
+        const roots = [...document.querySelectorAll(".main, .welcome-sub")];
+        const all = roots.flatMap((r) => [r, ...r.querySelectorAll("*")]);
+        const name = (el) =>
+          (el.className || "").toString().trim().split(/\s+/)[0] || el.tagName;
+        const live = [];
+        const trapped = [];
+        for (const el of all) {
+          const cs = getComputedStyle(el);
+          const over = el.scrollHeight - el.clientHeight;
+          if (over <= 1) continue;
+          if (/(auto|scroll|overlay)/.test(cs.overflowY)) live.push(name(el));
+          else if (cs.overflowY === "hidden") trapped.push(name(el));
+        }
+        return { live, trapped };
+      });
+
+      // 至多一个活跃滚动容器:两个就意味着滚轮落点决定滚谁,用户看到的条对不上
+      expect(probe.live.length).toBeLessThanOrEqual(1);
+      // 有溢出却被 hidden 裁掉 = 内容够不着且无提示
+      expect(probe.trapped).toEqual([]);
+    }
+  });
 });

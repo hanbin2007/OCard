@@ -287,7 +287,6 @@
 /* 子视图的「返回」并进顶栏:与新建/铃铛/设置同一排、同一视觉层级 */
 .topbar__back {
   flex: none;
-  margin-right: var(--space-1);
 }
 
 /* 标题栏是"框"，不跟着内容一起位移：只做交叉淡入，
@@ -479,10 +478,11 @@
   overflow-y: auto;
 }
 
-/* 屏间过渡动画只许落在滚动**内容**(.content__inner)上,绝不落在滚动
-   容器(.content)上:WebKit 里给滚动容器本身做 transform/opacity 动画
-   会把它踢出合成器异步滚动,退回主线程——滚动条与内容不同步、回弹消失
-   (macOS 实测:项目管理页没有这套动画所以正常,其余屏全部失同步)。 */
+/* 屏间过渡动画只落在滚动**内容**(.content__inner)上,不落在滚动容器
+   (.content)上:给滚动容器本身做 transform 动画会让它掉出合成器异步
+   滚动,退回主线程滚动。这条本身是对的,值得保留——
+   但它**不是**2026-08 那次「滚动条与内容不同步」的病因:真因是嵌套滚动
+   容器(见 fb64afa)。别再从渲染引擎方向找这个症状。 */
 .shell[data-nav="forward"] .content__inner {
   animation: screen-in-below var(--dur-spring-fast) var(--spring);
 }
@@ -525,12 +525,23 @@
 .content--flush .content__inner {
   max-width: none;
   padding: 0;
+  /* 高度必须传导下去:flush 屏内部靠 height:100% 撑满(选片屏的
+     .sorting),这层若是 auto 高,百分比就失去参照,网格被内容撑成
+     几千像素——外层日常态随之可滚,嵌套滚动又回来了(实测 2876px) */
+  height: 100%;
+  min-height: 0;
 }
 
-/* flush 屏(选片工作台)内部是自己滚的虚拟网格:外层必须**不滚**,
-   否则两层都能滚 = 滚动条与内容对不上(一屏一个滚动容器) */
+/* flush 屏(选片工作台)内部是自己滚的虚拟网格。
+   要守的不变式是「同一片区域、同一时刻只有一个容器响应滚轮/出条」,
+   **不是**「结构上只许有一个 overflow:auto」——后者会逼出更坏的结果:
+   一旦顶部横幅堆起来把网格挤没,hidden 会把内容连同底部动作一起裁掉,
+   既不出条也不响应滚轮,用户看不到任何提示(零静默 fail-open,评审 P0)。
+   改成兜底 auto:日常态 scrollHeight == clientHeight,外层根本不出条、
+   不吃滚轮,与内层零冲突;只有退化布局才滚,保证内容永远够得着。 */
 .content--flush {
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 /* 列表 + 详情 双栏 */

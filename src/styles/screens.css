@@ -492,10 +492,25 @@
   overflow: visible;
 }
 
+/* 表头吸顶要吸在**真正在滚的那个容器**上。
+   结构是 .list--files > .files__scroll > .list__head:外框 .list 的
+   overflow:hidden 会创建 scrollport,sticky 于是被钉死在这个自己不滚的
+   盒子上,随列表一起被 .content 滚走(评审 P0,实测已跑出视口)。
+   overflow:clip 一样裁剪(圆角照旧)但不创建 scroll container,
+   sticky 因此穿透到 .content。老内核不支持 clip 时回退 hidden:
+   只是没有吸顶,不会破相。 */
+@supports (overflow: clip) {
+  .list--files {
+    overflow: clip;
+  }
+}
+
 .files__scroll .list__head {
   position: sticky;
   top: 0;
   z-index: 1;
+  /* 吸顶时下方内容会穿到身后,必须有实底 */
+  background: var(--panel);
 }
 
 .tasks__tabs {
@@ -588,7 +603,10 @@
 
 .sorting__grid-wrap {
   flex: 1 1 auto;
-  min-height: 0;
+  /* 高度下限:顶部横幅可叠加(筛选提示/待修清理/缩略图降级/交付锁/索引),
+     堆起来会把网格压到 0——VirtualGrid 视口为 0 时会静默退化成按 6 行渲染,
+     屏幕一片空白却无任何提示(评审 P0)。给它保底,溢出由外层兜底滚动接管 */
+  min-height: 160px;
   display: flex;
 }
 

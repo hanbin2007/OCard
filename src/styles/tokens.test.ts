@@ -32,7 +32,15 @@ const light = declarationsOf(":root {");
 const systemDark = declarationsOf(':root:not([data-theme="light"])');
 const manualDark = declarationsOf(':root[data-theme="dark"]');
 
-const STYLESHEETS = ["base", "shell", "components", "screens", "tokens"] as const;
+const STYLESHEETS = [
+  "base",
+  "shell",
+  "components",
+  "screens",
+  "tokens",
+  // 欢迎/向导窗口的样式此前不在守卫扫描内,违规能静悄悄过 CI(评审 P1)
+  "welcome",
+] as const;
 const sheets = Object.fromEntries(
   STYLESHEETS.map((name) => [
     name,

@@ -187,18 +187,20 @@
 .welcome-recent__folder {
   display: flex;
   align-items: baseline;
-  gap: 0;
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   color: var(--text-tertiary);
-  font-family: var(--font-mono);
   font-size: var(--text-2xs);
 }
+/* 文件夹名占余量并自己省略;工况标签定宽,窄宽时它先被挤没 */
+.welcome-recent__folder-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .welcome-recent__time {
   flex: 0 0 auto;
   color: var(--text-tertiary);
@@ -236,9 +238,11 @@
   padding: var(--space-2) var(--space-6) var(--space-6);
 }
 
-/* 项目管理视图:整屏(含顶栏)自带布局,外层**不滚**——
-   外层滚会把顶栏一起卷走(用户点名:导航头没锁定),
-   而且与屏内 .content 形成嵌套滚动,滚动条与内容对不上 */
+/* 项目管理视图:整屏(含顶栏)自带布局,外层不滚——
+   外层滚会把顶栏一起卷走(用户点名:导航头没锁定),而且与屏内 .content
+   形成嵌套滚动,滚动条与内容对不上。这里敢用 hidden 是因为屏内布局本身
+   有界(顶栏定高 + .content 自滚),窗口最小高度 560 保证压不塌;
+   无界内容的 flush 屏必须用兜底 auto,见 .content--flush */
 .welcome-sub__body--flush {
   overflow: hidden;
   padding: 0;
@@ -292,7 +296,7 @@
   display: inline-flex;
   align-items: center;
   margin: 0 var(--space-2);
-  color: var(--text-quaternary, var(--text-tertiary));
+  color: var(--text-tertiary);
   opacity: 0.55;
 }
 .npw__step[aria-current="step"] {
@@ -315,7 +319,7 @@
   font-variant-numeric: tabular-nums;
   /* 序号盘的状态切换有实体感:颜色与描边一起走 */
   transition:
-    background-color var(--dur-quick) var(--ease-out),
+    background var(--dur-quick) var(--ease-out),
     border-color var(--dur-quick) var(--ease-out),
     color var(--dur-quick) var(--ease-out);
 }
@@ -327,8 +331,10 @@
   background: var(--accent);
   border-color: var(--accent);
   color: var(--on-accent);
-  /* 当前步轻微外扩,是「你在这」的空间提示 */
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+  /* 「你在这」的光晕:用 outline 而不是 box-shadow——阴影只留给浮层
+     (tokens.test 守卫的既有铁律);outline 会跟随 border-radius */
+  outline: 3px solid var(--accent-ring);
+  outline-offset: 0;
 }
 
 /* 步骤面板:换步即重挂(key),按行进方向进场——
@@ -357,7 +363,8 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  /* 减少动效 ≠ 没有反馈:位移换成纯淡入,不做前庭刺激 */
+  /* base.css 的全局规则已把动画时长压到 0.01ms,这里只负责**去掉位移**,
+     保证减少动效时不残留任何前庭刺激 */
   .npw__panel,
   .npw__panel[data-dir="back"] {
     animation: npw-step-fade var(--dur-quick) var(--ease-out);
