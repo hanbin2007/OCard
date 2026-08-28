@@ -104,6 +104,14 @@
   gap: var(--space-4);
 }
 
+/* 单列下取消 sticky(.split 在 shell.css 的 1080 断点塌单列)。
+   写在这里而不是 shell.css:跨文件源序不可靠,同文件紧跟基础规则最稳 */
+@media (max-width: 1080px) {
+  .detail {
+    position: static;
+  }
+}
+
 /* ---------- 新建项目向导 ---------- */
 
 .wizard {
@@ -123,6 +131,16 @@
 .wizard__preview {
   position: sticky;
   top: var(--space-5);
+}
+
+/* 单列下取消 sticky:塌成上下堆叠后,sticky 会把上半部分粘在顶部不动、
+   让下半部分从它身下滚过去——用户读作「内容不动但滚动条在走、停下也
+   对不上」。**必须放在基础规则之后**:同特指度下媒体查询不加权,
+   写在前面会被后面的 sticky 覆盖(第一版修复就栽在这)。 */
+@media (max-width: 1312px) {
+  .wizard__preview {
+    position: static;
+  }
 }
 
 .wizard__choices {
@@ -184,6 +202,13 @@
   gap: var(--space-4);
 }
 
+/* 单列下取消 sticky,理由与位置要求同 .wizard__preview */
+@media (max-width: 1312px) {
+  .devices__form {
+    position: static;
+  }
+}
+
 .code-preview {
   display: grid;
   gap: var(--space-1);
@@ -242,6 +267,15 @@
   top: var(--space-5);
   display: grid;
   gap: var(--space-4);
+}
+
+/* 单列下取消 sticky——这就是「滚动条与内容不同步」的真因:
+   1200~1312 宽的窗口正好落进单列,表单粘住不动、任务区从它身下滚过去,
+   于是内容视觉上不动而滑块照走。理由与位置要求同 .wizard__preview */
+@media (max-width: 1312px) {
+  .copy__form {
+    position: static;
+  }
 }
 
 .volume-row {
