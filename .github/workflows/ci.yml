@@ -34,12 +34,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # 归档缓存:省掉每轮 65.5 MB 的重复下载(dpkg 解包仍要跑)。
+      # 下载目录挪到 $HOME —— 默认的 /var/cache/apt 属 root,actions/cache 读不到
+      - name: Restore apt archives
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-cache
+          key: apt-tauri-noble-v1
+
       - name: Install Linux system deps (Tauri v2)
         run: |
+          mkdir -p ~/apt-cache/partial
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get -o Dir::Cache::archives="$HOME/apt-cache" \
+            install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev build-essential curl wget file \
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo chown -R "$USER" ~/apt-cache
 
       - uses: pnpm/action-setup@v6
 
@@ -118,13 +129,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Restore apt archives
+        if: matrix.platform == 'linux'
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-cache
+          key: apt-tauri-noble-v1
+
       - name: Install Linux system deps (Tauri v2)
         if: matrix.platform == 'linux'
         run: |
+          mkdir -p ~/apt-cache/partial
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get -o Dir::Cache::archives="$HOME/apt-cache" \
+            install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev build-essential curl wget file \
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo chown -R "$USER" ~/apt-cache
 
       - uses: pnpm/action-setup@v6
 
@@ -196,13 +217,30 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # apt 归档缓存:把下载目录挪到 $HOME(默认的 /var/cache/apt 属 root,
+      # actions/cache 拿不到)。只省下载,不省 dpkg 解包——所以字体包更要挑轻的。
+      - name: Restore apt archives
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-cache
+          # key 里带包清单版本号:改了装的包就必须换 key,否则会命中旧归档、
+          # 把「装的东西变了」掩盖成「没变化」(与 tauri-driver 缓存同一口径)
+          key: apt-e2e-noble-v1
+
       - name: Install Linux system deps (Tauri v2 + WebDriver)
         run: |
+          mkdir -p ~/apt-cache/partial
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          # 字体只为 E2E 截图能读出中文,不需要 Noto CJK 全套(61.2 MB,
+          # 含日韩越与多字重,下载 74s + fontconfig 重建缓存;实测把这个
+          # job 的系统依赖步骤从 30s 拖到 402s)。文泉驿正黑约 8 MB,
+          # 覆盖简繁足够看图。断言全部基于 DOM/几何,不依赖字形。
+          sudo apt-get -o Dir::Cache::archives="$HOME/apt-cache" \
+            install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev build-essential curl wget file \
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
-            webkit2gtk-driver xvfb fonts-noto-cjk
+            webkit2gtk-driver xvfb fonts-wqy-zenhei
+          sudo chown -R "$USER" ~/apt-cache
 
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
