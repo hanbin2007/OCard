@@ -6,6 +6,7 @@ import "./styles/base.css";
 import "./styles/shell.css";
 import "./styles/components.css";
 import "./styles/screens.css";
+import "./styles/gallery.css";
 import "./styles/welcome.css";
 
 /**

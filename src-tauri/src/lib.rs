@@ -36,6 +36,8 @@ macro_rules! ocard_invoke_handler {
             $crate::commands::list_copy_tasks,
             $crate::commands::get_copy_task,
             $crate::commands::list_copy_files,
+            $crate::commands::list_source_folders,
+            $crate::commands::plan_source_selection,
             $crate::commands::preview_copy_task,
             $crate::commands::start_copy_task,
             $crate::commands::pause_copy_task,

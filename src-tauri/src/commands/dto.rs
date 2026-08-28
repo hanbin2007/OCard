@@ -184,6 +184,10 @@ pub struct CopyTaskDto {
     /// 内容标签(Notion 式);旧 manifest 重建的任务为空
     pub tags: Vec<String>,
     pub target_folder: String,
+    /// 本次拷贝的源范围:空 = 整卷;非空 = 只拷了这些文件夹的直接子文件。
+    /// 前端据此判断「拷完能不能说本卡可格式化」——部分拷贝时卡上还有没拷的
+    /// 内容,那句话会直接导致用户格式化掉未备份素材。
+    pub source_folders: Vec<String>,
     pub destinations: Vec<CopyDestinationDto>,
     pub files: Vec<CopyFileItemDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -227,6 +231,41 @@ pub struct StartCopyInput {
     /// 目标夹已存在且非空时,须显式确认才继续(只补缺失文件,绝不覆盖)。
     #[serde(default)]
     pub confirm_existing_target: bool,
+    /// 空 / 不传 = 整卷。非空 = 只拷这些文件夹的直接子文件,落盘扁平化
+    /// (相对卷根、`/` 分隔;空串代表卷根自身)。
+    #[serde(default)]
+    pub source_folders: Vec<String>,
+}
+
+/// 拷卡源里的一个可勾选文件夹(`list_source_folders`)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceFolderDto {
+    /// 相对卷根,'/' 分隔,无前后斜杠;"" = 卷根自身的直接子文件
+    pub rel_path: String,
+    /// 该文件夹**直接子文件**数(不含子目录内的)
+    pub file_count: usize,
+    pub total_bytes: u64,
+    /// 是否还有子目录(子目录自身另有独立条目)
+    pub has_subfolders: bool,
+}
+
+/// 被系统改写落点的文件(双确认屏必须逐条列出,不许静默改名)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenamedFileDto {
+    pub source_rel: String,
+    pub target_rel: String,
+}
+
+/// 一次源选择的规模与改名清单(`plan_source_selection`)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourcePlanDto {
+    pub file_count: usize,
+    pub total_bytes: u64,
+    /// **只含被改写的**;没有重名时为空数组
+    pub renamed_files: Vec<RenamedFileDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]

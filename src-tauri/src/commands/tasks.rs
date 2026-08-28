@@ -22,6 +22,10 @@ pub struct TaskHandle {
     pub manifest_id: String,
     /// 源卷挂载点。可变:续传时可能按卷名重解析到新挂载点(卡后插/换口)。
     pub source_root: Mutex<PathBuf>,
+    /// 引擎清单:每项自带源与目标相对路径(整卷时两者相同)。
+    /// 与快照 `files` 按 `target_rel == CopyFileItemDto.id` 一一对应——
+    /// 快照是给人看的展示层,落点权威只有这一份,不从展示字段反推路径。
+    pub plan: Mutex<Vec<copy::PlannedFile>>,
     pub dest_targets: Vec<PathBuf>,
     pub machine_id: String,
     /// 应用配置目录(审计 outbox 兜底用)。
@@ -174,8 +178,25 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
                 d.state = dest_state;
             }
             snap.speed_bytes_per_sec = 0;
+            // 原因也写进目的地,任务详情页点得开(不然只有一个红字 failed)
+            for d in snap.destinations.iter_mut() {
+                d.error = Some(e.to_string());
+            }
+            let folder = snap.target_folder.clone();
+            let paused = snap.state == "paused";
             drop(snap);
             log::warn!("拷卡任务中断: {e}");
+            // 零静默:整任务级的中断此前只写 stderr(notify 模块头写着「只写
+            // stderr 不算提示」),用户只看到任务变红、没有一个失败文件、没有原因
+            super::notify::error(
+                &app,
+                "copy-task-aborted",
+                if paused {
+                    format!("拷卡任务「{folder}」已中断并转入暂停(可续传): {e}")
+                } else {
+                    format!("拷卡任务「{folder}」失败: {e}")
+                },
+            );
         }
         // 终态事件在 running=false 之后发(复核 P1-9):此刻点「继续」已能启动新 worker;
         // 事件读的是实时快照,若新 worker 已接手则发出的就是其当前状态,不会回退 UI
@@ -322,18 +343,40 @@ fn run_worker<R: tauri::Runtime>(
         source_root: handle.source_root.lock().unwrap().clone(),
         destinations: handle.dest_targets.clone(),
         task_tag: handle.manifest_id.chars().take(8).collect(),
+        // 口径取自 manifest(持久化的开拷选择):重启重建的任务也用同一把尺子
+        selection: copy::SourceSelection::from_folders(m.source_selection.clone()),
     };
 
     // 单一清单:引擎、manifest、UI 快照消费同一份文件列表(评审 M11/P1-11)。
     // 从 manifest+目标实存恢复初始进度(续传场景)。
-    let files: Vec<(String, u64)>;
+    let plan: Vec<copy::PlannedFile> = handle.plan.lock().unwrap().clone();
+    if plan.is_empty() {
+        // 零静默:清单为空说明接线出了问题,绝不能「跑完 0 个文件」再报成功
+        return Err(crate::core::CoreError::Invalid(
+            "任务清单为空,拒绝执行(请重新发起拷卡)".into(),
+        ));
+    }
     {
         let mut snap = handle.snapshot.lock().unwrap();
+        // 引擎清单与 UI 快照必须按目标 rel 一一对应:对不上就会出现「文件在拷、
+        // 界面不动」的静默失配,宁可当场拒绝也不让它悄悄跑
+        let ids: std::collections::HashSet<&str> =
+            snap.files.iter().map(|f| f.id.as_str()).collect();
+        let orphan = plan
+            .iter()
+            .find(|p| !ids.contains(p.target_rel.as_str()))
+            .map(|p| p.target_rel.clone());
+        if let Some(rel) = orphan {
+            return Err(crate::core::CoreError::Invalid(format!(
+                "任务清单与界面快照不一致(缺少 {rel}),拒绝执行;请重新发起拷卡"
+            )));
+        }
         snap.state = "running";
         snap.finished_at = None;
         let mut done_bytes = 0u64;
         for f in snap.files.iter_mut() {
-            // 轻量预判(仅 UI 快照口径);权威裁决在引擎 file_done(R5:免双重哈希)
+            // 轻量预判(仅 UI 快照口径);权威裁决在引擎 file_done(R5:免双重哈希)。
+            // f.id 是**目标** rel,与 manifest 同口径
             if copy::file_done_light(&m, &f.id, f.size_bytes, &req.destinations) {
                 f.status = "verified";
                 done_bytes += f.size_bytes;
@@ -342,18 +385,13 @@ fn run_worker<R: tauri::Runtime>(
             }
         }
         snap.copied_bytes = done_bytes;
-        files = snap
-            .files
-            .iter()
-            .map(|f| (f.id.clone(), f.size_bytes))
-            .collect();
     }
 
     let mut last_emit = Instant::now();
     let mut window_bytes = 0u64;
     let mut window_start = Instant::now();
 
-    let outcome = copy::run_copy(&req, &files, &mut m, &handle.project_root, |p| {
+    let outcome = copy::run_copy(&req, &plan, &mut m, &handle.project_root, |p| {
         let mut changed: Vec<CopyFileItemDto> = Vec::new();
         let mut force_emit = false;
         {
@@ -398,10 +436,12 @@ fn run_worker<R: tauri::Runtime>(
     // 收尾:状态、审计、终态事件
     let task_id;
     let operator;
+    let target_folder;
     {
         let mut snap = handle.snapshot.lock().unwrap();
         operator = snap.operator.clone();
         task_id = snap.id.clone();
+        target_folder = snap.target_folder.clone();
         snap.speed_bytes_per_sec = 0;
         snap.state = if outcome.paused {
             "paused"
@@ -426,6 +466,26 @@ fn run_worker<R: tauri::Runtime>(
         // 终态事件由 spawn_worker 在 running=false 之后统一发出(复核 P1-9)
     }
 
+    // 零静默中的最高危一条:部分拷贝完成时,`all_verified` 只代表**所选文件夹**
+    // 全过了,卡上其余内容一个字节都没拷。UI 那句「本卡可格式化」在这种任务上
+    // 是错的,会直接导致用户格式化掉没备份的素材——后端必须自己喊一嗓子。
+    if !outcome.paused && outcome.all_verified && !m.source_selection.is_empty() {
+        super::notify::warn(
+            app,
+            "copy-partial-scope-done",
+            format!(
+                "任务「{target_folder}」只拷贝了所选的 {} 个文件夹({}),卡上其余内容**没有**备份——请勿据此格式化这张卡",
+                m.source_selection.len(),
+                m.source_selection
+                    .iter()
+                    .map(|f| if f.is_empty() { "卡根目录" } else { f.as_str() })
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ),
+        );
+    }
+
     for f in &outcome.files {
         if let copy::FileStatus::Failed(e) = &f.status {
             append_audit(
@@ -436,7 +496,14 @@ fn run_worker<R: tauri::Runtime>(
                     handle.machine_id.clone(),
                     operator.clone(),
                     journal::kind::COPY_FILE_FAILED,
-                    serde_json::json!({"taskId": task_id, "file": f.rel_path, "error": e}),
+                    // file = 落点,sourceFile = 卡上的真实文件:扁平化改名后
+                    // 只报落点,事后没法回卡上找这个文件
+                    serde_json::json!({
+                        "taskId": task_id,
+                        "file": f.rel_path,
+                        "sourceFile": f.source_rel,
+                        "error": e,
+                    }),
                 ),
             );
         }
@@ -455,6 +522,8 @@ fn run_worker<R: tauri::Runtime>(
                     "manifestId": handle.manifest_id,
                     "allVerified": outcome.all_verified,
                     "bytesCopied": outcome.bytes_copied,
+                    // 审计必须记下这次的范围:allVerified 在部分拷贝下只覆盖所选夹子
+                    "sourceFolders": m.source_selection,
                 }),
             ),
         );
@@ -484,6 +553,27 @@ fn final_event(snap: &mut CopyTaskDto, changed: Vec<CopyFileItemDto>) -> CopyPro
     ev
 }
 
+/// 计划项 → 快照文件项。`id` 用**目标** rel(manifest/续传的身份,不可换);
+/// `path`/`name` 用**源**路径(types.ts 明确写着 path 是「源卡内相对路径」,
+/// 界面上人要按它回卡上找文件)。落点被改写的清单单独走 renamed_files 呈现。
+pub fn file_item_dto(p: &copy::PlannedFile) -> CopyFileItemDto {
+    CopyFileItemDto {
+        id: p.target_rel.clone(),
+        path: p.source_rel.clone(),
+        name: p
+            .source_rel
+            .rsplit('/')
+            .next()
+            .unwrap_or(&p.source_rel)
+            .to_string(),
+        size_bytes: p.size,
+        status: "pending",
+        hash: None,
+        error: None,
+        targets: None,
+    }
+}
+
 /// 由 StartCopyInput 组装任务快照与落盘目标。
 /// 目标夹命名走规范函数(评审 M14/P1-13):工况 A 强制 YYYYMMDD 前缀。
 #[allow(clippy::too_many_arguments)]
@@ -494,7 +584,7 @@ pub fn build_task(
     volume_name: &str,
     camera_code: &str,
     operator: &str,
-    files: &[(String, u64)],
+    plan: &[copy::PlannedFile],
     manifest_id: &str,
 ) -> crate::core::Result<(CopyTaskDto, Vec<PathBuf>)> {
     let target_folder = match scenario {
@@ -532,20 +622,8 @@ pub fn build_task(
         dest_targets.push(target);
     }
 
-    let total_bytes = files.iter().map(|(_, s)| *s).sum();
-    let file_dtos = files
-        .iter()
-        .map(|(rel, size)| CopyFileItemDto {
-            id: rel.clone(),
-            path: rel.clone(),
-            name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
-            size_bytes: *size,
-            status: "pending",
-            hash: None,
-            error: None,
-            targets: None,
-        })
-        .collect();
+    let total_bytes = plan.iter().map(|p| p.size).sum();
+    let file_dtos = plan.iter().map(file_item_dto).collect();
 
     let dto = CopyTaskDto {
         id: manifest_id.to_string(),
@@ -557,9 +635,10 @@ pub fn build_task(
         note: input.note.clone(),
         tags: input.tags.clone(),
         target_folder,
+        source_folders: input.source_folders.clone(),
         destinations: dest_dtos,
         files: file_dtos,
-        file_count: Some(files.len()),
+        file_count: Some(plan.len()),
         status_counts: None, // 快照对外发布时由 summary_of 现算
         total_bytes,
         copied_bytes: 0,

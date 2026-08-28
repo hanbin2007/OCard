@@ -1,0 +1,312 @@
+/*
+ * 画廊模式（Loupe 视图）：左大图 + 右详情 + 底部胶片条。
+ *
+ * 布局是 mobile-first 的：**基础形态一律单列**（大图 → 详情 → 胶片条竖着摞），
+ * 双列只写在 `@media (min-width: …)` 里。理由见 styles/sticky.test.ts 顶部那段
+ * 病历（865efe0）：窄窗口塌成单列后，为双列写的定位若没跟着取消，会读作
+ * 「滚动条与内容不同步」。这里更进一步——**整张表一处 sticky 都不写**：
+ * 画廊自己就是一块定高工作区，两栏各自内部滚动即可，没有任何需要吸顶的东西。
+ * 少一个 sticky，就少一条会在断点之间失效的规则。
+ *
+ * 颜色/间距/时长全部取 tokens.css 的变量；不写阴影、不写 backdrop-filter，
+ * 层次靠 tokens 的灰阶台阶 + 1px 细分割线（PRD §5.9）。
+ */
+
+.gallery {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  /* 父级给多高就占多高；min-height:0 是让内部 overflow 真正生效的前提 */
+  height: 100%;
+  min-height: 0;
+  /* 容器自己可聚焦（承接快捷键），但焦点环只在键盘导航时出现 */
+  outline: none;
+}
+
+.gallery:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* 聚焦项被移走后的回退提示：降级必须可见（零静默） */
+.gallery__alert {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 0 0 auto;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-md);
+  background: var(--warn-soft);
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+}
+
+/* ---------- 大图 + 详情 ---------- */
+
+/*
+ * 基础形态：单列。两块竖着摞，整块一起滚——窄窗口下这是唯一读得通的排法。
+ */
+.gallery__main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-3);
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.gallery__stage {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  min-height: 0;
+}
+
+.gallery__stage-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  min-height: var(--space-6);
+}
+
+.gallery__badges {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/*
+ * 画框。单列时给一个**确定**高度：大图靠 max-height:100% 收缩，
+ * 父级高度是 auto 的话这条约束会自我循环，图片会按原始像素撑爆版面。
+ * clamp 的上下限兼顾矮窗口（不至于只剩一条缝）与大屏（不至于顶满一屏）。
+ */
+.gallery__frame {
+  display: grid;
+  place-items: center;
+  gap: var(--space-2);
+  height: clamp(200px, 46vh, 560px);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  /* 深色下的"接光上棱"，与 .card 同一处理 */
+  border-top-color: var(--border-panel-top);
+  border-radius: var(--radius-lg);
+  background: var(--bg-sunken);
+  overflow: hidden;
+}
+
+.gallery__image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: var(--radius-md);
+  /* 首次挂载的落位；换图时的方向动画走 lib/motion 的 animateOnce */
+  animation: gallery-media-in var(--dur-spring-fast) var(--spring);
+}
+
+img.gallery__image {
+  cursor: zoom-in;
+}
+
+/* 终态交回静态样式（不写 to）：减少动效时直接静止在最终样子 */
+@keyframes gallery-media-in {
+  from {
+    opacity: 0;
+    transform: scale(0.985);
+  }
+}
+
+/* 缺图/取图失败的占位：虚线框读作"这里本该有东西"，文案说清是哪一种 */
+.gallery__image--empty {
+  display: grid;
+  place-items: center;
+  gap: var(--space-1);
+  width: 68%;
+  min-width: 0;
+  padding: var(--space-4);
+  text-align: center;
+  border: 1px dashed var(--border-strong);
+  background: var(--panel-raised);
+}
+
+.gallery__detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-top-color: var(--border-panel-top);
+  border-radius: var(--radius-lg);
+  background: var(--panel);
+}
+
+.gallery__filename {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+  /* 长文件名折行而不是截断：详情面板是"把话说全"的地方 */
+  overflow-wrap: anywhere;
+}
+
+.gallery__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: auto;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+/* ---------- 胶片条 ---------- */
+
+.gallery__strip {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  flex: 0 0 auto;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-top-color: var(--border-panel-top);
+  border-radius: var(--radius-lg);
+  background: var(--panel);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  /*
+   * 自动滚入视野的平滑度交给 CSS 而不是 scrollIntoView 的 behavior 参数：
+   * base.css 里 prefers-reduced-motion 的全局覆盖会把它压回 auto，
+   * JS 侧因此不必再判一次"用户是否要求减少动效"。
+   */
+  scroll-behavior: smooth;
+  outline: none;
+}
+
+.gallery__strip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.gallery__shot {
+  position: relative;
+  display: grid;
+  gap: var(--space-1);
+  flex: 0 0 auto;
+  width: 104px;
+  padding: var(--space-1);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background var(--dur-micro) var(--ease-out),
+    border-color var(--dur-micro) var(--ease-out);
+}
+
+.gallery__shot:hover {
+  background: var(--hover);
+}
+
+.gallery__shot--active {
+  background: var(--selected);
+  border-color: var(--accent);
+}
+
+.gallery__shot:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.gallery__shot-thumb {
+  display: block;
+  width: 100%;
+  height: 60px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+}
+
+.gallery__shot-thumb--empty {
+  display: grid;
+  place-items: center;
+  padding: 0 var(--space-1);
+  text-align: center;
+  border: 1px dashed var(--border-strong);
+}
+
+.gallery__shot-name {
+  display: block;
+  min-width: 0;
+  color: var(--text-secondary);
+}
+
+/* 待删 / 已精选角标：与网格里 .asset__flag 同一视觉体系 */
+.gallery__shot-flag {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+}
+
+.gallery__shot-flag--delete {
+  background: var(--danger);
+  color: var(--on-danger);
+}
+
+/* 两个角标可能同时在场：精选让位左移，与网格同一避让规则 */
+.gallery__shot-flag--curated {
+  background: var(--ok);
+  color: var(--text-inverse);
+}
+
+.gallery__shot-flag--curated + .gallery__shot-flag--delete {
+  right: var(--space-6);
+}
+
+/* ---------- 空态 ---------- */
+
+.gallery--empty {
+  display: grid;
+  place-items: center;
+}
+
+/* ----------------------------------------------------------------
+ * 双列。宽度够了才把详情面板挪到大图右边，同时把滚动责任从
+ * .gallery__main 交给两栏各自——这两件事必须写在**同一条**查询里，
+ * 否则断点之间会出现"已经并排了但还在整块滚"的中间态。
+ * 断点取 1000px：详情面板 320px + 大图至少 ~640px 才不至于把大图挤成邮票。
+ * ---------------------------------------------------------------- */
+@media (min-width: 1000px) {
+  .gallery__main {
+    grid-template-columns: minmax(0, 1fr) 320px;
+    align-items: stretch;
+    overflow: hidden;
+  }
+
+  .gallery__frame {
+    /* 双列时高度由这一行的剩余空间决定，不再用 clamp 的固定值 */
+    flex: 1 1 auto;
+    height: auto;
+    min-height: 240px;
+  }
+
+  .gallery__detail {
+    min-height: 0;
+    overflow-y: auto;
+  }
+}

@@ -3,7 +3,6 @@ import type { SortingCategory } from "../api/types";
 import {
   actionTargets,
   buildGridEntries,
-  filterBySuggestion,
   flattenEntries,
   GROUP_ID_PREFIX,
   resolveEntryIds,
@@ -100,7 +99,7 @@ describe("选区模型", () => {
     expect(rangeBetween(ids, "b", "zz")).toEqual([]);
   });
 
-  it("空格切换单项选中", () => {
+  it("X 切换单项选中（空格已改判给预览）", () => {
     const on = toggleSelection(emptySelection, "c");
     expect(on.selected).toEqual(["c"]);
     const off = toggleSelection(on, "c");
@@ -170,9 +169,21 @@ describe("快捷键映射", () => {
     expect(resolveShortcut({ key: "u" }, categories)).toEqual({ type: "unmarkDelete" });
   });
 
-  it("空格切换、Enter 预览", () => {
-    expect(resolveShortcut({ key: " " }, categories)).toEqual({ type: "toggle" });
+  it("空格 = 预览(Quick Look 语义),Enter 同义保留", () => {
+    expect(resolveShortcut({ key: " " }, categories)).toEqual({ type: "preview" });
     expect(resolveShortcut({ key: "Enter" }, categories)).toEqual({ type: "preview" });
+  });
+
+  it("切换选中改绑 X（大小写都认），空格不再是选中", () => {
+    expect(resolveShortcut({ key: "x" }, categories)).toEqual({ type: "toggle" });
+    expect(resolveShortcut({ key: "X" }, categories)).toEqual({ type: "toggle" });
+    expect(resolveShortcut({ key: " " }, categories)).not.toEqual({ type: "toggle" });
+  });
+
+  it("⌘空格 / Ctrl+空格 一律放行:那是 Spotlight 与输入法切换", () => {
+    expect(resolveShortcut({ key: " ", metaKey: true }, categories)).toBeNull();
+    expect(resolveShortcut({ key: " ", ctrlKey: true }, categories)).toBeNull();
+    expect(resolveShortcut({ key: "x", metaKey: true }, categories)).toBeNull();
   });
 
   it("方向键带 Shift 即连选", () => {
@@ -376,24 +387,6 @@ describe("连拍折叠（网格条目）", () => {
   });
 });
 
-describe("filterBySuggestion", () => {
-  const list = [
-    { id: "1", judgement: { suggestedKeep: true } },
-    { id: "2", judgement: { suggestedKeep: false } },
-    { id: "3" },
-  ];
-
-  it("关闭时原样返回", () => {
-    expect(filterBySuggestion(list, false)).toHaveLength(3);
-  });
-
-  it("开启时保留「建议保留」与尚无判定的", () => {
-    const out = filterBySuggestion(list, true);
-    expect(out.map((a) => a.id)).toEqual(["1", "3"]);
-  });
-});
-
-
 describe("组 id 空间的健壮性（P2 防御）", () => {
   it("裸素材 id 也能被 resolveEntryIds 认出（展开层选中）", () => {
     const entries = buildGridEntries([
@@ -457,8 +450,10 @@ describe("flattenEntries（预览的唯一下标空间）", () => {
 
 import {
   filterByJudgement,
+  JUDGEMENT_FILTER_LABEL,
   nextCursorAfterRemoval,
   removedEntryIds,
+  type JudgementFilter,
 } from "./sorting";
 
 describe("nextCursorAfterRemoval(评审 3.1:分类后光标自动前进)", () => {
@@ -500,33 +495,67 @@ describe("removedEntryIds(组条目只有全员被移才消失)", () => {
   });
 });
 
-describe("filterByJudgement(评审 3.6:筛选组)", () => {
+describe("filterByJudgement(全局筛选只留逐张成立的客观指标)", () => {
   const assets = [
     { id: "none" },
-    { id: "keep", judgement: { suggestedKeep: true, blurry: false, score: 80 } },
-    { id: "drop", judgement: { suggestedKeep: false, blurry: false, score: 60 } },
+    { id: "good", judgement: { suggestedKeep: true, blurry: false, score: 80 } },
+    { id: "mid", judgement: { suggestedKeep: false, blurry: false, score: 60 } },
     { id: "blur", judgement: { suggestedKeep: false, blurry: true, score: 10 } },
   ];
-
-  it("keep 沿用旧口径:建议保留 + 未判定", () => {
-    expect(filterByJudgement(assets, "keep", 25).map((a) => a.id)).toEqual([
-      "none",
-      "keep",
-    ]);
-  });
-
-  it("drop 是 keep 的严格反集:有判定且不建议保留", () => {
-    expect(filterByJudgement(assets, "drop", 25).map((a) => a.id)).toEqual([
-      "drop",
-      "blur",
-    ]);
-  });
 
   it("blurry / lowScore / unjudged 各取其类", () => {
     expect(filterByJudgement(assets, "blurry", 25).map((a) => a.id)).toEqual(["blur"]);
     expect(filterByJudgement(assets, "lowScore", 25).map((a) => a.id)).toEqual(["blur"]);
     expect(filterByJudgement(assets, "unjudged", 25).map((a) => a.id)).toEqual(["none"]);
     expect(filterByJudgement(assets, "all", 25)).toHaveLength(4);
+  });
+});
+
+/**
+ * 口径钉子:防止有人再把「建议保留 / 建议放弃」加回**全局**筛选。
+ *
+ * 后端 core/analysis.rs:318 —— `suggested_keep` 是「组内首选(荐优);
+ * 无组时高分单张也不标(避免噪声)」。也就是说不在连拍组里的单张,
+ * suggestedKeep 恒为 false,于是:
+ *   keep = `!judgement || suggestedKeep` → 把所有非连拍的已判定单张全藏起来;
+ *   drop = `judgement && !suggestedKeep` → 把它们全列成「建议放弃」。
+ * 两个都是在说谎。这个概念只在连拍组内部成立,归组全屏层。
+ */
+describe("★ 全局筛选不许再有「建议保留 / 建议放弃」", () => {
+  it("JudgementFilter 的取值集合里没有 keep / drop", () => {
+    expect(Object.keys(JUDGEMENT_FILTER_LABEL).sort()).toEqual(
+      ["all", "blurry", "lowScore", "unjudged"].sort(),
+    );
+    const labels = Object.values(JUDGEMENT_FILTER_LABEL).join(" ");
+    expect(labels).not.toContain("建议保留");
+    expect(labels).not.toContain("建议放弃");
+  });
+
+  it("按后端真实口径造数据:keep/drop 若复活,会把非连拍单张整批误判", () => {
+    // 后端口径:只有连拍组里的那张会被标 suggestedKeep=true,
+    // 单张无论 95 分还是 12 分都是 false
+    const library = [
+      { id: "solo-95", judgement: { suggestedKeep: false, blurry: false, score: 95 } },
+      { id: "solo-70", judgement: { suggestedKeep: false, blurry: false, score: 70 } },
+      { id: "burst-pick", judgement: { suggestedKeep: true, blurry: false, score: 88 } },
+      { id: "unjudged" },
+    ];
+
+    // 一旦有人把 keep 分支加回来,这里会只剩 burst-pick + unjudged
+    expect(
+      filterByJudgement(library, "keep" as unknown as JudgementFilter, 25).map(
+        (a) => a.id,
+      ),
+      "「建议保留」不得作为全局筛选存在:它会把两张完好的单张藏起来",
+    ).toEqual(["solo-95", "solo-70", "burst-pick", "unjudged"]);
+
+    // 一旦有人把 drop 分支加回来,这里会把 solo-95 也列成「建议放弃」
+    expect(
+      filterByJudgement(library, "drop" as unknown as JudgementFilter, 25).map(
+        (a) => a.id,
+      ),
+      "「建议放弃」不得作为全局筛选存在:95 分的单张会被列进去",
+    ).toEqual(["solo-95", "solo-70", "burst-pick", "unjudged"]);
   });
 });
 

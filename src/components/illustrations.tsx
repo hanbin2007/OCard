@@ -179,6 +179,100 @@ function SdCard({ id, label, sub, contacts }: SdCardProps) {
   );
 }
 
+/**
+ * NAS 机架（2 盘位 + 状态灯）。原点在机箱左上角，占 72×42。
+ * 流向图与拷卡屏 hero 共用同一张图形——同一个东西不该有两种画法。
+ */
+function NasRack({ id }: { id: (name: string) => string }) {
+  return (
+    <g>
+      <rect className="illu-ln" x="0" y="0" width="72" height="42" rx="4" fill={`url(#${id("metal")})`} />
+      <rect x="0" y="0" width="72" height="8" rx="4" fill={`url(#${id("sheen")})`} stroke="none" opacity="0.5" />
+      <rect className="illu-ln-soft" x="6" y="7" width="54" height="11" rx="2" fill={`url(#${id("dark")})`} />
+      <rect className="illu-ln-soft" x="6" y="24" width="54" height="11" rx="2" fill={`url(#${id("dark")})`} />
+      <circle cx="65" cy="12.5" r="1.8" fill="var(--ok)" />
+      <circle cx="65" cy="29.5" r="1.8" fill="var(--ok)" />
+    </g>
+  );
+}
+
+/** 便携移动盘。原点在盘体左上角，占 56×27。 */
+function PortableDrive({
+  id,
+  label,
+}: {
+  id: (name: string) => string;
+  label?: string;
+}) {
+  return (
+    <g>
+      <rect className="illu-ln" x="0" y="0" width="56" height="27" rx="6" fill={`url(#${id("dark")})`} />
+      <rect x="0" y="0" width="56" height="7" rx="6" fill={`url(#${id("sheen")})`} stroke="none" opacity="0.25" />
+      <line x1="9" y1="6" x2="9" y2="21" stroke="var(--ill-dark-side)" strokeWidth="1.4" />
+      {label ? (
+        <text className="illu-t-inv" x="15" y="17">
+          {label}
+        </text>
+      ) : null}
+    </g>
+  );
+}
+
+/**
+ * 独立可用的「存储卡」图形（拷卡屏 hero 的源端）。
+ *
+ * 直接复用流向图那张 SdCard，不另画一套：同一屏里 hero 的卡和确认页
+ * 流向图的卡必须是同一张，否则读者会以为在讲两件事。
+ * 装饰性图形，语义由旁边的 HTML 文本承担，故 aria-hidden。
+ */
+export function IllSdCard({
+  label = "源卡",
+  sub,
+}: {
+  label?: string;
+  /** 卡面小字：一般填选中的卷名（过长请调用方先截断，SVG 不会自己省略号） */
+  sub?: string;
+}) {
+  const id = useIllId();
+  return (
+    <svg width="88" height="72" viewBox="0 0 56 50" aria-hidden="true">
+      <GradientDefs id={id} use={["metal", "plastic", "gold", "sheen"]} />
+      <DropShadow id={id} cx={27} cy={44} rx={21} />
+      <g transform="translate(8,3)">
+        <SdCard id={id} label={label} sub={sub} contacts="gold" />
+      </g>
+    </svg>
+  );
+}
+
+/**
+ * 独立可用的「目的地」图形（拷卡屏 hero 的目的端）：
+ * NAS 画机架，其余画便携盘——与流向图同源，共用 NasRack / PortableDrive。
+ */
+export function IllStorageTarget({
+  kind = "external",
+}: {
+  kind?: CopyFlowDestination["kind"];
+}) {
+  const id = useIllId();
+  const isNas = kind === "nas";
+  return (
+    <svg width="88" height="72" viewBox="0 0 88 50" aria-hidden="true">
+      <GradientDefs id={id} use={["metal", "dark", "sheen"]} />
+      <DropShadow id={id} cx={44} cy={isNas ? 44 : 39} rx={isNas ? 34 : 27} />
+      {isNas ? (
+        <g transform="translate(8,1)">
+          <NasRack id={id} />
+        </g>
+      ) : (
+        <g transform="translate(16,9)">
+          <PortableDrive id={id} />
+        </g>
+      )}
+    </svg>
+  );
+}
+
 /** 拷卡任务空态：SD 卡插入读卡器（卡缓慢往复趋近插槽，LED 呼吸） */
 export function IllCopyEmpty() {
   const id = useIllId();
@@ -520,24 +614,14 @@ export function IllCopyFlow({ destinations }: CopyFlowProps) {
             </g>
             {isNas ? (
               <g transform={`translate(210,${y - 26})`}>
-                <rect className="illu-ln" x="0" y="0" width="72" height="42" rx="4" fill={`url(#${id("metal")})`} />
-                <rect x="0" y="0" width="72" height="8" rx="4" fill={`url(#${id("sheen")})`} stroke="none" opacity="0.5" />
-                <rect className="illu-ln-soft" x="6" y="7" width="54" height="11" rx="2" fill={`url(#${id("dark")})`} />
-                <rect className="illu-ln-soft" x="6" y="24" width="54" height="11" rx="2" fill={`url(#${id("dark")})`} />
-                <circle cx="65" cy="12.5" r="1.8" fill="var(--ok)" />
-                <circle cx="65" cy="29.5" r="1.8" fill="var(--ok)" />
+                <NasRack id={id} />
                 <text className="illu-t" x="4" y="52">
                   {dest.label}
                 </text>
               </g>
             ) : (
               <g transform={`translate(210,${y - 13.5})`}>
-                <rect className="illu-ln" x="0" y="0" width="56" height="27" rx="6" fill={`url(#${id("dark")})`} />
-                <rect x="0" y="0" width="56" height="7" rx="6" fill={`url(#${id("sheen")})`} stroke="none" opacity="0.25" />
-                <line x1="9" y1="6" x2="9" y2="21" stroke="var(--ill-dark-side)" strokeWidth="1.4" />
-                <text className="illu-t-inv" x="15" y="17">
-                  {dest.label}
-                </text>
+                <PortableDrive id={id} label={dest.label} />
               </g>
             )}
             <g

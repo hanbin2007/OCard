@@ -12,6 +12,8 @@ import type {
 import { AssetLightbox } from "../components/AssetLightbox";
 import { ConfirmDialog, type ConfirmRequest } from "../components/ConfirmDialog";
 import { DeliveryButton } from "../components/DeliveryPanel";
+import { GalleryView } from "../components/GalleryView";
+import { IconClose } from "../components/Icon";
 import { JudgementBadges, LOW_SCORE_AT } from "../components/JudgementBadges";
 import { TopBar } from "../components/TopBar";
 import { IllSortingEmpty } from "../components/illustrations";
@@ -38,6 +40,7 @@ import {
   JUDGEMENT_FILTER_LABEL,
   moveCursor,
   nextCursorAfterRemoval,
+  nextIndexInGrid,
   pendingDeleteReducer,
   pruneSelection,
   removedEntryIds,
@@ -101,6 +104,18 @@ export function SortingScreen() {
   /** 只看已标删(评审 3.9):删前复核不必满网格找红角标 */
   const [markedOnly, setMarkedOnly] = useState(false);
   const [openGroup, setOpenGroup] = useState<string | null>(null);
+  /** 组全屏层自己的光标（组成员 assetId）：方向键在组内走的就是它 */
+  const [groupCursorId, setGroupCursorId] = useState<string | null>(null);
+  /**
+   * 这次大图是**从组层**打开的吗。
+   * Esc 只退一层（大图 → 组层 → 网格），全靠它记住来路；
+   * 少了这一位，从组里点开一张再按 Esc 就会被一脚踢回网格。
+   */
+  const [previewFromGroup, setPreviewFromGroup] = useState(false);
+  /** 网格 / 画廊视图切换（本屏 state，不持久化） */
+  const [viewMode, setViewMode] = useState<"grid" | "gallery">("grid");
+  /** 画廊模式的聚焦项（assetId 空间；网格的 selection.cursor 走的是条目 id 空间） */
+  const [galleryCursorId, setGalleryCursorId] = useState<string | null>(null);
   const [flowHints, setFlowHints] = useState<CuratedFlowHint[]>([]);
   const [flowHintsOpen, setFlowHintsOpen] = useState(false);
   const [categories, setCategories] = useState<SortingCategory[]>([]);
@@ -244,9 +259,31 @@ export function SortingScreen() {
     return entry && entry.kind === "group" ? entry.items : [];
   }, [entries, openGroup]);
 
+  /**
+   * 大图的**翻页范围**：来路决定边界。
+   *
+   * 从组层进来的大图锁在组成员内——层级语义必须自洽：Esc 退回的是这个组，
+   * 那大图就不该能翻出组外，否则翻到第三张组外的图、再 Esc 却回到一个
+   * 不含它的组。从网格直接进来的维持全局摊平列表不变。
+   * `index / total` 也随之显示组内序号（lightbox 那边另有 scopeLabel 说明范围）。
+   */
+  const previewScope =
+    previewFromGroup && openGroupItems.length > 0 ? openGroupItems : previewAssets;
   const previewIndex = previewId
-    ? previewAssets.findIndex((a) => a.id === previewId)
+    ? previewScope.findIndex((a) => a.id === previewId)
     : -1;
+
+  /*
+   * 预览目标已经不在翻页范围里（被移走 / 被筛掉 / 整组清空）：大图会自动消失，
+   * 但 previewId 若留着非空，网格键盘流会一直被「预览中」挡在门外——
+   * 按什么键都毫无反应，还看不出为什么。必须归零。
+   */
+  useEffect(() => {
+    if (previewId !== null && previewIndex < 0) {
+      setPreviewId(null);
+      setPreviewFromGroup(false);
+    }
+  }, [previewId, previewIndex]);
   /** 选区认的是「条目 id」——组条目用合成 id，等高行与选择模型都不受影响 */
   const assetIds = useMemo(() => entries.map((e) => e.id), [entries]);
   const selectedSet = useMemo(() => new Set(selection.selected), [selection.selected]);
@@ -274,8 +311,11 @@ export function SortingScreen() {
    * `ocard-preview`，于是"打开"读起来是**同一张图长大了**，
    * 而不是网格消失、另一个界面出现（§7 空间一致性）。
    */
-  const openPreview = useCallback((assetId: string) => {
-    withViewTransition(() => setPreviewId(assetId));
+  const openPreview = useCallback((assetId: string, fromGroup = false) => {
+    withViewTransition(() => {
+      setPreviewId(assetId);
+      setPreviewFromGroup(fromGroup);
+    });
   }, []);
 
   /**
@@ -287,22 +327,61 @@ export function SortingScreen() {
    */
   const closePreview = useCallback(() => {
     withViewTransition(() => {
-      if (previewId && assetIds.includes(previewId)) {
-        setSelection((prev) => ({ ...prev, cursor: previewId, anchor: previewId }));
+      /*
+       * Esc 只退一层。大图从组层进来的就退回组层（层级：网格 → 组层 → 大图），
+       * 并把组层光标挪到你最后看的那张——退回去以后接着从这里挑，
+       * 而不是回到进大图之前的那一格。
+       * 组在预览期间被清空（整组分类/删除走光了）时没有可退的层，
+       * 只能连组层一起收起，退回网格。
+       */
+      const backToGroup = previewFromGroup && openGroupItems.length > 0;
+      if (backToGroup) {
+        if (previewId && openGroupItems.some((i) => i.id === previewId)) {
+          setGroupCursorId(previewId);
+        }
+      } else {
+        if (previewFromGroup) setOpenGroup(null);
+        if (previewId && assetIds.includes(previewId)) {
+          setSelection((prev) => ({ ...prev, cursor: previewId, anchor: previewId }));
+        }
       }
       setPreviewId(null);
+      setPreviewFromGroup(false);
     });
-  }, [previewId, assetIds]);
+  }, [previewId, assetIds, previewFromGroup, openGroupItems]);
 
-  /* 展开层没有共用实体，进场交给 CSS 关键帧（缩放 + 淡入）更好看；
+  /* 组全屏层没有共用实体，进场交给 CSS 关键帧（缩放 + 淡入）更好看；
      退场没有挂载动画可用，才需要视图过渡兜住。 */
   const openGroupOverlay = useCallback((groupId: string) => {
+    const entry = entriesRef.current.find(
+      (e) => e.kind === "group" && e.groupId === groupId,
+    );
     setOpenGroup(groupId);
+    // 组层光标默认落在组内首张，方向键从这里开始走
+    setGroupCursorId(
+      entry && entry.kind === "group" ? (entry.items[0]?.id ?? null) : null,
+    );
   }, []);
 
   const closeGroupOverlay = useCallback(() => {
     withViewTransition(() => setOpenGroup(null));
   }, []);
+
+  /**
+   * 盖在选片区上方的浮层：全屏大图与二次确认框。
+   *
+   * 它们收起时，下面那一层必须把键盘拿回来。用户若是点关闭/取消按钮退出来的，
+   * 焦点会随那个按钮一起消失（落到 body），键盘流就此断掉——按 Esc / 方向键
+   * 全无反应，还看不出为什么。组层自己按 coveredAbove 收焦点，这里只管网格那一路。
+   */
+  const modalAbove = previewId !== null || confirm !== null;
+  const hadModalRef = useRef(false);
+  useEffect(() => {
+    const had = hadModalRef.current;
+    hadModalRef.current = modalAbove;
+    if (!had || modalAbove) return;
+    if (openGroup === null) gridWrapRef.current?.focus();
+  }, [modalAbove, openGroup]);
 
   /* ---------------- 数据加载 ---------------- */
 
@@ -314,7 +393,10 @@ export function SortingScreen() {
     setTotal(0);
     setSelection(emptySelection);
     setPreviewId(null);
+    setPreviewFromGroup(false);
     setOpenGroup(null);
+    setGroupCursorId(null);
+    setGalleryCursorId(null);
     setCommit(null);
     setJudgeFilter("all");
     setMarkedOnly(false);
@@ -813,35 +895,89 @@ export function SortingScreen() {
 
   /* ---------------- 预览内打标(评审 3.2):作用于眼前这张,操作后自动前进 ---------------- */
 
-  const previewAsset = previewIndex >= 0 ? (previewAssets[previewIndex] ?? null) : null;
+  /* 自动前进也走 previewScope:从组层进来的大图,「下一张」是组内的下一张 */
+  const previewAsset = previewIndex >= 0 ? (previewScope[previewIndex] ?? null) : null;
 
   const previewAssign = useCallback(
     (categoryId: string) => {
       if (!previewAsset) return;
       // 先站到下一张再移走当前张:大图不闪断,失败时素材还在、toast 会说话
       const nextId =
-        previewAssets[previewIndex + 1]?.id ??
-        previewAssets[previewIndex - 1]?.id ??
+        previewScope[previewIndex + 1]?.id ??
+        previewScope[previewIndex - 1]?.id ??
         null;
       setPreviewId(nextId);
       void runAssign(categoryId, [previewAsset.id]);
     },
-    [previewAsset, previewAssets, previewIndex, runAssign],
+    [previewAsset, previewScope, previewIndex, runAssign],
   );
 
   const previewCurate = useCallback(() => {
     if (!previewAsset) return;
     void runCurate([previewAsset.id]);
-    const nextId = previewAssets[previewIndex + 1]?.id ?? null;
+    const nextId = previewScope[previewIndex + 1]?.id ?? null;
     if (nextId) setPreviewId(nextId);
-  }, [previewAsset, previewAssets, previewIndex, runCurate]);
+  }, [previewAsset, previewScope, previewIndex, runCurate]);
 
   const previewToggleDelete = useCallback(() => {
     if (!previewAsset) return;
     toggleMark([previewAsset.id]);
-    const nextId = previewAssets[previewIndex + 1]?.id ?? null;
+    const nextId = previewScope[previewIndex + 1]?.id ?? null;
     if (nextId) setPreviewId(nextId);
-  }, [previewAsset, previewAssets, previewIndex, toggleMark]);
+  }, [previewAsset, previewScope, previewIndex, toggleMark]);
+
+  /* ---------------- 画廊模式(接线):聚焦项在 assetId 空间里走 ---------------- */
+
+  /**
+   * 画廊的聚焦项。
+   *
+   * 网格的 `selection.cursor` 是**条目 id**（组条目是合成 id），画廊里
+   * 连拍组逐张平铺、没有组条目，所以这里单独持一个 assetId 光标。
+   * 素材被移走后旧 id 会失效，故每次渲染都按当前列表校验一次，
+   * 失效即退回首项——绝不让打标动作落到一个已经不在列表里的 id 上。
+   */
+  const galleryCursor =
+    galleryCursorId && previewAssets.some((a) => a.id === galleryCursorId)
+      ? galleryCursorId
+      : (previewAssets[0]?.id ?? null);
+  const galleryIndex = galleryCursor
+    ? previewAssets.findIndex((a) => a.id === galleryCursor)
+    : -1;
+
+  /** 打标后自动前进到下一张（与全屏预览同一套「看一张→按一键→看下一张」） */
+  const advanceGalleryCursor = useCallback(() => {
+    if (galleryIndex < 0) return;
+    const next =
+      previewAssets[galleryIndex + 1]?.id ??
+      previewAssets[galleryIndex - 1]?.id ??
+      null;
+    setGalleryCursorId(next);
+  }, [galleryIndex, previewAssets]);
+
+  const galleryAssign = useCallback(
+    (categoryId: string) => {
+      if (!galleryCursor) return;
+      advanceGalleryCursor();
+      void runAssign(categoryId, [galleryCursor]);
+    },
+    [galleryCursor, advanceGalleryCursor, runAssign],
+  );
+
+  const galleryCurate = useCallback(() => {
+    if (!galleryCursor) return;
+    void runCurate([galleryCursor]);
+    advanceGalleryCursor();
+  }, [galleryCursor, advanceGalleryCursor, runCurate]);
+
+  const galleryToggleDelete = useCallback(() => {
+    if (!galleryCursor) return;
+    toggleMark([galleryCursor]);
+    advanceGalleryCursor();
+  }, [galleryCursor, advanceGalleryCursor, toggleMark]);
+
+  const galleryOpenFullscreen = useCallback(() => {
+    if (galleryCursor) openPreview(galleryCursor);
+  }, [galleryCursor, openPreview]);
 
   const commitDelete = useCallback(async () => {
     // 双保险：即使对话框以某种方式被触发，打包期间也绝不下发删除
@@ -885,7 +1021,28 @@ export function SortingScreen() {
   }
 
   function requestDeleteConfirm() {
-    if (pendingDelete.marked.length === 0 || deliveryWorking) return;
+    /*
+     * 前置条件不满足时**说出来**,而不是默默 return。
+     * 走键盘的人（尤其组全屏层里,底部待删清单条被整层盖住）按下 Shift+D
+     * 却什么都不发生,分不清是"键没绑上"还是"清单是空的"——
+     * 按了没反应在本项目里就是零静默违规。
+     */
+    if (deliveryWorking) {
+      notify(
+        "warning",
+        "sorting-delete-blocked",
+        "交付打包进行中，暂不能移入回收站。待删标记都还在，等打包结束再按 Shift+D 提交。",
+      );
+      return;
+    }
+    if (pendingDelete.marked.length === 0) {
+      notify(
+        "warning",
+        "sorting-delete-empty",
+        "待删清单是空的，没有可提交的内容。先按 D 标记要删的素材，再按 Shift+D 提交确认。",
+      );
+      return;
+    }
     dispatchDelete({ type: "requestConfirm" });
     // 确认前要能看见删的是**哪些**(评审 3.9),不是只有一个数字
     const byId = new Map(assetsRef.current.map((a) => [a.id, a.fileName]));
@@ -901,6 +1058,9 @@ export function SortingScreen() {
       title: `把 ${pendingDelete.marked.length} 个文件移入回收站？`,
       message: `${listing}。文件会移入项目内 .ocard/trash，可以随时恢复；此操作不会物理删除任何文件。`,
       confirmLabel: "移入回收站",
+      /* 组全屏层 z-index 55 压过普通 .overlay(50):从组层里按 Shift+D 时,
+         确认框必须抬到 --elevated(90),否则它会被组层盖住、点不到也看不见 */
+      elevated: openGroup !== null,
       onConfirm: () => void commitDelete(),
     });
   }
@@ -910,8 +1070,10 @@ export function SortingScreen() {
   const handleKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLDivElement>) => {
       // 预览打开时键盘由 Lightbox 全权接管(评审 3.2):这里不再处理,
-      // 否则同一击键会两处生效——网格里作用的还是进预览前的旧选中
-      if (previewId !== null) return;
+      // 否则同一击键会两处生效——网格里作用的还是进预览前的旧选中。
+      // 组全屏层同理:它有自己的光标与自己的键盘流,不能让同一击键
+      // 在背后的网格里也作用一遍(网格光标停在组格上,展开成整组)
+      if (previewId !== null || openGroup !== null) return;
       const action = resolveShortcut(
         {
           key: event.key,
@@ -953,7 +1115,8 @@ export function SortingScreen() {
           setSelection((prev) => ({ ...prev, anchor: prev.cursor, selected: [] }));
           return;
         case "preview": {
-          // 光标停在折叠组上:Enter 展开组(评审 3.4),不再直接跳进第一张
+          // 空格/Enter = 预览。光标停在折叠组上时先铺开整组(评审 3.4),
+          // 不直接跳进第一张——连拍组要先看全,才谈得上挑
           const entry = entries.find((e) => e.id === selection.cursor);
           if (entry?.kind === "group") {
             openGroupOverlay(entry.groupId);
@@ -997,6 +1160,7 @@ export function SortingScreen() {
     [
       categories,
       previewId,
+      openGroup,
       assets.length,
       total,
       loading,
@@ -1013,6 +1177,67 @@ export function SortingScreen() {
       openPreview,
       closePreview,
       openGroupOverlay,
+    ],
+  );
+
+  /**
+   * 画廊模式的键盘兜底。
+   *
+   * 移动/选区类按键归 GalleryView 自己（它持有 cursorId 与列数），这里只接
+   * 「作用于当前聚焦项」的打标动作——两处各动一套光标必然打架。
+   * GalleryView 若自行处理并 stopPropagation，这个处理器根本不会被叫到。
+   */
+  const handleGalleryKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      if (previewId !== null) return;
+      const action = resolveShortcut(
+        {
+          key: event.key,
+          shiftKey: event.shiftKey,
+          metaKey: event.metaKey,
+          ctrlKey: event.ctrlKey,
+        },
+        categories,
+      );
+      if (!action) return;
+
+      switch (action.type) {
+        case "assign":
+          galleryAssign(action.categoryId);
+          break;
+        case "other": {
+          const other = categories.find((c) => c.kind === "other");
+          if (!other) return;
+          galleryAssign(other.id);
+          break;
+        }
+        case "curate":
+          galleryCurate();
+          break;
+        case "markDelete":
+        case "unmarkDelete":
+          galleryToggleDelete();
+          break;
+        case "preview":
+          galleryOpenFullscreen();
+          break;
+        case "confirmDelete":
+          requestDeleteConfirm();
+          break;
+        default:
+          // 方向键/全选/Esc 等交给 GalleryView 与浏览器，不在这里抢
+          return;
+      }
+      event.preventDefault();
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      previewId,
+      categories,
+      galleryAssign,
+      galleryCurate,
+      galleryToggleDelete,
+      galleryOpenFullscreen,
     ],
   );
 
@@ -1126,7 +1351,33 @@ export function SortingScreen() {
               ));
             })()}
 
+            {/* 视图切换:网格(连拍折成一格)/ 画廊(逐张平铺)。
+                只是同一批素材的两种看法,不改任何筛选口径 */}
             <span className="push-right row-inline text-xs">
+              <span className="dim">视图</span>
+              <button
+                type="button"
+                className="chip"
+                data-testid="sorting-view-grid"
+                aria-pressed={viewMode === "grid"}
+                title="网格:连拍组折叠成一格,空格铺开整组"
+                onClick={() => setViewMode("grid")}
+              >
+                网格
+              </button>
+              <button
+                type="button"
+                className="chip"
+                data-testid="sorting-view-gallery"
+                aria-pressed={viewMode === "gallery"}
+                title="画廊:连拍组也逐张平铺,适合通读"
+                onClick={() => setViewMode("gallery")}
+              >
+                画廊
+              </button>
+            </span>
+
+            <span className="row-inline text-xs">
               <span className="dim">筛选</span>
               <Select
                 ariaLabel="按 AI 判定筛选"
@@ -1140,6 +1391,16 @@ export function SortingScreen() {
                   label: JUDGEMENT_FILTER_LABEL[key],
                 }))}
               />
+              {/* 「建议保留」不再是全局筛选项——它从来只在连拍组内成立(后端
+                  analysis.rs:318:无组时高分单张也不标)。概念搬了家必须当面说一声,
+                  否则用户只会以为这个功能凭空没了(零静默) */}
+              <span
+                className="text-2xs dim"
+                data-testid="sorting-suggest-moved"
+                title="后端口径:suggested_keep 是「组内首选(荐优)」,不成组的单张再高分也不标。把它做成全局筛选会把所有非连拍的已判定单张一并藏起来或全列为「建议放弃」,所以它归回连拍组内部。"
+              >
+                「建议保留」已归入连拍组（展开组即可用）
+              </span>
             </span>
           </div>
 
@@ -1151,7 +1412,7 @@ export function SortingScreen() {
               data-testid="sorting-filter-hint"
             >
               <span className="text-xs">
-                还没有 AI 判定结果——先点右上角「AI 选片分析」，跑完才有「建议保留/放弃」可筛。
+                还没有 AI 判定结果——先点右上角「AI 选片分析」，跑完才有糊片 / 低分可筛。
               </span>
             </div>
           ) : null}
@@ -1239,13 +1500,14 @@ export function SortingScreen() {
             </div>
           ) : null}
 
-          {/* 网格 */}
+          {/* 网格 / 画廊 */}
           <div
             className="sorting__grid-wrap"
             ref={gridWrapRef}
             tabIndex={0}
-            onKeyDown={handleKeyDown}
+            onKeyDown={viewMode === "gallery" ? handleGalleryKeyDown : handleKeyDown}
             data-testid="sorting-grid-wrap"
+            data-view={viewMode}
             aria-label="待分类素材"
           >
             {loadError ? (
@@ -1301,6 +1563,24 @@ export function SortingScreen() {
                   清除筛选
                 </button>
               </div>
+            ) : viewMode === "gallery" ? (
+              /* 画廊模式:组件由另一路并行开发,这里只负责接线。
+                 assets 用 previewAssets——连拍组在画廊里逐张平铺,
+                 与全屏预览共用同一个下标空间,翻页不会错位 */
+              <GalleryView
+                assets={previewAssets}
+                cursorId={galleryCursor}
+                onCursorChange={(id) => setGalleryCursorId(id)}
+                categories={categories}
+                markedSet={markedSet}
+                curatedIds={curatedIds}
+                onAssign={(categoryId) => galleryAssign(categoryId)}
+                onCurate={galleryCurate}
+                onToggleDelete={galleryToggleDelete}
+                onOpenFullscreen={galleryOpenFullscreen}
+                onThumbError={onThumbError}
+                onThumbLoad={onThumbLoad}
+              />
             ) : (
               <VirtualGrid
                 items={entries}
@@ -1388,16 +1668,23 @@ export function SortingScreen() {
                 <Kbd>→</Kbd> 移动
               </span>
               <span>
-                <Kbd>空格</Kbd> 选中 · <Kbd>Shift</Kbd>+方向 连选 · <Kbd>⌘A</Kbd> 全选 ·{" "}
+                <Kbd>X</Kbd> 选中 · <Kbd>Shift</Kbd>+方向 连选 · <Kbd>⌘A</Kbd> 全选 ·{" "}
                 <Kbd>Esc</Kbd> 清选
               </span>
               <span>
                 <Kbd>1</Kbd>–<Kbd>9</Kbd> 分类 · <Kbd>P</Kbd> 精选 · <Kbd>O</Kbd> 其他 ·{" "}
                 <Kbd>D</Kbd> 标删/取消 · <Kbd>Shift+D</Kbd> 提交
               </span>
-              <span>
-                <Kbd>Enter</Kbd> 全屏/展开组
+              <span data-testid="sorting-hint-preview">
+                <Kbd>空格</Kbd>/<Kbd>Enter</Kbd> 预览（连拍组先铺开整组）
               </span>
+              {viewMode === "gallery" ? (
+                /* 画廊把连拍组拆开逐张列出——这与网格里"一组一格"的计数口径不同,
+                   不说破的话用户会以为素材数量变了(零静默) */
+                <span className="dim" data-testid="sorting-gallery-note">
+                  画廊模式：连拍组逐张平铺，不再折叠成一格
+                </span>
+              ) : null}
               {selection.selected.length > 0 ? (
                 <span className="push-right" data-testid="sorting-selected-count">
                   已选 {resolveEntryIds(entries, selection.selected).length}
@@ -1508,14 +1795,16 @@ export function SortingScreen() {
       </div>
 
       {openGroupItems.length > 0 ? (
-        <GroupOverlay
+        <GroupLayer
           items={openGroupItems}
+          cursorId={groupCursorId}
+          onCursorChange={setGroupCursorId}
           selectedSet={selectedSet}
           markedSet={markedSet}
           curatedIds={curatedIds}
           categories={categories}
           /* 关键：连选也在**组成员 id 空间**里做，
-             展开层选中的裸素材 id 由 resolveEntryIds 兜住，不再被静默丢弃 */
+             组层选中的裸素材 id 由 resolveEntryIds 兜住，不再被静默丢弃 */
           onSelect={(id, modifiers) =>
             setSelection((prev) =>
               clickSelection(
@@ -1529,28 +1818,39 @@ export function SortingScreen() {
           onAssign={(ids, categoryId) => void runAssign(categoryId, ids)}
           onCurate={(ids) => void runCurate(ids)}
           onToggleDelete={toggleMark}
+          onConfirmDelete={requestDeleteConfirm}
+          pendingCount={pendingDelete.marked.length}
+          deliveryWorking={deliveryWorking}
+          /* fromGroup=true:大图记住自己是从组层来的,Esc 才知道退回哪一层 */
+          onOpenPreview={(assetId) => openPreview(assetId, true)}
+          coveredAbove={modalAbove}
           onThumbError={onThumbError}
           onThumbLoad={onThumbLoad}
           onClose={closeGroupOverlay}
         />
       ) : null}
 
-      {previewIndex >= 0 && previewAssets[previewIndex] ? (
+      {previewIndex >= 0 && previewScope[previewIndex] ? (
         <AssetLightbox
-          asset={previewAssets[previewIndex]}
+          asset={previewScope[previewIndex]}
           index={previewIndex}
-          total={previewAssets.length}
+          total={previewScope.length}
+          /* 序号是**范围内**的序号:从组层进来时它数的是组内几张,
+             跟全库 1240 对不上——不说破就成了一个看不懂的数字 */
+          scopeLabel={
+            previewScope === openGroupItems ? "连拍组内" : undefined
+          }
           categories={categories}
-          marked={markedSet.has(previewAssets[previewIndex].id)}
-          curated={curatedIds.has(previewAssets[previewIndex].id)}
+          marked={markedSet.has(previewScope[previewIndex].id)}
+          curated={curatedIds.has(previewScope[previewIndex].id)}
           onClose={closePreview}
           onPrev={() =>
-            setPreviewId(previewAssets[Math.max(0, previewIndex - 1)].id)
+            setPreviewId(previewScope[Math.max(0, previewIndex - 1)].id)
           }
           onNext={() =>
             setPreviewId(
-              previewAssets[
-                Math.min(previewAssets.length - 1, previewIndex + 1)
+              previewScope[
+                Math.min(previewScope.length - 1, previewIndex + 1)
               ].id,
             )
           }
@@ -1791,18 +2091,39 @@ function GroupCell({
   );
 }
 
-/** 展开层键盘上下移动一次跨几张(网格为 auto-fill,取常见列数的近似) */
-const GROUP_OVERLAY_ROW_STEP = 4;
+/** 组层格子的最小宽与间距——键盘上下移动要按**真实列数**跨行，就得知道这两个数 */
+const GROUP_TILE_MIN_WIDTH = 168;
+const GROUP_TILE_GAP = 10;
+/** 量不到宽度时（jsdom / 首帧）的保守列数：宁可跨得少，也别跳过一整屏 */
+const GROUP_FALLBACK_COLUMNS = 4;
 
 /**
- * 组内网格：选中语义与主网格一致（写的是同一个选区）。
+ * 连拍组全屏层：把整组**铺开**，一屏之内挑片。
  *
- * 键盘流自洽(评审 3.4):浮层自己有光标,方向键在**组成员**里移动、
- * Esc 关层、空格选中、打标键作用于组内选中(或光标项)——
- * 不再把按键交给背后的主网格,那会让方向键动的是看不见的东西。
+ * 层级关系是三层：网格 → 组全屏层 → 大图 Lightbox。
+ * `Esc` 每次只退一层，`Enter` / 空格逐层深入——这是 Quick Look 的模型，
+ * 也是「先看全一组、再挑出那一张」的实际工作顺序。
+ *
+ * 有界与滚动：本层自己 `position: fixed; inset: 0`，内部是
+ * flex 列 + `min-height: 0` 的滚动区（见 screens.css 的 `.group-layer`）。
+ * 注意一条**靠外部条件兜着**的前提：本层打开期间，背后的 `.sorting__grid`
+ * 仍然是活跃滚动容器（滚动位置也还停在原处），只是因为本层是不透明全屏、
+ * 滚轮落不到它身上才无症状。本层若将来改成非全屏或可穿透，就必须同时
+ * 冻结背后那个容器——否则会违反「同一片区域同一时刻只有一个容器响应滚轮」。
+ * `.group-layer__grid` 的 `overscroll-behavior: contain` 只挡住滚动链，
+ * 挡不住直接落在下层上的滚轮。
+ * **不复用 `.overlay`**：那是 `display: grid` 且没写 `grid-template-rows`，
+ * 隐式行为 `auto`，内容一超视口行就被撑大、子元素的 `height/max-height: 100%`
+ * 随之失去约束，内部滚动条永不出现、内容跑出窗口下沿。组内可能有几十张，
+ * 这条坑必须绕开。
+ *
+ * 选中语义与主网格一致（写的是同一个选区），打标目标 = 组内已选中的成员，
+ * 都没选就用光标那张。
  */
-function GroupOverlay({
+function GroupLayer({
   items,
+  cursorId,
+  onCursorChange,
   selectedSet,
   markedSet,
   curatedIds,
@@ -1811,11 +2132,19 @@ function GroupOverlay({
   onAssign,
   onCurate,
   onToggleDelete,
+  onConfirmDelete,
+  pendingCount,
+  deliveryWorking,
+  onOpenPreview,
+  coveredAbove,
   onThumbError,
   onThumbLoad,
   onClose,
 }: {
   items: SortingAsset[];
+  /** 组层光标（组成员 assetId）；由父级持有，好让大图退回来时接着站在这张上 */
+  cursorId: string | null;
+  onCursorChange: (id: string) => void;
   selectedSet: Set<string>;
   markedSet: Set<string>;
   curatedIds: Set<string>;
@@ -1824,59 +2153,91 @@ function GroupOverlay({
   onAssign: (assetIds: string[], categoryId: string) => void;
   onCurate: (assetIds: string[]) => void;
   onToggleDelete: (assetIds: string[]) => void;
+  /** Shift+D：提交待删清单（与主屏同一条确认流） */
+  onConfirmDelete: () => void;
+  /** 全局待删清单条数——底部那条状态栏被本层整个盖住，所以要在这里复述 */
+  pendingCount: number;
+  deliveryWorking: boolean;
+  /** 打开光标那张的大图（父级会记住"这是从组层来的"） */
+  onOpenPreview: (assetId: string) => void;
+  /** 是否有浮层（大图 / 二次确认）盖在本层之上：它们收起时本层要把键盘焦点收回来 */
+  coveredAbove: boolean;
   onThumbError: () => void;
   onThumbLoad: () => void;
   onClose: () => void;
 }) {
   const boxRef = useRef<HTMLDivElement>(null);
-  const [cursorIdx, setCursorIdx] = useState(0);
-  // 展开层是 overlay，按键不会冒泡回网格——这里自己接，并把焦点拿过来
+  const gridRef = useRef<HTMLDivElement>(null);
+  const [columns, setColumns] = useState(GROUP_FALLBACK_COLUMNS);
+
+  /*
+   * 组层是独立浮层，按键不会冒泡回网格——这里自己接，并把焦点拿过来。
+   * 上方浮层（大图 / Shift+D 的二次确认）收起时同样要收回焦点：
+   * 用户若是点它们的关闭/取消按钮出来的，焦点已经随那个按钮消失，
+   * 不收回来的话 Esc 退层、方向键、打标键就此全部失灵。
+   */
   useEffect(() => {
-    boxRef.current?.focus();
+    if (!coveredAbove) boxRef.current?.focus();
+  }, [coveredAbove]);
+
+  /* 上下移动要跨"一行"，行有几张取决于当前窗口宽度。量出来而不是写死：
+     写死的近似值在宽屏上会让 ↓ 只挪半行，读起来像光标乱跳。 */
+  useEffect(() => {
+    const el = gridRef.current;
+    if (!el) return;
+    const measure = () => {
+      const width = el.clientWidth;
+      if (width <= 0) return; // 量不到就保留上一次/兜底值，别把列数算成 0
+      setColumns(
+        Math.max(
+          1,
+          Math.floor(
+            (width + GROUP_TILE_GAP) / (GROUP_TILE_MIN_WIDTH + GROUP_TILE_GAP),
+          ),
+        ),
+      );
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
   }, []);
 
+  /*
+   * 光标那张被移走（分类/精选/整组标删）之后，接住它**原来的位置**——
+   * 后一张补位过来，「按一键→看下一张」的循环不会断在「光标归零」上。
+   * 归零是此前展开层的老毛病：打完一张标，光标默默跳回组内第一张，
+   * 下一次按键就打在了另一张上。
+   */
+  const ids = items.map((i) => i.id);
+  const lastIdxRef = useRef(0);
+  const rawIdx = cursorId ? ids.indexOf(cursorId) : -1;
+  const cursorIdx =
+    rawIdx >= 0
+      ? rawIdx
+      : Math.min(lastIdxRef.current, Math.max(0, items.length - 1));
+  lastIdxRef.current = cursorIdx;
+  const cursorAsset = items[cursorIdx] ?? null;
+
+  /* 补位结果要同步回上层：上层还持着一个已经不存在的 id 的话，
+     「界面高亮的是 A、打标打在 B 上」这种静默错位就会发生 */
+  useEffect(() => {
+    if (rawIdx < 0 && cursorAsset && cursorAsset.id !== cursorId) {
+      onCursorChange(cursorAsset.id);
+    }
+  }, [rawIdx, cursorAsset, cursorId, onCursorChange]);
+
   /** 打标目标:组内已选中的成员;都没选就用光标那张 */
-  const overlayTargets = useCallback(() => {
+  const layerTargets = useCallback(() => {
     const selected = items.filter((i) => selectedSet.has(i.id)).map((i) => i.id);
     if (selected.length > 0) return selected;
     const at = items[cursorIdx];
     return at ? [at.id] : [];
   }, [items, selectedSet, cursorIdx]);
 
-  const handleOverlayKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    const { key } = event;
-    const step =
-      key === "ArrowRight"
-        ? 1
-        : key === "ArrowLeft"
-          ? -1
-          : key === "ArrowDown"
-            ? GROUP_OVERLAY_ROW_STEP
-            : key === "ArrowUp"
-              ? -GROUP_OVERLAY_ROW_STEP
-              : null;
-    if (step !== null) {
-      event.preventDefault();
-      event.stopPropagation();
-      setCursorIdx((prev) => Math.min(items.length - 1, Math.max(0, prev + step)));
-      return;
-    }
-    if (key === "Escape") {
-      event.preventDefault();
-      event.stopPropagation();
-      onClose();
-      return;
-    }
-    if (key === " ") {
-      event.preventDefault();
-      event.stopPropagation();
-      const at = items[cursorIdx];
-      if (at) onSelect(at.id, { meta: true });
-      return;
-    }
+  const handleLayerKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
     const action = resolveShortcut(
       {
-        key,
+        key: event.key,
         shiftKey: event.shiftKey,
         metaKey: event.metaKey,
         ctrlKey: event.ctrlKey,
@@ -1884,18 +2245,55 @@ function GroupOverlay({
       categories,
     );
     if (!action) return;
+
+    switch (action.type) {
+      case "move": {
+        const next = nextIndexInGrid(action.key, cursorIdx, items.length, columns);
+        if (next >= 0 && items[next]) onCursorChange(items[next].id);
+        break;
+      }
+      case "clearSelection":
+        // 组层里的 Esc = 退一层回网格（不是"清空选区"）：
+        // 层级导航优先于选区管理，否则用户要按两次 Esc 才出得去
+        onClose();
+        break;
+      case "preview":
+        // 空格 / Enter：再深一层，看这一张的大图
+        if (cursorAsset) onOpenPreview(cursorAsset.id);
+        break;
+      case "toggle":
+        if (cursorAsset) onSelect(cursorAsset.id, { meta: true });
+        break;
+      case "selectAll":
+        for (const item of items) {
+          if (!selectedSet.has(item.id)) onSelect(item.id, { meta: true });
+        }
+        break;
+      case "assign":
+        onAssign(layerTargets(), action.categoryId);
+        break;
+      case "other": {
+        const other = categories.find((c) => c.kind === "other");
+        if (other) onAssign(layerTargets(), other.id);
+        break;
+      }
+      case "curate":
+        onCurate(layerTargets());
+        break;
+      case "markDelete":
+      case "unmarkDelete":
+        onToggleDelete(layerTargets());
+        break;
+      case "confirmDelete":
+        // Shift+D 与主屏同一语义:标完直接进确认流,不必先退出组层。
+        // 清单为空 / 打包锁住时由 requestDeleteConfirm 发通知说明,不会静默落空
+        onConfirmDelete();
+        break;
+      default:
+        return;
+    }
     event.preventDefault();
     event.stopPropagation();
-    const targets = overlayTargets();
-    if (targets.length === 0) return;
-    if (action.type === "assign") onAssign(targets, action.categoryId);
-    else if (action.type === "other") {
-      const other = categories.find((c) => c.kind === "other");
-      if (other) onAssign(targets, other.id);
-    } else if (action.type === "curate") onCurate(targets);
-    else if (action.type === "markDelete" || action.type === "unmarkDelete") {
-      onToggleDelete(targets);
-    }
   };
 
   // 「一组保留 1-2 张、其余批量处理」(PRD §5.4)的一键版
@@ -1905,109 +2303,191 @@ function GroupOverlay({
     const rest = items.filter((i) => !keep.has(i.id)).map((i) => i.id);
     if (rest.length > 0) onToggleDelete(rest);
   };
+  const selectedCount = items.filter((i) => selectedSet.has(i.id)).length;
 
   return (
-    <div className="overlay" onClick={onClose}>
-      <div
-        className="dialog dialog--wide"
-        role="dialog"
-        aria-modal="true"
-        aria-label="连拍组"
-        data-testid="group-overlay"
-        ref={boxRef}
-        tabIndex={0}
-        onKeyDown={handleOverlayKey}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h2 className="dialog__title">连拍组（{items.length} 张）</h2>
-        <p className="dialog__message">
-          方向键移动、空格选中、P/数字键/D 直接打标；AI 只给建议，不会替你动文件。
-        </p>
-        <div className="row-inline">
-          <button
-            type="button"
-            className="btn btn--sm"
-            data-testid="group-keep-recommended"
-            disabled={suggested.length === 0 || suggested.length === items.length}
-            title={
-              suggested.length === 0
-                ? "先运行 AI 选片分析,组内才有「建议保留」"
-                : `保留 ${suggested.length} 张建议项,其余 ${items.length - suggested.length} 张标删(仍需底部确认才移入回收站)`
+    <div
+      className="group-layer"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`连拍组，共 ${items.length} 张`}
+      data-testid="group-overlay"
+      ref={boxRef}
+      tabIndex={-1}
+      onKeyDown={handleLayerKey}
+    >
+      <div className="group-layer__bar">
+        <span className="text-sm">连拍组（{items.length} 张）</span>
+        {selectedCount > 0 ? (
+          <Badge tone="ok">已选 {selectedCount}</Badge>
+        ) : null}
+        {/*
+          「建议保留」的家就在这里(后端 analysis.rs:318 的口径是「组内首选」)。
+          它刚从全局筛选里被拿掉,所以必须在这一层把话说全:
+          既说清它只在组内成立,也说清 AI 不会替你动文件。
+        */}
+        <span
+          className="text-2xs dim"
+          data-testid="group-suggest-scope"
+          title="后端只在连拍组内部评选「建议保留」；不成组的单张再高分也不标，所以这个概念不做全局筛选。"
+        >
+          「建议保留」只在连拍组内成立：AI 从同一串连拍里荐优，仅给建议，绝不替你动文件
+        </span>
+        <button
+          type="button"
+          className="btn btn--ghost btn--icon push-right"
+          data-testid="group-close"
+          aria-label="退出连拍组，回到网格"
+          title="Esc 退回网格"
+          onClick={onClose}
+        >
+          <IconClose />
+        </button>
+      </div>
+
+      <div className="group-layer__tools">
+        <button
+          type="button"
+          className="btn btn--sm"
+          data-testid="group-keep-recommended"
+          disabled={suggested.length === 0 || suggested.length === items.length}
+          title={
+            suggested.length === 0
+              ? "本组还没有「建议保留」——先跑一次 AI 选片分析"
+              : `保留 ${suggested.length} 张建议项,其余 ${items.length - suggested.length} 张标删(仍需底部确认才移入回收站)`
+          }
+          onClick={keepRecommended}
+        >
+          保留推荐，其余标删
+        </button>
+        {/* 按钮为什么能按/不能按,写在脸上而不是只藏在 title 里 */}
+        {suggested.length === 0 ? (
+          <span className="text-2xs dim" data-testid="group-suggest-none">
+            本组暂无「建议保留」——先跑「AI 选片分析」，或直接手动挑
+          </span>
+        ) : suggested.length === items.length ? (
+          <span className="text-2xs dim" data-testid="group-suggest-all">
+            本组每张都被推荐保留，没有可标删的余量
+          </span>
+        ) : (
+          <span className="text-2xs dim" data-testid="group-suggest-count">
+            AI 在本组推荐保留 {suggested.length} 张，其余 {items.length - suggested.length} 张会进待删清单
+          </span>
+        )}
+        <button
+          type="button"
+          className="btn btn--sm push-right"
+          data-testid="group-select-all"
+          onClick={() => {
+            for (const item of items) {
+              if (!selectedSet.has(item.id)) onSelect(item.id, { meta: true });
             }
-            onClick={keepRecommended}
+          }}
+        >
+          全选
+        </button>
+        <button
+          type="button"
+          className="btn btn--sm"
+          data-testid="group-invert"
+          onClick={() => {
+            for (const item of items) onSelect(item.id, { meta: true });
+          }}
+        >
+          反选
+        </button>
+      </div>
+
+      <div className="group-layer__grid" ref={gridRef} role="grid" aria-label="连拍组内素材">
+        {items.map((asset, i) => (
+          <div
+            key={asset.id}
+            role="gridcell"
+            aria-selected={selectedSet.has(asset.id)}
+            data-testid="group-item"
+            data-asset={asset.id}
+            className={`asset${selectedSet.has(asset.id) ? " asset--selected" : ""}${
+              i === cursorIdx ? " asset--focused" : ""
+            }${markedSet.has(asset.id) ? " asset--marked" : ""}`}
+            onClick={(e) => {
+              onCursorChange(asset.id);
+              onSelect(asset.id, {
+                shift: e.shiftKey,
+                meta: e.metaKey || e.ctrlKey,
+              });
+            }}
+            onDoubleClick={() => onOpenPreview(asset.id)}
           >
-            保留推荐，其余标删
-          </button>
+            <GroupThumb
+              asset={asset}
+              onThumbError={onThumbError}
+              onThumbLoad={onThumbLoad}
+            />
+            <span className="asset__name truncate">{asset.fileName}</span>
+            <JudgementBadges judgement={asset.judgement} />
+            {curatedIds.has(asset.id) ? (
+              <span
+                className="asset__flag asset__flag--curated"
+                title="已精选(复制进精选/待修)"
+              >
+                ✓
+              </span>
+            ) : null}
+            {markedSet.has(asset.id) ? (
+              <span className="asset__flag asset__flag--delete" title="已标记待删除">
+                D
+              </span>
+            ) : null}
+          </div>
+        ))}
+      </div>
+
+      <div className="group-layer__foot">
+        <div className="hint-bar">
+          <span>
+            <Kbd>↑</Kbd>
+            <Kbd>↓</Kbd>
+            <Kbd>←</Kbd>
+            <Kbd>→</Kbd> 组内移动
+          </span>
+          <span>
+            <Kbd>空格</Kbd>/<Kbd>Enter</Kbd> 看大图 · <Kbd>X</Kbd> 选中 ·{" "}
+            <Kbd>⌘A</Kbd> 全选
+          </span>
+          <span>
+            <Kbd>1</Kbd>–<Kbd>9</Kbd> 分类 · <Kbd>P</Kbd> 精选 · <Kbd>O</Kbd> 其他 ·{" "}
+            <Kbd>D</Kbd> 标删/取消 · <Kbd>Shift+D</Kbd> 提交
+          </span>
+          <span data-testid="group-esc-hint">
+            <Kbd>Esc</Kbd> 退一层（大图 → 组 → 网格）
+          </span>
+        </div>
+
+        {/*
+          屏底那条待删清单被本层整个盖住，所以在这里复述一遍：
+          组里按 D 标了几张、Shift+D 现在能不能按，都得看得见。
+          鼠标路径也给上——只留快捷键等于把这条路藏起来。
+        */}
+        {pendingCount > 0 ? (
           <button
             type="button"
-            className="btn btn--sm"
-            data-testid="group-select-all"
-            onClick={() => {
-              for (const item of items) {
-                if (!selectedSet.has(item.id)) onSelect(item.id, { meta: true });
-              }
-            }}
+            className="btn btn--sm btn--danger-solid"
+            data-testid="group-confirm-delete"
+            disabled={deliveryWorking}
+            title={
+              deliveryWorking
+                ? "交付打包进行中，暂不能移入回收站"
+                : "快捷键 Shift+D"
+            }
+            onClick={onConfirmDelete}
           >
-            全选
+            确认移入回收站（{pendingCount}）
           </button>
-          <button
-            type="button"
-            className="btn btn--sm"
-            data-testid="group-invert"
-            onClick={() => {
-              for (const item of items) onSelect(item.id, { meta: true });
-            }}
-          >
-            反选
-          </button>
-        </div>
-        <div className="group-overlay__grid dialog__form">
-          {items.map((asset, i) => (
-            <div
-              key={asset.id}
-              role="gridcell"
-              aria-selected={selectedSet.has(asset.id)}
-              data-testid="group-item"
-              data-asset={asset.id}
-              className={`asset${selectedSet.has(asset.id) ? " asset--selected" : ""}${
-                i === cursorIdx ? " asset--focused" : ""
-              }${markedSet.has(asset.id) ? " asset--marked" : ""}`}
-              onClick={(e) => {
-                setCursorIdx(i);
-                onSelect(asset.id, {
-                  shift: e.shiftKey,
-                  meta: e.metaKey || e.ctrlKey,
-                });
-              }}
-            >
-              <GroupThumb
-                asset={asset}
-                onThumbError={onThumbError}
-                onThumbLoad={onThumbLoad}
-              />
-              <span className="asset__name truncate">{asset.fileName}</span>
-              <JudgementBadges judgement={asset.judgement} />
-              {curatedIds.has(asset.id) ? (
-                <span
-                  className="asset__flag asset__flag--curated"
-                  title="已精选(复制进精选/待修)"
-                >
-                  ✓
-                </span>
-              ) : null}
-              {markedSet.has(asset.id) ? (
-                <span className="asset__flag asset__flag--delete" title="已标记待删除">
-                  D
-                </span>
-              ) : null}
-            </div>
-          ))}
-        </div>
-        <div className="dialog__actions">
-          <button type="button" className="btn" data-testid="group-close" onClick={onClose}>
-            关闭
-          </button>
-        </div>
+        ) : (
+          <span className="text-2xs dim" data-testid="group-pending-empty">
+            待删清单为空 —— 按 <Kbd>D</Kbd> 标删后可用 <Kbd>Shift+D</Kbd> 提交
+          </span>
+        )}
       </div>
     </div>
   );

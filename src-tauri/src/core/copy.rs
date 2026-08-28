@@ -23,6 +23,9 @@ pub struct CopyRequest {
     pub destinations: Vec<PathBuf>,
     /// 任务标识:让临时文件名任务唯一,杜绝跨任务/跨工作站同写一个 part 文件。
     pub task_tag: String,
+    /// 本次任务的源选择口径。清单是可被篡改的持久化输入,引擎按它复核每一项
+    /// 的源路径是否在用户当初勾选的范围内(整卷则要求源=目标),不符即拒。
+    pub selection: SourceSelection,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,7 +39,10 @@ pub enum FileStatus {
 
 #[derive(Debug, Clone)]
 pub struct FileReport {
+    /// **目标**相对路径(= manifest 与快照的文件标识)。
     pub rel_path: String,
+    /// 源在卷内的相对路径(整卷时与 `rel_path` 相同);失败审计要点名卡上的真实文件。
+    pub source_rel: String,
     pub size: u64,
     pub status: FileStatus,
 }
@@ -51,6 +57,8 @@ pub struct CopyOutcome {
     pub paused: bool,
 }
 
+/// 进度事件里的 `rel_path` 一律是**目标**相对路径:它同时是 manifest 键与
+/// UI 快照的文件 id,扁平化改名后也只有它能把三边对上号。
 #[derive(Debug)]
 pub enum Progress<'a> {
     Scanned {
@@ -77,13 +85,23 @@ pub enum CopyControl {
     Pause,
 }
 
-/// 扫描期跳过的符号链接计数(R2 P0:`metadata()` 跟随链接会把卡外目录树
-/// 卷进拷贝清单,甚至链接环死循环)。零静默:命令层取走后聚合为可见 warning。
-static SCAN_SYMLINKS_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    /// 扫描期跳过的符号链接计数(R2 P0:`metadata()` 跟随链接会把卡外目录树
+    /// 卷进拷贝清单,甚至链接环死循环)。零静默:命令层取走后聚合为可见 warning。
+    ///
+    /// **按线程**计数(双路评审):扫描与随后的 take 永远在同一个命令函数体里,
+    /// 而进程级全局计数会被并发的另一次扫描抢走——浏览文件夹时顺手偷走拷卡的
+    /// 跳过数,拷卡那条告警就静默消失了,正是零静默要堵的洞。
+    static SCAN_SYMLINKS_SKIPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
-/// 取走扫描期符号链接跳过数(swap 清零)。
+fn note_symlink_skipped() {
+    SCAN_SYMLINKS_SKIPPED.with(|c| c.set(c.get() + 1));
+}
+
+/// 取走本线程扫描期的符号链接跳过数(取走即清零)。
 pub fn take_scan_symlinks_skipped() -> u64 {
-    SCAN_SYMLINKS_SKIPPED.swap(0, std::sync::atomic::Ordering::Relaxed)
+    SCAN_SYMLINKS_SKIPPED.with(|c| c.replace(0))
 }
 
 /// 源选择:整盘,或卡内若干文件夹(只取各自的**直接子文件**,不递归)。
@@ -99,6 +117,42 @@ pub enum SourceSelection {
     Folders(Vec<String>),
 }
 
+impl SourceSelection {
+    /// 空列表 = 整卷(契约:前端不传/传空数组都按整卷处理,老客户端行为不变)。
+    pub fn from_folders(folders: Vec<String>) -> Self {
+        if folders.is_empty() {
+            Self::WholeVolume
+        } else {
+            Self::Folders(folders)
+        }
+    }
+
+    /// 持久化形态(manifest 审计用):整卷 = 空列表。
+    pub fn to_folders(&self) -> Vec<String> {
+        match self {
+            Self::WholeVolume => Vec::new(),
+            Self::Folders(f) => f.clone(),
+        }
+    }
+
+    /// 这条计划项是否符合本次选择的口径。清单经 NAS 持久化后可被篡改,
+    /// 引擎按此复核:
+    /// - 整卷:源即目标(保留原层级),任何源≠目标都说明清单被动过;
+    /// - 选文件夹:源必须是**所选文件夹的直接子文件**,目标必须是扁平文件名。
+    pub fn allows(&self, source_rel: &str, target_rel: &str) -> bool {
+        match self {
+            Self::WholeVolume => source_rel == target_rel,
+            Self::Folders(folders) => {
+                let parent = match source_rel.rfind('/') {
+                    Some(i) => &source_rel[..i],
+                    None => "",
+                };
+                !target_rel.contains('/') && folders.iter().any(|f| f == parent)
+            }
+        }
+    }
+}
+
 /// 一个待拷文件:源相对路径(相对卷根)与它在目标夹里的落点。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedFile {
@@ -106,39 +160,180 @@ pub struct PlannedFile {
     pub source_rel: String,
     /// 目标夹内的相对落点。扁平化后通常就是文件名;重名时按下述规则加前缀
     pub target_rel: String,
+    pub size: u64,
 }
 
 /// 因重名而被改写落点的文件(必须让用户看见——系统改了文件名,不许静默)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RenamedFile {
     pub source_rel: String,
     pub target_rel: String,
 }
 
-/// 列出某个文件夹下的**直接子文件**(不递归)。规则与 `walk` 一致:
-/// 跳过隐藏项与符号链接。
-fn list_direct_files(root: &Path, folder: &str) -> Result<Vec<(String, u64)>> {
-    let dir = if folder.is_empty() {
+/// 整卷清单 → 计划项:源即目标,保留原目录结构(历史行为)。
+pub fn plan_whole_volume(files: &[(String, u64)]) -> Vec<PlannedFile> {
+    files
+        .iter()
+        .map(|(rel, size)| PlannedFile {
+            source_rel: rel.clone(),
+            target_rel: rel.clone(),
+            size: *size,
+        })
+        .collect()
+}
+
+/// 一个可勾选的源文件夹(相对卷根,`/` 分隔;空串 = 卷根自身)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFolder {
+    pub rel_path: String,
+    /// **直接子文件**数(不含子目录内的)
+    pub file_count: usize,
+    pub total_bytes: u64,
+    /// 是否还有子目录(子目录自身另有独立条目)
+    pub has_subfolders: bool,
+}
+
+/// 把 `/` 分隔的相对路径接到根上(空串 = 根自身)。
+fn rel_join(root: &Path, rel: &str) -> PathBuf {
+    if rel.is_empty() {
         root.to_path_buf()
     } else {
-        folder
-            .split('/')
-            .fold(root.to_path_buf(), |acc, c| acc.join(c))
+        root.join(rel_to_native(rel))
+    }
+}
+
+/// 目录读取失败的人话翻译。零静默:源卷半死/无权限时绝不能吞成空列表,
+/// 用户会当成「卡是空的」而去格式化。
+fn dir_error(rel: &str, dir: &Path, e: &std::io::Error) -> super::CoreError {
+    let what = if rel.is_empty() {
+        "源卷根目录".to_string()
+    } else {
+        format!("文件夹「{rel}」")
     };
+    let msg = match e.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "{what}不存在(卡可能已被拔出,或内容在选择之后发生了变化): {}",
+            dir.display()
+        ),
+        std::io::ErrorKind::PermissionDenied => format!(
+            "没有读取{what}的权限,请在系统的隐私/磁盘访问设置中授权 OCard 后重试: {}",
+            dir.display()
+        ),
+        // 选中项其实是文件时报「挂载点断开」会把人引到完全错误的方向
+        _ if dir.is_file() => format!("{what}不是文件夹,不能作为拷贝范围: {}", dir.display()),
+        _ => format!(
+            "读取{what}失败(挂载点可能已断开,建议重新插拔存储卡): {} — {e}",
+            dir.display()
+        ),
+    };
+    super::CoreError::Invalid(msg)
+}
+
+/// 列文件夹时读不动的目录(相机卡上常见:Windows 格式化留下的
+/// `System Volume Information`/`$RECYCLE.BIN` 带 ACL)。
+/// 不让它废掉整个选择器,但**必须**逐条报到用户面前。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableFolder {
+    pub rel_path: String,
+    pub reason: String,
+}
+
+/// 列出卷内可勾选的文件夹(含卷根 `""`)。排序:`rel_path` 字典序,卷根恒第一。
+/// 只列**含直接子文件**或**含已列出子目录**的,纯空目录树不列——勾了也拷不出
+/// 东西,还会把真正的素材夹淹在噪声里。
+/// 隐藏项与符号链接与拷贝口径一致:一律跳过,链接计数供上层告警。
+///
+/// 卷根读不动 = 硬错(吞成空列表会被读成「卡是空的」);**子目录**读不动只跳过
+/// 该子树,连同原因一起回给调用方去告警——一个带 ACL 的
+/// `System Volume Information` 不该让整张卡选不了。
+pub fn list_source_folders(root: &Path) -> Result<(Vec<SourceFolder>, Vec<UnreadableFolder>)> {
     let mut out = Vec::new();
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
+    let mut bad = Vec::new();
+    // 卷根本身失败原样上抛(人话已在 dir_error 里)
+    collect_folders(root, "", &mut out, &mut bad)?;
+    // "" 在字典序里天然最小,卷根自动排第一
+    out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    bad.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok((out, bad))
+}
+
+/// 返回「本文件夹是否入列」。`has_subfolders` 只在**真有子条目入列**时为 true:
+/// 报了却点不出东西,等于骗用户去空文件夹里找素材。
+fn collect_folders(
+    root: &Path,
+    rel: &str,
+    out: &mut Vec<SourceFolder>,
+    bad: &mut Vec<UnreadableFolder>,
+) -> Result<bool> {
+    let dir = rel_join(root, rel);
+    let mut file_count = 0usize;
+    let mut total_bytes = 0u64;
+    let mut subs: Vec<String> = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| dir_error(rel, &dir, &e))? {
+        let entry = entry.map_err(|e| dir_error(rel, &dir, &e))?;
         let name = entry.file_name();
         let name = name.to_string_lossy().to_string();
         if name.starts_with('.') {
             continue;
         }
-        let ft = entry.file_type()?;
+        let ft = entry.file_type().map_err(|e| dir_error(rel, &dir, &e))?;
         if ft.is_symlink() {
-            SCAN_SYMLINKS_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_symlink_skipped();
             continue;
         }
-        let meta = entry.metadata()?;
+        let meta = entry.metadata().map_err(|e| dir_error(rel, &dir, &e))?;
+        if meta.is_dir() {
+            subs.push(if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            });
+        } else if meta.is_file() {
+            file_count += 1;
+            total_bytes += meta.len();
+        }
+    }
+    let mut has_subfolders = false;
+    for sub in subs {
+        match collect_folders(root, &sub, out, bad) {
+            Ok(listed) => has_subfolders |= listed,
+            // 跳过读不动的子树:不入列(勾不了就别显示),但要带原因回去告警
+            Err(e) => bad.push(UnreadableFolder {
+                rel_path: sub,
+                reason: e.to_string(),
+            }),
+        }
+    }
+    let listed = file_count > 0 || has_subfolders;
+    if listed {
+        out.push(SourceFolder {
+            rel_path: rel.to_string(),
+            file_count,
+            total_bytes,
+            has_subfolders,
+        });
+    }
+    Ok(listed)
+}
+
+/// 列出某个文件夹下的**直接子文件**(不递归)。规则与 `walk` 一致:
+/// 跳过隐藏项与符号链接。
+fn list_direct_files(root: &Path, folder: &str) -> Result<Vec<(String, u64)>> {
+    let dir = rel_join(root, folder);
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| dir_error(folder, &dir, &e))? {
+        let entry = entry.map_err(|e| dir_error(folder, &dir, &e))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let ft = entry.file_type().map_err(|e| dir_error(folder, &dir, &e))?;
+        if ft.is_symlink() {
+            note_symlink_skipped();
+            continue;
+        }
+        let meta = entry.metadata().map_err(|e| dir_error(folder, &dir, &e))?;
         if !meta.is_file() {
             continue;
         }
@@ -158,28 +353,35 @@ fn list_direct_files(root: &Path, folder: &str) -> Result<Vec<(String, u64)>> {
 /// 目录名开始、逐级向上追加**,直到该组内唯一——即「最短可区分前缀」。
 /// 例:`100MSDCF/DSC1.JPG` 与 `101MSDCF/DSC1.JPG` → `100MSDCF_DSC1.JPG`
 /// 与 `101MSDCF_DSC1.JPG`;若两侧目录名也相同则继续向上取一段。
+/// 加完前缀仍与**别的组**撞名时补 `_2`、`_3`(见函数内的全局唯一性兜底)。
+///
+/// 撞名判定按 [`fold_key`] 大小写不敏感:目的地常是 APFS/exFAT/SMB,
+/// `DSC1.JPG` 与 `dsc1.jpg` 在那儿是同一个文件——按字节比较会规划出两个
+/// 「不冲突」的落点,拷到第二个时才炸(或同内容时静默并成一个)。
 ///
 /// 排序稳定(按 source_rel),保证同一次选择的规划结果可复现——
 /// manifest 与断点续传依赖 target_rel 稳定。
 pub fn plan_flat_targets(files: &[(String, u64)]) -> (Vec<PlannedFile>, Vec<RenamedFile>) {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
-    let mut by_name: HashMap<&str, Vec<&String>> = HashMap::new();
+    let mut by_name: HashMap<String, Vec<&String>> = HashMap::new();
     for (rel, _) in files {
-        let base = rel.rsplit('/').next().unwrap_or(rel.as_str());
-        by_name.entry(base).or_default().push(rel);
+        by_name
+            .entry(fold_key(base_name(rel)))
+            .or_default()
+            .push(rel);
     }
 
     let mut planned = Vec::with_capacity(files.len());
-    let mut renamed = Vec::new();
 
-    for (rel, _) in files {
-        let base = rel.rsplit('/').next().unwrap_or(rel.as_str());
-        let group = &by_name[base];
+    for (rel, size) in files {
+        let base = base_name(rel);
+        let group = &by_name[&fold_key(base)];
         if group.len() == 1 {
             planned.push(PlannedFile {
                 source_rel: rel.clone(),
                 target_rel: base.to_string(),
+                size: *size,
             });
             continue;
         }
@@ -196,26 +398,83 @@ pub fn plan_flat_targets(files: &[(String, u64)]) -> (Vec<PlannedFile>, Vec<Rena
                 if odirs.len() < depth {
                     return true;
                 }
-                odirs[odirs.len() - depth..].join("_") != prefix
+                fold_key(&odirs[odirs.len() - depth..].join("_")) != fold_key(&prefix)
             });
             target = candidate;
             if unique {
                 break;
             }
         }
-        renamed.push(RenamedFile {
-            source_rel: rel.clone(),
-            target_rel: target.clone(),
-        });
         planned.push(PlannedFile {
             source_rel: rel.clone(),
             target_rel: target,
+            size: *size,
         });
     }
 
     planned.sort_by(|a, b| a.source_rel.cmp(&b.source_rel));
-    renamed.sort_by(|a, b| a.source_rel.cmp(&b.source_rel));
+
+    // 全局唯一性兜底:同名分组各自算前缀,**跨组**仍可能撞车——
+    // 例如卡根本来就有个 `100MSDCF_DSC1.JPG`,而 `100MSDCF/DSC1.JPG`
+    // 恰好被改写成同一个名字。两个源规划到同一落点 = 后者覆盖前者,
+    // 绝不允许。先把「一个字没改」的原名占住(不冲突的名字优先级最高),
+    // 被改写的再撞上就补 `_2`、`_3`。
+    let mut taken: HashSet<String> = planned
+        .iter()
+        .filter(|p| p.target_rel == base_name(&p.source_rel))
+        .map(|p| fold_key(&p.target_rel))
+        .collect();
+    for p in planned.iter_mut() {
+        if p.target_rel == base_name(&p.source_rel) {
+            continue;
+        }
+        if taken.insert(fold_key(&p.target_rel)) {
+            continue;
+        }
+        let (stem, ext) = split_ext(&p.target_rel);
+        for n in 2.. {
+            let candidate = if ext.is_empty() {
+                format!("{stem}_{n}")
+            } else {
+                format!("{stem}_{n}.{ext}")
+            };
+            if taken.insert(fold_key(&candidate)) {
+                p.target_rel = candidate;
+                break;
+            }
+        }
+    }
+
+    // 只有落盘名与原文件名不同的才算「被改写」(契约:清单只含被改写的)
+    let renamed = planned
+        .iter()
+        .filter(|p| p.target_rel != base_name(&p.source_rel))
+        .map(|p| RenamedFile {
+            source_rel: p.source_rel.clone(),
+            target_rel: p.target_rel.clone(),
+        })
+        .collect();
     (planned, renamed)
+}
+
+/// `a/b/c.JPG` → `c.JPG`
+pub(crate) fn base_name(rel: &str) -> &str {
+    rel.rsplit('/').next().unwrap_or(rel)
+}
+
+/// 落点撞名比较键:目的地文件系统(APFS/exFAT/SMB)通常大小写不敏感,
+/// 判重必须按同一把尺子,否则「不冲突」的规划会在盘上变成同一个文件。
+/// (Unicode 等价形式 NFC/NFD 的归一未做——没引入依赖;见交回说明。)
+pub(crate) fn fold_key(name: &str) -> String {
+    name.to_lowercase()
+}
+
+/// 拆主名与扩展名(无扩展名或以点开头时 ext 为空)。
+fn split_ext(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i + 1..]),
+        _ => (name, ""),
+    }
 }
 
 /// 按选择扫描源。整盘 = 历史行为(递归、保留结构);
@@ -228,18 +487,18 @@ pub fn scan_selection(
         SourceSelection::WholeVolume => {
             let files = scan_source(root)?;
             let total = files.iter().map(|(_, s)| *s).sum();
-            let planned = files
-                .into_iter()
-                .map(|(rel, _)| PlannedFile {
-                    target_rel: rel.clone(),
-                    source_rel: rel,
-                })
-                .collect();
-            Ok((planned, Vec::new(), total))
+            Ok((plan_whole_volume(&files), Vec::new(), total))
         }
         SourceSelection::Folders(folders) => {
             let mut files = Vec::new();
             for f in folders {
+                // 闸放在扫描入口而不是只放在命令层:续传时选择来自可被改写的
+                // manifest,`../` 会让复扫越过卷根去读卡外的目录
+                if !f.is_empty() && !super::paths::is_safe_rel(f) {
+                    return Err(super::CoreError::Invalid(format!(
+                        "源文件夹路径非法,拒绝扫描: {f}"
+                    )));
+                }
                 files.extend(list_direct_files(root, f)?);
             }
             files.sort();
@@ -273,7 +532,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> Result<()> {
         // file_type() 不跟随链接;链接一律跳过+计数(跟随会把根外树卷进来或死循环)
         let ft = entry.file_type()?;
         if ft.is_symlink() {
-            SCAN_SYMLINKS_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_symlink_skipped();
             continue;
         }
         let meta = entry.metadata()?;
@@ -295,7 +554,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> Result<()> {
 
 /// 轻量完成预判(UI 快照/任务重建用):只看 manifest 与目的地存在+尺寸,
 /// **不做哈希**——权威裁决只在引擎的 [`file_done`] 一处(R5:消除预统计与
-/// 正式复制的双重全量哈希)。
+/// 正式复制的双重全量哈希)。`rel` 是**目标**相对路径(与 manifest 同口径)。
 pub fn file_done_light(m: &CopyManifest, rel: &str, size: u64, destinations: &[PathBuf]) -> bool {
     if !m.is_done(rel, size) {
         return false;
@@ -315,22 +574,26 @@ pub fn file_done_light(m: &CopyManifest, rel: &str, size: u64, destinations: &[P
 /// - **每个目的地**:目的地根非链接、目标 canonical 在该根内(中间祖先链接
 ///   同拒)、非链接、尺寸一致、绕缓存回读 xxh3 与清单一致。
 ///
+/// 清单条目一律按**目标**相对路径认(扁平化后源与目标不同名,断点续传的
+/// 身份必须是落盘位置,否则改了名的文件每次续传都会被判成没拷过)。
+///
 /// 任何一条不满足=不算完成,引擎按正常路径重拷(既有目标不同内容=可见冲突)。
 pub fn file_done(
     m: &CopyManifest,
     source_root: &Path,
-    rel: &str,
+    source_rel: &str,
+    target_rel: &str,
     size: u64,
     destinations: &[PathBuf],
 ) -> bool {
     let Some(entry) = m
         .entries
         .iter()
-        .find(|e| e.rel_path == rel && e.verified && e.size == size)
+        .find(|e| e.rel_path == target_rel && e.verified && e.size == size)
     else {
         return false;
     };
-    let src = source_root.join(rel_to_native(rel));
+    let src = source_root.join(rel_to_native(source_rel));
     if super::paths::is_symlink(&src) || super::paths::assert_within(source_root, &src).is_err() {
         return false;
     }
@@ -344,7 +607,7 @@ pub fn file_done(
         if super::paths::is_symlink(d) {
             return false;
         }
-        let p = d.join(rel_to_native(rel));
+        let p = d.join(rel_to_native(target_rel));
         // R5:中间祖先链接同样拒(canonical 断言),不只看末节点
         if super::paths::is_symlink(&p) || super::paths::assert_within(d, &p).is_err() {
             return false;
@@ -361,31 +624,56 @@ pub fn file_done(
     })
 }
 
-/// 执行拷卡。`files` 为调用方预先扫描的清单(与 UI 快照/manifest 同源,
-/// 避免两次扫描产生分歧);`project_root` 用于逐文件持久化 manifest(断点续传依据)。
+/// 执行拷卡。`plan` 为调用方预先规划好的清单(与 UI 快照/manifest 同源,
+/// 避免两次扫描产生分歧):每项自带**源**相对路径与**目标**相对路径,
+/// 整卷时两者相同,选文件夹扁平化时两者分离。
+/// `project_root` 用于逐文件持久化 manifest(断点续传依据)。
 /// 回调返回 [`CopyControl::Pause`] 时在当前文件完成后停下,manifest 保证可续传。
 pub fn run_copy(
     req: &CopyRequest,
-    files: &[(String, u64)],
+    plan: &[PlannedFile],
     m: &mut CopyManifest,
     project_root: &Path,
     mut progress: impl FnMut(Progress) -> CopyControl,
 ) -> Result<CopyOutcome> {
     assert!(!req.destinations.is_empty(), "至少需要一个目的地");
-    let total_bytes: u64 = files.iter().map(|(_, s)| *s).sum();
+    // 全计划预检,闸先于任何副作用:清单可能来自被改写的 manifest。
+    // ① 落点必须两两不同(按目的地文件系统的大小写口径):两项共用一个落点时,
+    //    第二项会被续传判定当成「已完成」跳过,整批却仍报完成 = 静默漏拷;
+    // ② 落点不许占用引擎内部的 `.ocardpart` 命名空间:临时文件与正式文件同目录,
+    //    别人的正式文件正好叫某项的 part 名时,会被那项的残留清理删掉。
+    {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for p in plan {
+            if p.target_rel.ends_with(PART_SUFFIX) {
+                return Err(super::CoreError::Invalid(format!(
+                    "清单落点占用了引擎内部临时后缀 {PART_SUFFIX},拒绝执行: {}",
+                    p.target_rel
+                )));
+            }
+            if !seen.insert(fold_key(&p.target_rel)) {
+                return Err(super::CoreError::Invalid(format!(
+                    "清单里有两个文件规划到同一个落点,拒绝执行(会互相覆盖): {}",
+                    p.target_rel
+                )));
+            }
+        }
+    }
+    let total_bytes: u64 = plan.iter().map(|p| p.size).sum();
     let mut control = progress(Progress::Scanned {
-        total_files: files.len(),
+        total_files: plan.len(),
         total_bytes,
     });
 
-    let mut reports = Vec::with_capacity(files.len());
+    let mut reports = Vec::with_capacity(plan.len());
     let mut bytes_copied = 0u64;
     let mut paused = false;
     // 连续 IO 失败视为基础设施故障(NAS 断连),转入暂停而非全部标失败(评审复核 P1)
     let mut consecutive_io = 0usize;
-    let total = files.len();
+    let total = plan.len();
 
-    for (index, (rel, size)) in files.iter().enumerate() {
+    for (index, item) in plan.iter().enumerate() {
+        let (src_rel, rel, size) = (&item.source_rel, &item.target_rel, item.size);
         if control == CopyControl::Pause {
             paused = true;
             break;
@@ -400,50 +688,59 @@ pub fn run_copy(
             break;
         }
 
-        // R5 三票 P1:时间戳快照在 file_done 的源哈希**之前**采集——
-        // 修复目标场景里,验证读同样会刷新源 atime
-        let pre_meta = fs::metadata(req.source_root.join(rel_to_native(rel))).ok();
-        let status = if file_done(m, &req.source_root, rel, *size, &req.destinations) {
-            FileStatus::SkippedResume
+        // 清单来自持久化存储(NAS 上可被改写):源路径必须仍落在用户当初勾选的
+        // 范围内,否则等于拿旧任务的授权去读别处的文件——拒绝并可见记为失败
+        let status = if !req.selection.allows(src_rel, rel) {
+            FileStatus::Failed(format!(
+                "清单项与本次源选择不符,拒绝执行: {src_rel} → {rel}(任务清单可能已损坏或被篡改,请重新发起拷贝)"
+            ))
         } else {
-            match copy_one(
-                &req.source_root,
-                rel,
-                pre_meta,
-                &req.destinations,
-                &req.task_tag,
-                &mut |delta| {
-                    // 块级进度只上报,不在文件中途暂停
-                    let _ = progress(Progress::BytesCopied {
-                        rel_path: rel,
-                        delta,
-                    });
-                },
-            ) {
-                Ok(xxh3) => {
-                    consecutive_io = 0;
-                    m.upsert(ManifestEntry {
-                        rel_path: rel.clone(),
-                        size: *size,
-                        xxh3,
-                        verified: true,
-                    });
-                    bytes_copied += size;
-                    FileStatus::Copied
-                }
-                Err(e) => {
-                    if matches!(e, super::CoreError::Io(_)) {
-                        consecutive_io += 1;
-                    } else {
+            // R5 三票 P1:时间戳快照在 file_done 的源哈希**之前**采集——
+            // 修复目标场景里,验证读同样会刷新源 atime
+            let pre_meta = fs::metadata(req.source_root.join(rel_to_native(src_rel))).ok();
+            if file_done(m, &req.source_root, src_rel, rel, size, &req.destinations) {
+                FileStatus::SkippedResume
+            } else {
+                match copy_one(
+                    &req.source_root,
+                    src_rel,
+                    rel,
+                    pre_meta,
+                    &req.destinations,
+                    &req.task_tag,
+                    &mut |delta| {
+                        // 块级进度只上报,不在文件中途暂停
+                        let _ = progress(Progress::BytesCopied {
+                            rel_path: rel,
+                            delta,
+                        });
+                    },
+                ) {
+                    Ok(xxh3) => {
                         consecutive_io = 0;
+                        m.upsert(ManifestEntry {
+                            rel_path: rel.clone(),
+                            size,
+                            xxh3,
+                            verified: true,
+                        });
+                        bytes_copied += size;
+                        FileStatus::Copied
                     }
-                    m.upsert(ManifestEntry {
-                        rel_path: rel.clone(),
-                        size: *size,
-                        xxh3: String::new(),
-                        verified: false,
-                    });
-                    FileStatus::Failed(e.to_string())
+                    Err(e) => {
+                        if matches!(e, super::CoreError::Io(_)) {
+                            consecutive_io += 1;
+                        } else {
+                            consecutive_io = 0;
+                        }
+                        m.upsert(ManifestEntry {
+                            rel_path: rel.clone(),
+                            size,
+                            xxh3: String::new(),
+                            verified: false,
+                        });
+                        FileStatus::Failed(e.to_string())
+                    }
                 }
             }
         };
@@ -455,7 +752,8 @@ pub fn run_copy(
         });
         reports.push(FileReport {
             rel_path: rel.clone(),
-            size: *size,
+            source_rel: src_rel.clone(),
+            size,
             status,
         });
         if consecutive_io >= 3 {
@@ -489,24 +787,28 @@ pub fn run_copy(
 /// 逐目的地回读校验,全部通过后统一改名。返回源文件 xxh3。
 fn copy_one(
     source_root: &Path,
-    rel: &str,
+    source_rel: &str,
+    target_rel: &str,
     src_meta: Option<fs::Metadata>,
     destinations: &[PathBuf],
     task_tag: &str,
     on_chunk: &mut dyn FnMut(u64),
 ) -> Result<String> {
-    // R2 P0:rel 可能来自持久化清单(resume),被篡改为 `../../…` 即任意读写。
+    // R2 P0:两条 rel 都可能来自持久化清单(resume),被篡改为 `../../…` 即任意
+    // 读写——源侧越界=任意读,目标侧越界=任意写,两侧都必须过闸。
     // 引擎层兜底闸:非法相对路径直接拒绝(入口处 resume 合并另有前置校验)。
-    if !super::paths::is_safe_rel(rel) {
-        return Err(super::CoreError::Invalid(format!(
-            "清单相对路径非法,拒绝执行: {rel}"
-        )));
+    for rel in [source_rel, target_rel] {
+        if !super::paths::is_safe_rel(rel) {
+            return Err(super::CoreError::Invalid(format!(
+                "清单相对路径非法,拒绝执行: {rel}"
+            )));
+        }
     }
-    let src_path = source_root.join(rel_to_native(rel));
+    let src_path = source_root.join(rel_to_native(source_rel));
     // 扫描已跳过链接;这里再挡一道(清单项可能指向后来被替换成链接的路径)
     if super::paths::is_symlink(&src_path) {
         return Err(super::CoreError::Invalid(format!(
-            "源文件是符号链接,拒绝拷贝: {rel}"
+            "源文件是符号链接,拒绝拷贝: {source_rel}"
         )));
     }
     // R4(终审 P0-2):末节点检查挡不住**祖先**链接(DCIM → 外部目录时,
@@ -519,9 +821,10 @@ fn copy_one(
         super::fsx::note_times_preserve_failures(destinations.len() as u64);
     }
 
+    // 落点用**目标** rel:扁平化后它与源路径不同(通常只是文件名)
     let finals: Vec<PathBuf> = destinations
         .iter()
-        .map(|d| d.join(rel_to_native(rel)))
+        .map(|d| d.join(rel_to_native(target_rel)))
         .collect();
 
     // 目的地已有同名最终文件 → 先算源哈希,再逐一比对。
@@ -636,7 +939,7 @@ fn copy_one(
         if let Some(known) = &known_src_hash {
             if known != &src_hash {
                 return Err(super::CoreError::Invalid(format!(
-                    "源文件在两次读取之间发生变化: {rel}"
+                    "源文件在两次读取之间发生变化: {source_rel}"
                 )));
             }
         }
@@ -811,6 +1114,7 @@ mod tests {
             source_root: card,
             destinations: vec![dest1, dest2],
             task_tag: "t1".into(),
+            selection: SourceSelection::WholeVolume,
         };
         let m = CopyManifest::new(
             "2. 原始素材/20260824_A7M4_A_ZS",
@@ -844,7 +1148,7 @@ mod tests {
         let mut events = 0usize;
         let out = run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| {
@@ -889,7 +1193,7 @@ mod tests {
         let (_tmp, req, mut m, project) = setup();
         run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| CopyControl::Continue,
@@ -899,7 +1203,7 @@ mod tests {
         // 第二次执行:全部续传跳过,拷贝字节为 0
         let out = run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| CopyControl::Continue,
@@ -919,7 +1223,7 @@ mod tests {
         let (_tmp, req, mut m, project) = setup();
         run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| CopyControl::Continue,
@@ -938,7 +1242,7 @@ mod tests {
         );
         let out = run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m2,
             &project,
             |_| CopyControl::Continue,
@@ -968,7 +1272,7 @@ mod tests {
         let (_tmp, req, mut m, project) = setup();
         run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| CopyControl::Continue,
@@ -984,7 +1288,7 @@ mod tests {
         );
         let out = run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m2,
             &project,
             |_| CopyControl::Continue,
@@ -1000,7 +1304,7 @@ mod tests {
         let (_tmp, req, mut m, project) = setup();
         run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| CopyControl::Continue,
@@ -1010,7 +1314,7 @@ mod tests {
 
         let out = run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| CopyControl::Continue,
@@ -1034,7 +1338,7 @@ mod tests {
 
         let out = run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| CopyControl::Continue,
@@ -1070,7 +1374,7 @@ mod tests {
         let mut bytes = 0u64;
         run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |p| {
@@ -1091,7 +1395,7 @@ mod tests {
         let mut finished = 0usize;
         let out = run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |p| {
@@ -1114,7 +1418,7 @@ mod tests {
         // 续传:剩余文件补齐,已拷的跳过
         let out2 = run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| CopyControl::Continue,
@@ -1163,6 +1467,7 @@ mod review_regression_tests {
                 tmp.path().join("backup/target"),
             ],
             task_tag: "regr".into(),
+            selection: SourceSelection::WholeVolume,
         };
         let project = tmp.path().join("project");
         fs::create_dir_all(&project).unwrap();
@@ -1179,7 +1484,10 @@ mod review_regression_tests {
         fs::write(req.destinations[0].join(&part_name), b"stale junk").unwrap();
 
         let files = scan_source(&req.source_root).unwrap();
-        let out = run_copy(&req, &files, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(out.all_verified);
         assert!(!req.destinations[0].join(&part_name).exists());
         assert_eq!(
@@ -1196,7 +1504,10 @@ mod review_regression_tests {
         files.push(("GONE.MP4".to_string(), 4242));
         files.sort();
 
-        let out = run_copy(&req, &files, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         let gone = out.files.iter().find(|f| f.rel_path == "GONE.MP4").unwrap();
         assert!(matches!(gone.status, FileStatus::Failed(_)));
         assert!(!out.all_verified, "有计划内文件缺失绝不能给可格式化信号");
@@ -1211,7 +1522,10 @@ mod review_regression_tests {
         req.destinations = vec![blocked.join("sub")];
 
         let files = scan_source(&req.source_root).unwrap();
-        let out = run_copy(&req, &files, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(out.paused, "连续 IO 失败应转入可续传的暂停,而非终态 failed");
         assert!(!out.all_verified);
         let saved = manifest::load(&project, &m.id).unwrap();
@@ -1229,7 +1543,7 @@ mod review_regression_tests {
         drop(f);
         run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| CopyControl::Continue,
@@ -1277,7 +1591,10 @@ mod review_regression_tests {
         fs::write(tmp.path().join("escape.bin"), b"boom").unwrap();
         let mut files = scan_source(&req.source_root).unwrap();
         files.push(("../escape.bin".into(), 4));
-        let out = run_copy(&req, &files, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(!out.all_verified);
         assert!(
             out.files.iter().any(|f| f.rel_path == "../escape.bin"
@@ -1305,7 +1622,7 @@ mod review_regression_tests {
         std::os::unix::fs::symlink(&outside, req.destinations[0].join("DCIM")).unwrap();
         let out = run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| CopyControl::Continue,
@@ -1331,7 +1648,10 @@ mod review_regression_tests {
         let mut files = scan_source(&req.source_root).unwrap();
         assert!(files.iter().all(|(r, _)| r != "ALIAS.MP4"), "扫描已跳过");
         files.push(("ALIAS.MP4".into(), 9000));
-        let out = run_copy(&req, &files, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(out
             .files
             .iter()
@@ -1346,7 +1666,7 @@ mod review_regression_tests {
         let (_t, req, mut m, project) = setup();
         run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| CopyControl::Continue,
@@ -1355,6 +1675,7 @@ mod review_regression_tests {
         assert!(file_done(
             &m,
             &req.source_root,
+            "CLIP0001.MP4",
             "CLIP0001.MP4",
             9000,
             &req.destinations
@@ -1368,6 +1689,7 @@ mod review_regression_tests {
             !file_done(
                 &m,
                 &req.source_root,
+                "CLIP0001.MP4",
                 "CLIP0001.MP4",
                 9000,
                 &req.destinations
@@ -1383,7 +1705,7 @@ mod review_regression_tests {
         let (_t, req, mut m, project) = setup();
         run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| CopyControl::Continue,
@@ -1392,6 +1714,7 @@ mod review_regression_tests {
         assert!(file_done(
             &m,
             &req.source_root,
+            "CLIP0001.MP4",
             "CLIP0001.MP4",
             9000,
             &req.destinations
@@ -1404,6 +1727,7 @@ mod review_regression_tests {
             !file_done(
                 &m,
                 &req.source_root,
+                "CLIP0001.MP4",
                 "CLIP0001.MP4",
                 9000,
                 &req.destinations
@@ -1419,7 +1743,7 @@ mod review_regression_tests {
         let (tmp, req, mut m, project) = setup();
         run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| CopyControl::Continue,
@@ -1427,7 +1751,7 @@ mod review_regression_tests {
         .unwrap();
         let rel = "DCIM/IMG_0001.JPG";
         assert!(
-            file_done(&m, &req.source_root, rel, 3000, &req.destinations),
+            file_done(&m, &req.source_root, rel, rel, 3000, &req.destinations),
             "基线:正常拷完必须判完成"
         );
         // 把 dest0 的 DCIM 换成指向外部同构树的链接(链下同内容文件)
@@ -1438,7 +1762,7 @@ mod review_regression_tests {
         fs::remove_dir_all(&dcim).unwrap();
         std::os::unix::fs::symlink(&outside, &dcim).unwrap();
         assert!(
-            !file_done(&m, &req.source_root, rel, 3000, &req.destinations),
+            !file_done(&m, &req.source_root, rel, rel, 3000, &req.destinations),
             "目的地中间祖先为链接时不得判完成(经链接读的是外部文件)"
         );
     }
@@ -1456,7 +1780,10 @@ mod review_regression_tests {
         std::os::unix::fs::symlink(&outside, req.source_root.join("LINKED")).unwrap();
         let mut files = scan_source(&req.source_root).unwrap();
         files.push(("LINKED/EVIL.MP4".into(), 64));
-        let out = run_copy(&req, &files, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(out
             .files
             .iter()
@@ -1485,7 +1812,7 @@ mod review_regression_tests {
         .unwrap();
         let out = run_copy(
             &req,
-            &scan_source(&req.source_root).unwrap(),
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
             |_| CopyControl::Continue,
@@ -1497,6 +1824,387 @@ mod review_regression_tests {
                 .any(|f| f.rel_path == "CLIP0001.MP4" && matches!(f.status, FileStatus::Failed(_))),
             "链接目标必须显式失败,不许当作已交付: {:?}",
             out.files
+        );
+    }
+}
+
+/// 「按文件夹多选 + 落盘扁平化」贯通到引擎的回归网。
+/// 关注点:源/目标分离、落点锁定后的续传身份、清单被篡改时的 fail-closed。
+#[cfg(test)]
+mod folder_selection_tests {
+    use super::*;
+    use crate::core::manifest::{self, CopyManifest};
+    use tempfile::tempdir;
+
+    /// 一张两个相机夹、且**跨夹重名**的卡(扁平化的典型冲突场景)。
+    fn make_card(root: &Path) {
+        fs::create_dir_all(root.join("DCIM/100MSDCF")).unwrap();
+        fs::create_dir_all(root.join("DCIM/101MSDCF")).unwrap();
+        fs::create_dir_all(root.join("EMPTY")).unwrap();
+        fs::write(root.join("DCIM/100MSDCF/DSC1.JPG"), vec![1u8; 1000]).unwrap();
+        fs::write(root.join("DCIM/100MSDCF/ONLY.JPG"), vec![2u8; 2000]).unwrap();
+        fs::write(root.join("DCIM/101MSDCF/DSC1.JPG"), vec![3u8; 3000]).unwrap();
+        fs::write(root.join("ROOT.MP4"), vec![4u8; 4000]).unwrap();
+    }
+
+    fn setup(
+        selection: SourceSelection,
+    ) -> (tempfile::TempDir, CopyRequest, CopyManifest, PathBuf) {
+        let tmp = tempdir().unwrap();
+        let card = tmp.path().join("card");
+        make_card(&card);
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let req = CopyRequest {
+            source_root: card,
+            destinations: vec![tmp.path().join("nas/target"), tmp.path().join("bak/target")],
+            task_tag: "fsel".into(),
+            selection,
+        };
+        let m = CopyManifest::new("target", "card", "A7M4_A_ZS", "ZS", "");
+        (tmp, req, m, project)
+    }
+
+    fn folders(list: &[&str]) -> SourceSelection {
+        SourceSelection::Folders(list.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn empty_selection_is_whole_volume() {
+        // 契约:不传/传空数组 = 整卷(老客户端一个字都不用改)
+        assert_eq!(
+            SourceSelection::from_folders(Vec::new()),
+            SourceSelection::WholeVolume
+        );
+        let tmp = tempdir().unwrap();
+        make_card(tmp.path());
+        let (a, _, ta) =
+            scan_selection(tmp.path(), &SourceSelection::from_folders(Vec::new())).unwrap();
+        let (b, _, tb) = scan_selection(tmp.path(), &SourceSelection::WholeVolume).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(ta, tb);
+        assert!(
+            a.iter().all(|p| p.source_rel == p.target_rel),
+            "整卷源即目标"
+        );
+    }
+
+    #[test]
+    fn folder_selection_flattens_and_separates_source_from_target() {
+        let (_t, req, mut m, project) = setup(folders(&["DCIM/100MSDCF"]));
+        let (plan, renamed, total) = scan_selection(&req.source_root, &req.selection).unwrap();
+        assert_eq!(total, 3000);
+        assert!(renamed.is_empty(), "只勾一个夹子不会撞名");
+        m.planned = plan.iter().map(manifest::PlannedFile::from_plan).collect();
+
+        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(out.all_verified);
+        for d in &req.destinations {
+            // 落盘扁平:不带 DCIM/100MSDCF 这层
+            assert!(d.join("DSC1.JPG").is_file());
+            assert!(d.join("ONLY.JPG").is_file());
+            assert!(!d.join("DCIM").exists(), "不得保留源目录结构");
+        }
+        // 源路径没被当成目标用,目标路径也没被当成源用
+        let saved = manifest::load(&project, &m.id).unwrap();
+        let mut keys: Vec<&str> = saved.entries.iter().map(|e| e.rel_path.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["DSC1.JPG", "ONLY.JPG"], "清单键必须是目标落点");
+        let p = saved
+            .planned
+            .iter()
+            .find(|p| p.rel_path == "DSC1.JPG")
+            .unwrap();
+        assert_eq!(p.source(), "DCIM/100MSDCF/DSC1.JPG");
+    }
+
+    #[test]
+    fn renamed_file_resume_is_recognized_by_target_rel() {
+        // 核心断言:落点被改写后,续传要按**目标** rel 认出它已经拷过——
+        // 按源 rel 认的话每次续传都会重拷(且第二次会撞上「目标已存在」)
+        let (_t, req, mut m, project) = setup(folders(&["DCIM/100MSDCF", "DCIM/101MSDCF"]));
+        let (plan, renamed, _) = scan_selection(&req.source_root, &req.selection).unwrap();
+        assert_eq!(renamed.len(), 2, "两个 DSC1.JPG 必须都被改写并留痕");
+        m.planned = plan.iter().map(manifest::PlannedFile::from_plan).collect();
+        m.source_selection = req.selection.to_folders();
+        m.renamed_files = renamed.clone();
+
+        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(out.all_verified);
+        for d in &req.destinations {
+            assert!(d.join("100MSDCF_DSC1.JPG").is_file());
+            assert!(d.join("101MSDCF_DSC1.JPG").is_file());
+            assert!(d.join("ONLY.JPG").is_file());
+        }
+
+        // 续传:同一份锁定的计划再跑一遍,必须全部跳过、零字节
+        let saved = manifest::load(&project, &m.id).unwrap();
+        let resumed: Vec<PlannedFile> = saved.planned.iter().map(|p| p.to_plan()).collect();
+        assert_eq!(resumed, plan, "持久化的计划必须能原样还原");
+        let out2 = run_copy(&req, &resumed, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(
+            out2.files
+                .iter()
+                .all(|f| f.status == FileStatus::SkippedResume),
+            "改名后的续传必须按目标 rel 认出已完成: {:?}",
+            out2.files
+        );
+        assert_eq!(out2.bytes_copied, 0);
+        assert!(out2.all_verified);
+    }
+
+    #[test]
+    fn plan_item_outside_selection_is_refused() {
+        // 清单存在 NAS 上可被改写:把源指到没勾选的夹子 = 拿旧授权读别处的文件
+        let (_t, req, mut m, project) = setup(folders(&["DCIM/100MSDCF"]));
+        let (mut plan, _, _) = scan_selection(&req.source_root, &req.selection).unwrap();
+        plan.push(PlannedFile {
+            source_rel: "DCIM/101MSDCF/DSC1.JPG".into(),
+            target_rel: "偷渡.JPG".into(),
+            size: 3000,
+        });
+        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(
+            out.files
+                .iter()
+                .any(|f| f.rel_path == "偷渡.JPG" && matches!(f.status, FileStatus::Failed(_))),
+            "未勾选目录的文件必须显式失败: {:?}",
+            out.files
+        );
+        assert!(!out.all_verified, "有拒绝项绝不能给可格式化信号");
+        assert!(!req.destinations[0].join("偷渡.JPG").exists());
+    }
+
+    #[test]
+    fn whole_volume_plan_must_keep_source_equal_target() {
+        // 整卷口径下源≠目标只可能来自清单被动过手脚:拒绝,不许悄悄改落点
+        let (_t, req, mut m, project) = setup(SourceSelection::WholeVolume);
+        let plan = vec![PlannedFile {
+            source_rel: "ROOT.MP4".into(),
+            target_rel: "改过的名字.MP4".into(),
+            size: 4000,
+        }];
+        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(matches!(out.files[0].status, FileStatus::Failed(_)));
+        assert!(!req.destinations[0].join("改过的名字.MP4").exists());
+    }
+
+    /// 目标带目录段(越出扁平口径)必须被**选择闸**拒下——这条测的是
+    /// `SourceSelection::allows`;`copy_one` 自己的目标侧路径闸另有直击测试
+    /// (`copy_one_refuses_escaping_target_rel`)。
+    #[test]
+    fn target_rel_escape_is_refused_by_engine() {
+        let (tmp, req, mut m, project) = setup(folders(&[""]));
+        let plan = vec![PlannedFile {
+            source_rel: "ROOT.MP4".into(),
+            target_rel: "../逃逸.MP4".into(),
+            size: 4000,
+        }];
+        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(matches!(out.files[0].status, FileStatus::Failed(_)));
+        assert!(
+            !tmp.path().join("nas/逃逸.MP4").exists() && !tmp.path().join("bak/逃逸.MP4").exists(),
+            "目的地根外不得出现任何写入"
+        );
+    }
+
+    #[test]
+    fn list_source_folders_orders_root_first_and_skips_empty_dirs() {
+        let tmp = tempdir().unwrap();
+        make_card(tmp.path());
+        // 只含空子目录的树同样不该出现:点进去什么都没有
+        fs::create_dir_all(tmp.path().join("EMPTY/更空")).unwrap();
+        fs::create_dir_all(tmp.path().join(".Trashes")).unwrap();
+        fs::write(tmp.path().join(".Trashes/junk"), b"x").unwrap();
+        let (list, unreadable) = list_source_folders(tmp.path()).unwrap();
+        assert!(unreadable.is_empty(), "正常卡不该有读不动的目录");
+        let rels: Vec<&str> = list.iter().map(|f| f.rel_path.as_str()).collect();
+        assert_eq!(
+            rels,
+            vec!["", "DCIM", "DCIM/100MSDCF", "DCIM/101MSDCF"],
+            "卷根恒第一、字典序;空目录与隐藏项不列"
+        );
+        let root = &list[0];
+        assert_eq!(root.file_count, 1, "卷根只算直接子文件");
+        assert_eq!(root.total_bytes, 4000);
+        assert!(root.has_subfolders);
+        let dcim = &list[1];
+        assert_eq!(dcim.file_count, 0, "DCIM 自身没有直接子文件");
+        assert!(dcim.has_subfolders, "只有子目录也要列出来,否则点不进去");
+        assert_eq!(list[2].file_count, 2);
+        assert_eq!(list[2].total_bytes, 3000);
+        assert!(!list[2].has_subfolders);
+    }
+
+    /// 修复:分组内各算前缀,**跨组**仍可能撞到同一个落点
+    /// (根目录本来就有 `100MSDCF_DSC1.JPG`,而 `100MSDCF/DSC1.JPG` 恰好被改成同名)。
+    /// 两个源规划到同一落点 = 后者覆盖前者,必须补序号错开。
+    #[test]
+    fn cross_group_target_collision_never_lands_on_one_file() {
+        let f = |rel: &str| (rel.to_string(), 1u64);
+        let (planned, renamed) = plan_flat_targets(&[
+            f("100MSDCF/DSC1.JPG"),
+            f("101MSDCF/DSC1.JPG"),
+            f("100MSDCF_DSC1.JPG"),
+        ]);
+        let targets: Vec<&str> = planned.iter().map(|p| p.target_rel.as_str()).collect();
+        let uniq: std::collections::HashSet<&&str> = targets.iter().collect();
+        assert_eq!(uniq.len(), targets.len(), "落点必须互不相同: {targets:?}");
+        // 没被改动的原名优先级最高:卡根那个文件一个字都不改
+        let root = planned
+            .iter()
+            .find(|p| p.source_rel == "100MSDCF_DSC1.JPG")
+            .unwrap();
+        assert_eq!(root.target_rel, "100MSDCF_DSC1.JPG");
+        // 让路的那个补序号,并且必须出现在改名清单里(不许静默)
+        let moved = planned
+            .iter()
+            .find(|p| p.source_rel == "100MSDCF/DSC1.JPG")
+            .unwrap();
+        assert_eq!(moved.target_rel, "100MSDCF_DSC1_2.JPG");
+        assert!(renamed
+            .iter()
+            .any(|r| r.target_rel == "100MSDCF_DSC1_2.JPG"));
+    }
+
+    /// 修复:落盘名与原名相同的不算「被改写」,不能混进改名清单
+    /// (契约:`renamed_files` 只含被改写的;否则双确认屏会出现
+    ///  「DSC1.JPG → DSC1.JPG」这种没意义还吓人的条目)。
+    #[test]
+    fn unchanged_name_is_never_reported_as_renamed() {
+        let f = |rel: &str| (rel.to_string(), 1u64);
+        // 卡根的 DSC1.JPG 与 100MSDCF/DSC1.JPG 同名:根那个没有目录可加,保持原名
+        let (planned, renamed) = plan_flat_targets(&[f("DSC1.JPG"), f("100MSDCF/DSC1.JPG")]);
+        let root = planned.iter().find(|p| p.source_rel == "DSC1.JPG").unwrap();
+        assert_eq!(root.target_rel, "DSC1.JPG");
+        assert_eq!(renamed.len(), 1, "只有真被改名的那个进清单: {renamed:?}");
+        assert_eq!(renamed[0].source_rel, "100MSDCF/DSC1.JPG");
+        assert_eq!(renamed[0].target_rel, "100MSDCF_DSC1.JPG");
+    }
+
+    /// 双路评审 P0/P1:目的地(APFS/exFAT/SMB)通常大小写不敏感,
+    /// 按字节判重会规划出两个「不冲突」的落点,拷到第二个时才炸。
+    #[test]
+    fn case_only_difference_counts_as_a_clash() {
+        let f = |rel: &str| (rel.to_string(), 1u64);
+        let (planned, renamed) = plan_flat_targets(&[f("A/DSC1.JPG"), f("B/dsc1.jpg")]);
+        let targets: Vec<&str> = planned.iter().map(|p| p.target_rel.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec!["A_DSC1.JPG", "B_dsc1.jpg"],
+            "必须当成撞名各自加前缀"
+        );
+        assert_eq!(renamed.len(), 2, "两个都被改写,都要进清单");
+    }
+
+    /// 清单可被改写:两项共用一个落点时,第二项会被续传判定当成「已完成」跳过,
+    /// 整批却仍报完成 = 静默漏拷。闸必须在任何副作用之前。
+    #[test]
+    fn duplicate_targets_in_plan_are_refused_before_any_write() {
+        let (_t, req, mut m, project) = setup(folders(&["DCIM/100MSDCF", "DCIM/101MSDCF"]));
+        let plan = vec![
+            PlannedFile {
+                source_rel: "DCIM/100MSDCF/DSC1.JPG".into(),
+                target_rel: "X.JPG".into(),
+                size: 1000,
+            },
+            PlannedFile {
+                source_rel: "DCIM/101MSDCF/DSC1.JPG".into(),
+                target_rel: "x.jpg".into(), // 大小写不同 = 同一个落点
+                size: 3000,
+            },
+        ];
+        let e = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap_err();
+        assert!(e.to_string().contains("同一个落点"), "{e}");
+        assert!(!req.destinations[0].exists(), "拒绝要发生在任何写入之前");
+    }
+
+    /// 落点不许占用引擎内部的 `.ocardpart` 命名空间:临时文件与正式文件同目录,
+    /// 别人的正式文件正好叫某项的 part 名时会被残留清理删掉。
+    #[test]
+    fn target_using_internal_part_suffix_is_refused() {
+        let (_t, req, mut m, project) = setup(folders(&[""]));
+        let plan = vec![PlannedFile {
+            source_rel: "ROOT.MP4".into(),
+            target_rel: format!("ROOT.MP4.{}{}", req.task_tag, PART_SUFFIX),
+            size: 4000,
+        }];
+        let e = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap_err();
+        assert!(e.to_string().contains(PART_SUFFIX), "{e}");
+    }
+
+    /// 目标侧路径闸的**直击**测试:反斜杠段过得了 `allows`(不含 `/`),
+    /// 但过不了 `is_safe_rel`——删掉 copy_one 里目标侧那道闸,本测试必红。
+    #[test]
+    fn copy_one_refuses_escaping_target_rel() {
+        let (_t, req, mut m, project) = setup(folders(&[""]));
+        let plan = vec![PlannedFile {
+            source_rel: "ROOT.MP4".into(),
+            target_rel: r"..\逃逸.MP4".into(),
+            size: 4000,
+        }];
+        assert!(
+            req.selection.allows("ROOT.MP4", r"..\逃逸.MP4"),
+            "前置断言:这条要能过选择闸,才谈得上测目标侧路径闸"
+        );
+        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        assert!(
+            matches!(&out.files[0].status, FileStatus::Failed(e) if e.contains("清单相对路径非法")),
+            "必须被目标侧路径闸拒: {:?}",
+            out.files[0].status
+        );
+    }
+
+    /// 零静默 + 可用性:相机卡上常有 Windows 留下的受限目录
+    /// (`System Volume Information`),它不该让整个文件夹选择器不可用,
+    /// 但被跳过的目录必须逐条报出来。
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subdir_is_skipped_and_reported_not_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        make_card(tmp.path());
+        let locked = tmp.path().join("System Volume Information");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("inside.bin"), b"x").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (list, unreadable) = list_source_folders(tmp.path()).unwrap();
+        // 复原权限,别把不可删目录留给 TempDir
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            list.iter().any(|f| f.rel_path == "DCIM/100MSDCF"),
+            "其余目录必须照常可选"
+        );
+        assert_eq!(
+            unreadable.len(),
+            1,
+            "读不动的目录必须报出来: {unreadable:?}"
+        );
+        assert_eq!(unreadable[0].rel_path, "System Volume Information");
+        assert!(!unreadable[0].reason.is_empty());
+    }
+
+    /// 选择项非法时,扫描入口自己就要拒(续传时选择来自可被改写的 manifest)。
+    #[test]
+    fn scan_selection_refuses_escaping_folder() {
+        let tmp = tempdir().unwrap();
+        make_card(tmp.path());
+        let e = scan_selection(tmp.path(), &folders(&["../外面"])).unwrap_err();
+        assert!(e.to_string().contains("源文件夹路径非法"), "{e}");
+    }
+
+    #[test]
+    fn missing_folder_reports_readable_error_not_empty_list() {
+        // 零静默:选中的夹子没了要说人话,绝不能返回空清单让用户以为卡是空的
+        let tmp = tempdir().unwrap();
+        make_card(tmp.path());
+        let e = scan_selection(tmp.path(), &folders(&["DCIM/199MSDCF"])).unwrap_err();
+        let msg = e.to_string();
+        assert!(
+            msg.contains("DCIM/199MSDCF") && msg.contains("不存在"),
+            "{msg}"
         );
     }
 }

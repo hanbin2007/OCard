@@ -67,8 +67,13 @@ const NOTICE_TITLES: Record<string, string> = {
   "copy-pause-failed": "拷卡暂停/继续失败",
   "delivery-cancelled": "交付打包已取消",
   // 拷卡终态(评审 2.1):全应用最重要的两个事件,必须在任何屏都能听见
-  "copy-task-done": "拷卡完成，本卡可格式化",
+  /* 抬头不许替正文表态:「可格式化」只在整卷时成立,部分拷贝时是反的。
+     抬头写死一句会和正文互相打架,让人按抬头行事——所以抬头只说事件,
+     能不能格式化交给正文按 sourceFolders 分情况说。 */
+  "copy-task-done": "拷卡完成",
   "copy-task-failed": "拷卡失败",
+  /* 后端在部分拷贝完成时另发的告警:卡上还有没拷的内容 */
+  "copy-partial-scope-done": "部分拷贝完成，请勿格式化",
 };
 
 /** 未知 code 也要有体面的抬头，不能露出空白 */

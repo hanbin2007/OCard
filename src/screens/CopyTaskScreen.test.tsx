@@ -389,6 +389,38 @@ describe("文件明细分页", () => {
 
     expect(await screen.findByText(/本卡可格式化/)).toBeDefined();
   });
+
+  /**
+   * ★ 部分拷贝完成时**绝不许**出现「本卡可格式化」。
+   *
+   * 这是全应用后果最重的一句文案：按文件夹拷时卡上还留着没拷的内容，
+   * 照说那句话会引导用户在相机里格式化掉未备份素材，且不可逆。
+   * 范围口径只认后端回填的 `task.sourceFolders`，不看屏内表单状态
+   * （表单在拷贝期间可能已被改动）。
+   */
+  it("★ 部分拷贝完成不许说「可格式化」，且要点名拷了哪些文件夹", async () => {
+    const partial = {
+      ...mockCopyTasks[1],
+      files: [],
+      sourceFolders: ["DCIM/100MSDCF", "PRIVATE/M4ROOT/CLIP"],
+    };
+    render(
+      <App
+        preloaded={{
+          ...preloaded,
+          tasks: [partial],
+          selectedTaskId: partial.id,
+        }}
+      />,
+    );
+
+    const notice = await screen.findByTestId("copy-partial-done");
+    expect(notice.textContent).toMatch(/请勿格式化/);
+    // 拷了哪些必须写出来:只说「部分」而不说「哪部分」等于让人自己猜
+    expect(notice.textContent).toMatch(/DCIM\/100MSDCF/);
+    expect(notice.textContent).toMatch(/PRIVATE\/M4ROOT\/CLIP/);
+    expect(screen.queryByText(/本卡可格式化/)).toBeNull();
+  });
 });
 
 describe("分页与进度事件互不打架", () => {
@@ -676,4 +708,281 @@ describe("切项目的状态隔离(codex 评审 P1)", () => {
     expect(screen.queryByText("确认拷卡信息")).toBeNull();
     expect(screen.getByLabelText("内容标签")).toBeDefined();
   });
+});
+
+/* ------------------------------------------------------------------ *
+ * hero：同一条管道，静止示意 → 运行真值
+ * ------------------------------------------------------------------ */
+
+describe("拷卡 hero 的流向管道", () => {
+  it("没有任务时管道是静止示意：不报 progressbar，只留 data-state=idle", async () => {
+    render(<App preloaded={{ ...preloaded, tasks: [], selectedTaskId: null }} />);
+
+    const bar = await screen.findByTestId("copy-flowbar");
+    expect(bar.getAttribute("data-state")).toBe("idle");
+    // 静止态没有进度可言,报成 progressbar 只会让读屏器念一个假的 0%
+    expect(bar.getAttribute("role")).toBeNull();
+    expect(bar.getAttribute("aria-hidden")).toBe("true");
+    // 动效被关掉也读得出状态:文字状态任何时候都在
+    expect(screen.getByTestId("copy-flow-caption").textContent).toContain("源读一次");
+  });
+
+  it("任务在跑时同一个元素直接承载真实进度（不是换成另一块 UI）", async () => {
+    render(<App preloaded={preloaded} />);
+
+    const bar = await screen.findByTestId("copy-flowbar");
+    expect(bar.getAttribute("data-state")).toBe("running");
+    expect(bar.getAttribute("role")).toBe("progressbar");
+    expect(Number(bar.getAttribute("aria-valuenow"))).toBeGreaterThan(0);
+    // 百分比与速度也跟着上到管道旁边
+    expect(screen.getByTestId("copy-flow-percent")).toBeDefined();
+    expect(screen.getByTestId("copy-flow-caption").textContent).toContain(
+      mockCopyTasks[0].volumeName,
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 源「按文件夹多选」
+ * ------------------------------------------------------------------ */
+
+describe("按文件夹多选", () => {
+  /** 选卷 → 展开文件夹面板 → 等清单出来 */
+  async function openPicker(
+    user: ReturnType<typeof userEvent.setup>,
+    volumeName = "NIKON_Z9",
+  ) {
+    await user.click(screen.getByRole("radio", { name: `选择源卷 ${volumeName}` }));
+    await user.click(screen.getByTestId("copy-folder-toggle"));
+    await screen.findByTestId("copy-folder-list");
+  }
+
+  /** 填齐其余必填项并进入双确认屏 */
+  async function reachConfirm(user: ReturnType<typeof userEvent.setup>) {
+    await addTag(user, "下午径赛");
+    await fillDestinations(user);
+    await user.click(screen.getByRole("button", { name: "开始拷卡" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("confirm-target-folder").textContent).not.toBe("解析中…"),
+    );
+  }
+
+  it("默认整卷：不展开面板，提交也不带 sourceFolders", async () => {
+    const user = userEvent.setup();
+    const spy = vi.spyOn(api, "startCopyTask");
+    render(<App preloaded={preloaded} />);
+
+    expect(screen.getByTestId("copy-source-scope").textContent).toBe("整卷（卡内全部）");
+    expect(screen.queryByTestId("copy-folder-picker")).toBeNull();
+
+    await user.click(screen.getByRole("radio", { name: "选择源卷 NIKON_Z9" }));
+    await reachConfirm(user);
+    // 整卷也照样核算规模,双确认屏永远有「N 个文件」这条真值
+    await waitFor(() =>
+      expect(screen.getByTestId("confirm-plan-scale").textContent).toContain("个文件"),
+    );
+    expect(screen.getByTestId("confirm-source-scope").textContent).toContain("整卷");
+    await user.click(screen.getByTestId("copy-confirm-start"));
+
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+    // 空 = 整卷,但干脆不带这个字段:与老客户端请求体逐字节一致
+    expect(spy.mock.calls[0][0].sourceFolders).toBeUndefined();
+    spy.mockRestore();
+  }, 15000);
+
+  it("列表逐条给出相对路径、直接子文件数、大小与有无子目录", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+    await openPicker(user);
+
+    const list = screen.getByTestId("copy-folder-list");
+    // 卷根恒排第一
+    expect(list.textContent).toContain("（卷根）");
+    // 子目录不递归,自己是独立一条
+    expect(screen.getByLabelText("选择文件夹 DCIM")).toBeDefined();
+    expect(screen.getByLabelText("选择文件夹 DCIM/100MSDCF")).toBeDefined();
+    expect(screen.getByLabelText("选择文件夹 PRIVATE/M4ROOT/CLIP")).toBeDefined();
+    // 只有直接子文件数,不含子目录里的
+    expect(list.textContent).toContain("3 个文件");
+    expect(list.textContent).toContain("含子目录（另有条目）");
+  });
+
+  it("勾选多个文件夹后，双确认屏给出文件数与改名清单", async () => {
+    const user = userEvent.setup();
+    const spy = vi.spyOn(api, "startCopyTask");
+    render(<App preloaded={preloaded} />);
+    await openPicker(user);
+
+    await user.click(screen.getByLabelText("选择文件夹 DCIM/100MSDCF"));
+    await user.click(screen.getByLabelText("选择文件夹 DCIM/101MSDCF"));
+    expect(screen.getByTestId("copy-source-scope").textContent).toBe("已选 2 个文件夹");
+
+    await reachConfirm(user);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("confirm-plan-scale").textContent).toContain("6 个文件"),
+    );
+    // 改名 = 系统替用户改了文件名,必须逐条明示
+    const renames = screen.getByTestId("confirm-renames");
+    expect(renames.textContent).toContain("4 个文件将被系统自动改名");
+    expect(renames.textContent).toContain("DCIM/100MSDCF/C0001.MP4");
+    expect(renames.textContent).toContain("100MSDCF_C0001.MP4");
+    expect(renames.textContent).toContain("101MSDCF_C0001.MP4");
+
+    await user.click(screen.getByTestId("copy-confirm-start"));
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+    expect(spy.mock.calls[0][0].sourceFolders).toEqual([
+      "DCIM/100MSDCF",
+      "DCIM/101MSDCF",
+    ]);
+    spy.mockRestore();
+  }, 20000);
+
+  it("改名条数多时折叠，但「共几条」始终可见", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+    await openPicker(user);
+
+    await user.click(screen.getByLabelText("选择文件夹 DCIM/100MSDCF"));
+    await user.click(screen.getByLabelText("选择文件夹 DCIM/101MSDCF"));
+    await user.click(screen.getByLabelText("选择文件夹 PRIVATE/M4ROOT/CLIP"));
+    await reachConfirm(user);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("confirm-renames").textContent).toContain(
+        "7 个文件将被系统自动改名",
+      ),
+    );
+    // 折的只是明细,数量任何时候都在
+    expect(screen.getAllByTestId("confirm-rename-item")).toHaveLength(5);
+    await user.click(screen.getByTestId("confirm-renames-expand"));
+    expect(screen.getAllByTestId("confirm-rename-item")).toHaveLength(7);
+  }, 20000);
+
+  it("planSourceSelection 失败：报错 + 重试，绝不静默退回整卷继续", async () => {
+    const user = userEvent.setup();
+    const startSpy = vi.spyOn(api, "startCopyTask");
+    const planSpy = vi
+      .spyOn(api, "planSourceSelection")
+      .mockRejectedValue(new Error("卡上目录读不动"));
+
+    render(<App preloaded={preloaded} />);
+    await openPicker(user);
+    await user.click(screen.getByLabelText("选择文件夹 DCIM/100MSDCF"));
+    await reachConfirm(user);
+
+    const banner = await screen.findByTestId("copy-plan-error");
+    expect(banner.textContent).toContain("无法核算本次拷贝范围");
+    // 没有改名清单就开跑 = 静默改名:确认按钮必须是死的
+    expect(
+      (screen.getByTestId("copy-confirm-start") as HTMLButtonElement).disabled,
+    ).toBe(true);
+    await user.click(screen.getByTestId("copy-confirm-start"));
+    expect(startSpy).not.toHaveBeenCalled();
+
+    planSpy.mockResolvedValueOnce({
+      fileCount: 3,
+      totalBytes: 1024,
+      renamedFiles: [],
+    });
+    await user.click(screen.getByTestId("copy-plan-retry"));
+    await waitFor(() =>
+      expect(screen.getByTestId("confirm-plan-scale").textContent).toContain("3 个文件"),
+    );
+    expect(
+      (screen.getByTestId("copy-confirm-start") as HTMLButtonElement).disabled,
+    ).toBe(false);
+
+    planSpy.mockRestore();
+    startSpy.mockRestore();
+  }, 20000);
+
+  it("listSourceFolders 失败：就地报错 + 重试，范围仍停在整卷", async () => {
+    const user = userEvent.setup();
+    const spy = vi
+      .spyOn(api, "listSourceFolders")
+      .mockRejectedValue(new Error("卡被拔了"));
+
+    render(<App preloaded={preloaded} />);
+    await user.click(screen.getByRole("radio", { name: "选择源卷 NIKON_Z9" }));
+    await user.click(screen.getByTestId("copy-folder-toggle"));
+
+    const banner = await screen.findByTestId("copy-folder-error");
+    expect(banner.textContent).toContain("卡被拔了");
+    expect(screen.getByTestId("copy-source-scope").textContent).toBe("整卷（卡内全部）");
+
+    spy.mockRestore();
+    await user.click(screen.getByTestId("copy-folder-retry"));
+    expect(await screen.findByTestId("copy-folder-list")).toBeDefined();
+  }, 15000);
+
+  it("切到「按文件夹」却一个没勾：拦下提交，不静默按整卷跑", async () => {
+    const user = userEvent.setup();
+    const spy = vi.spyOn(api, "startCopyTask");
+    render(<App preloaded={preloaded} />);
+    await openPicker(user);
+
+    await user.click(screen.getByTestId("copy-scope-folders"));
+    await addTag(user, "下午径赛");
+    await fillDestinations(user);
+    await user.click(screen.getByRole("button", { name: "开始拷卡" }));
+
+    expect(screen.getByTestId("copy-folder-error-empty").textContent).toContain(
+      "至少勾一个",
+    );
+    expect(screen.queryByText("确认拷卡信息")).toBeNull();
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  }, 15000);
+
+  it("换源卷会清掉文件夹选择，并且出声（路径属于上一张卡）", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+    await openPicker(user);
+    await user.click(screen.getByLabelText("选择文件夹 DCIM/100MSDCF"));
+    expect(screen.getByTestId("copy-source-scope").textContent).toBe("已选 1 个文件夹");
+
+    await user.click(screen.getByRole("radio", { name: "选择源卷 SONY_A7M4" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("copy-source-scope").textContent).toBe(
+        "整卷（卡内全部）",
+      ),
+    );
+
+    await user.click(screen.getByTestId("notice-bell"));
+    await waitFor(() =>
+      expect(
+        screen
+          .getAllByTestId("notice-item")
+          .some((n) => n.getAttribute("data-code") === "source-folders-reset"),
+      ).toBe(true),
+    );
+  }, 15000);
+});
+
+describe("按文件夹多选的空选择", () => {
+  it("只勾了「只有子目录」的父目录：明说一个文件都不会拷，并拦住开始", async () => {
+    const user = userEvent.setup();
+    const spy = vi.spyOn(api, "startCopyTask");
+    render(<App preloaded={preloaded} />);
+
+    await user.click(screen.getByRole("radio", { name: "选择源卷 NIKON_Z9" }));
+    await user.click(screen.getByTestId("copy-folder-toggle"));
+    await screen.findByTestId("copy-folder-list");
+    // DCIM 自身没有直接子文件,素材都在它的两个子目录里
+    await user.click(screen.getByLabelText("选择文件夹 DCIM"));
+
+    await addTag(user, "下午径赛");
+    await fillDestinations(user);
+    await user.click(screen.getByRole("button", { name: "开始拷卡" }));
+
+    const warn = await screen.findByTestId("confirm-plan-empty");
+    expect(warn.textContent).toContain("一个文件都不会拷");
+    expect(screen.getByTestId("confirm-plan-scale").textContent).toContain("0 个文件");
+    expect(
+      (screen.getByTestId("copy-confirm-start") as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  }, 20000);
 });

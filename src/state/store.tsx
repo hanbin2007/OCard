@@ -247,10 +247,17 @@ function applyProgress(task: CopyTask, event: CopyProgressEvent): CopyTask {
 function terminalNotice(before: CopyTask, after: CopyTask): NoticeDto | null {
   if (before.state === after.state) return null;
   if (after.state === "done") {
+    /* 「可格式化」只在整卷时成立。按文件夹拷时卡上还留着没拷的内容,
+       照旧说那句话会直接引导用户格式化掉未备份素材——这是本项目里
+       后果最重的一句文案,宁可啰嗦也不能省(后端另发 copy-partial-scope-done)。 */
+    const partial = (after.sourceFolders?.length ?? 0) > 0;
     return {
       level: "info",
       code: "copy-task-done",
-      message: `「${after.volumeName}」校验 100% 通过，本卡可格式化（请在相机内格式化）。`,
+      message: partial
+        ? `「${after.volumeName}」所选 ${after.sourceFolders?.length} 个文件夹校验 100% 通过。` +
+          `本次是部分拷贝，卡上其余内容尚未备份——请勿格式化。`
+        : `「${after.volumeName}」校验 100% 通过，本卡可格式化（请在相机内格式化）。`,
       occurredAt: after.finishedAt ?? new Date().toISOString(),
       taskId: after.id,
       projectId: after.projectId,

@@ -194,6 +194,35 @@ describe("reducer", () => {
     expect(again.notices.filter((n) => n.code === "copy-task-failed").length).toBe(1);
   });
 
+  /**
+   * ★ 全局通知同样不许在部分拷贝后说「可格式化」。
+   *
+   * 拷卡终态大概率不在拷卡屏被看到——用户看到的就是这条 toast/铃铛。
+   * 屏内提示改对了而这里没改,等于漏了最可能被读到的那一处。
+   */
+  it("★ 部分拷贝的完成通知说「请勿格式化」,整卷才说「可格式化」", () => {
+    const partial = {
+      ...runningTask,
+      sourceFolders: ["DCIM/100MSDCF"],
+    };
+    const done = reducer(
+      { ...initialState, tasks: [partial] },
+      { type: "taskProgress", event: progressEvent({ revision: 2, state: "done" }) },
+    );
+    const notice = done.notices.find((n) => n.code === "copy-task-done");
+    expect(notice?.message).toMatch(/请勿格式化/);
+    expect(notice?.message).not.toMatch(/本卡可格式化/);
+
+    // 整卷(sourceFolders 缺省)维持原文案
+    const whole = reducer(
+      { ...initialState, tasks: [runningTask] },
+      { type: "taskProgress", event: progressEvent({ revision: 2, state: "done" }) },
+    );
+    expect(
+      whole.notices.find((n) => n.code === "copy-task-done")?.message,
+    ).toMatch(/本卡可格式化/);
+  });
+
   it("快照对账补出的终态同样出声,但新任务快照不算", () => {
     const seeded = { ...initialState, tasks: [runningTask] };
     const viaSnapshot = reducer(seeded, {

@@ -438,34 +438,200 @@ describe("#24 score 量纲是 0–100", () => {
   });
 });
 
-describe("按判定筛选(筛选组)", () => {
-  it("「建议保留」只留建议保留与尚无判定的", async () => {
+describe("按判定筛选(只留逐张成立的客观指标)", () => {
+  /**
+   * 口径钉子(屏级):后端 analysis.rs:318 只在连拍组内评「建议保留」,
+   * 不成组的单张恒为 false。做成全局筛选就会把非连拍的已判定单张
+   * 整批藏起来 / 整批列成「建议放弃」——这两个选项必须不存在。
+   */
+  it("★ 筛选下拉里没有「建议保留 / 建议放弃」", async () => {
+    const user = userEvent.setup();
+    await renderSorting();
+
+    await user.click(screen.getByTestId("sorting-judge-filter"));
+    const options = screen.getAllByRole("option").map((o) => o.textContent ?? "");
+    expect(options).toEqual(["全部", "糊片", "低分", "未判定"]);
+    expect(options.join(" ")).not.toContain("建议");
+  });
+
+  it("「建议保留」搬去哪了要说清楚,不能凭空消失(零静默)", async () => {
+    await renderSorting();
+    const note = screen.getByTestId("sorting-suggest-moved");
+    expect(note.textContent).toContain("连拍组");
+  });
+
+  it("「糊片」只留 blurry 的那些", async () => {
     const user = userEvent.setup();
     await renderSorting();
     const before = screen.getAllByTestId("asset-cell").length;
 
     await user.click(screen.getByTestId("sorting-judge-filter"));
-    await user.click(screen.getByRole("option", { name: /建议保留/ }));
+    await user.click(screen.getByRole("option", { name: "糊片" }));
     await waitFor(() =>
       expect(screen.getAllByTestId("asset-cell").length).not.toBe(before),
     );
-    // 明确判定为不保留的那些被过滤掉了
-    expect(screen.queryAllByTestId("asset-group")).toHaveLength(0);
+    // mock 里 blurry 的只有 i=5 与连拍组里的 i=41,单件格数一定很少
+    expect(screen.getAllByTestId("asset-cell").length).toBeLessThan(10);
+  });
+});
+
+/**
+ * 连拍组全屏层:网格 → 组层 → 大图 三层,Esc 每次只退一层。
+ * 「建议保留」这个概念的家从全局筛选搬到了这里,所以组层必须把它说全。
+ */
+describe("连拍组全屏层", () => {
+  async function openGroupLayer(user: ReturnType<typeof userEvent.setup>) {
+    await renderSorting();
+    const group = (await screen.findAllByTestId("asset-group"))[0];
+    await user.click(within(group).getByTestId("group-expand"));
+    return screen.findByTestId("group-overlay");
+  }
+
+  it("是全屏层而不是居中对话框,且组内可滚", async () => {
+    const user = userEvent.setup();
+    const layer = await openGroupLayer(user);
+    expect(layer.className).toContain("group-layer");
+    expect(layer.className).not.toContain("dialog");
+    // 滚动交给内部的格子区,层本身不背这个责任
+    const grid = layer.querySelector(".group-layer__grid");
+    expect(grid).not.toBeNull();
   });
 
-  it("「建议放弃」是它的严格反集:批量弃片有了路径(评审 3.6)", async () => {
+  it("组内空格 = 看大图;大图里再按 Esc 退回**组层**,不是一脚踢回网格", async () => {
+    const user = userEvent.setup();
+    const layer = await openGroupLayer(user);
+
+    fireEvent.keyDown(layer, { key: " " });
+    await screen.findByTestId("asset-lightbox");
+    // 组层还在底下待着
+    expect(screen.queryByTestId("group-overlay")).not.toBeNull();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("asset-lightbox")).toBeNull());
+    // 退了一层:组层仍在
+    expect(screen.queryByTestId("group-overlay")).not.toBeNull();
+
+    // 再按一次才回到网格
+    fireEvent.keyDown(screen.getByTestId("group-overlay"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("group-overlay")).toBeNull());
+  });
+
+  it("方向键在组内移动光标", async () => {
+    const user = userEvent.setup();
+    const layer = await openGroupLayer(user);
+    const items = within(layer).getAllByTestId("group-item");
+    expect(items[0].className).toContain("asset--focused");
+
+    fireEvent.keyDown(layer, { key: "ArrowRight" });
+    await waitFor(() => {
+      const after = within(screen.getByTestId("group-overlay")).getAllByTestId(
+        "group-item",
+      );
+      expect(after[1].className).toContain("asset--focused");
+    });
+  });
+
+  /**
+   * 层级语义要自洽:Esc 退回的是这个组,那大图就不该翻得出组外——
+   * 否则翻到第三张组外的图、再 Esc 却回到一个不含它的组。
+   */
+  it("从组层打开的大图,翻页边界是组成员,序号也是组内序号", async () => {
+    const user = userEvent.setup();
+    const layer = await openGroupLayer(user);
+
+    fireEvent.keyDown(layer, { key: " " });
+    await screen.findByTestId("asset-lightbox");
+    // mock 里这一组是 5 张
+    expect(screen.getByTestId("lightbox-position").textContent).toBe("1 / 5");
+    // 范围与全库对不上,必须当面说清是在哪个范围里数的
+    expect(screen.getByTestId("lightbox-scope").textContent).toContain("连拍组内");
+
+    // 往右猛翻,封顶在组内最后一张,绝不越到组外
+    for (let i = 0; i < 12; i += 1) {
+      fireEvent.keyDown(document, { key: "ArrowRight" });
+    }
+    await waitFor(() =>
+      expect(screen.getByTestId("lightbox-position").textContent).toBe("5 / 5"),
+    );
+
+    // 往左猛翻同理,封底在第一张
+    for (let i = 0; i < 12; i += 1) {
+      fireEvent.keyDown(document, { key: "ArrowLeft" });
+    }
+    await waitFor(() =>
+      expect(screen.getByTestId("lightbox-position").textContent).toBe("1 / 5"),
+    );
+  });
+
+  it("从网格直接打开的大图仍走全局摊平列表(两个入口的差别)", async () => {
     const user = userEvent.setup();
     await renderSorting();
 
-    await user.click(screen.getByTestId("sorting-judge-filter"));
-    await user.click(screen.getByRole("option", { name: "建议放弃" }));
-    await waitFor(() => {
-      // mock 里有判定且 suggestedKeep=false 的:i=5、i=7 与连拍组的 4 张
-      const cells = screen.queryAllByTestId("asset-cell");
-      const groups = screen.queryAllByTestId("asset-group");
-      expect(cells.length + groups.length).toBeGreaterThan(0);
-      expect(cells.length).toBeLessThan(10);
+    await user.dblClick(screen.getAllByTestId("asset-cell")[0]);
+    await screen.findByTestId("asset-lightbox");
+    // 全局入口:总数是已加载的整页,不是 5
+    expect(screen.getByTestId("lightbox-position").textContent).not.toContain("/ 5");
+    // 范围就是默认的「全部待分类」,不需要额外说明
+    expect(screen.queryByTestId("lightbox-scope")).toBeNull();
+  });
+
+  it("组层里 Shift+D 直接进确认流,不必先退出组层", async () => {
+    const user = userEvent.setup();
+    const layer = await openGroupLayer(user);
+
+    // 先标一张
+    fireEvent.keyDown(layer, { key: "d" });
+    await waitFor(() =>
+      expect(
+        within(screen.getByTestId("group-overlay")).getByTestId(
+          "group-confirm-delete",
+        ).textContent,
+      ).toContain("1"),
+    );
+
+    fireEvent.keyDown(screen.getByTestId("group-overlay"), {
+      key: "D",
+      shiftKey: true,
     });
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog.textContent).toContain("移入回收站");
+    // 组层 z-index 55 压过普通 .overlay(50):确认框必须抬到 --elevated 才点得到
+    expect(dialog.parentElement?.className).toContain("overlay--elevated");
+  });
+
+  it("待删清单为空时 Shift+D 不静默落空,而是说明为什么", async () => {
+    const user = userEvent.setup();
+    const layer = await openGroupLayer(user);
+
+    // 组层里也看得见「清单为空」这件事(屏底那条被本层盖住了)
+    expect(within(layer).getByTestId("group-pending-empty").textContent).toContain(
+      "待删清单为空",
+    );
+
+    fireEvent.keyDown(layer, { key: "D", shiftKey: true });
+    const toast = await screen.findByTestId("notice-toast-warning");
+    expect(toast.getAttribute("data-code")).toBe("sorting-delete-empty");
+    expect(toast.textContent).toContain("先按 D 标记");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+  });
+
+  it("保留全选 / 反选 / 「保留推荐，其余标删」,并讲清「建议保留」只在组内成立", async () => {
+    const user = userEvent.setup();
+    const layer = await openGroupLayer(user);
+
+    expect(within(layer).getByTestId("group-select-all")).toBeTruthy();
+    expect(within(layer).getByTestId("group-invert")).toBeTruthy();
+    expect(within(layer).getByTestId("group-suggest-scope").textContent).toContain(
+      "只在连拍组内成立",
+    );
+    // mock 组里恰好 1 张 suggestedKeep,按钮可用且说明写在脸上
+    expect(within(layer).getByTestId("group-suggest-count").textContent).toContain(
+      "推荐保留 1 张",
+    );
+
+    await user.click(within(layer).getByTestId("group-keep-recommended"));
+    const bar = await screen.findByTestId("sorting-pending-delete");
+    expect(bar.textContent).toContain("已标记 4 个待删除");
   });
 });
 

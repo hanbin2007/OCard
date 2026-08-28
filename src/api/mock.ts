@@ -21,6 +21,9 @@ import type {
   CopyFileItem,
   CopyTask,
   Project,
+  RenamedFile,
+  SourceFolder,
+  SourcePlan,
   ProjectCards,
   ProjectSettings,
   StorageCard,
@@ -370,6 +373,139 @@ export const mockInspection = {
   latestShotAt: "2026-08-24T11:07:00+08:00",
   fileCount: 12,
 };
+
+/* ---------- 源「按文件夹多选」的 mock（契约 2026-08-28） ---------- */
+
+/**
+ * 卡内目录的 mock 底稿：连**文件名**一起给，plan 才能真算出重名。
+ *
+ * 刻意造出跨目录重名（三处都有 C0001.MP4）——「加前缀 = 系统替用户改了
+ * 文件名」是本次改动最需要被看见的降级，浏览器预览与测试都必须能复现它。
+ */
+interface MockSourceEntry {
+  relPath: string;
+  files: Array<{ name: string; sizeBytes: number }>;
+}
+
+const MOCK_SOURCE_TREE: MockSourceEntry[] = [
+  // 卷根只有一个相机写的索引文件，但它有子目录，按契约要列出来
+  { relPath: "", files: [{ name: "AVCHD_INDEX.BDM", sizeBytes: 24 * MB }] },
+  { relPath: "DCIM", files: [] },
+  {
+    relPath: "DCIM/100MSDCF",
+    files: [
+      { name: "C0001.MP4", sizeBytes: 12.4 * GB },
+      { name: "C0002.MP4", sizeBytes: 9.8 * GB },
+      { name: "C0003.MP4", sizeBytes: 14.1 * GB },
+    ],
+  },
+  {
+    relPath: "DCIM/101MSDCF",
+    files: [
+      { name: "C0001.MP4", sizeBytes: 11.2 * GB },
+      { name: "C0002.MP4", sizeBytes: 13.7 * GB },
+      { name: "C0009.MP4", sizeBytes: 8.6 * GB },
+    ],
+  },
+  { relPath: "PRIVATE", files: [] },
+  { relPath: "PRIVATE/M4ROOT", files: [] },
+  {
+    relPath: "PRIVATE/M4ROOT/CLIP",
+    files: [
+      { name: "C0001.MP4", sizeBytes: 10.9 * GB },
+      // 与 100MSDCF 再撞一个：三个目录一起勾时改名清单会超过折叠阈值，
+      // 「展开查看全部 N 条」这条路径在浏览器预览里也走得到
+      { name: "C0003.MP4", sizeBytes: 7.7 * GB },
+      { name: "C0007.MP4", sizeBytes: 12.0 * GB },
+    ],
+  },
+  {
+    relPath: "PRIVATE/M4ROOT/SUB",
+    files: [{ name: "C0001S01.MP4", sizeBytes: 486 * MB }],
+  },
+];
+
+/** 某条目是否还有子目录（子目录自身另有独立条目） */
+function hasSubfolders(relPath: string): boolean {
+  const prefix = relPath === "" ? "" : `${relPath}/`;
+  return MOCK_SOURCE_TREE.some(
+    (e) =>
+      e.relPath !== relPath &&
+      e.relPath.startsWith(prefix) &&
+      !e.relPath.slice(prefix.length).includes("/"),
+  );
+}
+
+/** `list_source_folders` 的浏览器/测试回退 */
+export function mockSourceFolders(_volumeId: string): SourceFolder[] {
+  return MOCK_SOURCE_TREE
+    // 契约：只列「含直接子文件」或「含子目录」的，空目录不列
+    .filter((e) => e.files.length > 0 || hasSubfolders(e.relPath))
+    .map((e) => ({
+      relPath: e.relPath,
+      fileCount: e.files.length,
+      totalBytes: e.files.reduce((sum, f) => sum + f.sizeBytes, 0),
+      hasSubfolders: hasSubfolders(e.relPath),
+    }))
+    // 契约：relPath 字典序，"" 恒排第一
+    .sort((a, b) =>
+      a.relPath === "" ? -1 : b.relPath === "" ? 1 : a.relPath.localeCompare(b.relPath),
+    );
+}
+
+/**
+ * `plan_source_selection` 的浏览器/测试回退。
+ *
+ * 与后端同一套规则：扁平化后同名的那一组，从最深一级目录名起逐级向上
+ * 追加前缀，直到组内唯一（最短可区分前缀）；不冲突的名字一个字都不改。
+ * `folders` 为空 = 整卷，整卷保留原层级、不会撞名，故改名清单恒为空。
+ */
+export function mockSourcePlan(_volumeId: string, folders: string[]): SourcePlan {
+  if (folders.length === 0) {
+    const all = MOCK_SOURCE_TREE.flatMap((e) => e.files);
+    return {
+      fileCount: all.length,
+      totalBytes: all.reduce((sum, f) => sum + f.sizeBytes, 0),
+      renamedFiles: [],
+    };
+  }
+
+  const picked = MOCK_SOURCE_TREE.filter((e) => folders.includes(e.relPath)).flatMap(
+    (e) => e.files.map((f) => ({ dir: e.relPath, name: f.name, sizeBytes: f.sizeBytes })),
+  );
+
+  const byName = new Map<string, typeof picked>();
+  for (const f of picked) {
+    const bucket = byName.get(f.name);
+    if (bucket) bucket.push(f);
+    else byName.set(f.name, [f]);
+  }
+
+  const renamedFiles: RenamedFile[] = [];
+  for (const [name, group] of byName) {
+    if (group.length < 2) continue;
+    const segments = group.map((f) => (f.dir === "" ? [] : f.dir.split("/")));
+    // 逐级向上加，直到组内唯一；到卷根仍撞名就用完整路径（mock 里到不了）
+    const depth = Math.max(...segments.map((s) => s.length));
+    let level = 1;
+    for (; level <= depth; level += 1) {
+      const names = segments.map((s) => [...s.slice(-level), name].join("_"));
+      if (new Set(names).size === names.length) break;
+    }
+    group.forEach((f, i) => {
+      renamedFiles.push({
+        sourceRel: f.dir === "" ? name : `${f.dir}/${name}`,
+        targetRel: [...segments[i].slice(-level), name].join("_"),
+      });
+    });
+  }
+
+  return {
+    fileCount: picked.length,
+    totalBytes: picked.reduce((sum, f) => sum + f.sizeBytes, 0),
+    renamedFiles,
+  };
+}
 
 export const mockCopyTasks: CopyTask[] = [
   {

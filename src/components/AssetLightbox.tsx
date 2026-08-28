@@ -24,6 +24,7 @@ export function AssetLightbox({
   asset,
   index,
   total,
+  scopeLabel,
   categories = [],
   marked = false,
   curated = false,
@@ -37,6 +38,14 @@ export function AssetLightbox({
   asset: SortingAsset;
   index: number;
   total: number;
+  /**
+   * 「index / total 是在什么范围里数的」。
+   *
+   * 从连拍组进来的大图只在组成员内翻页（Esc 也退回那个组），于是 2/5 这种
+   * 数字与全库总数对不上。范围一旦不是「全部待分类」，就必须当面说清楚，
+   * 否则用户只会以为素材少了。缺省不传 = 全局摊平列表，无需额外说明。
+   */
+  scopeLabel?: string;
   /** 分类清单:动作条按钮与数字键映射都从这来;缺省不渲染动作条 */
   categories?: SortingCategory[];
   /** 当前项已标记待删 */
@@ -135,7 +144,16 @@ export function AssetLightbox({
           onToggleDelete
         ) {
           onToggleDelete();
-        } else return;
+        } else if (action.type === "preview") {
+          // 空格再按一次 = 收起大图(Quick Look 语义:同一个键开、同一个键关)。
+          // onClose 由调用方决定退回哪一层——从连拍组进来的退回组层
+          onClose();
+        }
+        /*
+         * 落到这里的还有 move / toggle / selectAll 之类:本层不支持,
+         * 但**照样吞掉**。不吞的话按键会继续冒泡到底下那层(组全屏层/网格),
+         * 于是「你看着这张大图按了 X」,动的却是背后看不见的另一个光标。
+         */
       }
       e.preventDefault();
       e.stopPropagation();
@@ -158,6 +176,15 @@ export function AssetLightbox({
         <span className="text-xs dim" data-testid="lightbox-position">
           {index + 1} / {total}
         </span>
+        {scopeLabel ? (
+          <span
+            className="text-2xs dim"
+            data-testid="lightbox-scope"
+            title="左右键只在这个范围内翻页；Esc 退回该范围所在的那一层"
+          >
+            （{scopeLabel}）
+          </span>
+        ) : null}
         <span className="text-xs dim mono">{formatBytes(asset.sizeBytes)}</span>
         {asset.shotAt ? (
           <span className="text-xs dim mono">
@@ -302,7 +329,9 @@ export function AssetLightbox({
               {marked ? "取消标删" : "标删"}
             </button>
           ) : null}
-          <span className="text-2xs dim push-right">操作后自动看下一张</span>
+          <span className="text-2xs dim push-right">
+            操作后自动看下一张 · <Kbd>空格</Kbd>/<Kbd>Esc</Kbd> 退一层
+          </span>
         </div>
       ) : null}
     </div>

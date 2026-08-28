@@ -277,6 +277,447 @@
   }
 }
 
+/* 任务区（右列）。双确认屏通栏时它整体换到下一整行,
+   否则会被挤进 380px 的表单列里。 */
+.copy__tasks {
+  display: grid;
+  gap: var(--space-4);
+  align-content: start;
+  min-width: 0;
+}
+
+.copy__tasks--wide {
+  grid-column: 1 / -1;
+}
+
+/* ---------- 拷卡 hero：存储卡 →（管道）→ 目的地 ---------- */
+
+/* 通栏:hero 横跨整个内容区,下半区才是「拷卡设置」与任务详情 */
+.copy-stage {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-5);
+  padding: var(--space-5);
+  border: 1px solid var(--border);
+  border-top-color: var(--border-panel-top);
+  border-radius: var(--radius-lg);
+  background: var(--panel);
+}
+
+.copy-stage__node {
+  display: grid;
+  gap: var(--space-3);
+  align-content: start;
+  min-width: 0;
+}
+
+.copy-stage__art {
+  display: flex;
+  justify-content: center;
+}
+
+.copy-stage__box {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-sunken);
+  min-width: 0;
+}
+
+.copy-stage__box-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.copy-stage__box-title {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: var(--text-secondary);
+}
+
+.copy-stage__note {
+  font-size: var(--text-2xs);
+  color: var(--text-tertiary);
+}
+
+.copy-stage__flow {
+  display: grid;
+  gap: var(--space-3);
+  align-content: center;
+  min-width: 0;
+}
+
+.copy-stage__idle {
+  display: grid;
+  gap: 2px;
+}
+
+.copy-stage__idle-title {
+  font-size: var(--text-md);
+  font-weight: var(--weight-medium);
+  color: var(--text-secondary);
+}
+
+.copy-stage__pipe {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.copy-stage__arrow {
+  color: var(--text-tertiary);
+}
+
+/* 管道的文字状态。动效被关掉时,「现在到底怎么样」全靠这一行,
+   所以它不是装饰,任何状态下都在。 */
+.copy-stage__caption {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.copy-stage__readout {
+  font-size: var(--text-2xs);
+  color: var(--text-tertiary);
+}
+
+/* 中间这列比原先整块仪表区窄:曲线与间距收一收,别把速度数字挤出去 */
+.copy-stage .copy-hero__row {
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.copy-stage .copy-hero__vitals {
+  gap: var(--space-5);
+}
+
+.copy-stage .copy-hero__spark {
+  width: 120px;
+  height: 26px;
+}
+
+/* 主行动按钮:绿色 =「开跑」。--ok 与 --accent 是两条独立色轴,
+   文字色用它自己的 --on-ok(见 tokens.css),不借强调色那一档。 */
+.copy-stage__start {
+  justify-self: end;
+  height: 36px;
+  padding: 0 var(--space-5);
+  background: var(--ok);
+  border-color: var(--ok);
+  color: var(--on-ok);
+  font-size: var(--text-base);
+}
+
+.copy-stage__start:hover:not(:disabled) {
+  background: var(--ok);
+  border-color: var(--ok);
+  filter: brightness(1.08);
+}
+
+.copy-stage__start:active:not(:disabled) {
+  background: var(--ok);
+}
+
+/* ---- 管道本体：静止示意 ⇄ 运行真值，同一个元素 ---- */
+
+.copy-flowbar {
+  position: relative;
+  height: 14px;
+  border-radius: var(--radius-pill);
+  /* 静止态的静态表达:一段虚线管道。reduced-motion 把流光按停之后,
+     「还没开始流」这件事照样看得出来,不依赖那道光。 */
+  background: repeating-linear-gradient(
+    90deg,
+    var(--bg-sunken) 0 8px,
+    var(--border) 8px 10px
+  );
+  overflow: hidden;
+}
+
+/* 一有任务,管道变成实心轨道,同一条上直接承载真实进度 */
+.copy-flowbar:not([data-state="idle"]) {
+  background: var(--bg-sunken);
+}
+
+.copy-flowbar__fill {
+  position: absolute;
+  inset: 0;
+  border-radius: var(--radius-pill);
+  /* 与 .progress__bar 同一套渐变语言:尾部是强调色自身的半透明 */
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--accent) 45%, transparent),
+    var(--accent)
+  );
+  transform: scaleX(0);
+  transform-origin: left center;
+  /* 走 scaleX 不走 width:进度事件每 ~200ms 一条,动 width 就是每帧重排 */
+  transition: transform var(--dur-quick) var(--ease-out);
+}
+
+.copy-flowbar[data-state="done"] .copy-flowbar__fill {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--ok) 45%, transparent),
+    var(--ok)
+  );
+}
+
+.copy-flowbar[data-state="failed"] .copy-flowbar__fill {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--danger) 45%, transparent),
+    var(--danger)
+  );
+}
+
+.copy-flowbar[data-state="paused"] .copy-flowbar__fill {
+  background: var(--border-focus);
+}
+
+/* 流动光效:一束光从左掠到右,读作「数据在往那边流」。
+   静态终态停在轨道右侧之外且完全透明——reduced-motion 把迭代次数压成 1、
+   时长压成 0.01ms 后,它一步落到终态(不可见),流动消失、静态表达仍在。
+   只动 transform / opacity,不碰布局。 */
+.copy-flowbar__sheen {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 36%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--accent) 55%, transparent),
+    transparent
+  );
+  transform: translateX(320%);
+  opacity: 0;
+}
+
+.copy-flowbar[data-state="idle"] .copy-flowbar__sheen,
+.copy-flowbar[data-state="running"] .copy-flowbar__sheen {
+  animation: copy-flow-sheen 2.4s linear infinite;
+}
+
+/* base.css 的全局闸门已经把时长/迭代压到不可见,这里再明写一遍意图:
+   减少动效时流光整条关掉,状态改由虚线管道 + 实心进度 + 下方文字承担。 */
+@media (prefers-reduced-motion: reduce) {
+  .copy-flowbar__sheen {
+    animation: none;
+  }
+}
+
+@keyframes copy-flow-sheen {
+  from {
+    transform: translateX(-110%);
+    opacity: 0;
+  }
+
+  18% {
+    opacity: 0.9;
+  }
+
+  78% {
+    opacity: 0.9;
+  }
+}
+
+/* ---- hero 里的目的地摘要（增删改在下半区的设置里） ---- */
+
+.copy-dest-summary {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.copy-dest-summary__item {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.copy-dest-summary__path {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-secondary);
+}
+
+/* ---------- 双确认屏（通栏：改名清单要地方） ---------- */
+
+.copy-confirm {
+  grid-column: 1 / -1;
+}
+
+.copy-confirm__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-6);
+}
+
+.copy-confirm__folders {
+  display: block;
+  margin-top: var(--space-1);
+  font-size: var(--text-2xs);
+  color: var(--text-tertiary);
+}
+
+.copy-plan {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-sunken);
+}
+
+.copy-plan__label {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.copy-plan__value {
+  font-family: var(--font-mono);
+  font-size: var(--text-lg);
+  color: var(--text-primary);
+}
+
+/* 改名清单:条数可能上百,列表自滚;但「共几条」永远写在上方标题里 */
+.copy-renames {
+  display: grid;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.copy-renames__item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 12px minmax(0, 1fr);
+  gap: var(--space-2);
+  align-items: baseline;
+  font-size: var(--text-2xs);
+}
+
+.copy-renames__from {
+  color: var(--text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+.copy-renames__arrow {
+  color: var(--text-tertiary);
+  text-align: center;
+}
+
+.copy-renames__to {
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+/* 宽屏:左边核对项目/路径,右边核对规模与改名,两栏并读 */
+@media (min-width: 1000px) {
+  .copy-stage {
+    grid-template-columns: minmax(240px, 1fr) minmax(220px, 1.15fr) minmax(240px, 1fr);
+    align-items: start;
+  }
+
+  .copy-stage__flow {
+    align-self: center;
+  }
+
+  .copy-confirm__grid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+
+/* ---------- 源「按文件夹多选」 ---------- */
+
+.folder-scope {
+  display: grid;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border);
+}
+
+.folder-scope__row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.folder-scope__label {
+  font-size: var(--text-2xs);
+  color: var(--text-tertiary);
+}
+
+.folder-scope__value {
+  font-size: var(--text-xs);
+  color: var(--text-primary);
+}
+
+.folder-picker {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel);
+}
+
+.folder-picker__head {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.folder-picker__note {
+  font-size: var(--text-2xs);
+  color: var(--text-secondary);
+}
+
+/* 一张卡里几十个目录很常见:列表自滚,别把 hero 撑成一整屏 */
+.folder-list {
+  display: grid;
+  gap: 2px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.folder-row {
+  display: flex;
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+}
+
+.folder-row:hover {
+  background: var(--hover);
+}
+
+.folder-row .checkbox__label {
+  display: grid;
+  gap: 1px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.folder-row__path {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.folder-row__meta {
+  font-size: var(--text-2xs);
+  color: var(--text-tertiary);
+}
+
 .volume-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -298,8 +739,15 @@
   margin-top: var(--space-2);
 }
 
-.volume-row:hover {
+.volume-row:hover:not(:disabled) {
   border-color: var(--border-strong);
+}
+
+/* 双确认屏开着时源卷被锁死:换了卷而预览还是旧的,等于「对着 A 的
+   预览把任务落进 B」。锁上就要看得出来锁了,不做无声禁用。 */
+.volume-row:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .volume-row[aria-checked="true"],
@@ -343,17 +791,28 @@
   align-items: center;
 }
 
-/* 非 NAS 目的地多一列「选盘…」快捷选择(评审 1.2) */
+/* 非 NAS 目的地多一个「选盘…」快捷选择(评审 1.2)。
+   它不再占第三列:设置列只有 380px,减去卡片内边距约 300px,
+   120(类型) + 116(选盘) + 32(删除) + 三道 8px 间距 = 292px,
+   路径输入框只剩几十像素,实测被压成「/Vol」。改成把「选盘…」放到
+   路径框下面自成一行——路径是这行的主角,不该给快捷入口让位。 */
 .dest-row:has(> :nth-child(4)) {
-  grid-template-columns: var(--dest-kind-col) minmax(0, 1fr) 116px 32px;
+  grid-template-columns: var(--dest-kind-col) minmax(0, 1fr) 32px;
 }
 
-/* ---- 拷卡仪表区：百分比与速度是这块屏的主角 ---- */
-
-.copy-hero {
-  display: grid;
-  gap: var(--space-3);
+.dest-row:has(> :nth-child(4)) > :nth-child(3) {
+  grid-row: 2;
+  grid-column: 2;
+  justify-self: start;
 }
+
+.dest-row:has(> :nth-child(4)) > :nth-child(4) {
+  grid-row: 1;
+  grid-column: 3;
+}
+
+/* ---- 拷卡仪表：百分比与速度。整块已上移到 hero 的管道上方,
+   这里只留排版件（.copy-stage 里再按窄列微调）---- */
 
 .copy-hero__row {
   display: flex;
@@ -422,11 +881,6 @@
   font-size: var(--text-lg);
   line-height: 1.1;
   color: var(--text-primary);
-}
-
-/* 主进度条明显粗于常规：它是仪表，不是装饰，也不能被角落的曲线抢掉分量 */
-.copy-hero__bar .progress {
-  height: 10px;
 }
 
 .task-stats {
@@ -662,6 +1116,14 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  padding: var(--space-3) var(--space-5);
+}
+
+/* 画廊与网格挂在同一个容器里(容器是横向 flex):横向要占满,
+   高度由容器给——.gallery 自己写的是 height:100%,不撑宽就会缩成内容宽 */
+.sorting__grid-wrap > .gallery {
+  flex: 1 1 auto;
+  min-width: 0;
   padding: var(--space-3) var(--space-5);
 }
 
@@ -1018,12 +1480,116 @@
   color: var(--text-secondary);
 }
 
-.group-overlay__grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+/*
+ * 连拍组全屏层。
+ *
+ * 视觉与 .lightbox 同源（满屏遮罩 + 顶栏 + 主体 + 底栏），层级排在它下面一档：
+ * .overlay(50) < .group-layer(55) < .lightbox(60)，
+ * 于是「网格 → 组层 → 大图」这三层在 z 轴上的先后与用户心里的先后一致。
+ *
+ * 有界与内部滚动是这一层的命门（组内可能几十张）。刚踩过的坑：.overlay 是
+ * display:grid 且没写 grid-template-rows，隐式行是 auto —— 内容超过视口时
+ * 行被撑大，子元素的 height/max-height:100% 随之失去约束，内部滚动条永远
+ * 不出现、内容跑出窗口下沿。这里改用最不容易出错的组合：
+ *   固定定位的 flex 列容器（高度 = 视口）
+ *   + 滚动区 flex:1 1 auto 且 min-height:0（flex 子项默认 min-height:auto，
+ *     不写 0 的话内容一多同样会把行撑破，症状与上面那条一模一样）。
+ * 顶栏/工具条/底栏一律 flex:0 0 auto，绝不参与瓜分剩余高度。
+ */
+.group-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+  display: flex;
+  flex-direction: column;
+  background: var(--overlay);
+  animation: scrim-in var(--dur-quick) var(--ease-out);
+}
+
+.group-layer:focus {
+  outline: none;
+}
+
+.group-layer__bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  animation: group-layer-bar-in var(--dur-spring-fast) var(--spring);
+}
+
+@keyframes group-layer-bar-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, -10px, 0);
+  }
+}
+
+.group-layer__tools {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
   gap: var(--space-2);
-  max-height: 50vh;
+  flex-wrap: wrap;
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.group-layer__grid {
+  /* min-height:0 是这层能滚的前提，删掉它就回到「内容跑出窗口下沿」那个 bug */
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
+  /*
+   * 滚到底之后不要把滚动链往上传。
+   *
+   * 当前**恰好**无症状：本层是不透明全屏、body 又全局禁滚，链传不出去。
+   * 但那是外部条件在兜着，不是这一层自己的保证——本层若哪天改成非全屏或
+   * 可穿透，滚轮就会穿到底下的 .sorting__grid 上（组层打开期间它仍是活跃
+   * 滚动容器，滚动位置也还停在原处），直接违反「同一片区域同一时刻只有
+   * 一个容器响应滚轮」。零成本的保险，写死在这里。
+   */
+  overscroll-behavior: contain;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  /* 行不跟着内容拉伸：格子少的时候也保持原始高度，从顶部排起 */
+  grid-auto-rows: max-content;
+  align-content: start;
+  gap: 10px;
+  padding: var(--space-4);
+  animation: group-layer-grid-in var(--dur-spring-fast) var(--spring);
+}
+
+@keyframes group-layer-grid-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+}
+
+/* 全屏铺开就该看得更清楚：格子里的图比网格里高一档 */
+.group-layer__grid .asset__thumb {
+  height: 132px;
+}
+
+.group-layer__foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.group-layer__foot .hint-bar {
+  margin-top: 0;
+  flex: 1 1 auto;
 }
 
 .final-cut__row {

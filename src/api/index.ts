@@ -34,6 +34,8 @@ import {
   mockProjects,
   mockProjectCards,
   mockProjectSettings,
+  mockSourceFolders,
+  mockSourcePlan,
   mockStorageCards,
   mockVolumes,
   mockWorkstation,
@@ -80,6 +82,8 @@ import type {
   ProjectCards,
   ProjectSettings,
   Scenario,
+  SourceFolder,
+  SourcePlan,
   StartCopyInput,
   StorageCard,
   Volume,
@@ -546,6 +550,32 @@ export function listCopyFiles(
   if (IS_TAURI) return ipc("list_copy_files", { taskId, offset, limit });
   const files = mockCopyTasks.find((t) => t.id === taskId)?.files ?? [];
   return reply({ items: files.slice(offset, offset + limit), total: files.length });
+}
+
+/**
+ * 列出卡内可勾选的文件夹（契约 2026-08-28）。
+ *
+ * 勾一个文件夹只拷它的**直接子文件**；子目录不递归，子目录自身是列表里
+ * 另一条独立条目。只列「含直接子文件」或「含子目录」的，空目录不列。
+ */
+export function listSourceFolders(volumeId: string): Promise<SourceFolder[]> {
+  if (IS_TAURI) return ipc("list_source_folders", { volumeId });
+  return reply(mockSourceFolders(volumeId));
+}
+
+/**
+ * 核算这次源选择的规模与改名清单（契约 2026-08-28）。
+ *
+ * 进双确认屏时调用。`folders` 为空 = 整卷（整卷保留原层级，不会撞名，
+ * `renamedFiles` 恒为空）。它与 `previewCopyTask` 是两件事：那个解析
+ * **落盘路径**，这个回答**拷多少、谁被改名**，不许合成一个命令。
+ */
+export function planSourceSelection(
+  volumeId: string,
+  folders: string[],
+): Promise<SourcePlan> {
+  if (IS_TAURI) return ipc("plan_source_selection", { volumeId, folders });
+  return reply(mockSourcePlan(volumeId, folders));
 }
 
 /** 探查源卷：素材时间范围 + 建议时段前缀（PRD §5.3「从素材时间戳自动推断，可改」） */

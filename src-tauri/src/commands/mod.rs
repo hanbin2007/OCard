@@ -872,6 +872,176 @@ pub fn inspect_volume(volume_id: String) -> CmdResult<VolumeInspectionDto> {
     })
 }
 
+// ---------- 源文件夹多选 ----------
+
+/// 源卷可达性闸。零静默:卷不存在/挂载点半死/没权限必须各说各的,
+/// 绝不吞成空列表——用户会把「列不出来」读成「卡是空的」。
+fn ensure_source_volume(root: &Path) -> CmdResult<()> {
+    match std::fs::metadata(root) {
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => Err(format!("源卷路径不是文件夹: {}", root.display())),
+        Err(e) => Err(match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                format!("源卷不存在或已被拔出: {}", root.display())
+            }
+            std::io::ErrorKind::PermissionDenied => format!(
+                "没有访问源卷的权限,请在系统的隐私/磁盘访问设置中授权 OCard 后重试: {}",
+                root.display()
+            ),
+            _ => format!(
+                "源卷不可访问(挂载点可能已断开,建议重新插拔存储卡): {} — {e}",
+                root.display()
+            ),
+        }),
+    }
+}
+
+/// 把前端传来的文件夹列表转成引擎口径的选择。空 = 整卷(契约)。
+/// 每一项都要过相对路径闸:空串(卷根)放行,其余必须是安全相对路径——
+/// `../` 之类等于让拷贝去读卡外的东西。
+fn parse_selection(folders: &[String]) -> CmdResult<copy::SourceSelection> {
+    let mut clean: Vec<String> = Vec::with_capacity(folders.len());
+    for f in folders {
+        if !f.is_empty() && !crate::core::paths::is_safe_rel(f) {
+            return Err(format!("文件夹路径非法,拒绝执行: {f}"));
+        }
+        // 去重按大小写不敏感:卡多是 exFAT,`DCIM` 与 `dcim` 是同一个夹子,
+        // 当成两项会把同一批文件规划两遍(内容重复、落点还不一样)
+        if !clean.iter().any(|c| copy::fold_key(c) == copy::fold_key(f)) {
+            clean.push(f.clone());
+        }
+    }
+    Ok(copy::SourceSelection::from_folders(clean))
+}
+
+/// 扫描期跳过的符号链接聚合告警(链接目标不会被拷贝,必须让用户知道)。
+/// 失败路径也要调用:计数留着会算到下一次操作头上,报数失真。
+fn notice_symlinks_skipped<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let n = copy::take_scan_symlinks_skipped();
+    if n > 0 {
+        notify::warn(
+            app,
+            "copy-symlinks-skipped",
+            format!("源卷上发现 {n} 个符号链接,已跳过(链接目标不会被拷贝)"),
+        );
+    }
+}
+
+/// 目标夹里已存在同名文件的可见告警(不阻断:引擎对同内容复用、异内容拒覆盖,
+/// 但用户有权在开拷**之前**就知道这次会碰上哪些已有文件)。
+fn notice_target_name_clashes<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    plan: &[copy::PlannedFile],
+    dest_targets: &[PathBuf],
+) {
+    let mut clashes: Vec<String> = Vec::new();
+    for d in dest_targets {
+        let Ok(entries) = std::fs::read_dir(d) else {
+            continue; // 目标夹还不存在 = 没有可撞的东西;不可读会在拷贝时显式失败
+        };
+        let existing: std::collections::HashSet<String> = entries
+            .flatten()
+            .map(|e| copy::fold_key(&e.file_name().to_string_lossy()))
+            .collect();
+        for p in plan {
+            // 只看扁平落点(整卷带层级的落点由目录结构天然隔开)
+            if !p.target_rel.contains('/')
+                && existing.contains(&copy::fold_key(&p.target_rel))
+                && !clashes.contains(&p.target_rel)
+            {
+                clashes.push(p.target_rel.clone());
+            }
+        }
+    }
+    if clashes.is_empty() {
+        return;
+    }
+    let shown: Vec<&str> = clashes.iter().take(5).map(|s| s.as_str()).collect();
+    notify::warn(
+        app,
+        "copy-target-name-clash",
+        format!(
+            "目标夹里已有 {} 个同名文件({}{}):内容相同会直接复用,内容不同会在拷到它时报冲突并停在该文件上——请确认这次拷的不是另一张卡的同名素材",
+            clashes.len(),
+            shown.join("、"),
+            if clashes.len() > shown.len() { " 等" } else { "" }
+        ),
+    );
+}
+
+/// 列出源卷里可勾选的文件夹(含卷根)。勾选后只拷该文件夹的直接子文件。
+#[tauri::command(async)]
+pub fn list_source_folders<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    volume_id: String,
+) -> CmdResult<Vec<SourceFolderDto>> {
+    let root = PathBuf::from(&volume_id);
+    ensure_source_volume(&root)?;
+    let listed = copy::list_source_folders(&root);
+    notice_symlinks_skipped(&app);
+    let (folders, unreadable) = listed.map_err(err)?;
+    // 零静默:读不动的子目录被跳过了,必须逐条报出来——否则用户看到的
+    // 文件夹列表是残缺的,而他不会知道
+    if !unreadable.is_empty() {
+        let names: Vec<&str> = unreadable
+            .iter()
+            .take(5)
+            .map(|u| u.rel_path.as_str())
+            .collect();
+        notify::warn(
+            &app,
+            "source-folders-unreadable",
+            format!(
+                "源卷上有 {} 个目录读不动,已从列表中跳过(这些目录里的文件不会被拷贝): {}{} — 首个原因: {}",
+                unreadable.len(),
+                names.join("、"),
+                if unreadable.len() > names.len() {
+                    " 等"
+                } else {
+                    ""
+                },
+                unreadable[0].reason
+            ),
+        );
+    }
+    Ok(folders
+        .into_iter()
+        .map(|f| SourceFolderDto {
+            rel_path: f.rel_path,
+            file_count: f.file_count,
+            total_bytes: f.total_bytes,
+            has_subfolders: f.has_subfolders,
+        })
+        .collect())
+}
+
+/// 规划一次源选择:这次到底要拷多少、有谁会被改名(双确认屏用)。
+/// `folders` 为空 = 整卷(整卷保留原层级,不会撞名,`renamed_files` 恒为空)。
+#[tauri::command(async)]
+pub fn plan_source_selection<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    volume_id: String,
+    folders: Vec<String>,
+) -> CmdResult<SourcePlanDto> {
+    let root = PathBuf::from(&volume_id);
+    ensure_source_volume(&root)?;
+    let selection = parse_selection(&folders)?;
+    let scanned = copy::scan_selection(&root, &selection);
+    notice_symlinks_skipped(&app);
+    let (plan, renamed, total_bytes) = scanned.map_err(err)?;
+    Ok(SourcePlanDto {
+        file_count: plan.len(),
+        total_bytes,
+        renamed_files: renamed
+            .into_iter()
+            .map(|r| RenamedFileDto {
+                source_rel: r.source_rel,
+                target_rel: r.target_rel,
+            })
+            .collect(),
+    })
+}
+
 // ---------- 拷卡任务 ----------
 
 #[tauri::command(async)]
@@ -1007,18 +1177,19 @@ pub fn start_copy_task<R: tauri::Runtime>(
         .ok_or_else(|| format!("相机未登记: {}", input.camera_id))?;
 
     let source_root = PathBuf::from(&input.volume_id);
-    let files = copy::scan_source(&source_root).map_err(err)?;
+    // 空 / 不传 = 整卷(与改造前逐字节同路径);非空 = 按文件夹多选 + 落盘扁平化
+    let selection = parse_selection(&input.source_folders)?;
+    let scanned = copy::scan_selection(&source_root, &selection);
     // 零静默:扫描跳过的符号链接必须让用户知道(链接目标不会被拷贝)
-    let symlinks_skipped = copy::take_scan_symlinks_skipped();
-    if symlinks_skipped > 0 {
-        notify::warn(
-            &app,
-            "copy-symlinks-skipped",
-            format!("源卷上发现 {symlinks_skipped} 个符号链接,已跳过(链接目标不会被拷贝)"),
-        );
-    }
-    if files.is_empty() {
-        return Err("源卷上没有可拷贝的素材".into());
+    notice_symlinks_skipped(&app);
+    let (plan, renamed, _) = scanned.map_err(err)?;
+    if plan.is_empty() {
+        return Err(match &selection {
+            copy::SourceSelection::WholeVolume => "源卷上没有可拷贝的素材".into(),
+            copy::SourceSelection::Folders(_) => {
+                "所选文件夹里没有可拷贝的素材(只拷直接子文件,子目录需要单独勾选)".to_string()
+            }
+        });
     }
     // 源必须是当前真实挂载的卷:这是后面写卡片指纹文件的前提
     // (codex 评审 12:不核实挂载点就写指纹,等于往任意目录塞文件)
@@ -1039,7 +1210,7 @@ pub fn start_copy_task<R: tauri::Runtime>(
         &volume_name,
         &camera.code,
         &op,
-        &files,
+        &plan,
         &m.id,
     )
     .map_err(err)?;
@@ -1095,15 +1266,33 @@ pub fn start_copy_task<R: tauri::Runtime>(
         .iter()
         .map(|p| p.display().to_string())
         .collect();
-    // 持久化完整计划清单:续传/重建以它兜底,源文件消失必须被发现(复核 P0)
-    m.planned = files
-        .iter()
-        .map(|(rel, size)| manifest::PlannedFile {
-            rel_path: rel.clone(),
-            size: *size,
-        })
-        .collect();
+    // 持久化完整计划清单:续传/重建以它兜底,源文件消失必须被发现(复核 P0)。
+    // 落点在此刻锁定(含重名改写结果),续传只认这份,不再重新规划。
+    m.planned = plan.iter().map(manifest::PlannedFile::from_plan).collect();
+    // 审计痕迹:勾了哪些夹子、谁被改了名——事后必须查得到(改名=系统动了用户的文件名)
+    m.source_selection = selection.to_folders();
+    m.renamed_files = renamed;
     manifest::save(&stats.root, &m).map_err(err)?;
+
+    // 零静默,且必须在清单**落盘之后**才说(不然「已写入清单」是空头支票):
+    // 系统替用户改了文件名,双确认屏之外再兜一次底
+    if !m.renamed_files.is_empty() {
+        let r = &m.renamed_files[0];
+        notify::warn(
+            &app,
+            "copy-flatten-renamed",
+            format!(
+                "本次有 {} 个同名文件被加前缀区分(如 {} → {}),完整清单已写入拷卡清单可供事后核对",
+                m.renamed_files.len(),
+                r.source_rel,
+                r.target_rel
+            ),
+        );
+    }
+    // 零静默:扁平化把「目标夹已有同名文件」从边角情形变成常态
+    //(先拷 100MSDCF 再拷 101MSDCF 到同一个夹子)。同名同内容会被复用、
+    // 同名不同内容会在拷到那一刻报冲突——开拷前就该点名,别让人拷到一半才知道
+    notice_target_name_clashes(&app, &plan, &dest_targets);
 
     tasks::append_audit(
         &app,
@@ -1120,6 +1309,9 @@ pub fn start_copy_task<R: tauri::Runtime>(
                 "note": input.note,
                 "tags": input.tags,
                 "targetFolder": dto.target_folder,
+                // 审计:整卷 = 空数组;按夹子拷时连改名条数一并留痕
+                "sourceFolders": m.source_selection,
+                "renamedCount": m.renamed_files.len(),
             }),
         ),
     );
@@ -1147,6 +1339,7 @@ pub fn start_copy_task<R: tauri::Runtime>(
         project_root: stats.root.clone(),
         manifest_id: m.id.clone(),
         source_root: std::sync::Mutex::new(source_root),
+        plan: std::sync::Mutex::new(plan),
         dest_targets,
         machine_id: state.machine_id.clone(),
         config_dir: state.config_dir.clone(),
@@ -1185,15 +1378,38 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         // 都说明清单损坏或被篡改,整单拒绝续传(fail-closed,可见报错),
         // 绝不静默丢弃单条(丢弃=静默漏拷)。闸在卷重解析之前:清单坏了就该
         // 直说,不能先让用户「插回原卡」再报废(R3-F2:也让闸不依赖挂载环境)。
-        if let Some(bad) = m
-            .planned
-            .iter()
-            .find(|p| !crate::core::paths::is_safe_rel(&p.rel_path))
-        {
+        // 源与目标两条路径都要过闸:源侧越界=去卡外读文件,目标侧越界=写到目的地根外
+        if let Some(bad) = m.planned.iter().find(|p| {
+            !crate::core::paths::is_safe_rel(&p.rel_path)
+                || !crate::core::paths::is_safe_rel(p.source())
+        }) {
             return Err(err(format!(
                 "任务清单损坏或被篡改(非法相对路径 {:?}),拒绝续传;请重新发起拷贝",
-                bad.rel_path
+                if crate::core::paths::is_safe_rel(&bad.rel_path) {
+                    bad.source()
+                } else {
+                    &bad.rel_path
+                }
             )));
+        }
+        // 选择本身也是清单的一部分,同样要过闸(复扫会照着它去 read_dir)
+        if let Some(bad) = m
+            .source_selection
+            .iter()
+            .find(|f| !f.is_empty() && !crate::core::paths::is_safe_rel(f))
+        {
+            return Err(err(format!(
+                "任务清单损坏或被篡改(非法源文件夹 {bad:?}),拒绝续传;请重新发起拷贝"
+            )));
+        }
+        // 两个持久化信号必须自洽:`source_selection` 被清空、planned 却带着扁平落点时,
+        // 按整卷解读会把整张卡按原目录结构灌进那个扁平化的目标夹(且悄无声息)。
+        // 反向(选了夹子但源=目标)是合法的——只勾卷根时落点本来就等于源。
+        if m.source_selection.is_empty() && m.planned.iter().any(|p| !p.source_rel.is_empty()) {
+            return Err(err(
+                "任务清单口径自相矛盾(没有源选择记录,计划里却有扁平化落点),拒绝续传;请重新发起拷贝"
+                    .to_string(),
+            ));
         }
         // 只看可移动卷:系统盘永远在场,混进来会让「没有检测到可移动卷」
         // 分支永不可达,报文失真(复验 18)
@@ -1221,49 +1437,107 @@ pub fn resume_copy_task<R: tauri::Runtime>(
             snap.volume_id = resolved.display().to_string();
         }
         // 刷新清单:源卡内容可能在暂停期间变化,快照与引擎必须消费同一份新清单。
-        // 与持久化的计划清单取并集:计划内但已从源消失的文件必须进清单
-        // (引擎会因打不开源文件将其记为失败,绝不静默漏拷,复核 P0)。
         // (planned 的合法性已在上方 manifest 加载后整单校验。)
-        let mut files = copy::scan_source(&resolved).map_err(err)?;
-        let symlinks_skipped = copy::take_scan_symlinks_skipped();
-        if symlinks_skipped > 0 {
-            notify::warn(
-                &app,
-                "copy-symlinks-skipped",
-                format!("源卷上发现 {symlinks_skipped} 个符号链接,已跳过(链接目标不会被拷贝)"),
-            );
-        }
-        for p in &m.planned {
-            if !files.iter().any(|(rel, _)| rel == &p.rel_path) {
-                files.push((p.rel_path.clone(), p.size));
-            }
-        }
-        files.sort();
+        let plan = refresh_resume_plan(&app, &m, &resolved)?;
         let mut snap = handle.snapshot.lock().unwrap();
         let old: std::collections::HashMap<String, &'static str> = snap
             .files
             .iter()
             .map(|f| (f.id.clone(), f.status))
             .collect();
-        snap.total_bytes = files.iter().map(|(_, s)| *s).sum();
-        snap.files = files
+        snap.total_bytes = plan.iter().map(|p| p.size).sum();
+        snap.files = plan
             .iter()
-            .map(|(rel, size)| dto::CopyFileItemDto {
-                id: rel.clone(),
-                path: rel.clone(),
-                name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
-                size_bytes: *size,
-                status: old.get(rel).copied().unwrap_or("pending"),
-                hash: None,
-                error: None,
-                targets: None,
+            .map(|p| {
+                let mut f = tasks::file_item_dto(p);
+                f.status = old.get(&f.id).copied().unwrap_or("pending");
+                f
             })
             .collect();
-        snap.file_count = Some(files.len());
+        snap.file_count = Some(plan.len());
+        *handle.plan.lock().unwrap() = plan;
     }
 
     tasks::spawn_worker(app, handle);
     Ok(())
+}
+
+/// 续传前刷新清单。
+/// - **整卷**:重扫全卷 ∪ 持久化计划——计划内但已从源消失的文件必须留在清单里
+///   (引擎打不开源就记失败,绝不静默漏拷,复核 P0);卡上新增的文件照旧带上。
+/// - **按文件夹**:落点在开拷那一刻就锁定了(重名前缀是拿**整组**文件算出来的,
+///   卡上多一个同名文件会让已拷文件换个落点,续传就认不出它已经拷过),
+///   所以只认持久化计划;卡上新增的文件不悄悄带进来,而是发可见告警让用户另起任务。
+fn refresh_resume_plan<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    m: &manifest::CopyManifest,
+    source_root: &Path,
+) -> CmdResult<Vec<copy::PlannedFile>> {
+    let selection = copy::SourceSelection::from_folders(m.source_selection.clone());
+    if matches!(selection, copy::SourceSelection::WholeVolume) {
+        let mut files = copy::scan_source(source_root).map_err(err)?;
+        notice_symlinks_skipped(app);
+        for p in &m.planned {
+            if !files.iter().any(|(rel, _)| rel == &p.rel_path) {
+                files.push((p.rel_path.clone(), p.size));
+            }
+        }
+        files.sort();
+        return Ok(copy::plan_whole_volume(&files));
+    }
+
+    if m.planned.is_empty() {
+        return Err(
+            "任务清单缺少开拷时锁定的文件列表,无法续传;请重新发起拷卡(不会覆盖已拷素材)".into(),
+        );
+    }
+    let mut plan: Vec<copy::PlannedFile> = m.planned.iter().map(|p| p.to_plan()).collect();
+    // 复查源卡:落点沿用锁定的,**尺寸取当前实际值**——暂停期间文件被改写时,
+    // 沿用旧 size 会让 manifest 记下与实际内容不符的长度(进度也会失真),
+    // 续传下一轮才靠哈希发现问题。失败不阻断续传,但必须可见。
+    let scanned = copy::scan_selection(source_root, &selection);
+    match scanned {
+        Ok((fresh, _, _)) => {
+            notice_symlinks_skipped(app);
+            let mut resized = 0usize;
+            for p in plan.iter_mut() {
+                if let Some(f) = fresh.iter().find(|f| f.source_rel == p.source_rel) {
+                    if f.size != p.size {
+                        resized += 1;
+                        p.size = f.size;
+                    }
+                }
+            }
+            if resized > 0 {
+                notify::warn(
+                    app,
+                    "copy-resume-size-changed",
+                    format!(
+                        "所选文件夹里有 {resized} 个文件在暂停期间大小变了,已按当前实际大小续传;若这不是预期,请核对是否换了卡或有人动过源文件"
+                    ),
+                );
+            }
+            let added = fresh
+                .iter()
+                .filter(|f| !plan.iter().any(|p| p.source_rel == f.source_rel))
+                .count();
+            if added > 0 {
+                notify::warn(
+                    app,
+                    "copy-resume-new-files",
+                    format!(
+                        "所选文件夹里新增了 {added} 个文件,不在本任务开拷时锁定的清单内,本次续传不会拷它们;需要的话请对这些文件另发起一次拷卡"
+                    ),
+                );
+            }
+        }
+        Err(e) => notify::warn(
+            app,
+            "copy-resume-rescan-failed",
+            format!("续传前复查源卷失败,已按开拷时锁定的清单继续(卡上新增的文件不会被发现): {e}"),
+        ),
+    }
+    Ok(plan)
 }
 
 /// 启动时从各项目未完成的 manifest 重建 paused 任务(评审 H3/P0-3):
@@ -1339,50 +1613,50 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
                 .map(|v| v.mount_point.clone())
                 .unwrap_or_default();
             // 重建以完整计划清单为准(entries 只含已处理过的文件,复核 P0);
-            // 旧格式 manifest 无 planned 时退回 entries
-            let files: Vec<CopyFileItemDto> = if m.planned.is_empty() {
+            // 旧格式 manifest 无 planned 时退回 entries(那时源即目标,无扁平化)
+            let plan: Vec<copy::PlannedFile> = if m.planned.is_empty() {
+                if !m.source_selection.is_empty() {
+                    // 按夹子拷的任务没有 planned = 清单残缺:entries 的 rel 是扁平落点,
+                    // 拿它当源路径会指向卡上根本不存在的文件。宁可不重建也不给错清单
+                    notify::warn(
+                        app,
+                        "rebuild-selection-manifest-incomplete",
+                        format!(
+                            "项目「{}」的任务「{}」记录了按文件夹拷贝,却缺少开拷时锁定的文件清单,无法自动续传;重新发起拷卡即可,不会覆盖已有素材",
+                            p.folder_name, m.target_rel
+                        ),
+                    );
+                    continue;
+                }
                 m.entries
                     .iter()
-                    .map(|e| CopyFileItemDto {
-                        id: e.rel_path.clone(),
-                        path: e.rel_path.clone(),
-                        name: e
-                            .rel_path
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(&e.rel_path)
-                            .to_string(),
-                        size_bytes: e.size,
-                        status: if e.verified { "verified" } else { "pending" },
-                        hash: (!e.xxh3.is_empty()).then(|| e.xxh3.clone()),
-                        error: None,
-                        targets: None,
+                    .map(|e| copy::PlannedFile {
+                        source_rel: e.rel_path.clone(),
+                        target_rel: e.rel_path.clone(),
+                        size: e.size,
                     })
                     .collect()
             } else {
-                m.planned
-                    .iter()
-                    .map(|p| CopyFileItemDto {
-                        id: p.rel_path.clone(),
-                        path: p.rel_path.clone(),
-                        name: p
-                            .rel_path
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(&p.rel_path)
-                            .to_string(),
-                        size_bytes: p.size,
-                        status: if m.is_done(&p.rel_path, p.size) {
-                            "verified"
-                        } else {
-                            "pending"
-                        },
-                        hash: None,
-                        error: None,
-                        targets: None,
-                    })
-                    .collect()
+                m.planned.iter().map(|p| p.to_plan()).collect()
             };
+            let files: Vec<CopyFileItemDto> = plan
+                .iter()
+                .map(|p| {
+                    let mut f = tasks::file_item_dto(p);
+                    // 完成状态一律按**目标** rel 认(manifest 口径)
+                    f.status = if m.is_done(&p.target_rel, p.size) {
+                        "verified"
+                    } else {
+                        "pending"
+                    };
+                    f.hash = m
+                        .entries
+                        .iter()
+                        .find(|e| e.rel_path == p.target_rel && !e.xxh3.is_empty())
+                        .map(|e| e.xxh3.clone());
+                    f
+                })
+                .collect();
             let copied: u64 = m
                 .entries
                 .iter()
@@ -1404,6 +1678,7 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
                     .next()
                     .unwrap_or(&m.target_rel)
                     .to_string(),
+                source_folders: m.source_selection.clone(),
                 destinations: m
                     .destinations
                     .iter()
@@ -1438,6 +1713,7 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
                 project_root: p.root.clone(),
                 manifest_id: m.id.clone(),
                 source_root: std::sync::Mutex::new(source_root),
+                plan: std::sync::Mutex::new(plan),
                 dest_targets,
                 machine_id: state.machine_id.clone(),
                 config_dir: state.config_dir.clone(),

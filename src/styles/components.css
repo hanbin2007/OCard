@@ -978,6 +978,24 @@
   inset: 0;
   z-index: 50;
   display: grid;
+  /*
+   * 这一行显式钉成 minmax(0, 1fr),不能省。
+   *
+   * 省掉它只剩一条**隐式 auto 行**:内容比视口矮时 align-content 的 stretch
+   * 把它拉满、一切正常;内容一旦超过视口,这条 auto 行就被内容撑到内容高度——
+   * 于是浮层身上的 height/max-height:100% 解析出来的是「内容高度」而不是
+   * 「一屏」,自封闭的滚动结构整个失效。
+   *
+   * 实测(927px 视口 / 19 条审计事件,见 overflow.test.ts 抬头):
+   *   行 = 1507px → .drawer 高 1507px → 它自己的 minmax(0,1fr) 正文行吃满 1313px
+   *   → .drawer__body 的 scrollHeight === clientHeight === 1313,overflow-y:auto
+   *   永远没有可滚量,列表直接跑出窗口下沿、.drawer__foot 被推到视口外(top=1472)。
+   *
+   * minmax(0,1fr) 的 min=0 是关键:行既不被内容撑大(1fr 只吃自由空间),
+   * 也允许内容溢出它——溢出的那部分交给子元素自己的 overflow 处理,
+   * 这里**不加 overflow:hidden**(那会把内容彻底锁死,是评审判过 P0 的静默 fail-open)。
+   */
+  grid-template-rows: minmax(0, 1fr);
   place-items: center;
   padding: var(--space-6);
   background: var(--overlay);
@@ -1070,6 +1088,24 @@
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   width: min(560px, 100vw);
   height: 100%;
+  /*
+   * 退化态兜底,日常态对用户不存在。
+   *
+   * 头/过滤/脚三条 auto 行加起来 194px 是抽屉的最小骨架;视口比它还矮时,
+   * 骨架会溢出抽屉自己的盒子,脚被推到视口外——正是本次报障的形态。
+   * 挂一条 auto 让抽屉自身能滚,那 14px 就还够得着。
+   *
+   * 实测(933px 视口 / 19 条事件):scrollHeight === clientHeight === 933、
+   * scrollWidth === clientWidth === 559 → 不出条、不吃滚轮,同一时刻只有
+   * .drawer__body 真在滚;560/260px 视口下 maxScrollTop 仍是 0;
+   * 到 180px 才开始有 14px 行程,脚重新可达。
+   * (Tauri 欢迎窗 minHeight=560,所以 194px 这条线现实中够不到;
+   *  留着是因为"够不着"靠的是窗口配置,不是这层样式自己的保证。)
+   *
+   * 用 auto 而不是 hidden:hidden 会把够不着的内容直接锁死,
+   * 是评审判过 P0 的静默 fail-open。
+   */
+  overflow-y: auto;
   border-left: 1px solid var(--border-strong);
   background: var(--panel);
   animation: drawer-in var(--dur-spring-fast) var(--spring);

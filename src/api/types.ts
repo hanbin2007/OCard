@@ -252,6 +252,14 @@ export interface CopyTask {
   tags: string[];
   /** 目标子文件夹名，如 `20260824_DJIRonin4D_B_ZS` 或 `0824上午_A7M4_A_LM` */
   targetFolder: string;
+  /**
+   * 本次拷贝的源范围：空 / 省略 = 整卷；非空 = 只拷了这些文件夹的直接子文件。
+   *
+   * **这不是展示字段**：拷完那句「本卡可格式化」只在整卷时成立。部分拷贝时
+   * 卡上还留着没拷的内容，照说那句话会直接导致用户格式化掉未备份素材。
+   * 任何生成该文案的地方都必须先看它。
+   */
+  sourceFolders?: string[];
   destinations: CopyDestination[];
   /**
    * 文件明细。注意：一张卡上千文件，Rust 侧不要在 `list_copy_tasks` 里全量返回，
@@ -275,6 +283,46 @@ export interface CopyTask {
   finishedAt?: string;
 }
 
+/* ---------- 源「按文件夹多选」（契约 docs/superpowers/specs/2026-08-28-copy-folder-selection-contract.md） ---------- */
+
+/**
+ * 卡内一个可勾选的文件夹。
+ *
+ * 勾选一个文件夹 = 只拷它的**直接子文件**；子目录不递归，
+ * 子目录自身是列表里另一条独立条目（这是用户定的规则，别自作主张改成递归）。
+ */
+export interface SourceFolder {
+  /** 相对卷根，'/' 分隔，无前后斜杠；`""` = 卷根自身的直接子文件 */
+  relPath: string;
+  /** 该文件夹**直接子文件**数（不含子目录内的） */
+  fileCount: number;
+  totalBytes: number;
+  /** 是否还有子目录（子目录自身另有独立条目） */
+  hasSubfolders: boolean;
+}
+
+/**
+ * 一条「系统替用户改了文件名」的记录。
+ *
+ * 扁平化落盘后同名的那一组，会从最深一级目录名起逐级向上追加前缀，
+ * 直到组内唯一。不冲突的文件名一个字都不改（素材名是相机连号，改了对不上）。
+ */
+export interface RenamedFile {
+  sourceRel: string;
+  targetRel: string;
+}
+
+/**
+ * 本次源选择的核算结果：到底拷多少、有谁被改名。
+ * 进双确认屏时拉一次——零静默的依据全在这里，拿不到就不许开跑。
+ */
+export interface SourcePlan {
+  fileCount: number;
+  totalBytes: number;
+  /** **只含被改写的**；没有重名时为空数组 */
+  renamedFiles: RenamedFile[];
+}
+
 /** 发起拷卡任务的提交体 */
 export interface StartCopyInput {
   projectId: string;
@@ -291,6 +339,11 @@ export interface StartCopyInput {
   targetPrefix: string;
   /** 目的地路径列表，至少一个 */
   destinations: Array<{ kind: DestinationKind; path: string }>;
+  /**
+   * 只拷这些文件夹的**直接子文件**，落盘扁平化（不保留文件夹名与层级）。
+   * 空 / 省略 = 整卷（向后兼容：老客户端与老 manifest 行为逐字节不变）。
+   */
+  sourceFolders?: string[];
   /** 拷完自动转代理（工况 A，PRD §5.6） */
   autoProxy?: boolean;
   /**

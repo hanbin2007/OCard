@@ -83,7 +83,7 @@ export function moveCursor(
   return { cursor, anchor, selected: rangeBetween(ids, anchor, cursor) };
 }
 
-/** 空格：切换单项选中，并把焦点与锚点落到它 */
+/** X 键：切换单项选中，并把焦点与锚点落到它（空格已改判给预览，见 resolveShortcut） */
 export function toggleSelection(selection: Selection, id: string): Selection {
   const has = selection.selected.includes(id);
   return {
@@ -228,8 +228,18 @@ export function resolveShortcut(
   if (MOVE_KEYS.includes(key)) {
     return { type: "move", key, extend: Boolean(event.shiftKey) };
   }
-  if (key === " ") return { type: "toggle" };
-  if (key === "Enter") return { type: "preview" };
+  /*
+   * 空格 = 预览(Quick Look 语义)。
+   *
+   * 这是 macOS 上「看一眼这是什么」的通用肌肉记忆(Finder / 照片 / 邮件附件都是它),
+   * 而选片这件事里「看清楚」的频次远高于「加选」——把最顺手的键给了低频动作,
+   * 等于逼着用户每张都先按 Enter。Enter 保留同义,老肌肉记忆不作废。
+   * 让出来的「切换选中」改绑 X:Gmail 系列的 x 就是「勾选这一条」,
+   * 且它离方向键那只手很近,与既有的 P/O/D/U/1–9 全不冲突,
+   * 也不碰 ⌘空格(Spotlight)/Ctrl+空格(输入法)这两个系统键位。
+   */
+  if (key === " " || key === "Enter") return { type: "preview" };
+  if (key === "x" || key === "X") return { type: "toggle" };
   // 网格态 Esc = 清空选区;预览态在上面已拦下作关预览
   if (key === "Escape") return { type: "clearSelection" };
 
@@ -508,32 +518,23 @@ export function flattenEntries<T extends { id: string }>(
   return out;
 }
 
-/** 「按建议筛选」：只保留 AI 建议保留的、以及没有判定结果的 */
-export function filterBySuggestion<
-  T extends { judgement?: { suggestedKeep: boolean } },
->(assets: T[], enabled: boolean): T[] {
-  if (!enabled) return assets;
-  return assets.filter((a) => !a.judgement || a.judgement.suggestedKeep);
-}
-
 /**
- * 判定筛选组(评审 3.6):选片的两个批量动作是「这批全要」和「这批全不要」。
- * 旧的单勾选只支持前一半——「AI 建议放弃的全标删」没有任何路径。
- * keep 沿用旧口径(建议保留 + 未判定,漏判不该被藏起来);
- * drop 是它的严格反集(有判定且不建议保留),两边拼起来恰好覆盖全量。
+ * 判定筛选组。
+ *
+ * **这里绝不能再出现 keep / drop。** 后端 `core/analysis.rs:318` 写死了
+ * `suggested_keep` 的口径:「组内首选(荐优);无组时高分单张也不标(避免噪声)」——
+ * 也就是说,**任何不在连拍组里的单张,哪怕 95 分,suggestedKeep 也恒为 false**。
+ * 于是曾经的两个全局筛选都在说谎:
+ *   keep = `!judgement || suggestedKeep` → 跑完分析后把**所有非连拍的已判定单张**藏光;
+ *   drop = `judgement && !suggestedKeep` → 把那些单张全列成「建议放弃」。
+ * 「建议保留」这个概念只在**连拍组内部**成立,因此它归回组全屏层
+ * (组内「保留推荐,其余标删」+ 封面角标),不做全局筛选项。
+ * 剩下的 blurry / lowScore / unjudged 都是逐张成立的客观指标,可以全局筛。
  */
-export type JudgementFilter =
-  | "all"
-  | "keep"
-  | "drop"
-  | "blurry"
-  | "lowScore"
-  | "unjudged";
+export type JudgementFilter = "all" | "blurry" | "lowScore" | "unjudged";
 
 export const JUDGEMENT_FILTER_LABEL: Record<JudgementFilter, string> = {
   all: "全部",
-  keep: "建议保留（含未判定）",
-  drop: "建议放弃",
   blurry: "糊片",
   lowScore: "低分",
   unjudged: "未判定",
@@ -541,14 +542,10 @@ export const JUDGEMENT_FILTER_LABEL: Record<JudgementFilter, string> = {
 
 export function filterByJudgement<
   T extends {
-    judgement?: { suggestedKeep: boolean; blurry: boolean; score: number };
+    judgement?: { blurry: boolean; score: number };
   },
 >(assets: T[], filter: JudgementFilter, lowScoreAt: number): T[] {
   switch (filter) {
-    case "keep":
-      return assets.filter((a) => !a.judgement || a.judgement.suggestedKeep);
-    case "drop":
-      return assets.filter((a) => a.judgement && !a.judgement.suggestedKeep);
     case "blurry":
       return assets.filter((a) => a.judgement?.blurry);
     case "lowScore":

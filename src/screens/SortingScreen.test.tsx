@@ -286,6 +286,92 @@ describe("分类工作台", () => {
     spy.mockRestore();
   });
 
+  /**
+   * 空格 = 预览（Quick Look 语义）。这是 macOS 上「看一眼这是什么」的通用
+   * 肌肉记忆，选片时「看清楚」的频次也远高于「加选」。切换选中让给 X。
+   */
+  it("空格打开全屏预览（Enter 保持同义）", async () => {
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "ArrowRight" });
+    fireEvent.keyDown(grid(), { key: " " });
+    expect(screen.getByTestId("asset-lightbox")).toBeTruthy();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("asset-lightbox")).toBeNull());
+
+    fireEvent.keyDown(grid(), { key: "Enter" });
+    expect(screen.getByTestId("asset-lightbox")).toBeTruthy();
+  });
+
+  it("X 切换选中；空格不再是选中", async () => {
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "ArrowRight" });
+    fireEvent.keyDown(grid(), { key: "ArrowRight" });
+    expect(screen.getByTestId("sorting-selected-count").textContent).toContain("已选 1");
+
+    // X 取消当前光标项的选中
+    fireEvent.keyDown(grid(), { key: "x" });
+    expect(screen.queryByTestId("sorting-selected-count")).toBeNull();
+
+    // 再按一次加回来
+    fireEvent.keyDown(grid(), { key: "X" });
+    expect(screen.getByTestId("sorting-selected-count").textContent).toContain("已选 1");
+
+    // 空格走的是预览，不动选区
+    fireEvent.keyDown(grid(), { key: " " });
+    expect(screen.getByTestId("asset-lightbox")).toBeTruthy();
+  });
+
+  it("底部提示条不说谎：空格写成预览、选中写成 X", async () => {
+    await renderSorting();
+    const hint = screen.getByTestId("sorting-hint-preview");
+    expect(hint.textContent).toContain("空格");
+    expect(hint.textContent).toContain("预览");
+    const foot = hint.parentElement!;
+    expect(foot.textContent).toContain("X 选中");
+    // 旧文案「空格 选中」必须已经消失
+    expect(foot.textContent).not.toContain("空格 选中");
+  });
+
+  /**
+   * 画廊模式只做接线：组件本体由 components/GalleryView.tsx 负责。
+   * 这里只钉住「切换真的换了视图，且换视图这件事说清楚了」，
+   * 不去断言画廊内部结构——那是它自己的用例的事。
+   */
+  it("工具条能在网格 / 画廊之间切视图，并说明画廊会拆开连拍组", async () => {
+    const user = userEvent.setup();
+    await renderSorting();
+
+    const wrap = grid();
+    expect(wrap.getAttribute("data-view")).toBe("grid");
+    expect(screen.queryByTestId("sorting-gallery-note")).toBeNull();
+
+    await user.click(screen.getByTestId("sorting-view-gallery"));
+    await waitFor(() => expect(grid().getAttribute("data-view")).toBe("gallery"));
+    expect(
+      screen.getByTestId("sorting-view-gallery").getAttribute("aria-pressed"),
+    ).toBe("true");
+    // 画廊把连拍组拆成逐张——计数口径变了就得说破
+    expect(screen.getByTestId("sorting-gallery-note").textContent).toContain(
+      "逐张平铺",
+    );
+
+    await user.click(screen.getByTestId("sorting-view-grid"));
+    await waitFor(() => expect(grid().getAttribute("data-view")).toBe("grid"));
+  });
+
+  it("网格里 Shift+D 遇上空清单也会说明原因，不是按了没反应", async () => {
+    await renderSorting();
+
+    fireEvent.keyDown(grid(), { key: "D", shiftKey: true });
+
+    const toast = await screen.findByTestId("notice-toast-warning");
+    expect(toast.getAttribute("data-code")).toBe("sorting-delete-empty");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+  });
+
   it("Enter 打开全屏预览，左右切换、Esc 关闭", async () => {
     await renderSorting();
 
