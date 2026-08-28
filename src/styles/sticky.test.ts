@@ -130,6 +130,44 @@ describe("侧栏 sticky 契约", () => {
     }
   });
 
+  it("默认窗口宽度足以容纳双栏(否则一打开就是单列)", () => {
+    // 主窗口默认 1280 而双栏断点 1313 —— 一打开就落在单列区间,
+    // 正是这次报障的现场。默认尺寸与断点必须一起看,单独调任何一边都会
+    // 让「默认双栏」这个产品意图悄悄失效。
+    const conf = JSON.parse(
+      readFileSync(resolve(process.cwd(), "src-tauri/tauri.conf.json"), "utf8"),
+    );
+    const win = (label: string) =>
+      conf.app.windows.find((w: { label: string }) => w.label === label);
+
+    const screens = SHEETS.find((x) => x.name === "screens.css")!.css;
+    const bp = (sel: string) => {
+      // 找到承载该侧栏 sticky 的 min-width 断点
+      const m = new RegExp(
+        `@media \\(min-width: (\\d+)px\\) \\{[^@]*?${sel.replace(".", "\\.")} \\{[^}]*position:\\s*sticky`,
+        "s",
+      ).exec(screens);
+      expect(m, `${sel} 应当在某个 min-width 查询里开启 sticky`).not.toBeNull();
+      return Number(m![1]);
+    };
+
+    expect(
+      win("main").width,
+      `主窗口默认宽度必须 ≥ 拷卡/设备屏的双栏断点(${bp(".copy__form")}px)`,
+    ).toBeGreaterThanOrEqual(bp(".copy__form"));
+
+    const shell = SHEETS.find((x) => x.name === "shell.css")!.css;
+    const splitBp = Number(
+      /@media \(min-width: (\d+)px\) \{[^@]*?\.split \{[^}]*grid-template-columns/s.exec(
+        shell,
+      )![1],
+    );
+    expect(
+      win("welcome").width,
+      `欢迎窗口默认宽度必须 ≥ 项目管理页的双栏断点(${splitBp}px)`,
+    ).toBeGreaterThanOrEqual(splitBp);
+  });
+
   it("基础形态是单列(降级方向安全)", () => {
     const sheet = SHEETS.find((s) => s.name === "screens.css")!.css;
     for (const c of [".wizard", ".devices", ".copy"]) {

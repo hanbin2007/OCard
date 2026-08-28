@@ -86,6 +86,171 @@ pub fn take_scan_symlinks_skipped() -> u64 {
     SCAN_SYMLINKS_SKIPPED.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// 源选择:整盘,或卡内若干文件夹(只取各自的**直接子文件**,不递归)。
+///
+/// DIT 常见诉求是「只要 100MSDCF 和 CLIP 里的素材」,而不是整张卡;
+/// 且落到目标夹时不要相机那层目录名。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceSelection {
+    /// 整盘递归(历史行为,保留目录结构)
+    WholeVolume,
+    /// 选中的文件夹(相对卷根、`/` 分隔;空串代表卷根自身)。
+    /// 只取每个文件夹下的直接子文件,子目录需要另行勾选。
+    Folders(Vec<String>),
+}
+
+/// 一个待拷文件:源相对路径(相对卷根)与它在目标夹里的落点。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedFile {
+    /// 卷内真实位置,如 `DCIM/100MSDCF/DSC001.JPG`
+    pub source_rel: String,
+    /// 目标夹内的相对落点。扁平化后通常就是文件名;重名时按下述规则加前缀
+    pub target_rel: String,
+}
+
+/// 因重名而被改写落点的文件(必须让用户看见——系统改了文件名,不许静默)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenamedFile {
+    pub source_rel: String,
+    pub target_rel: String,
+}
+
+/// 列出某个文件夹下的**直接子文件**(不递归)。规则与 `walk` 一致:
+/// 跳过隐藏项与符号链接。
+fn list_direct_files(root: &Path, folder: &str) -> Result<Vec<(String, u64)>> {
+    let dir = if folder.is_empty() {
+        root.to_path_buf()
+    } else {
+        folder
+            .split('/')
+            .fold(root.to_path_buf(), |acc, c| acc.join(c))
+    };
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            SCAN_SYMLINKS_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        let meta = entry.metadata()?;
+        if !meta.is_file() {
+            continue;
+        }
+        let rel = if folder.is_empty() {
+            name
+        } else {
+            format!("{folder}/{name}")
+        };
+        out.push((rel, meta.len()));
+    }
+    Ok(out)
+}
+
+/// 把「源相对路径」列表规划成扁平的目标落点,并解决重名。
+///
+/// 重名规则(用户选定):不改动不冲突的文件名;只给冲突的那些**从最深一级
+/// 目录名开始、逐级向上追加**,直到该组内唯一——即「最短可区分前缀」。
+/// 例:`100MSDCF/DSC1.JPG` 与 `101MSDCF/DSC1.JPG` → `100MSDCF_DSC1.JPG`
+/// 与 `101MSDCF_DSC1.JPG`;若两侧目录名也相同则继续向上取一段。
+///
+/// 排序稳定(按 source_rel),保证同一次选择的规划结果可复现——
+/// manifest 与断点续传依赖 target_rel 稳定。
+pub fn plan_flat_targets(files: &[(String, u64)]) -> (Vec<PlannedFile>, Vec<RenamedFile>) {
+    use std::collections::HashMap;
+
+    let mut by_name: HashMap<&str, Vec<&String>> = HashMap::new();
+    for (rel, _) in files {
+        let base = rel.rsplit('/').next().unwrap_or(rel.as_str());
+        by_name.entry(base).or_default().push(rel);
+    }
+
+    let mut planned = Vec::with_capacity(files.len());
+    let mut renamed = Vec::new();
+
+    for (rel, _) in files {
+        let base = rel.rsplit('/').next().unwrap_or(rel.as_str());
+        let group = &by_name[base];
+        if group.len() == 1 {
+            planned.push(PlannedFile {
+                source_rel: rel.clone(),
+                target_rel: base.to_string(),
+            });
+            continue;
+        }
+        // 冲突:逐级向上追加目录名,直到在该组内唯一
+        let segs: Vec<&str> = rel.split('/').collect();
+        let dirs = &segs[..segs.len().saturating_sub(1)];
+        let mut target = base.to_string();
+        for depth in 1..=dirs.len() {
+            let prefix = dirs[dirs.len() - depth..].join("_");
+            let candidate = format!("{prefix}_{base}");
+            let unique = group.iter().filter(|other| **other != rel).all(|other| {
+                let osegs: Vec<&str> = other.split('/').collect();
+                let odirs = &osegs[..osegs.len().saturating_sub(1)];
+                if odirs.len() < depth {
+                    return true;
+                }
+                odirs[odirs.len() - depth..].join("_") != prefix
+            });
+            target = candidate;
+            if unique {
+                break;
+            }
+        }
+        renamed.push(RenamedFile {
+            source_rel: rel.clone(),
+            target_rel: target.clone(),
+        });
+        planned.push(PlannedFile {
+            source_rel: rel.clone(),
+            target_rel: target,
+        });
+    }
+
+    planned.sort_by(|a, b| a.source_rel.cmp(&b.source_rel));
+    renamed.sort_by(|a, b| a.source_rel.cmp(&b.source_rel));
+    (planned, renamed)
+}
+
+/// 按选择扫描源。整盘 = 历史行为(递归、保留结构);
+/// 选文件夹 = 只取直接子文件、扁平落点(重名按最短前缀区分)。
+pub fn scan_selection(
+    root: &Path,
+    selection: &SourceSelection,
+) -> Result<(Vec<PlannedFile>, Vec<RenamedFile>, u64)> {
+    match selection {
+        SourceSelection::WholeVolume => {
+            let files = scan_source(root)?;
+            let total = files.iter().map(|(_, s)| *s).sum();
+            let planned = files
+                .into_iter()
+                .map(|(rel, _)| PlannedFile {
+                    target_rel: rel.clone(),
+                    source_rel: rel,
+                })
+                .collect();
+            Ok((planned, Vec::new(), total))
+        }
+        SourceSelection::Folders(folders) => {
+            let mut files = Vec::new();
+            for f in folders {
+                files.extend(list_direct_files(root, f)?);
+            }
+            files.sort();
+            files.dedup();
+            let total = files.iter().map(|(_, s)| *s).sum();
+            let (planned, renamed) = plan_flat_targets(&files);
+            Ok((planned, renamed, total))
+        }
+    }
+}
+
 /// 扫描源:递归列出全部普通文件(相对路径统一 `/` 分隔)。
 /// 跳过点开头的隐藏项(存储卡上的 .Trashes/.fseventsd 等系统残留);
 /// 符号链接不跟随(存储卡不产生合法链接),跳过并计数供上层告警。
@@ -533,6 +698,94 @@ fn rel_to_native(rel: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    fn f(rel: &str) -> (String, u64) {
+        (rel.to_string(), 1)
+    }
+
+    #[test]
+    fn flat_plan_keeps_unique_names_untouched() {
+        let (planned, renamed) = plan_flat_targets(&[f("100MSDCF/A.JPG"), f("CLIP/B.MP4")]);
+        assert_eq!(planned[0].target_rel, "A.JPG");
+        assert_eq!(planned[1].target_rel, "B.MP4");
+        // 不冲突就一个字都不改——素材文件名是相机连号,改了就对不上号
+        assert!(renamed.is_empty());
+    }
+
+    #[test]
+    fn flat_plan_disambiguates_only_the_clashing_ones() {
+        let (planned, renamed) = plan_flat_targets(&[
+            f("100MSDCF/DSC1.JPG"),
+            f("101MSDCF/DSC1.JPG"),
+            f("100MSDCF/ONLY.JPG"),
+        ]);
+        let t = |src: &str| {
+            planned
+                .iter()
+                .find(|p| p.source_rel == src)
+                .unwrap()
+                .target_rel
+                .clone()
+        };
+        assert_eq!(t("100MSDCF/DSC1.JPG"), "100MSDCF_DSC1.JPG");
+        assert_eq!(t("101MSDCF/DSC1.JPG"), "101MSDCF_DSC1.JPG");
+        // 没冲突的保持原名
+        assert_eq!(t("100MSDCF/ONLY.JPG"), "ONLY.JPG");
+        // 只有被改写的进入回执清单(要显式告诉用户)
+        assert_eq!(renamed.len(), 2);
+    }
+
+    #[test]
+    fn flat_plan_walks_further_up_when_parent_names_also_collide() {
+        // 两侧最深一级目录名都叫 CLIP:加一级还撞,必须继续向上取
+        let (planned, _) = plan_flat_targets(&[f("A/CLIP/C1.MP4"), f("B/CLIP/C1.MP4")]);
+        let t: Vec<&str> = planned.iter().map(|p| p.target_rel.as_str()).collect();
+        assert_eq!(t, vec!["A_CLIP_C1.MP4", "B_CLIP_C1.MP4"]);
+        // 关键:两个落点必须互不相同,否则就是覆盖
+        assert_ne!(planned[0].target_rel, planned[1].target_rel);
+    }
+
+    #[test]
+    fn flat_plan_is_deterministic() {
+        // 断点续传按 target_rel 认文件:同一组输入必须每次规划出同样的结果
+        let input = [f("B/x.JPG"), f("A/x.JPG"), f("A/y.JPG")];
+        let (p1, _) = plan_flat_targets(&input);
+        let (p2, _) = plan_flat_targets(&input);
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn scan_selection_takes_direct_children_only() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("CLIP/SUB")).unwrap();
+        std::fs::write(root.join("CLIP/a.mp4"), b"aa").unwrap();
+        std::fs::write(root.join("CLIP/SUB/deep.mp4"), b"bbb").unwrap();
+        std::fs::write(root.join("other.txt"), b"c").unwrap();
+
+        let (planned, renamed, total) =
+            scan_selection(root, &SourceSelection::Folders(vec!["CLIP".into()])).unwrap();
+        // 子目录不递归(它自己是另一个可勾选项),卷根的文件也不带进来
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].source_rel, "CLIP/a.mp4");
+        assert_eq!(planned[0].target_rel, "a.mp4");
+        assert_eq!(total, 2);
+        assert!(renamed.is_empty());
+    }
+
+    #[test]
+    fn scan_selection_whole_volume_keeps_structure() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("DCIM/100")).unwrap();
+        std::fs::write(root.join("DCIM/100/a.jpg"), b"a").unwrap();
+
+        let (planned, renamed, _) = scan_selection(root, &SourceSelection::WholeVolume).unwrap();
+        // 整盘仍是历史行为:保留目录结构,不改名
+        assert_eq!(planned[0].source_rel, "DCIM/100/a.jpg");
+        assert_eq!(planned[0].target_rel, "DCIM/100/a.jpg");
+        assert!(renamed.is_empty());
+    }
     use super::*;
     use tempfile::tempdir;
 
