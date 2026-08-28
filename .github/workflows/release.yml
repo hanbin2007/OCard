@@ -68,6 +68,30 @@ jobs:
         run: cargo test
         working-directory: src-tauri
 
+      # 创建 draft 必须是**单点**动作,放在三条平台腿的共同前置里。
+      # 此前是交给 tauri-action 顺手创建:哪条腿先跑完谁创建,后两条 attach。
+      # v0.3.9 三条腿同时没找到 draft、同时去创建,全部被拒
+      # (Resource not accessible by integration),三平台白构建 20 分钟才暴露。
+      # 收敛到这里之后:只有一个创建者、没有竞态;真出问题也在几分钟内就红,
+      # 不用等构建跑完。幂等——draft 已存在(如重推 tag)就跳过。
+      - name: Ensure draft release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release/draft $TAG 已存在,跳过创建"
+            exit 0
+          fi
+          if ! gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+              --title "OCard $TAG" \
+              --notes "产物由 release 工作流附加;齐备后由 finalize 追加标记。"; then
+            echo "::error::创建 draft release 失败。三平台构建已提前中止(不再白跑)。"
+            echo "::error::排查:仓库 Settings→Actions→Workflow permissions 是否允许写入;"
+            echo "::error::本 workflow 顶层已声明 contents: write,可对照 Set up job 日志里的 GITHUB_TOKEN Permissions。"
+            exit 1
+          fi
+
   # Linux / Windows 完全接触不到 Apple 凭据(凭据只进 release-macos)
   release-linux:
     name: Release (linux)
@@ -110,7 +134,7 @@ jobs:
         run: bash scripts/fetch-ffmpeg.sh
 
       - name: Build and attach to GitHub Release
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -163,7 +187,7 @@ jobs:
         run: bash scripts/fetch-ffmpeg.sh
 
       - name: Build and attach to GitHub Release
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -226,7 +250,7 @@ jobs:
         run: bash scripts/fetch-ffmpeg.sh
 
       - name: Build, sign, notarize and attach to GitHub Release
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
