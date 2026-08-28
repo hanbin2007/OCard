@@ -242,6 +242,15 @@ jobs:
       - name: Build app (debug, no bundle)
         run: pnpm tauri build --debug --no-bundle
 
+      # E2E 测的是功能不是动效:进场动画会让元素在点击瞬间还在位移,
+      # webdriver 报 element click intercepted / not interactable(实测把
+      # 建项目用例刷成 flaky)。GTK 关动画 → WebKitGTK 报告
+      # prefers-reduced-motion: reduce → base.css 把动画压到 0.01ms。
+      - name: Disable animations for deterministic E2E
+        run: |
+          mkdir -p ~/.config/gtk-3.0
+          printf '[Settings]\ngtk-enable-animations=0\n' > ~/.config/gtk-3.0/settings.ini
+
       - name: Run E2E smoke
         run: xvfb-run --auto-servernum pnpm --filter ocard-e2e test
 

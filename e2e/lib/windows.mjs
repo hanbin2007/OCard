@@ -44,15 +44,24 @@ export async function createProjectViaWizard(name, scenario) {
   await $('[data-testid="np-name"]').waitForExist({ timeout: 15000 });
   await $('[data-testid="np-name"]').setValue(name);
   await $(`[data-testid="np-scenario-${scenario}"]`).click();
-  // 逐步点「下一步」直到出现「创建项目」(对步骤数量不敏感)
+  // 逐步点「下一步」直到出现「创建项目」(对步骤数量不敏感)。
+  // 每轮都**重新查询**元素,绝不跨 await 缓存句柄:换步会重挂面板,
+  // 缓存下来的句柄下一拍就 stale(CI 实测 stale element reference)。
+  // 点击也要容错:步骤面板有进场动画,动画期间点击可能被判为
+  // intercepted/not interactable——失败就等下一轮重试,而不是炸掉。
   await browser.waitUntil(
     async () => {
       if (await $('[data-testid="np-submit"]').isExisting()) return true;
-      const next = $('[data-testid="npw-next"]');
-      if (await next.isExisting()) await next.click();
+      if (await $('[data-testid="npw-next"]').isExisting()) {
+        try {
+          await $('[data-testid="npw-next"]').click();
+        } catch {
+          return false; // 动画/重挂撞上了,下一轮再来
+        }
+      }
       return false;
     },
-    { timeout: 30000, timeoutMsg: "引导没有走到「确认创建」步" },
+    { timeout: 30000, interval: 300, timeoutMsg: "引导没有走到「确认创建」步" },
   );
   await $('[data-testid="np-submit"]').click();
   // 创建成功 → 主窗口显示并选中新项目;主窗口侧栏有「项目管理」入口
