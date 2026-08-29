@@ -18,6 +18,14 @@
  *    绝不静默停在缩略图上装作没事；
  * 4. 点击放大只在全尺寸到位后才有意义——没到位就不许放大，
  *    否则又回到「放大一团糊还以为是原图」。
+ *
+ * ## RAW：换上来了 ≠ 够用
+ *
+ * RAW 走的是**相机内嵌的那张 JPEG**。它可能是全尺寸，也可能只有半幅、
+ * 甚至只有缩略级——由机身决定。所以这条路上「成功」有四档：
+ * `fullSize / reduced / thumbnailOnly / unknown`，四档各有各的话
+ * （见 `previewNotice`）。把半幅或「不知道多大」当成全尺寸端上去，
+ * 只是把上面那个 bug 换了个方式继续犯。
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -58,6 +66,74 @@ type FullState =
 /** 顶部提示条要说的话；null = 无话可说（全尺寸已到位且是原始像素）。 */
 type Notice = { tone: "warn" | "info" | "danger"; text: string } | null;
 
+/** 秒数写成人话：整数不带小数点，小数留一位 */
+function formatSeconds(sec: number): string {
+  return Number.isInteger(sec) ? String(sec) : sec.toFixed(1);
+}
+
+/**
+ * 视频帧要说的那句话。
+ *
+ * 视频在全屏里给的是**一帧静止画面**，而不是整段素材。不说清这一点，
+ * 用户会拿一个瞬间去替一整条镜头下判断——「这条抖不抖、有没有穿帮」
+ * 在一张静图上根本判不了。所以视频帧**永远**有话说，
+ * 这也是它与 HEIC 的分野：HEIC 解出来的就是照片本身，没有额外的话。
+ */
+function videoFrameText(preview: FullPreview): string {
+  const at =
+    preview.frameAtSec == null
+      ? "开头的一帧（时长读不出，说不准是第几秒）"
+      : `第 ${formatSeconds(preview.frameAtSec)} 秒的一帧`;
+  const total =
+    preview.durationSec == null
+      ? ""
+      : `，整段共 ${formatSeconds(preview.durationSec)} 秒`;
+  return `这是视频${at}${total}——不是整段影像，动态与音画都判不了`;
+}
+
+/**
+ * RAW 内嵌预览**永远**要说的那半句。
+ *
+ * 即便内嵌预览是全尺寸的，它也是**相机机内渲染的 JPEG**：白平衡、风格、
+ * 降噪都按机身设置烤死了，宽容度也不是 RAW 的宽容度。判虚实/对焦够用，
+ * 但「这张欠曝能不能拉回来」这类判断不能拿它当准。不说这一句，
+ * 用户会以为自己在看解出来的 RAW。
+ */
+const RAW_RENDER_CLAUSE =
+  "画面是相机机内渲染的 JPEG（白平衡与风格按机身设置烤死），不是解出来的 RAW";
+
+/**
+ * 四档 adequacy 各自的语气。
+ *
+ * - `fullSize` → info：尺寸这一维**没有**降级，只是要交代来路，
+ *   用告警色会让人以为这张不能用；
+ * - `reduced` → warn：能看构图、看不了细节，是货真价实的降级；
+ * - `thumbnailOnly` → danger：等同于「判不了」，与解码失败同一处境，
+ *   所以给和失败一样的红；
+ * - `unknown` → warn：**不知道**够不够。绝不能因为「说不定是全尺寸」就给 info——
+ *   那就是把「不知道」偷偷当成「够用」，正是这一路要修的那个 bug。
+ */
+const RAW_TONE = {
+  fullSize: "info",
+  reduced: "warn",
+  thumbnailOnly: "danger",
+  unknown: "warn",
+} as const;
+
+/** RAW 内嵌预览要说的那句话（后端原话 + 永远要补的来路交代）。 */
+function rawEmbeddedText(preview: FullPreview): string {
+  // 后端 warning() 只有 fullSize 一档是 null——那一档没有尺寸方面的警示，
+  // 但**仍然**要说清这是内嵌预览，所以这里补一句而不是闭嘴。
+  //
+  // 尺寸取 sourceWidth/Height 而不是 width/height：后者是**呈现**尺寸，
+  // 内嵌预览超过 8192 长边时它已经被缩过了。拿缩放后的数字去说
+  // 「内嵌预览有这么大」，等于在一句用来交代实情的话里报了个假数
+  const head =
+    preview.rawWarning ??
+    `这是相机内嵌的全尺寸 JPEG 预览（${preview.sourceWidth}×${preview.sourceHeight}），判虚实与对焦够用`;
+  return `${head}；${RAW_RENDER_CLAUSE}`;
+}
+
 /**
  * 「现在该跟用户说什么」的唯一真相来源。
  * 抽成纯函数是为了让「提示什么时候出现、什么时候消失」能被单测直接钉住。
@@ -80,15 +156,32 @@ export function previewNotice(full: FullState, hasThumb: boolean): Notice {
       : { tone: "info", text: "正在解码全尺寸原图…" };
   }
   const { preview } = full;
-  if (preview.downscaled) {
-    // 超限降级也要看得见:不说，用户就会拿一张缩放图去数睫毛
-    return {
-      tone: "warn",
-      text:
-        `原图 ${preview.sourceWidth}×${preview.sourceHeight} 超过显示上限，` +
-        `这里是缩放后的 ${preview.width}×${preview.height}——不是原始像素，细节以原片为准`,
-    };
+  // 超限降级也要看得见:不说，用户就会拿一张缩放图去数睫毛。
+  // 视频帧/内嵌预览同时被缩放时两句都得说——两个降级各自独立，
+  // 漏掉哪个都是静默
+  const scaled = preview.downscaled
+    ? // RAW 那一支缩的是**内嵌预览**而不是原图，说成「原图」会让用户
+      // 以为看到的是原始感光尺寸缩下来的。两条支路各叫各的名字
+      `${preview.kind === "rawEmbedded" ? "内嵌预览" : "原图"} ` +
+      `${preview.sourceWidth}×${preview.sourceHeight} 超过显示上限，` +
+      `这里是缩放后的 ${preview.width}×${preview.height}——不是原始像素，细节以原片为准`
+    : null;
+  if (preview.kind === "videoFrame") {
+    const frame = videoFrameText(preview);
+    return { tone: "warn", text: scaled ? `${frame}；${scaled}` : frame };
   }
+  if (preview.kind === "rawEmbedded") {
+    const raw = rawEmbeddedText(preview);
+    // 档位读不出来时按 warn 兜底：绝不 fail-open 成 info。
+    // 「拿不准就当没事」是这条 bug 的另一种写法
+    const base = RAW_TONE[preview.rawAdequacy ?? "unknown"] ?? "warn";
+    // 缩放本身就是一条降级。全尺寸档遇上缩放要跟着升到 warn——
+    // 「内嵌预览够大」不能替「你看到的不是原始像素」消音，
+    // 其它支路的缩放也一律是 warn，这里没有理由更宽松
+    const tone = scaled && base === "info" ? "warn" : base;
+    return { tone, text: scaled ? `${raw}；${scaled}` : raw };
+  }
+  if (scaled) return { tone: "warn", text: scaled };
   // 全尺寸原图已到位且是原始像素:这是**唯一**该闭嘴的情形
   return null;
 }
@@ -447,8 +540,16 @@ export function AssetLightbox({
                 ? zoomed
                   ? "点击还原"
                   : /* 别把 2.4 倍说成「1:1 原始像素」——那是同一类谎话的另一种
-                       说法。说清放大倍数和原图尺寸,用户自己判断够不够看 */
-                    `点击放大 2.4 倍看细节（全尺寸原图 ${full.preview.width}×${full.preview.height}）`
+                       说法。说清放大倍数和原图尺寸,用户自己判断够不够看。
+                       视频帧与 RAW 内嵌预览同理:它们都不是「原图」,
+                       在这里也不许把它们说成原图 */
+                    `点击放大 2.4 倍看细节（${
+                      full.preview.kind === "videoFrame"
+                        ? "这一帧"
+                        : full.preview.kind === "rawEmbedded"
+                          ? "相机内嵌预览"
+                          : "全尺寸原图"
+                    } ${full.preview.width}×${full.preview.height}）`
                 : "全尺寸原图还没到位，放大只会放大缩略图——先等它换上"
             }
             onClick={() => {

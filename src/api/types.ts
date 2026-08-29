@@ -568,6 +568,45 @@ export interface FullPreview {
   downscaled: boolean;
   /** 本次是否命中本机缓存（诊断用；界面不据此改文案） */
   fromCache: boolean;
+  /**
+   * 这张图**是什么**。
+   * - `original`：就是这个素材本身的像素（JPEG / PNG / HEIC）；
+   * - `videoFrame`：视频里抽出来的**一帧**；
+   * - `rawEmbedded`：RAW 里**相机自己渲染进去的那张 JPEG**，不是解出来的 RAW。
+   *
+   * 一帧静止画面代表不了一整条素材——它判不了运动、判不了这条到底拍了什么。
+   * 一张内嵌预览也代表不了 RAW：白平衡与风格由机内决定，而且它**不一定是
+   * 全尺寸**。界面必须据此多说一句，不说就是把「你看到的不是原图」藏起来了。
+   */
+  kind: "original" | "videoFrame" | "rawEmbedded";
+  /**
+   * 视频帧抽的是第几秒。`null` = 时长读不出、退回了开头，说不准具体秒数
+   * （后端宁可不说，也不举一个可能是错的数字）。非视频恒为 `null`。
+   */
+  frameAtSec: number | null;
+  /** 视频整段多长（秒）；读不出或非视频为 `null` */
+  durationSec: number | null;
+  /**
+   * RAW 内嵌预览**够不够拿来判虚实**。非 RAW 恒为 `null`。
+   *
+   * - `fullSize`：长边 ≥ 原图的 90%，可以按 1:1 判对焦；
+   * - `reduced`：半幅级——够看构图，抠不了对焦；
+   * - `thumbnailOnly`：缩略级——放大是插值糊块，**判不了**；
+   * - `unknown`：读不到 RAW 的原始感光尺寸，**不知道**够不够。
+   *
+   * 最后一档是这条契约里最容易被写坏的地方：`unknown` 不是 `fullSize`。
+   * 把「不知道」当成「够用」，正是这一路要修的那个 bug 的成因。
+   */
+  rawAdequacy: "fullSize" | "reduced" | "thumbnailOnly" | "unknown" | null;
+  /**
+   * RAW 内嵌预览要当面说的那句话（后端 `EmbeddedPreview::warning()` 的原话，
+   * 已经写清了内嵌预览多大、原图多大、判得了什么判不了什么）。
+   *
+   * 只有 `fullSize` 一档是 `null`，而那一档**照样有话说**——
+   * 「这是机内渲染的 JPEG，不是解出来的 RAW」那句由界面补（见
+   * `AssetLightbox` 的 `previewNotice`）。所以 `null` ≠ 可以闭嘴。
+   */
+  rawWarning: string | null;
 }
 
 /**

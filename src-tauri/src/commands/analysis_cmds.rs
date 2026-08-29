@@ -302,30 +302,44 @@ fn extract_video_thumb(
         return false;
     }
     let tmp = dir.join(format!(".{}.vthumb.jpg", uuid::Uuid::new_v4()));
-    let args = [
-        "-nostdin",
-        "-hide_banner",
-        "-v",
-        "error",
-        "-protocol_whitelist",
-        "file",
-        "-ss",
-        "0.5",
-        "-i",
-        &abs.to_string_lossy(),
-        "-frames:v",
-        "1",
-        "-vf",
-        "scale=-2:320",
-        "-q:v",
-        "5",
-        "-n",
-        &tmp.to_string_lossy(),
-    ];
-    let ok = matches!(
-        crate::core::ffmpeg::run_with_timeout(bin, &args, std::time::Duration::from_secs(30)),
-        Ok(out) if out.status.success()
-    ) && tmp.is_file();
+    // 取帧时刻与全屏预览**同一个常量**:网格里那张小图和全屏里那一帧
+    // 必须是同一个瞬间。两处各写一个数,用户会看到「网格里是这个画面,
+    // 点开却是另一个画面」,还以为自己点错了素材。
+    // (缓存键不含时刻,所以既有缓存不会因这次改动失效;新生成的按新时刻。)
+    let at = format!("{:.3}", crate::core::preview_ffmpeg::FRAME_AT_SEC);
+    let run = |seek: &str, dest: &std::path::Path| {
+        let args = [
+            "-nostdin",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            "file",
+            "-ss",
+            seek,
+            "-i",
+            &abs.to_string_lossy(),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=-2:320",
+            "-q:v",
+            "5",
+            "-n",
+            &dest.to_string_lossy(),
+        ];
+        matches!(
+            crate::core::ffmpeg::run_with_timeout(bin, &args, std::time::Duration::from_secs(30)),
+            Ok(out) if out.status.success()
+        ) && dest.is_file()
+    };
+    // 比取帧时刻还短的素材:`-ss` 落到最后一帧之后,ffmpeg 一帧都不吐。
+    // 退回第 0 秒重试——缩略图不像全屏预览那样要**声称**自己是第几秒,
+    // 所以这里换一帧不会让界面说错话,能出图就比空占位强
+    let ok = run(&at, &tmp) || {
+        let _ = std::fs::remove_file(&tmp);
+        run("0", &tmp)
+    };
     if !ok {
         let _ = std::fs::remove_file(&tmp);
         return false;
@@ -670,5 +684,130 @@ mod video_thumb_tests {
             "不可解码产物不得计成功"
         );
         assert!(!cache.exists(), "不可解码产物不得留在缓存位");
+    }
+}
+
+/// 视频首帧图(真 ffmpeg sidecar)。
+///
+/// 守两件事:
+/// 1. 取帧时刻与全屏预览**同一个瞬间**——网格里那张小图和点开后看到的
+///    那一帧不是同一画面,用户会以为自己点错了素材;
+/// 2. 比取帧时刻还短的素材要**退回第 0 秒**出图,而不是留一个空占位。
+#[cfg(all(test, unix))]
+mod video_thumb_frame_choice_tests {
+    use super::*;
+
+    /// 仓内 sidecar 的裸名目录(与集成测试同一套口径:缺失即如实跳过,
+    /// 但 CI 上必须已经就位)。
+    fn sidecar() -> Option<PathBuf> {
+        let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-sidecar");
+        std::fs::create_dir_all(&dir).ok()?;
+        for name in ["ffmpeg", "ffprobe"] {
+            let src = std::fs::read_dir(&bins)
+                .ok()?
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().starts_with(&format!("{name}-")))
+                        .unwrap_or(false)
+                        && p.extension().is_none_or(|e| e != "txt")
+                })?;
+            let link = dir.join(name);
+            match std::os::unix::fs::symlink(&src, &link) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return None,
+            }
+            if !link.is_file() {
+                return None;
+            }
+        }
+        Some(dir.join("ffmpeg"))
+    }
+
+    /// 造一段视频:`head_black` 秒黑场 + 其余白场,总长 `total` 秒。
+    fn make_clip(ffmpeg: &PathBuf, dst: &std::path::Path, head_black: f64, total: f64) {
+        let white = total - head_black;
+        let filter = format!(
+            "color=c=black:s=320x180:d={head_black}:r=25[a];\
+             color=c=white:s=320x180:d={white}:r=25[b];[a][b]concat=n=2:v=1[v]"
+        );
+        let out = std::process::Command::new(ffmpeg)
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-filter_complex",
+                &filter,
+                "-map",
+                "[v]",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+            ])
+            .arg(dst)
+            .output()
+            .expect("生成测试视频失败");
+        assert!(
+            out.status.success() && dst.is_file(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// 缩略图的平均亮度(判「取到的是黑场还是白场」)。
+    fn mean_luma(p: &std::path::Path) -> f64 {
+        let rgb = image::open(p).expect("缩略图必须可解码").to_rgb8();
+        rgb.pixels().map(|q| q.0[0] as f64).sum::<f64>() / rgb.pixels().len() as f64
+    }
+
+    #[test]
+    fn thumb_skips_the_black_head_and_falls_back_on_short_clips() {
+        let Some(ffmpeg) = sidecar() else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI 上缺 sidecar:fetch-ffmpeg 步骤未生效,拒绝静默跳过"
+            );
+            eprintln!("跳过:src-tauri/binaries 无 sidecar(先跑 scripts/fetch-ffmpeg.sh)");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // ① 常规素材:前 1 秒黑场。取帧时刻若退回 0,拿到的就是黑帧
+        let long = root.join("C0001.MP4");
+        make_clip(&ffmpeg, &long, 1.0, 4.0);
+        let meta = std::fs::metadata(&long).unwrap();
+        let (size, mt) = (meta.len(), media::mtime_nanos(&meta));
+        assert!(
+            extract_video_thumb(&root, "C0001.MP4", size, mt, &long, Some(&ffmpeg)),
+            "视频必须抽出首帧图"
+        );
+        let cache = media::cached_thumb_path(&root, "C0001.MP4", size, mt);
+        let luma = mean_luma(&cache);
+        assert!(
+            luma > 200.0,
+            "取帧时刻应越过开头的黑场;均值 {luma:.1} 说明取的是黑帧"
+        );
+
+        // ② 比取帧时刻还短的素材:必须退回第 0 秒出图,而不是留空占位
+        let short = root.join("C0002.MP4");
+        make_clip(&ffmpeg, &short, 0.1, 0.4);
+        let meta = std::fs::metadata(&short).unwrap();
+        let (size, mt) = (meta.len(), media::mtime_nanos(&meta));
+        assert!(
+            extract_video_thumb(&root, "C0002.MP4", size, mt, &short, Some(&ffmpeg)),
+            "0.4 秒的素材也要出图:-ss 越界必须退回第 0 秒重试"
+        );
+        assert!(media::cached_thumb_path(&root, "C0002.MP4", size, mt).is_file());
+
+        // ③ 引擎缺失如实返回 false(启动期已有 ffmpeg-missing 可见提示)
+        assert!(!extract_video_thumb(&root, "C0003.MP4", 1, 1, &long, None));
     }
 }

@@ -719,12 +719,26 @@ fn archive_output_ancestor_symlink_refused_through_real_handler() {
 
 // ---------- 真实链路行为级(完整网络会话兑现:行为级验证不再只属于 E2E/CI) ----------
 
-/// 把仓内 target-triple 命名的 sidecar 以裸名注入独立目录,返回该目录。
-/// sidecar 缺失(未跑 scripts/fetch-ffmpeg.sh)时返回 None,调用方如实跳过。
+/// 把仓内 target-triple 命名的 sidecar 以裸名注入一个**进程内共用的固定目录**,
+/// 返回该目录。sidecar 缺失(未跑 scripts/fetch-ffmpeg.sh)时返回 None,
+/// 调用方如实跳过。
+///
+/// 为什么落在 `target/` 而不是各用例自己的 TempDir(修一类假红):
+/// `transcode_cmds` 的 `PROBE_STATE` 是**进程级**缓存,里面存的是 ffmpeg /
+/// ffprobe 的**绝对路径**;而 `transcode_capabilities` 会在后台线程里读
+/// `OCARD_FFMPEG_DIR`,它并不持有 `FFMPEG_ENV_LOCK`。于是只要某个用例在
+/// 别的用例设着 env 的窗口里触发一次探测,这份全局缓存就会记下**那个用例的
+/// 临时目录**;等那个 TempDir 随用例结束被删掉,后面真正用转码的用例就会
+/// 拿着一条死路径去 spawn,报出 `No such file or directory`——一个和被测
+/// 逻辑毫无关系的假红,而且只在并行跑全量时出现。
+///
+/// 固定目录让「被别人缓存下来的路径」始终有效,从根上消掉这一类竞态。
 #[cfg(unix)]
-fn stage_sidecar_dir(tmp: &std::path::Path) -> Option<std::path::PathBuf> {
+fn stage_sidecar_dir(_tmp: &std::path::Path) -> Option<std::path::PathBuf> {
     let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries");
-    let dir = tmp.join("ffmpeg-dir");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-sidecar");
     std::fs::create_dir_all(&dir).ok()?;
     for name in ["ffmpeg", "ffprobe"] {
         let src = std::fs::read_dir(&bins)
@@ -737,7 +751,17 @@ fn stage_sidecar_dir(tmp: &std::path::Path) -> Option<std::path::PathBuf> {
                     .unwrap_or(false)
                     && p.extension().is_none_or(|e| e != "txt")
             })?;
-        std::os::unix::fs::symlink(src, dir.join(name)).ok()?;
+        let link = dir.join(name);
+        // 目录是共用的:并行用例会同时来铺,已经铺好就直接用。
+        // 但要验一眼链接确实指得到东西——半截的链接比没有还糟
+        match std::os::unix::fs::symlink(&src, &link) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+        if !link.is_file() {
+            return None;
+        }
     }
     Some(dir)
 }
@@ -2888,7 +2912,9 @@ fn full_preview_returns_native_pixels_and_names_every_failure() {
     assert_eq!(again["width"], 1200);
     assert_eq!(again["downscaled"], false);
 
-    // ③ 三类失败各说各的话
+    // ③ 各类失败各说各的话。这个 .NEF 里装的是垃圾字节:RAW 现在有解码器
+    // 认领了,所以它必须报成「内嵌预览损坏」,不能再报「格式不支持」——
+    // 后者会把人引去找解码器,而毛病在文件本身
     std::fs::write(inbox.join("DSC_0002.NEF"), b"raw bytes").unwrap();
     let raw = invoke(
         &window,
@@ -2899,8 +2925,30 @@ fn full_preview_returns_native_pixels_and_names_every_failure() {
     .as_str()
     .unwrap()
     .to_string();
-    assert!(raw.contains("libraw"), "RAW 要如实点名缺什么: {raw}");
+    assert!(
+        raw.contains("损坏") && raw.contains("nef"),
+        "坏 RAW 要点名是文件坏了、坏在哪个格式: {raw}"
+    );
+    assert!(
+        !raw.contains("尚未接入"),
+        "RAW 已接入内嵌预览,不该再说「尚未接入」: {raw}"
+    );
 
+    std::fs::write(inbox.join("readme.txt"), b"not an image").unwrap();
+    let other = invoke(
+        &window,
+        "load_full_preview",
+        json!({"projectId": pid, "assetId": "1. 待分类/readme.txt"}),
+    )
+    .unwrap_err()
+    .as_str()
+    .unwrap()
+    .to_string();
+    assert!(other.contains("不是本工具能解码"), "{other}");
+
+    // 视频与 HEIC 现在有解码器认领:**不再**是「格式不支持」。
+    // 这个 .MP4 里装的是垃圾字节,所以必须报成「文件损坏」——
+    // 把损坏说成「格式不支持」会把人引去找解码器,而毛病在文件本身
     std::fs::write(inbox.join("CLIP0001.MP4"), b"video bytes").unwrap();
     let video = invoke(
         &window,
@@ -2911,7 +2959,16 @@ fn full_preview_returns_native_pixels_and_names_every_failure() {
     .as_str()
     .unwrap()
     .to_string();
-    assert!(video.contains("抽帧"), "视频要如实点名缺什么: {video}");
+    assert!(
+        !video.contains("尚未接入") && !video.contains("不是本工具能解码"),
+        "视频已接入抽帧,不该再报「格式不支持」: {video}"
+    );
+    // sidecar 在场时报「损坏」,不在场时报「缺 ffmpeg」——两句都合法,
+    // 但都必须点名到底是哪一种,不能笼统一句「加载失败」
+    assert!(
+        video.contains("损坏") || video.contains("ffmpeg"),
+        "视频失败要点名是文件坏了还是缺组件: {video}"
+    );
 
     std::fs::write(inbox.join("broken.jpg"), b"this is definitely not a jpeg").unwrap();
     let broken = invoke(
@@ -2925,9 +2982,9 @@ fn full_preview_returns_native_pixels_and_names_every_failure() {
     .to_string();
     assert!(broken.contains("损坏"), "损坏文件要说是损坏: {broken}");
 
-    assert_ne!(raw, video);
-    assert_ne!(raw, broken);
-    assert_ne!(video, broken);
+    for (a, b) in [(&raw, &other), (&raw, &video), (&other, &video)] {
+        assert_ne!(a, b, "两类失败说了同一句话,等于没分类");
+    }
 
     // ④ 相对路径闸:前端传来的 assetId 逃不出项目根
     for evil in ["../../etc/passwd", "/etc/passwd", "1. 待分类/../../x.jpg"] {
@@ -2940,5 +2997,420 @@ fn full_preview_returns_native_pixels_and_names_every_failure() {
             .is_err(),
             "{evil} 必须被拒"
         );
+    }
+}
+
+/// 全屏预览的 **RAW 内嵌预览**接线。
+///
+/// 守的是这一路最容易复发的那件事:**「够不够用」必须原样走到界面**。
+/// 内嵌预览取到了 ≠ 够用——半幅/缩略级的图判不了 1:1 的虚实,
+/// 把它当原图端上去只是换了个方式继续骗人。所以四档 adequacy 各自
+/// 在 DTO 上留什么、缓存命中那条路会不会把警示弄丢,都在这里钉死。
+#[test]
+fn full_preview_wires_raw_embedded_with_its_adequacy() {
+    use crate::core::raw_fixture::SynthRaw;
+
+    let (window, tmp, nas) = mock_app();
+    let pid = create_b_project(&window);
+    let inbox = nas.join(&pid).join("1. 待分类");
+    std::fs::create_dir_all(&inbox).unwrap();
+
+    let get = |name: &str| -> serde_json::Value {
+        invoke(
+            &window,
+            "load_full_preview",
+            json!({"projectId": pid, "assetId": format!("1. 待分类/{name}")}),
+        )
+        .unwrap_or_else(|e| panic!("{name} 应能取出内嵌预览,实得 {e}"))
+    };
+
+    // ① 四档 adequacy 各自到达界面
+    SynthRaw::new((1600, 1067), Some((1620, 1080))).write(&inbox.join("FULL.NEF"));
+    SynthRaw::new((1600, 1067), Some((3000, 2000))).write(&inbox.join("HALF.ARW"));
+    SynthRaw::new((800, 533), Some((3000, 2000))).write(&inbox.join("TINY.CR2"));
+    SynthRaw::new((1600, 1067), None).write(&inbox.join("NOSIZE.DNG"));
+
+    let full = get("FULL.NEF");
+    assert_eq!(full["kind"], "rawEmbedded", "{full}");
+    assert_eq!(full["rawAdequacy"], "fullSize", "{full}");
+    assert!(
+        full["rawWarning"].is_null(),
+        "全尺寸内嵌预览没有尺寸方面的警示(「这是机内渲染」那句由界面补): {full}"
+    );
+    assert_eq!(full["width"], 1600, "{full}");
+    assert_eq!(full["downscaled"], false);
+
+    let half = get("HALF.ARW");
+    assert_eq!(half["rawAdequacy"], "reduced", "{half}");
+    let half_warn = half["rawWarning"].as_str().expect("半幅级必须有常驻警示");
+    assert!(
+        half_warn.contains("1600×1067") && half_warn.contains("3000×2000"),
+        "半幅警示要写清内嵌预览多大、原图多大: {half_warn}"
+    );
+
+    let tiny = get("TINY.CR2");
+    assert_eq!(tiny["rawAdequacy"], "thumbnailOnly", "{tiny}");
+    assert!(tiny["rawWarning"].as_str().unwrap().contains("判不了虚实"));
+
+    let unknown = get("NOSIZE.DNG");
+    assert_eq!(
+        unknown["rawAdequacy"], "unknown",
+        "读不到原图尺寸时不许假装是全尺寸: {unknown}"
+    );
+    assert!(unknown["rawWarning"].as_str().unwrap().contains("无法确认"));
+
+    // 四档的话必须互不相同,否则等于没分档
+    let mut said: Vec<String> = [&half, &tiny, &unknown]
+        .iter()
+        .map(|v| v["rawWarning"].as_str().unwrap().to_string())
+        .collect();
+    said.sort();
+    said.dedup();
+    assert_eq!(said.len(), 3, "三档警示说了同一句话,等于没分档");
+
+    // ② 落盘的确实是内嵌预览那张图(不是 320px 缩略图)
+    let cache_name = full["url"].as_str().unwrap().rsplit('/').next().unwrap();
+    let cached = tmp.path().join("cache/previews").join(cache_name);
+    assert_eq!(image::image_dimensions(&cached).unwrap(), (1600, 1067));
+
+    // ③ **缓存命中不许把警示弄丢**。这是这条 bug 最省事的复发路径:
+    // 第一次老老实实说「这是半幅」,第二次走缓存就悄悄闭嘴了
+    let again = get("HALF.ARW");
+    assert_eq!(again["fromCache"], true, "{again}");
+    assert_eq!(again["kind"], "rawEmbedded", "{again}");
+    assert_eq!(again["rawAdequacy"], "reduced", "缓存命中也必须报半幅");
+    assert_eq!(
+        again["rawWarning"], half["rawWarning"],
+        "缓存命中的警示必须与首次一字不差"
+    );
+    assert_eq!(again["sourceWidth"], 1600, "{again}");
+    assert_eq!(again["sourceHeight"], 1067, "{again}");
+
+    // ④ 方向:EXIF 说转 90° 就转,而且解码路径与缓存路径转得一样多
+    SynthRaw::new((1600, 1067), Some((3000, 2000)))
+        .with_orientation(6)
+        .write(&inbox.join("ROT.NEF"));
+    let rot = get("ROT.NEF");
+    assert_eq!(
+        (rot["width"].as_u64(), rot["height"].as_u64()),
+        (Some(1067), Some(1600))
+    );
+    let rot_cached = get("ROT.NEF");
+    assert_eq!(rot_cached["fromCache"], true);
+    assert_eq!(
+        (
+            rot_cached["sourceWidth"].as_u64(),
+            rot_cached["sourceHeight"].as_u64()
+        ),
+        (Some(1067), Some(1600)),
+        "缓存那条路报的尺寸必须也是摆正后的: {rot_cached}"
+    );
+
+    // ⑤ 相机已经把预览摆正过时不许再转一次(转两次是倒的,比不转更糟)
+    SynthRaw::new((1067, 1600), Some((3000, 2000)))
+        .with_orientation(6)
+        .write(&inbox.join("UPRIGHT.NEF"));
+    let upright = get("UPRIGHT.NEF");
+    assert_eq!(
+        (upright["width"].as_u64(), upright["height"].as_u64()),
+        (Some(1067), Some(1600)),
+        "已摆正的预览再转一次会把它转倒: {upright}"
+    );
+}
+
+/// 全屏预览的**视频抽帧**接线(真 ffmpeg sidecar)。
+///
+/// 守三件事:
+/// 1. 视频在全屏里**真的出画面**了——此前这里只有一句「暂时看不到画面」;
+/// 2. 抽的不是第 0 帧。用例造的素材前 1 秒是纯黑(模拟打板/黑头),
+///    取回来的那一帧必须是**亮的**——这是「抽哪一帧」那个设计决定的
+///    唯一硬证据,把 FRAME_AT_SEC 改回 0 本用例立刻变红;
+/// 3. 拿到的是一帧静止画面这件事**说得出口**:kind/frameAtSec 必须一路
+///    传到前端,否则用户看着一张静图不知道它代表整段素材的哪个瞬间。
+#[cfg(unix)]
+#[test]
+fn full_preview_extracts_a_video_frame_with_real_ffmpeg() {
+    let (window, tmp, nas) = mock_app();
+    let Some(ffdir) = stage_sidecar_dir(tmp.path()) else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI 上缺 sidecar:fetch-ffmpeg 步骤未生效,拒绝静默跳过"
+        );
+        eprintln!("跳过:src-tauri/binaries 无 sidecar(先跑 scripts/fetch-ffmpeg.sh)");
+        return;
+    };
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("OCARD_FFMPEG_DIR");
+        }
+    }
+    let _g = crate::core::ffmpeg::FFMPEG_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    std::env::set_var("OCARD_FFMPEG_DIR", &ffdir);
+    let _env_guard = EnvGuard;
+
+    let pid = create_b_project(&window);
+    let inbox = nas.join(&pid).join("1. 待分类");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let ffmpeg = ffdir.join("ffmpeg");
+
+    // 前 1 秒纯黑 + 后 3 秒纯白:实拍素材开头常常是黑场/板子,
+    // 拿第 0 帧当预览等于给用户看一片黑
+    let clip = inbox.join("C0001.MP4");
+    let out = std::process::Command::new(&ffmpeg)
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=640x360:d=1:r=25",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=white:s=640x360:d=3:r=25",
+            "-filter_complex",
+            "[0:v][1:v]concat=n=2:v=1[v]",
+            "-map",
+            "[v]",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+        ])
+        .arg(&clip)
+        .output()
+        .expect("生成测试视频失败");
+    assert!(
+        out.status.success() && clip.is_file(),
+        "ffmpeg 生成源视频失败: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = invoke(
+        &window,
+        "load_full_preview",
+        json!({"projectId": pid, "assetId": "1. 待分类/C0001.MP4"}),
+    )
+    .expect("视频必须能取到一帧画面");
+
+    // ① 真的出画面了,而且是整帧分辨率(不是 320px 缩略图)
+    assert_eq!(got["width"], 640, "{got}");
+    assert_eq!(got["height"], 360, "{got}");
+    assert_eq!(got["sourceWidth"], 640);
+    assert_eq!(got["downscaled"], false);
+    // ② 这是「一帧」这件事必须说得出口
+    assert_eq!(got["kind"], "videoFrame", "视频帧不能冒充原图: {got}");
+    assert_eq!(
+        got["frameAtSec"].as_f64(),
+        Some(crate::core::preview_ffmpeg::FRAME_AT_SEC),
+        "抽的是第几秒必须一路传到界面: {got}"
+    );
+    assert!(
+        (got["durationSec"].as_f64().unwrap_or(0.0) - 4.0).abs() < 0.5,
+        "整段时长也要报出来: {got}"
+    );
+
+    // ③ 抽的不是黑场那一帧——「靠前但不为 0」这个决定的硬证据
+    let cache_name = got["url"].as_str().unwrap().rsplit('/').next().unwrap();
+    let cached = tmp.path().join("cache/previews").join(cache_name);
+    let frame = image::open(&cached).expect("落盘的预览必须可解码");
+    assert_eq!((frame.width(), frame.height()), (640, 360));
+    let rgb = frame.to_rgb8();
+    let mean: f64 = rgb.pixels().map(|p| p.0[0] as f64).sum::<f64>() / rgb.pixels().len() as f64;
+    assert!(
+        mean > 200.0,
+        "抽到的应是第 1 秒的白场;均值 {mean:.1} 说明取的还是开头的黑帧"
+    );
+
+    // ④ 命中缓存时,「这是第几秒」不能丢——否则第二次打开同一条素材,
+    //    界面就变成举着一张来路不明的静图
+    let again = invoke(
+        &window,
+        "load_full_preview",
+        json!({"projectId": pid, "assetId": "1. 待分类/C0001.MP4"}),
+    )
+    .expect("第二次必须命中缓存");
+    assert_eq!(again["fromCache"], true, "{again}");
+    assert_eq!(again["kind"], "videoFrame", "{again}");
+    assert_eq!(
+        again["frameAtSec"].as_f64(),
+        Some(crate::core::preview_ffmpeg::FRAME_AT_SEC),
+        "缓存命中也要说得出第几秒: {again}"
+    );
+    assert_eq!(again["sourceWidth"], 640, "{again}");
+
+    // ⑤ 比抽帧偏移还短的素材:退回第 0 秒,而不是判成失败
+    let short = inbox.join("C0002.MP4");
+    let out = std::process::Command::new(&ffmpeg)
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=320x240:r=25:d=0.4",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+        ])
+        .arg(&short)
+        .output()
+        .expect("生成短视频失败");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tiny = invoke(
+        &window,
+        "load_full_preview",
+        json!({"projectId": pid, "assetId": "1. 待分类/C0002.MP4"}),
+    )
+    .expect("0.4 秒的素材也必须出画面,不能因为 -ss 越界就判失败");
+    assert_eq!(tiny["width"], 320, "{tiny}");
+    assert_eq!(
+        tiny["frameAtSec"].as_f64(),
+        Some(0.0),
+        "短片要退回第 0 秒: {tiny}"
+    );
+
+    // ⑥ 坏文件报「损坏」,不报「格式不支持」——两者指向完全不同的排查方向
+    std::fs::write(inbox.join("C0003.MP4"), vec![0x5Au8; 40_000]).unwrap();
+    let broken = invoke(
+        &window,
+        "load_full_preview",
+        json!({"projectId": pid, "assetId": "1. 待分类/C0003.MP4"}),
+    )
+    .unwrap_err()
+    .as_str()
+    .unwrap()
+    .to_string();
+    assert!(broken.contains("损坏"), "坏视频要说是损坏: {broken}");
+    assert!(
+        !broken.contains("解码器"),
+        "别把坏文件说成缺解码器: {broken}"
+    );
+}
+
+/// 全屏预览的 **HEIC/HEIF** 接线(真 ffmpeg sidecar)。
+///
+/// 这里同时是「HEIC 到底能不能解」那个结论的可执行版本:能不能解**不做
+/// 编译期假设**,由这条用例在每台机器上真解一次来回答。`.heic` 容器里
+/// 装的可能是 HEVC 也可能是 AV1,所以两种都要过一遍。
+#[cfg(unix)]
+#[test]
+fn full_preview_decodes_heif_with_real_ffmpeg() {
+    let (window, tmp, nas) = mock_app();
+    let Some(ffdir) = stage_sidecar_dir(tmp.path()) else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI 上缺 sidecar:fetch-ffmpeg 步骤未生效,拒绝静默跳过"
+        );
+        eprintln!("跳过:src-tauri/binaries 无 sidecar(先跑 scripts/fetch-ffmpeg.sh)");
+        return;
+    };
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("OCARD_FFMPEG_DIR");
+        }
+    }
+    let _g = crate::core::ffmpeg::FFMPEG_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    std::env::set_var("OCARD_FFMPEG_DIR", &ffdir);
+    let _env_guard = EnvGuard;
+
+    let pid = create_b_project(&window);
+    let inbox = nas.join(&pid).join("1. 待分类");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let ffmpeg = ffdir.join("ffmpeg");
+
+    // 真 HEIF 家族文件:ffmpeg 没有 heif 复用器,但 avif 复用器写出来的
+    // 就是 ISOBMFF/HEIF 结构(AVIF 本就是「装 AV1 的 HEIF」),
+    // 走的是与 .heic 完全相同的那条解复用+解码路径,而且三平台都造得出来
+    let heif = inbox.join("IMG_0001.heif");
+    let out = std::process::Command::new(&ffmpeg)
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=640x480:d=1",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "libaom-av1",
+            "-still-picture",
+            "1",
+            "-f",
+            "avif",
+        ])
+        .arg(&heif)
+        .output()
+        .expect("生成 HEIF 素材失败");
+    assert!(
+        out.status.success() && heif.is_file(),
+        "ffmpeg 生成 HEIF 失败: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = invoke(
+        &window,
+        "load_full_preview",
+        json!({"projectId": pid, "assetId": "1. 待分类/IMG_0001.heif"}),
+    )
+    .expect("HEIF 必须能解出整幅");
+    assert_eq!(got["width"], 640, "{got}");
+    assert_eq!(got["height"], 480, "{got}");
+    assert_eq!(got["sourceWidth"], 640);
+    assert_eq!(got["downscaled"], false);
+    // HEIC 解出来的**就是这张照片本身**,不是「其中一帧」:
+    // 和 JPEG 同级,界面没有额外的话要说
+    assert_eq!(got["kind"], "original", "HEIC 是原图不是视频帧: {got}");
+    assert!(got["frameAtSec"].is_null(), "静态图没有「第几秒」: {got}");
+
+    // macOS 上顺手用系统的 sips 造一张**真 HEVC 编码、带拼贴网格**的 .heic:
+    // 这是 iPhone 实际产出的形态,拼贴那条路(整图尺寸只在 stream_groups 里)
+    // 只有它才走得到
+    #[cfg(target_os = "macos")]
+    {
+        let src = inbox.join("_src.jpg");
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(1600, 1200, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 90])
+        }))
+        .save(&src)
+        .unwrap();
+        let heic = inbox.join("IMG_0002.heic");
+        let sips = std::process::Command::new("/usr/bin/sips")
+            .args(["-s", "format", "heic"])
+            .arg(&src)
+            .arg("--out")
+            .arg(&heic)
+            .output();
+        std::fs::remove_file(&src).ok();
+        if matches!(&sips, Ok(o) if o.status.success()) && heic.is_file() {
+            let got = invoke(
+                &window,
+                "load_full_preview",
+                json!({"projectId": pid, "assetId": "1. 待分类/IMG_0002.heic"}),
+            )
+            .expect("真 HEIC(HEVC)必须能解出整幅");
+            // 拼贴网格:逐块是 512×512,整图才是 1600×1200。
+            // 报成 512 就说明 stream_groups 那条路断了,像素上限也会跟着失效
+            assert_eq!(got["width"], 1600, "拼贴 HEIC 要拼回整图: {got}");
+            assert_eq!(got["height"], 1200, "{got}");
+            assert_eq!(got["kind"], "original", "{got}");
+        } else {
+            eprintln!("跳过真 HEIC 分支:sips 不可用");
+        }
     }
 }

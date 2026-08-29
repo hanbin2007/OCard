@@ -15,7 +15,12 @@ pub mod naming;
 pub mod packaging;
 pub mod paths;
 pub mod preview;
+pub mod preview_ffmpeg;
+pub mod preview_raw;
 pub mod project;
+/// 合成 RAW 样本(测试专用;接线侧的用例与集成用例共用一份构造器)
+#[cfg(test)]
+pub mod raw_fixture;
 pub mod registry;
 pub mod sorting;
 pub mod transcode;

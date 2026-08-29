@@ -243,4 +243,40 @@ describe("useModalFocus", () => {
     cleanup();
     expect(modalLayerCount()).toBe(0);
   });
+
+  /**
+   * ★ 死层不许堵住活层。
+   *
+   * 栈原本完全依赖「卸载时 cleanup 一定跑、且顺序如预期」。这个假设破了之后
+   * 栈顶会是一个已经离开文档的节点，`isTopModalLayer` 于是对**活着的那层**
+   * 返回 false，那层的键盘处理器整个闭嘴——弹窗开着、Tab 和 Esc 全没反应，
+   * 屏上却没有任何迹象。这正是历史事故清单上的「按键按了没反应」。
+   *
+   * 现实里的症状是全量测试约五分之一概率红一条焦点用例（单跑那个文件 12 轮
+   * 全绿），也就是说真实使用中同样会偶发，只是没人能稳定复现、更没人能归因。
+   * 这里直接把「节点被摘走但没出栈」这个状态造出来，钉住栈必须自愈。
+   */
+  it("★ 已离开文档的层不许堵住活着的那层（栈自愈）", async () => {
+    const user = userEvent.setup();
+    render(<Harness />);
+    await user.click(screen.getByTestId("trigger"));
+    expect(modalLayerCount()).toBe(1);
+
+    // 绕过 React 卸载，直接把层从文档上摘掉：模拟「cleanup 还没轮到」
+    const layer = screen.getByTestId("layer-outer");
+    const parent = layer.parentElement!;
+    parent.removeChild(layer);
+
+    // 死层必须当场从栈里消失，而不是继续占着栈顶
+    expect(modalLayerCount()).toBe(0);
+    parent.appendChild(layer); // 放回去，免得影响后面的清理
+
+    // 关键：栈没有被永久毒化——重新挂一层，它必须照常拿到键盘
+    cleanup();
+    render(<Harness />);
+    await user.click(screen.getByTestId("trigger"));
+    expect(modalLayerCount()).toBe(1);
+    await user.keyboard("{Escape}");
+    expect(screen.queryByTestId("layer-outer")).toBeNull();
+  });
 });

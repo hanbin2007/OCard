@@ -82,7 +82,27 @@ export function trapTabFocus(
  */
 const modalLayers: HTMLElement[] = [];
 
+/**
+ * 取栈顶前先把**已经离开文档**的层清掉(自愈)。
+ *
+ * 栈原本完全依赖「卸载时 cleanup 一定跑、且顺序如预期」。这个假设一旦破了
+ * ——节点先被父层从 DOM 上摘走、cleanup 还没轮到——栈顶就是一个死节点,
+ * 于是 `isTopModalLayer` 对**活着的那层**返回 false,那层的键盘处理器整个
+ * 闭嘴:弹窗开着、Tab 和 Esc 全没反应,而且屏上没有任何迹象。
+ * 这正是本项目历史事故清单上的「按键按了没反应」。
+ *
+ * 症状是全量测试里约五分之一概率红一条焦点用例(单跑那个文件 12 轮全绿),
+ * 也就是说它在真实使用中同样会偶发,只是没人能稳定复现、更没人能归因。
+ * 与其去猜哪条卸载路径漏了,不如让栈本身不可能被死节点堵住。
+ */
+function pruneDetached(): void {
+  for (let i = modalLayers.length - 1; i >= 0; i--) {
+    if (!modalLayers[i].isConnected) modalLayers.splice(i, 1);
+  }
+}
+
 export function topModalLayer(): HTMLElement | null {
+  pruneDetached();
   return modalLayers.length > 0 ? modalLayers[modalLayers.length - 1] : null;
 }
 
@@ -90,8 +110,9 @@ export function isTopModalLayer(node: HTMLElement | null): boolean {
   return node !== null && topModalLayer() === node;
 }
 
-/** 仅供测试与断言使用：当前叠了几层模态 */
+/** 仅供测试与断言使用：当前叠了几层模态（不含已离开文档的死层） */
 export function modalLayerCount(): number {
+  pruneDetached();
   return modalLayers.length;
 }
 

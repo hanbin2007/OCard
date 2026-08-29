@@ -657,6 +657,109 @@ function mockFullImage(hue: number, w: number, h: number): string {
 }
 
 /**
+ * RAW 走「相机内嵌预览」这条路的 mock。
+ *
+ * 后端的结局不是二元的：**取到了也可能不够用**。所以这里把四档 adequacy、
+ * 两类取不到、以及「全尺寸档同时超过显示长边上限」都排进循环，
+ * 浏览器里挨个翻过去七种呈现都能亲眼看到——尤其是 `reduced` /
+ * `thumbnailOnly` / `unknown` 三条常驻警示，它们一旦从界面上消失，
+ * 用户就会拿半幅图去判虚实。
+ *
+ * 循环用的是**第几张 RAW**（`seq / 7`）而不是 `seq % n`：mock 里 RAW 恰好是
+ * 每 7 张一件，拿 `seq % 7` 会永远落在同一档，七档只剩一档。
+ *
+ * 数字照真机身的量级取：Z9 是 8256×5504，主流 4500 万级是 8192×5464，
+ * 半幅预览约 4128×2752，老机身的缩略级约 640×480。
+ */
+function mockRawPreview(
+  ext: string,
+  seq: number,
+  fail: (message: string) => Promise<FullPreview>,
+): Promise<FullPreview> {
+  const tier = Math.floor(seq / 7) % 7;
+  // 取不到的两类先短路：文案要与「取到了但不够用」明显不同
+  if (tier === 4) {
+    return fail(
+      `这个 .${ext} 文件里没有可用的内嵌预览（已按格式规范检查过 3 处标签位置）。` +
+        `相机可能没写全尺寸预览，或把它放在了本模块不解析的 MakerNote 里`,
+    );
+  }
+  if (tier === 5) {
+    return fail(
+      `这个 .${ext} 文件的内嵌预览损坏，取不出完整图像（EOI 标记缺失）。` +
+        `文件可能在传输中被截断，建议重新从存储卡拷贝并校验`,
+    );
+  }
+
+  const full: [number, number] = [8256, 5504];
+  // [内嵌预览宽, 高, adequacy, warning]
+  const [w, h, adequacy, warning]: [
+    number,
+    number,
+    FullPreview["rawAdequacy"],
+    string | null,
+  ] =
+    tier === 0
+      ? // 全尺寸且**没超**显示上限：这一档只交代来路，不该用告警色
+        [8192, 5464, "fullSize", null]
+      : tier === 6
+        ? // 全尺寸但超过 8192 长边：尺寸够 + 呈现被缩放，两个降级各说各的
+          [8256, 5504, "fullSize", null]
+        : tier === 1
+          ? [
+              4128,
+              2752,
+              "reduced",
+              `这是相机内嵌的「半幅」预览（4128×2752，原始尺寸 ${full[0]}×${full[1]}），不是全分辨率原图：` +
+                `构图和明显跑焦看得出，细微的虚实判不准——要抠对焦请用 RAW 处理软件`,
+            ]
+          : tier === 2
+            ? [
+                640,
+                480,
+                "thumbnailOnly",
+                `这只是相机内嵌的「缩略级」预览（640×480，原始尺寸 ${full[0]}×${full[1]}），` +
+                  `放大后是插值糊块，判不了虚实和对焦——请打开配套 JPEG 或用 RAW 处理软件看原片`,
+              ]
+            : [
+                3840,
+                2560,
+                "unknown",
+                "这是相机内嵌的预览（3840×2560），读不到 RAW 的原始感光尺寸，" +
+                  "无法确认它是不是全分辨率——判虚实前请留意这一点",
+              ];
+
+  // 超过长边上限（8192）的那一档同时吃「缩放呈现」这条降级：
+  // 两个降级各自独立，界面必须两句都说
+  const downscaled = Math.max(w, h) > 8192;
+  const shown: [number, number] = downscaled
+    ? [8192, Math.round((h * 8192) / w)]
+    : [w, h];
+  return new Promise<FullPreview>((resolve) =>
+    setTimeout(
+      () =>
+        resolve({
+          // 真画出来的按 1600 宽即可（8256 的 SVG 没必要真渲染）；
+          // 文字里写的是真实档位，浏览器里一眼分得清现在是哪一档
+          url: mockFullImage((seq * 37) % 360, 1600, 1067),
+          width: shown[0],
+          height: shown[1],
+          sourceWidth: w,
+          sourceHeight: h,
+          downscaled,
+          fromCache: false,
+          kind: "rawEmbedded",
+          frameAtSec: null,
+          durationSec: null,
+          rawAdequacy: adequacy,
+          rawWarning: warning,
+        }),
+      600,
+    ),
+  );
+}
+
+/**
  * `loadFullPreview` 的 mock。
  *
  * 分支照着**后端真实的四类结局**排，浏览器预览里四种都能亲眼看到：
@@ -672,15 +775,37 @@ export function mockFullPreview(assetId: string): Promise<FullPreview> {
     );
 
   if (["nef", "cr3", "arw", "raf", "dng", "orf", "rw2", "cr2"].includes(ext)) {
-    return fail(
-      `RAW（.${ext.toUpperCase()}）尚未接入全尺寸解码（本机构建不含 libraw）。` +
-        `你看到的是相机内嵌的小预览，判不了虚实——请打开配套 JPEG，或用 RAW 处理软件看原片`,
-    );
+    return mockRawPreview(ext, seq, fail);
   }
+  // 视频走 ffmpeg sidecar 抽帧：浏览器 mock 里也要**真的给出一帧**，
+  // 否则前端开发时永远看不到「这是第 1 秒的一帧」那条提示长什么样
   if (["mp4", "mov", "avi", "mts", "m4v"].includes(ext)) {
-    return fail(
-      `视频（.${ext.toUpperCase()}）的全屏预览尚未接入抽帧，暂时看不到画面；` +
-        `请用转码后的代理片或外部播放器查看`,
+    // 每 13 条给一条坏文件：四类失败的文案在浏览器里也要能亲眼验
+    if (seq % 13 === 0 && seq > 0) {
+      return fail(
+        "这个视频打不开——文件已损坏或被截断（ffmpeg: moov atom not found）；请回源盘核对这个文件",
+      );
+    }
+    const duration = 4 + (seq % 37);
+    return new Promise<FullPreview>((resolve) =>
+      setTimeout(
+        () =>
+          resolve({
+            url: mockFullImage((seq * 37) % 360, 1600, 900),
+            width: 1920,
+            height: 1080,
+            sourceWidth: 1920,
+            sourceHeight: 1080,
+            downscaled: false,
+            fromCache: false,
+            kind: "videoFrame",
+            frameAtSec: 1,
+            durationSec: duration,
+            rawAdequacy: null,
+            rawWarning: null,
+          }),
+        600,
+      ),
     );
   }
   if (seq % 17 === 0 && seq > 0) {
@@ -710,6 +835,12 @@ export function mockFullPreview(assetId: string): Promise<FullPreview> {
           sourceHeight: downscaled ? 7768 : height,
           downscaled,
           fromCache: false,
+          // HEIC 走 sidecar 解出来的**就是这张照片本身**，和 JPEG 同级
+          kind: "original",
+          frameAtSec: null,
+          durationSec: null,
+          rawAdequacy: null,
+          rawWarning: null,
         }),
       600,
     ),
