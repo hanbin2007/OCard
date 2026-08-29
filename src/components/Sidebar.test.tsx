@@ -19,6 +19,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { renderWelcome } from "../testUtils";
+import * as prefs from "../lib/prefs";
 import { loadUiPref, saveUiPref } from "../state/store";
 import {
   mockCameras,
@@ -30,6 +31,35 @@ import {
 } from "../api/mock";
 
 afterEach(cleanup);
+
+/*
+ * 给 `lib/prefs` 留一份可控实现:默认原样透传(真读真写 localStorage,
+ * 上面那几条纯函数用例要的就是真实现),需要造失败时再逐条 mockImplementation。
+ * 打在这一层而不是浏览器 API 上——那条链路太长,平台差异会让它在 CI 上
+ * 无声地不触发(见下面两条用例的说明)。
+ */
+vi.mock("../lib/prefs", async () => {
+  const real = await vi.importActual<typeof import("../lib/prefs")>("../lib/prefs");
+  return {
+    ...real,
+    loadPref: vi.fn(real.loadPref),
+    savePref: vi.fn(real.savePref),
+    // 真实现要从工厂里带出来:`vi.mock` 会提升到 import 之上,
+    // 测试文件里再 import 一次拿到的还是被 mock 过的那份,
+    // 拿它去 mockImplementation 等于把桩设成它自己(实测:一片红)
+    __real: real,
+  };
+});
+
+const loadPrefMock = vi.mocked(prefs.loadPref);
+const savePrefMock = vi.mocked(prefs.savePref);
+const realPrefs = (prefs as unknown as { __real: typeof import("../lib/prefs") })
+  .__real;
+
+afterEach(() => {
+  loadPrefMock.mockImplementation(realPrefs.loadPref);
+  savePrefMock.mockImplementation(realPrefs.savePref);
+});
 
 const base = {
   workstation: mockWorkstation,
@@ -263,15 +293,26 @@ describe("侧栏折叠的跨会话记忆", () => {
     expect(issues).toEqual(["read:ui"]);
   });
 
+  /*
+   * 下面两条**不再**去给浏览器的 localStorage 打桩。
+   *
+   * 原来的写法是「打桩 window.localStorage → 穿过整个 bootstrap → 断言
+   * 屏上出现 toast」,本机稳过、CI(Linux + Node 22 + 51 文件并行)必红,
+   * 而 CI 打出的 DOM 显示欢迎页整个渲染完成、一条 toast 都没有——
+   * 也就是失败路径**根本没被触发**。链条太长(浏览器存储 API → prefs →
+   * store 初始化 → effect → 通知 → toast),平台差异随便哪一环都能打断它,
+   * 而它红的时候指不出是哪一环。
+   *
+   * 要守的两件事拆开各自确定性地测,一件都没弱化:
+   *   1. 存储读写失败 → 报出 issue：由本 describe 上面那几条纯函数用例覆盖
+   *      (它们直接调 loadUiPref/saveUiPref,CI 一直是绿的);
+   *   2. issue → 用户看得见的通知：就是下面两条,直接把 `lib/prefs` 打桩,
+   *      不碰浏览器 API。测的正是「wiring 有没有接上」这件事本身。
+   */
   it("写不进去时给出可见提示(零静默:不能让人以为软件只是记性差)", async () => {
-    // 打桩打在**实例**上,不是 Storage.prototype:jsdom 的 localStorage 走的是
-    // 代理实现,原型上的桩根本不生效(实测:打了也照样写成功,用例假绿)
-    const spy = vi
-      .spyOn(window.localStorage, "setItem")
-      .mockImplementation((key: string) => {
-        // 只让界面偏好这一把键写失败,别把主题等无关路径一起打断
-        if (key.startsWith("ocard:v1:ui")) throw new Error("配额已满");
-      });
+    savePrefMock.mockImplementation((key, _value, onIssue) => {
+      if (key === "ui") onIssue?.({ key, op: "write", reason: "配额已满" });
+    });
 
     renderWelcome();
 
@@ -285,16 +326,16 @@ describe("侧栏折叠的跨会话记忆", () => {
     });
     expect(alert.textContent).toContain("界面偏好没能存到本机");
     expect(alert.textContent).toContain("配额已满");
-    spy.mockRestore();
   });
 
   it("读不出来时也给出可见提示,并说明「按默认值启动」", async () => {
-    const spy = vi
-      .spyOn(window.localStorage, "getItem")
-      .mockImplementation((key: string) => {
-        if (key.startsWith("ocard:v1:ui")) throw new Error("存储被禁用");
-        return null;
-      });
+    loadPrefMock.mockImplementation((key, fallback, onIssue) => {
+      if (key === "ui") {
+        onIssue?.({ key, op: "read", reason: "存储被禁用" });
+        return fallback;
+      }
+      return fallback;
+    });
 
     renderWelcome();
 
@@ -308,6 +349,5 @@ describe("侧栏折叠的跨会话记忆", () => {
     expect(alert.textContent).toContain("读取本机界面偏好失败");
     expect(alert.textContent).toContain("存储被禁用");
     expect(alert.textContent).toContain("已按默认值启动");
-    spy.mockRestore();
   });
 });
