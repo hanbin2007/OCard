@@ -7,6 +7,8 @@ import { act, cleanup, render, screen, waitFor, within } from "@testing-library/
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
+import { NoticeToasts } from "./NotificationCenter";
+import { StoreProvider } from "../state/store";
 import * as api from "../api";
 import { mockProjects, mockWorkstation } from "../api/mock";
 import type { NoticeDto } from "../api/types";
@@ -757,5 +759,57 @@ describe("通知中心", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.getAttribute("data-code")).toBe("notice-listen-failed");
     expect(alert.textContent).toContain("channel refused");
+  });
+});
+
+/**
+ * ★ 「自动收进铃铛」的前提是这个窗口里真的有铃铛。
+ *
+ * 铃铛住在 `TopBar` 里,而欢迎窗口只有**项目管理视图**渲染 TopBar ——
+ * 首页 / 新建向导 / 首跑设置 / 加载失败四种视图都没有。warning 在那儿
+ * 按常规六秒自动收起,就不是被收纳,而是**彻底消失、再也找不回来**:
+ * 消息只存在六秒等于没说,正是零静默铁律要防的事。
+ *
+ * 这条同时是一次 CI 红的根因:Sidebar 那两条「偏好读写失败要有可见提示」
+ * 本机快、断言时 toast 还在,CI 上 51 个文件并行、双核 runner 走到断言
+ * 已经超过六秒,于是一个 `role="status"` 都找不到。修的是产品,不是测试。
+ */
+describe("★ 没有铃铛的窗口里,warning 不许自动消失", () => {
+  it("hasBell=false 时 warning 留到用户自己关掉", () => {
+    vi.useFakeTimers();
+    try {
+      render(
+        <StoreProvider preloaded={{ ...preloaded, notices: [] }}>
+          <NoticeToasts hasBell={false} />
+        </StoreProvider>,
+      );
+      send(notice({ level: "warning", code: "pref-write-failed" }));
+      expect(screen.getByTestId("notice-toast-warning")).toBeDefined();
+
+      // 远超 AUTO_HIDE_MS(6s):有铃铛时它早该收起了
+      act(() => void vi.advanceTimersByTime(30_000));
+      const still = screen.getByTestId("notice-toast-warning");
+      expect(still.getAttribute("data-code")).toBe("pref-write-failed");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("有铃铛时仍按原样自动收起(不能顺手把主窗口也改了)", () => {
+    vi.useFakeTimers();
+    try {
+      render(
+        <StoreProvider preloaded={{ ...preloaded, notices: [] }}>
+          <NoticeToasts hasBell />
+        </StoreProvider>,
+      );
+      send(notice({ level: "warning", code: "pref-write-failed" }));
+      expect(screen.getByTestId("notice-toast-warning")).toBeDefined();
+
+      act(() => void vi.advanceTimersByTime(30_000));
+      expect(screen.queryByTestId("notice-toast-warning")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

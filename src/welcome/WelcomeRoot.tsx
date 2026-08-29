@@ -120,7 +120,11 @@ export function WelcomeRoot() {
       {body}
       {/* 本窗口也要能看到失败提示与打开设置(项目管理视图的顶栏有设置入口) */}
       <SettingsDialog />
-      <NoticeToasts />
+      {/* 只有项目管理视图渲染 TopBar,也就只有它有铃铛。其余视图(首页 /
+          新建向导 / 首跑设置 / 加载失败)里,warning 若按常规六秒自动收起,
+          就是收进一个不存在的铃铛——消息只存在六秒然后再也找不回来,
+          那是静默不是收纳。没铃铛时留到用户自己关掉。 */}
+      <NoticeToasts hasBell={view === "manager"} />
     </div>
   );
 }

@@ -108,7 +108,14 @@ function useGoToTask() {
  * 即时呈现区（Shell 级，一份）
  * ------------------------------------------------------------------ */
 
-function NoticeBanner({ entry }: { entry: NoticeEntry }) {
+function NoticeBanner({
+  entry,
+  recoverable,
+}: {
+  entry: NoticeEntry;
+  /** 本窗口有没有铃铛可以把它收进去(见 NoticeToasts 的说明) */
+  recoverable: boolean;
+}) {
   const { dispatch } = useStore();
   const goToTask = useGoToTask();
   const isError = entry.level === "error";
@@ -118,12 +125,16 @@ function NoticeBanner({ entry }: { entry: NoticeEntry }) {
     // 折叠计数增长**不再**重置隐藏计时(评审 6.8):持续故障期间
     // 同一条 warning 会 ×N 不断累积,跟着续命就成了赖着不走的 toast。
     if (isError) return;
+    // 「自动收进铃铛」的前提是**这个窗口有铃铛**。欢迎/项目管理窗口没有,
+    // 于是 warning 六秒后不是被收纳而是彻底消失、再也找不回来——
+    // 那正好是零静默铁律要防的事(消息只存在六秒等于没说)。
+    if (!recoverable) return;
     const timer = setTimeout(
       () => dispatch({ type: "noticeToastDismissed", id: entry.id }),
       AUTO_HIDE_MS,
     );
     return () => clearTimeout(timer);
-  }, [isError, entry.id, dispatch]);
+  }, [isError, recoverable, entry.id, dispatch]);
 
   return (
     <div
@@ -179,15 +190,24 @@ function NoticeBanner({ entry }: { entry: NoticeEntry }) {
   );
 }
 
-/** 即时呈现层：只显示还 live 的通知，最多 3 条，其余进铃铛 */
-export function NoticeToasts() {
+/**
+ * 即时呈现层：只显示还 live 的通知，最多 3 条，其余进铃铛。
+ *
+ * `hasBell` 说的是**这个窗口里有没有铃铛**。主窗口的 TopBar 有，所以
+ * warning 自动收起后还能翻回来；欢迎/项目管理窗口没有，自动收起等于
+ * 消息只存在六秒然后彻底消失——那是静默，不是收纳。没有铃铛时
+ * warning 与 error 一样留到用户自己关掉。
+ *
+ * 默认 `true` 是为了不动主窗口既有行为；缺铃铛的那一侧必须显式传 false。
+ */
+export function NoticeToasts({ hasBell = true }: { hasBell?: boolean } = {}) {
   const { state } = useStore();
   const live = state.notices.filter((n) => n.live).slice(0, 3);
   if (live.length === 0) return null;
   return (
     <div className="toasts" data-testid="notice-toasts">
       {live.map((entry) => (
-        <NoticeBanner key={entry.id} entry={entry} />
+        <NoticeBanner key={entry.id} entry={entry} recoverable={hasBell} />
       ))}
     </div>
   );
