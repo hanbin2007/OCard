@@ -44,6 +44,11 @@ fn mock_app() -> (
         notices: Default::default(),
         ops: Default::default(),
         approved_plans: Default::default(),
+        preview_cache: std::sync::Arc::new(
+            crate::core::preview::PreviewCache::with_default_budget(
+                tmp.path().join("cache/previews"),
+            ),
+        ),
     });
     let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
         .build()
@@ -2829,4 +2834,111 @@ fn ocard_state_dir_never_leaks_into_any_nas_material_path() {
         packaged.iter().any(|p| p.contains("待交付.jpg")),
         "真素材必须进包: {packaged:?}"
     );
+}
+
+/// 全屏预览的全尺寸取图(load_full_preview)接线。
+///
+/// 本用例守的是这条 bug 的核心:**全屏里必须能拿到原始像素的图**,
+/// 拿不到时必须返回一句**说清为什么**的话,而不是返回成功让界面
+/// 停在放大的缩略图上装作没事。
+#[test]
+fn full_preview_returns_native_pixels_and_names_every_failure() {
+    let (window, tmp, nas) = mock_app();
+    let pid = create_b_project(&window);
+    let inbox = nas.join(&pid).join("1. 待分类");
+    std::fs::create_dir_all(&inbox).unwrap();
+
+    // ① JPEG:必须是原始像素,不是 320px 缩略图
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(1200, 800, |x, y| {
+        image::Rgb([(x % 256) as u8, (y % 256) as u8, 77])
+    }));
+    img.save(inbox.join("DSC_0001.jpg")).unwrap();
+    let got = invoke(
+        &window,
+        "load_full_preview",
+        json!({"projectId": pid, "assetId": "1. 待分类/DSC_0001.jpg"}),
+    )
+    .expect("JPEG 必须能取到全尺寸");
+    assert_eq!(got["width"], 1200, "{got}");
+    assert_eq!(got["height"], 800, "{got}");
+    assert_eq!(got["sourceWidth"], 1200);
+    assert_eq!(got["downscaled"], false, "没超上限就必须是原始像素");
+    assert_eq!(got["fromCache"], false);
+    let url = got["url"].as_str().unwrap().to_string();
+    assert!(url.contains(".jpg"), "{url}");
+
+    // 落盘的确实是全尺寸,不是缩略图(直接量一下缓存文件)
+    let cache_name = url.rsplit('/').next().unwrap();
+    let cached = tmp.path().join("cache/previews").join(cache_name);
+    assert!(
+        cached.is_file(),
+        "预览必须落进本机缓存: {}",
+        cached.display()
+    );
+    assert_eq!(image::image_dimensions(&cached).unwrap(), (1200, 800));
+
+    // ② 第二次命中缓存,尺寸口径不变(缓存里不许端出一份说不清的元信息)
+    let again = invoke(
+        &window,
+        "load_full_preview",
+        json!({"projectId": pid, "assetId": "1. 待分类/DSC_0001.jpg"}),
+    )
+    .unwrap();
+    assert_eq!(again["fromCache"], true, "{again}");
+    assert_eq!(again["width"], 1200);
+    assert_eq!(again["downscaled"], false);
+
+    // ③ 三类失败各说各的话
+    std::fs::write(inbox.join("DSC_0002.NEF"), b"raw bytes").unwrap();
+    let raw = invoke(
+        &window,
+        "load_full_preview",
+        json!({"projectId": pid, "assetId": "1. 待分类/DSC_0002.NEF"}),
+    )
+    .unwrap_err()
+    .as_str()
+    .unwrap()
+    .to_string();
+    assert!(raw.contains("libraw"), "RAW 要如实点名缺什么: {raw}");
+
+    std::fs::write(inbox.join("CLIP0001.MP4"), b"video bytes").unwrap();
+    let video = invoke(
+        &window,
+        "load_full_preview",
+        json!({"projectId": pid, "assetId": "1. 待分类/CLIP0001.MP4"}),
+    )
+    .unwrap_err()
+    .as_str()
+    .unwrap()
+    .to_string();
+    assert!(video.contains("抽帧"), "视频要如实点名缺什么: {video}");
+
+    std::fs::write(inbox.join("broken.jpg"), b"this is definitely not a jpeg").unwrap();
+    let broken = invoke(
+        &window,
+        "load_full_preview",
+        json!({"projectId": pid, "assetId": "1. 待分类/broken.jpg"}),
+    )
+    .unwrap_err()
+    .as_str()
+    .unwrap()
+    .to_string();
+    assert!(broken.contains("损坏"), "损坏文件要说是损坏: {broken}");
+
+    assert_ne!(raw, video);
+    assert_ne!(raw, broken);
+    assert_ne!(video, broken);
+
+    // ④ 相对路径闸:前端传来的 assetId 逃不出项目根
+    for evil in ["../../etc/passwd", "/etc/passwd", "1. 待分类/../../x.jpg"] {
+        assert!(
+            invoke(
+                &window,
+                "load_full_preview",
+                json!({"projectId": pid, "assetId": evil}),
+            )
+            .is_err(),
+            "{evil} 必须被拒"
+        );
+    }
 }

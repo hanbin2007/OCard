@@ -12,6 +12,7 @@ import type {
   DeliveryStatus,
   FfmpegStatus,
   FinalCutReport,
+  FullPreview,
   TranscodeCapabilities,
   DeliverySummary,
   IndexingStatus,
@@ -634,6 +635,85 @@ function mockThumb(hue: number): string {
     `<svg xmlns="http://www.w3.org/2000/svg" width="8" height="6">` +
     `<rect width="8" height="6" fill="hsl(${hue} 30% 62%)"/></svg>`;
   return `data:image/svg+xml;base64,${btoa(svg)}`;
+}
+
+/**
+ * mock 的「全尺寸」图：刻意画满细网格与刻度线。
+ *
+ * 缩略图 mock 是 8×6 的纯色块，放大后必然是一团糊——这正是被修的那个 bug 的
+ * 样子。全尺寸 mock 必须**一眼看得出锐利**，浏览器里才验得了「换上了没有」。
+ */
+function mockFullImage(hue: number, w: number, h: number): string {
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">` +
+    `<defs><pattern id="g" width="16" height="16" patternUnits="userSpaceOnUse">` +
+    `<path d="M16 0H0V16" fill="none" stroke="hsl(${hue} 45% 35%)" stroke-width="1"/>` +
+    `</pattern></defs>` +
+    `<rect width="${w}" height="${h}" fill="hsl(${hue} 30% 62%)"/>` +
+    `<rect width="${w}" height="${h}" fill="url(#g)"/>` +
+    `<text x="24" y="56" font-family="monospace" font-size="40" fill="#111">` +
+    `${w}×${h} 全尺寸</text></svg>`;
+  return `data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(svg)))}`;
+}
+
+/**
+ * `loadFullPreview` 的 mock。
+ *
+ * 分支照着**后端真实的四类结局**排，浏览器预览里四种都能亲眼看到：
+ * 成功 / 超长边缩放 / 三类失败。延迟给足（600ms）——「先缩略图、后全尺寸」
+ * 这条交互只有在解码真的要花时间时才看得出来，秒回等于没测。
+ */
+export function mockFullPreview(assetId: string): Promise<FullPreview> {
+  const ext = (assetId.split(".").pop() ?? "").toLowerCase();
+  const seq = Number(/(\d+)\.[^.]+$/.exec(assetId)?.[1] ?? 0);
+  const fail = (message: string) =>
+    new Promise<FullPreview>((_, reject) =>
+      setTimeout(() => reject(new Error(message)), 400),
+    );
+
+  if (["nef", "cr3", "arw", "raf", "dng", "orf", "rw2", "cr2"].includes(ext)) {
+    return fail(
+      `RAW（.${ext.toUpperCase()}）尚未接入全尺寸解码（本机构建不含 libraw）。` +
+        `你看到的是相机内嵌的小预览，判不了虚实——请打开配套 JPEG，或用 RAW 处理软件看原片`,
+    );
+  }
+  if (["mp4", "mov", "avi", "mts", "m4v"].includes(ext)) {
+    return fail(
+      `视频（.${ext.toUpperCase()}）的全屏预览尚未接入抽帧，暂时看不到画面；` +
+        `请用转码后的代理片或外部播放器查看`,
+    );
+  }
+  if (seq % 17 === 0 && seq > 0) {
+    return fail(
+      "原图 14000×10000（约 1.4 亿像素）超过全尺寸解码上限 1.2 亿像素——" +
+        "再解会把内存吃爆，已停在缩略图；请用外部看图软件查看这张",
+    );
+  }
+  if (seq % 19 === 0 && seq > 0) {
+    return fail("全尺寸解码失败（文件可能损坏或被截断）: unexpected end of file");
+  }
+
+  const hue = (seq * 37) % 360;
+  // 每 23 张给一张「超过长边上限、已缩放呈现」的：可见降级也要能亲眼验
+  const downscaled = seq % 23 === 0 && seq > 0;
+  const width = downscaled ? 8192 : 1600;
+  const height = downscaled ? 5464 : 1067;
+  return new Promise<FullPreview>((resolve) =>
+    setTimeout(
+      () =>
+        resolve({
+          // 真画出来的那张按 1600 宽画就够了(8192 的 SVG 没必要真渲染)
+          url: mockFullImage(hue, 1600, 1067),
+          width,
+          height,
+          sourceWidth: downscaled ? 11648 : width,
+          sourceHeight: downscaled ? 7768 : height,
+          downscaled,
+          fromCache: false,
+        }),
+      600,
+    ),
+  );
 }
 
 const SORTING_TOTAL = 1240;

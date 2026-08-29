@@ -14,6 +14,7 @@ pub mod media;
 pub mod naming;
 pub mod packaging;
 pub mod paths;
+pub mod preview;
 pub mod project;
 pub mod registry;
 pub mod sorting;

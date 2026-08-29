@@ -46,6 +46,7 @@ macro_rules! ocard_invoke_handler {
             $crate::commands::updater::check_for_update,
             $crate::commands::updater::install_update,
             $crate::commands::notify::list_notices,
+            $crate::commands::preview_cmds::load_full_preview,
             $crate::commands::sorting_cmds::list_pending_assets,
             $crate::commands::sorting_cmds::list_categories,
             $crate::commands::sorting_cmds::move_assets,
@@ -150,6 +151,14 @@ pub fn run() {
             );
             let machine_id = core::machine::machine_id(&config_dir)
                 .map_err(|e| format!("初始化机器 ID 失败: {e}"))?;
+            // 全尺寸预览缓存放**本机** cache 目录:单张几 MB,写 NAS 既慢又会把
+            // 项目撑肿,而它随时能按原图重解。拿不到 cache 目录时退到 config 目录,
+            // 总好过整条全尺寸路径不可用。
+            let preview_dir = app
+                .path()
+                .app_cache_dir()
+                .unwrap_or_else(|_| config_dir.clone())
+                .join("previews");
             app.manage(commands::updater::PendingUpdate::default());
             app.manage(commands::windows_cmds::PendingOpenProject::default());
             app.manage(commands::sorting_cmds::IndexManager::default());
@@ -161,6 +170,9 @@ pub fn run() {
                 notices: Default::default(),
                 ops: Default::default(),
                 approved_plans: Default::default(),
+                preview_cache: std::sync::Arc::new(
+                    core::preview::PreviewCache::with_default_budget(preview_dir),
+                ),
             });
             // 卷插拔监视(快捷拷卡):2s 轮询本地挂载表(不碰 NAS/登记表),
             // 有插拔即发 volumes://changed;前端收到后再拉带卡匹配的完整列表。
@@ -335,6 +347,48 @@ pub fn run() {
                             );
                             CONSECUTIVE_FAILS.store(0, Ordering::Relaxed);
                         }
+                        responder.respond(
+                            tauri::http::Response::builder()
+                                .status(404)
+                                .body(Vec::new())
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+            });
+        })
+        .register_asynchronous_uri_scheme_protocol("preview", |ctx, request, responder| {
+            // 全尺寸预览按需读取:闸在 preview_proto::resolve_preview_request,
+            // 这里只做 IO;异步线程防主线程卡死。
+            //
+            // 与 thumb:// 的差别:缩略图 404 只是「这一格是占位」,可以静默;
+            // 全尺寸 404 意味着**用户以为自己在看原图、其实没看到**,
+            // 所以除了 404 之外还要发一条可见告警——界面那侧同时也会
+            // 因为 <img> onError 退回缩略图并把话说破(零静默两道保险)。
+            let app = ctx.app_handle().clone();
+            let path = request.uri().path().to_string();
+            std::thread::spawn(move || {
+                let bytes = (|| -> Result<Vec<u8>, String> {
+                    let state = app.state::<commands::AppState>();
+                    let dir = state.preview_cache.dir().to_path_buf();
+                    let p = commands::preview_proto::resolve_preview_request(&dir, &path)?;
+                    std::fs::read(&p).map_err(|e| e.to_string())
+                })();
+                match bytes {
+                    Ok(body) => responder.respond(
+                        tauri::http::Response::builder()
+                            .status(200)
+                            .header("Content-Type", "image/jpeg")
+                            .body(body)
+                            .unwrap_or_default(),
+                    ),
+                    Err(e) => {
+                        log::warn!("preview:// 读取失败 {path}: {e}");
+                        commands::notify::warn(
+                            &app,
+                            "preview-protocol-failed",
+                            format!("全尺寸预览读取失败({e});全屏里显示的仍是缩略图,清晰度不足以判断虚实"),
+                        );
                         responder.respond(
                             tauri::http::Response::builder()
                                 .status(404)

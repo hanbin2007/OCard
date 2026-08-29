@@ -27,6 +27,7 @@ import {
   mockFlowHints,
   mockDiagnostics,
   mockFfmpegStatus,
+  mockFullPreview,
   mockIndexing,
   mockInspection,
   mockPendingAssets,
@@ -56,6 +57,7 @@ import type {
   CopyTask,
   AssetPage,
   BulkResult,
+  FullPreview,
   CopyTaskPreview,
   AnalyzeJob,
   CuratedFlowHint,
@@ -850,6 +852,24 @@ export function listPendingAssets(
     items: mockPendingAssets.slice(offset, offset + capped),
     total: mockPendingAssets.length,
   });
+}
+
+/**
+ * 按需取一张素材的**全尺寸**预览（全屏预览专用）。
+ *
+ * 只在打开全屏时调用：整库全尺寸解码是几十 GB 的事，绝不能进索引阶段。
+ * 后端解好落本机有界缓存，返回一个可直接放进 `<img src>` 的 `preview://` URL。
+ *
+ * **失败一律 reject**，`Error.message` 是一句说清原因的话（RAW 未接 libraw /
+ * 视频未接抽帧 / 超出像素上限 / 文件损坏 …）。调用方必须把它显示出来——
+ * 静默停在缩略图上，正是这条 bug 本身。
+ */
+export function loadFullPreview(
+  projectId: string,
+  assetId: string,
+): Promise<FullPreview> {
+  if (IS_TAURI) return ipc("load_full_preview", { projectId, assetId });
+  return mockFullPreview(assetId);
 }
 
 /** 分类夹清单（含固定项），带各自计数 */

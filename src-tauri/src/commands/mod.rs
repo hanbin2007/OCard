@@ -14,6 +14,8 @@ pub mod finalcut_cmds;
 #[cfg(all(test, not(windows)))]
 mod integration_tests;
 pub mod notify;
+pub mod preview_cmds;
+pub mod preview_proto;
 pub mod sorting_cmds;
 pub mod tasks;
 pub mod thumb_proto;
@@ -40,6 +42,9 @@ pub struct AppState {
     pub ops: sorting_cmds::OpsMutex,
     /// 双确认屏批准过的计划快照(见 [`ApprovedPlans`])。
     pub approved_plans: ApprovedPlans,
+    /// 全屏预览的全尺寸取图缓存(本机、有界 LRU,见 [`crate::core::preview::PreviewCache`])。
+    /// 放进 AppState 是因为 `preview://` 协议处理器也要问它「缓存目录在哪」。
+    pub preview_cache: std::sync::Arc<crate::core::preview::PreviewCache>,
 }
 
 /// 最多留几份批准过的计划(用户来回改勾选会连着拉好几次计划,只有最后一份会被批准)。

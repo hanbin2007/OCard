@@ -199,6 +199,10 @@ export function Shell() {
       className="shell"
       data-nav={navDirection}
       data-platform={IS_MAC_DESKTOP ? "mac" : undefined}
+      /* 折叠态只改 `--sidebar-width` 这一个布局基准:栅格的侧栏列、
+         以及所有按它定位的东西(左下角的快捷拷卡浮层)一起跟着走,
+         结构一行不动 */
+      data-sidebar={state.sidebarCollapsed ? "collapsed" : "expanded"}
     >
       <Sidebar />
       <main className="main">

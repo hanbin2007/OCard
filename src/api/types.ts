@@ -540,6 +540,37 @@ export interface AssetPage {
 }
 
 /**
+ * 全屏预览的**全尺寸**取图结果（`load_full_preview`）。
+ *
+ * 为什么要单独一条路：`thumbnail` 是 320px 缩略图，全屏里把它放大看到的是
+ * 插值出来的糊块——而选片时在全屏里判的恰恰是虚实与对焦。拿放大的缩略图
+ * 当原图下判断，是把错误决定伪装成正确决定，所以全屏必须换成真原图。
+ *
+ * **按需**：只有打开全屏才会请求，索引阶段一张都不解。
+ *
+ * 失败一律是 reject，`message` 是一句**说清为什么**的话（格式不支持 /
+ * 超出尺寸上限 / 解码失败各说各的），界面原样展示——绝不允许静默停在
+ * 缩略图上装作没事。
+ */
+export interface FullPreview {
+  /** `preview://localhost/<cacheName>`（Windows 上是 `http://preview.localhost/...`） */
+  url: string;
+  /** 实际呈现的像素尺寸 */
+  width: number;
+  height: number;
+  /** 摆正后的原始像素尺寸 */
+  sourceWidth: number;
+  sourceHeight: number;
+  /**
+   * true = 原图超过长边上限（8192px），呈现的是**缩放过的**图。
+   * 界面必须据此说明「你看到的不是原始像素」——不然「超限降级」就成了静默降级。
+   */
+  downscaled: boolean;
+  /** 本次是否命中本机缓存（诊断用；界面不据此改文案） */
+  fromCache: boolean;
+}
+
+/**
  * 分类夹。固定项与自定义分类统一表达，前端不硬编码顺序。
  * - inbox：`1. 待分类`
  * - custom：建项目时定义的分类，绑定数字键 1–9

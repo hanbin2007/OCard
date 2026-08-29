@@ -4,14 +4,30 @@
  * 预览打开期间键盘由这里**全权接管**(评审 3.2):你操作的就是你看见的
  * 这张——P/数字键/D 作用于当前预览项,绝不落到网格里进预览前的旧选中。
  * 底部动作条同时是快捷键提示:预览此前是唯一没有 hint 的操作场所。
+ *
+ * ## 全尺寸原图（修 v1「全屏预览不是全分辨率」）
+ *
+ * v1 在全屏里放大的是 320px 缩略图。选片时在全屏里判的恰恰是虚实与对焦，
+ * 而放大的缩略图**根本判不了**——用户却以为自己在看原图下判断。
+ *
+ * 现在的口径：
+ * 1. 打开即先显示已有缩略图（立刻有东西看，不白屏），同时按需请求全尺寸；
+ * 2. 换上之前**必须当面说清「你现在看的是缩略图」**，换上之后提示消失。
+ *    这一条是本 bug 的核心：提示要是提前消失，等于这个 bug 没修；
+ * 3. 解不出来（格式不支持 / 超尺寸上限 / 解码失败）各给各的具体说明，
+ *    绝不静默停在缩略图上装作没事；
+ * 4. 点击放大只在全尺寸到位后才有意义——没到位就不许放大，
+ *    否则又回到「放大一团糊还以为是原图」。
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { SortingAsset, SortingCategory } from "../api/types";
+import { loadFullPreview } from "../api";
+import type { FullPreview, SortingAsset, SortingCategory } from "../api/types";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import { animateOnce } from "../lib/motion";
 import { trapTabFocus } from "../lib/focusTrap";
 import { resolveShortcut, shouldYieldShortcut } from "../lib/sorting";
+import { useSelectedProject } from "../state/store";
 import { IconArrowLeft, IconChevronRight, IconClose } from "./Icon";
 import { JudgementBadges } from "./JudgementBadges";
 import { Badge, Kbd } from "./ui";
@@ -20,6 +36,62 @@ import { Badge, Kbd } from "./ui";
 const SWAP_SHIFT_PX = 18;
 /** 与 CSS --dur-spring-fast 同一档（ζ=1，response 0.25s） */
 const SWAP_DURATION_MS = 350;
+
+/**
+ * 发起全尺寸解码前的等待。
+ *
+ * 一直按着方向键扫图时，中间掠过的每一张都发一次整幅解码，会把 CPU 和内存
+ * 都吃光；停下来看的那张才值得解。停留不足这个时长的直接不发请求——
+ * 这既是省算力，也是「慢响应盖住新的那张」这类竞态的第一道闸。
+ */
+export const FULL_PREVIEW_DELAY_MS = 150;
+
+/** 缩略图最长边（与 Rust 侧 `media::THUMB_MAX_EDGE` 同一个数，改一处要改两处） */
+const THUMB_MAX_EDGE = 320;
+
+/** 全尺寸取图的状态机。三种终态各自对应界面上一句不同的话。 */
+type FullState =
+  | { phase: "loading" }
+  | { phase: "ready"; preview: FullPreview }
+  | { phase: "failed"; message: string };
+
+/** 顶部提示条要说的话；null = 无话可说（全尺寸已到位且是原始像素）。 */
+type Notice = { tone: "warn" | "info" | "danger"; text: string } | null;
+
+/**
+ * 「现在该跟用户说什么」的唯一真相来源。
+ * 抽成纯函数是为了让「提示什么时候出现、什么时候消失」能被单测直接钉住。
+ */
+export function previewNotice(full: FullState, hasThumb: boolean): Notice {
+  if (full.phase === "failed") {
+    return {
+      tone: "danger",
+      text: hasThumb
+        ? `${full.message}；你现在看到的仍是 ${THUMB_MAX_EDGE}px 缩略图，不能据此判断虚实`
+        : full.message,
+    };
+  }
+  if (full.phase === "loading") {
+    return hasThumb
+      ? {
+          tone: "warn",
+          text: `当前显示的是 ${THUMB_MAX_EDGE}px 缩略图，清晰度不足以判断虚实与对焦——全尺寸原图解码中…`,
+        }
+      : { tone: "info", text: "正在解码全尺寸原图…" };
+  }
+  const { preview } = full;
+  if (preview.downscaled) {
+    // 超限降级也要看得见:不说，用户就会拿一张缩放图去数睫毛
+    return {
+      tone: "warn",
+      text:
+        `原图 ${preview.sourceWidth}×${preview.sourceHeight} 超过显示上限，` +
+        `这里是缩放后的 ${preview.width}×${preview.height}——不是原始像素，细节以原片为准`,
+    };
+  }
+  // 全尺寸原图已到位且是原始像素:这是**唯一**该闭嘴的情形
+  return null;
+}
 
 export function AssetLightbox({
   asset,
@@ -80,12 +152,61 @@ export function AssetLightbox({
 }) {
   // thumb:// 取图可能 404：转占位而不是留一个碎图
   const [failed, setFailed] = useState(false);
-  /** 点击放大(评审 3.11 v1):在全尺寸解码接上之前,先给一个粗判焦的放大 */
+  /** 点击放大：**只在全尺寸到位后**才允许（放大一张缩略图正是本 bug 本身） */
   const [zoomed, setZoomed] = useState(false);
+  const [full, setFull] = useState<FullState>({ phase: "loading" });
   useEffect(() => {
     setFailed(false);
     setZoomed(false);
   }, [asset.id]);
+
+  /*
+   * 全尺寸取图。projectId 从 store 取:调用方(SortingScreen)只传素材,
+   * 而后端要按项目定位文件。
+   */
+  const projectId = useSelectedProject()?.id ?? null;
+  useEffect(() => {
+    // live 是这条竞态的全部答案:换到下一张时上一次 effect 先 cleanup,
+    // 它那份 live 变 false,于是**慢半拍才回来的上一张结果被丢弃**,
+    // 不会盖住眼前这张。刚修过一批同类竞态,别再造一个。
+    let live = true;
+    setFull({ phase: "loading" });
+    if (!projectId) {
+      // 没有当前项目 = 取不到原图。这也要说出来,不能停在缩略图装作没事
+      setFull({
+        phase: "failed",
+        message: "当前没有选定项目，取不到全尺寸原图",
+      });
+      return;
+    }
+    const timer = setTimeout(() => {
+      loadFullPreview(projectId, asset.id).then(
+        (preview) => {
+          if (live) setFull({ phase: "ready", preview });
+        },
+        (e: unknown) => {
+          if (!live) return;
+          const message =
+            e instanceof Error ? e.message : typeof e === "string" ? e : String(e);
+          setFull({
+            phase: "failed",
+            message: message || "全尺寸原图加载失败（后端没有给出原因）",
+          });
+        },
+      );
+    }, FULL_PREVIEW_DELAY_MS);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [asset.id, projectId]);
+
+  const hasThumb = Boolean(asset.thumbReady && asset.thumbnail && !failed);
+  const showFull = full.phase === "ready";
+  const notice = previewNotice(full, hasThumb);
+  /** 有东西可看 = 全尺寸到位，或者还有缩略图顶着 */
+  const hasImage = showFull || hasThumb;
+  const imageSrc = showFull ? full.preview.url : asset.thumbnail;
 
   const rootRef = useRef<HTMLDivElement>(null);
   const mediaRef = useRef<HTMLElement | null>(null);
@@ -279,6 +400,23 @@ export function AssetLightbox({
         </button>
       </div>
 
+      {/*
+        「你现在看的到底是什么」必须写在脸上。
+        用户拿放大的缩略图当原图下判断,正是这条 bug 的成因;
+        全尺寸到位且是原始像素时(且仅在那时)这条提示消失。
+      */}
+      {notice ? (
+        <div
+          className={`lightbox__notice lightbox__notice--${notice.tone}`}
+          data-testid="lightbox-preview-notice"
+          data-tone={notice.tone}
+          role="status"
+          aria-live="polite"
+        >
+          {notice.text}
+        </div>
+      ) : null}
+
       <div className="lightbox__stage">
         <button
           type="button"
@@ -291,8 +429,7 @@ export function AssetLightbox({
           <IconArrowLeft />
         </button>
 
-        {asset.thumbReady && asset.thumbnail && !failed ? (
-          // v1 放大缩略图；像素级查看等 media_indexer 的全尺寸解码接上再换
+        {hasImage ? (
           <img
             ref={(node) => {
               mediaRef.current = node;
@@ -300,12 +437,38 @@ export function AssetLightbox({
             /* 与网格里那一格共用过渡名：支持的内核上，两者是同一个实体在形变 */
             style={{ viewTransitionName: "ocard-preview" }}
             className={`lightbox__image${zoomed ? " lightbox__image--zoomed" : ""}`}
-            src={asset.thumbnail}
+            src={imageSrc}
             alt={asset.fileName}
             data-testid="lightbox-image"
-            title={zoomed ? "点击还原" : "点击放大(缩略图预览,清晰度有限)"}
-            onClick={() => setZoomed((z) => !z)}
-            onError={() => setFailed(true)}
+            /* 测试与实测都要能一眼分辨「现在挂的是哪一路图」 */
+            data-source={showFull ? "full" : "thumb"}
+            title={
+              showFull
+                ? zoomed
+                  ? "点击还原"
+                  : /* 别把 2.4 倍说成「1:1 原始像素」——那是同一类谎话的另一种
+                       说法。说清放大倍数和原图尺寸,用户自己判断够不够看 */
+                    `点击放大 2.4 倍看细节（全尺寸原图 ${full.preview.width}×${full.preview.height}）`
+                : "全尺寸原图还没到位，放大只会放大缩略图——先等它换上"
+            }
+            onClick={() => {
+              // 全尺寸没到位就不许放大:放大一团糊会被读成「这张拍虚了」
+              if (showFull) setZoomed((z) => !z);
+            }}
+            onError={() => {
+              if (showFull) {
+                // preview:// 读不出来(本机缓存被清、协议闸拒绝):退回缩略图,
+                // 并把话说破——不能让人对着一张缩略图以为是原图
+                setZoomed(false);
+                setFull({
+                  phase: "failed",
+                  message:
+                    "全尺寸原图读取失败（本机预览缓存可能已被清理）；切走再切回来可重试",
+                });
+              } else {
+                setFailed(true);
+              }
+            }}
           />
         ) : (
           <div

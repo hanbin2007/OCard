@@ -177,6 +177,20 @@ export function IconSettings(props: IconProps) {
   );
 }
 
+/**
+ * 侧栏开合(macOS「sidebar.left」同款几何):一个窗框 + 靠左的分栏线。
+ * 两态共用同一个字形——开合状态由按钮的 aria-expanded 与文案承担,
+ * 图标本身不做左右翻转:翻过来读起来像「右侧栏」,是另一个东西。
+ */
+export function IconSidebar(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <rect x="2" y="3" width="12" height="10" rx="1.4" />
+      <path d="M6.2 3v10" />
+    </Svg>
+  );
+}
+
 export function IconArrowLeft(props: IconProps) {
   return (
     <Svg {...props}>

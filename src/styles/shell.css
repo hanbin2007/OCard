@@ -165,6 +165,14 @@
   color: var(--text-tertiary);
 }
 
+/* 「项目管理」尾巴上那个 + 号是**装饰**,与 __count 长在同一个位置但不是
+   同一类东西:计数有行动意义(正在拷 2 张),+ 号没有。分开一个类,
+   折叠态才能只收它、把真正有信息量的计数留下 */
+.nav-item__add {
+  margin-left: auto;
+  color: var(--text-tertiary);
+}
+
 .sidebar__projects {
   display: flex;
   flex-direction: column;
@@ -246,6 +254,169 @@
 .sidebar__operator--btn:hover {
   color: var(--text-primary);
   text-decoration: underline;
+}
+
+/* 底部动作组:主题三态 + 折叠开关 */
+.sidebar__foot-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/*
+ * 折叠开关。放在侧栏**底部**是被 macOS 逼出来的:无边框窗口下红绿灯钉在
+ * 窗口左上角、不随布局走(上面那条 76px 让位就是给它的),折叠后整条轨才
+ * 78px 宽,品牌区被红绿灯占满,那里塞不下按钮。底部两态同位置,
+ * 连按两下不用重新找。
+ */
+.sidebar__toggle {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  transition:
+    background var(--dur-micro) var(--ease-out),
+    color var(--dur-micro) var(--ease-out),
+    transform var(--dur-spring-fast) var(--spring);
+}
+
+.sidebar__toggle:hover {
+  background: var(--hover);
+  color: var(--text-primary);
+}
+
+.sidebar__toggle:active {
+  transform: scale(0.94);
+  transition-duration: var(--dur-instant);
+  transition-timing-function: var(--ease-out);
+}
+
+/* ---------- 侧栏折叠态 ---------- */
+
+/*
+ * 折叠只改**一个数**:`--sidebar-width`。
+ * `.shell` 的栅格按它排,左下角的快捷拷卡浮层也按它定左缘
+ * (`left: calc(var(--sidebar-width) + …)`),所以改基准值等于两处一起对,
+ * 结构一行不动 —— 这正是不去直接改 grid-template-columns 的理由。
+ *
+ * 宽度本身**不做过渡**:动效守卫(tokens.test)只放行合成/上色属性,
+ * 过渡 width 会让每一帧重排整个网格。这一帧交给视图过渡,
+ * 由 Sidebar.tsx 的 withViewTransition 承担(它内部已处理
+ * 「内核不支持」与「用户要求减少动效」,两种情况都是直接落地)。
+ */
+.shell[data-sidebar="collapsed"] {
+  --sidebar-width: 64px;
+}
+
+/*
+ * macOS 的 Overlay 标题栏:红绿灯钉在**窗口**左上角,不随布局走。
+ * 轨要是比它窄,红绿灯就压到内容区顶栏的标题上去了 ——
+ * 所以 mac 下的折叠宽度以「装得下红绿灯」为底线,不取 64。
+ */
+.shell[data-platform="mac"][data-sidebar="collapsed"] {
+  --sidebar-width: 78px;
+}
+
+/* 品牌区:字标居中,名字收起 */
+.sidebar--collapsed .sidebar__brand {
+  justify-content: center;
+  padding: 0;
+}
+
+/*
+ * mac 折叠态:让位**照留**,字标反而要收掉。
+ * 红绿灯就落在这 76×46 里,再放个字标进去必然被压。整行空着是对的——
+ * macOS 上「窗口左上角属于系统按钮」本来就是标准形态。
+ *
+ * 这条规则的存在是刻意的:上面那句 `padding: 0` 的选择器只有 (0,2,0),
+ * 而展开态的让位规则 `.shell[data-platform="mac"] .sidebar__brand` 是 (0,3,0),
+ * 本来就压得住它。写死在这里,是为了让「mac 下让位仍然生效」变成一条
+ * 看得见的决定,而不是靠 specificity 巧合。
+ */
+.shell[data-platform="mac"] .sidebar--collapsed .sidebar__brand {
+  padding-left: 76px;
+}
+
+.shell[data-platform="mac"] .sidebar--collapsed .sidebar__mark {
+  display: none;
+}
+
+.sidebar--collapsed .sidebar__name {
+  display: none;
+}
+
+.sidebar--collapsed .sidebar__scroll {
+  padding-left: var(--space-1);
+  padding-right: var(--space-1);
+}
+
+/* 折叠态是「一条认得出来的图标轨」,不是空条:每个入口的图标都在,
+   名字由 Sidebar.tsx 补进 title / aria-label(display:none 会把可访问名
+   一起抹掉,只靠 CSS 收标签等于让读屏只念得出「按钮」) */
+.sidebar--collapsed .nav-item {
+  justify-content: center;
+  /* 只剩图标时行要方一点:展开态 6px 的行高只有 28px,一条 55px 宽的轨里
+     那是个又扁又窄的靶子。8px → 32px,鼠标好点,读起来也像一条「轨」 */
+  padding: 8px 0;
+}
+
+.sidebar--collapsed .nav-item__label {
+  display: none;
+}
+
+/* 「正在拷 2 张」是有行动意义的量,不允许因为折叠就静静消失:
+   折叠态改成贴在图标右上角的小徽标,数字照旧看得见 */
+.sidebar--collapsed .nav-item__count {
+  position: absolute;
+  top: 0;
+  right: 4px;
+  margin-left: 0;
+  min-width: 15px;
+  padding: 0 4px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  color: var(--on-accent);
+  line-height: 15px;
+  text-align: center;
+}
+
+/* 装饰性的 + 号在轨里没有位置(有信息量的计数见上一条) */
+.sidebar--collapsed .nav-item__add {
+  display: none;
+}
+
+/* 项目快速切换整段收起:项目名是一串文字,压不进一条 64px 的轨。
+   这不是「静默丢功能」—— 同一件事在顶栏「当前项目」胶囊里一直都在
+   (原地切项目下拉,评审 5.2) */
+.sidebar--collapsed .sidebar__section--projects {
+  display: none;
+}
+
+/* 底部改纵排:操作人那行是「张三 · MBP-01」这样的长文本,收起
+   (换操作人还有顶栏设置入口);主题三态与折叠开关竖着摞 */
+.sidebar--collapsed .sidebar__foot {
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-1);
+}
+
+.sidebar--collapsed .sidebar__operator {
+  display: none;
+}
+
+.sidebar--collapsed .sidebar__foot-actions {
+  flex-direction: column;
+}
+
+.sidebar--collapsed .segmented {
+  flex-direction: column;
 }
 
 /* ---------- 主区 ---------- */

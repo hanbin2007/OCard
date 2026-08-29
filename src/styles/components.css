@@ -2252,18 +2252,21 @@
   outline: none;
   padding: 2px 0;
 }
+/* 候选浮层:portal 到 body,fixed 定位(left/width/top|bottom/max-height 由 JS 内联写)。
+   为什么非 portal 不可:标签字段坐在 .card 里,而 .card 是 overflow: hidden——
+   普通绝对定位的菜单会被卡片下沿裁掉,而 overflow 裁剪 z-index 逃不掉。
+   层级与 .select-pop 并列(70),理由同源:它同样可能长在 .overlay(50)的 dialog 里,
+   压不过去就等于在弹窗里没有下拉。大小关系由 stacking.test 静态钉住 */
 .tag-picker__menu {
-  position: absolute;
-  z-index: 30;
-  top: calc(100% + 4px);
-  left: 0;
-  right: 0;
+  position: fixed;
+  z-index: 70;
   max-height: 220px;
   overflow-y: auto;
   padding: var(--space-1);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
-  background: var(--panel);
+  background: var(--panel-raised);
+  /* 浮层层级允许克制阴影(与 dialog 同白名单) */
   box-shadow: var(--shadow-overlay);
 }
 .tag-picker__option {
@@ -2284,6 +2287,12 @@
   background: var(--hover);
 }
 .tag-picker__create-label {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+/* 没有候选时的一句话。空白下拉是典型的静默:用户分不清「没得选了」和「坏了」 */
+.tag-picker__empty {
+  padding: 6px 8px;
   font-size: var(--text-xs);
   color: var(--text-secondary);
 }
@@ -2321,4 +2330,48 @@
   color: var(--text-primary);
   font-weight: var(--weight-medium);
   outline: 1px solid var(--border-strong);
+}
+
+/*
+ * 全屏预览的「你现在看的是什么」提示条。
+ *
+ * 它守的是被修的那条 bug：全尺寸原图没到位时，用户看到的是 320px 缩略图，
+ * 而选片判的就是虚实——不说破，用户就会拿糊的缩略图当原图下判断。
+ * 全尺寸换上且是原始像素时这条整个不渲染（消失），其余情形一律有话说。
+ *
+ * 放在 .lightbox__bar 与 .lightbox__stage 之间，是 .lightbox 这条 flex 列上的
+ * 一条固定高度轨：**不许写 flex-grow**——.lightbox 的弹性子轨必须仍然只有
+ * .lightbox__stage 一条（见 styles/overflow.test.ts 的全屏层契约）。
+ */
+.lightbox__notice {
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  border-bottom: 1px solid var(--border);
+  /* 长文案(超限说明带两组尺寸)在窄窗里要能换行,不能把提示挤没 */
+  overflow-wrap: anywhere;
+}
+/*
+ * 色调层要压在**不透明**的 panel 上。
+ * `--warn-soft` / `--danger-soft` 都是 rgba：直接当背景会透出身后的遮罩和网格，
+ * 实测(Chrome, 1568px)整条提示读起来像浮在半透明玻璃上，字被下面的分类
+ * 胶囊串扰。分层背景(色调 + panel)让它和 .lightbox__bar 一样实。
+ */
+.lightbox__notice--info {
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+}
+.lightbox__notice--warn {
+  background:
+    linear-gradient(var(--warn-soft), var(--warn-soft)),
+    var(--panel);
+  color: var(--warn);
+  font-weight: var(--weight-medium);
+}
+.lightbox__notice--danger {
+  background:
+    linear-gradient(var(--danger-soft), var(--danger-soft)),
+    var(--panel);
+  color: var(--danger);
+  font-weight: var(--weight-medium);
 }

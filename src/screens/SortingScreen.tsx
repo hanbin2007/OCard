@@ -2217,31 +2217,48 @@ export function SortingScreen() {
           </div>
 
           <div className="sorting__foot">
+            {/*
+              画廊模式下这条只留**屏级**的东西。逐张操作的键位由 GalleryView
+              自己那条提示条负责——两条都列会同时显示、而且互相矛盾:
+              这条写着「X 选中 · Shift+方向 连选 · ⌘A 全选」,画廊那条写着
+              「X 选中 / ⌘A 全选不适用」。用户实际看到的就是两排打架的提示。
+              `Shift+D` 留在这里是因为它作用于**整屏的待删清单**,不是某一张,
+              而画廊那条不写它 —— 不留的话它就成了一个谁都没告诉你的隐藏键。
+            */}
             <div className="hint-bar">
-              <span>
-                <Kbd>↑</Kbd>
-                <Kbd>↓</Kbd>
-                <Kbd>←</Kbd>
-                <Kbd>→</Kbd> 移动
-              </span>
-              <span>
-                <Kbd>X</Kbd> 选中 · <Kbd>Shift</Kbd>+方向 连选 · <Kbd>⌘A</Kbd> 全选 ·{" "}
-                <Kbd>Esc</Kbd> 清选
-              </span>
-              <span>
-                <Kbd>1</Kbd>–<Kbd>9</Kbd> 分类 · <Kbd>P</Kbd> 精选 · <Kbd>O</Kbd> 其他 ·{" "}
-                <Kbd>D</Kbd> 标删/取消 · <Kbd>Shift+D</Kbd> 提交
-              </span>
-              <span data-testid="sorting-hint-preview">
-                <Kbd>空格</Kbd>/<Kbd>Enter</Kbd> 预览（连拍组先铺开整组）
-              </span>
-              {viewMode === "gallery" ? (
-                /* 画廊把连拍组拆开逐张列出——这与网格里"一组一格"的计数口径不同,
-                   不说破的话用户会以为素材数量变了(零静默) */
-                <span className="dim" data-testid="sorting-gallery-note">
-                  画廊模式：连拍组逐张平铺，不再折叠成一格
-                </span>
-              ) : null}
+              {viewMode === "grid" ? (
+                <>
+                  <span>
+                    <Kbd>↑</Kbd>
+                    <Kbd>↓</Kbd>
+                    <Kbd>←</Kbd>
+                    <Kbd>→</Kbd> 移动
+                  </span>
+                  <span>
+                    <Kbd>X</Kbd> 选中 · <Kbd>Shift</Kbd>+方向 连选 ·{" "}
+                    <Kbd>⌘A</Kbd> 全选 · <Kbd>Esc</Kbd> 清选
+                  </span>
+                  <span>
+                    <Kbd>1</Kbd>–<Kbd>9</Kbd> 分类 · <Kbd>P</Kbd> 精选 ·{" "}
+                    <Kbd>O</Kbd> 其他 · <Kbd>D</Kbd> 标删/取消 ·{" "}
+                    <Kbd>Shift+D</Kbd> 提交
+                  </span>
+                  <span data-testid="sorting-hint-preview">
+                    <Kbd>空格</Kbd>/<Kbd>Enter</Kbd> 预览（连拍组先铺开整组）
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span data-testid="sorting-hint-submit">
+                    <Kbd>Shift+D</Kbd> 提交待删清单
+                  </span>
+                  {/* 画廊把连拍组拆开逐张列出——这与网格里「一组一格」的计数口径
+                      不同,不说破的话用户会以为素材数量变了(零静默) */}
+                  <span className="dim" data-testid="sorting-gallery-note">
+                    画廊模式：连拍组逐张平铺，不再折叠成一格；逐张操作的键位见下方
+                  </span>
+                </>
+              )}
               {selection.selected.length > 0 ? (
                 <span className="push-right" data-testid="sorting-selected-count">
                   已选 {resolveEntryIds(entries, selection.selected).length}

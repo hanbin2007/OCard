@@ -29,7 +29,10 @@
  *   .lightbox(60)/.overlay--keyhelp(65)。
  *   本轮的处置:它是外壳级非模态浮层(和 .notice-panel/.quick-copy 同类),
  *   CSS 已改成 z-index: 35,名册里单独排一层。`.select-pop` 需要 70 的理由
- *   ——Select 会长在 dialog 里面——只对 .select-pop 成立,不可照抄。
+ *   ——Select 会长在 dialog 里面——不是随便哪个下拉都能照抄的。
+ *   (2026-08-29 补:`.tag-picker__menu` 也 portal 到 body 之后进了这一层。
+ *    它够格是因为**理由同源**——同样是焦点驱动的下拉、同样会长在 dialog 里,
+ *    不是因为「别人是 70 我也 70」。判据写在那一层的 whyTie 里。)
  *
  * 名册的形状也跟着变了:一层 = 一个 **tier**,tier 之间必须严格递增,
  * tier 内部允许并列**但必须写明理由**(whyTie)。这样「意外并列」照样判红,
@@ -80,7 +83,6 @@ interface Tier {
  * 这是 fail-closed 的方向:漏登记判红,而不是默默放行。
  */
 const LAYERS: Tier[] = [
-  { members: [{ classes: ["tag-picker__menu"], note: "标签选择器菜单" }] },
   {
     members: [
       {
@@ -107,7 +109,20 @@ const LAYERS: Tier[] = [
           "这条理由**只对它成立**,别照抄给别的下拉(2026-08-28:.topbar__project-menu 就是照抄了 70," +
           "结果压过了所有模态与全屏层)。",
       },
+      {
+        classes: ["tag-picker__menu"],
+        note:
+          "标签候选浮层。2026-08-29 从 z=30 的普通绝对定位改成 portal 到 body:" +
+          "它的宿主 .card 是 overflow:hidden,菜单被卡片下沿裁掉(用户只看得见半行候选)," +
+          "而 overflow 裁剪 z-index 逃不掉,只能脱离子树。",
+      },
     ],
+    whyTie:
+      "两者是**同一类东西**:都是 portal 到 body、fixed 定位、由输入焦点驱动的下拉," +
+      "都必须压过 .overlay(50)才能在 dialog 里可用。允许并列的前提是它们**不可能同时开**——" +
+      "两者都由焦点唯一驱动(Select 打开后焦点在自己的 listbox 上,TagPicker 的焦点在自己的输入框里)," +
+      "焦点只有一个,所以不存在互相遮挡的场面;真并列了也只是书写次序决定谁在上,不致病。" +
+      "反过来说:任何**不由焦点独占驱动**的浮层(悬浮提示、通知面板)都不许加进这一层。",
   },
   { members: [{ classes: ["overlay--gate"], note: "会话门" }] },
   { members: [{ classes: ["overlay--elevated"], note: "门上的二次确认" }] },

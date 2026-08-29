@@ -73,6 +73,8 @@ const SECTIONS: Array<{ title: string; rows: Array<[string, string]> }> = [
     rows: [
       ["?", "打开/关闭本速查"],
       ["Esc", "关闭浮层"],
+      // 键位存在却没写进这张表 = 学不到 = 等于没有(Shift+D 的老账)
+      ["⌘/Ctrl + \\", "收起/展开侧栏(收起后只剩图标轨,各屏入口仍可点)"],
     ],
   },
 ];

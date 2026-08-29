@@ -22,7 +22,7 @@ import {
   formatScopeFolders,
   isPartialCopy,
 } from "../lib/copyScope";
-import { loadPref, savePref } from "../lib/prefs";
+import { loadPref, savePref, type PrefIssue } from "../lib/prefs";
 import type {
   CameraReg,
   CopyDestination,
@@ -119,6 +119,13 @@ export interface AppState {
    * 卷被拔走时随 volumesUpdated 自动出队。
    */
   quickCopyQueue: string[];
+  /**
+   * 侧栏是否收成图标轨。
+   *
+   * 放全局状态是因为它有两个宿主:`.shell` 的栅格(宽度基准写在外壳上)
+   * 与侧栏自身的形态,两边必须是同一个真相。跨会话记忆走本地偏好。
+   */
+  sidebarCollapsed: boolean;
   /** 拷卡屏预填草稿:快捷拷卡引导「去拷卡」时带上卷(和匹配卡的相机) */
   copyDraft: { volumeId: string; cameraId?: string } | null;
   /** 设备屏卡登记预填草稿:快捷拷卡引导「去登记」时带上待绑定的卷 */
@@ -132,6 +139,7 @@ type BootstrapPayload = Pick<
 
 export type AppAction =
   | { type: "navigate"; route: RouteName }
+  | { type: "sidebarToggled" }
   | { type: "loadStarted" }
   | { type: "bootstrapped"; payload: BootstrapPayload }
   | { type: "loadFailed"; error: string }
@@ -195,9 +203,66 @@ export const initialState: AppState = {
   noticeKeys: {},
   jobs: [],
   quickCopyQueue: [],
+  sidebarCollapsed: false,
   copyDraft: null,
   cardDraft: null,
 };
+
+/* ------------------------------------------------------------------ *
+ * 本地界面偏好(`ocard:v1:ui`)
+ *
+ * 路由 / 当前项目 / 侧栏折叠共用一把键:它们是同一件事——「上次这台机器上
+ * 界面长什么样」。一把键 = 一条读路径 + 一条写路径,失败也就只有一处要说。
+ * ------------------------------------------------------------------ */
+
+export interface UiPref {
+  route?: RouteName;
+  selectedProjectId?: string | null;
+  sidebarCollapsed?: boolean;
+}
+
+const UI_PREF_KEY = "ui";
+
+/**
+ * 读界面偏好。读不动(存储不可用 / 存进去的内容坏了)时返回空对象并**报出去**,
+ * 由调用方转成用户看得见的提示——静默回落会让「每次开机侧栏又展开了」
+ * 变成一件谁也解释不了的怪事。
+ */
+export function loadUiPref(onIssue?: (issue: PrefIssue) => void): UiPref {
+  const raw = loadPref<unknown>(UI_PREF_KEY, {}, onIssue);
+  // JSON 里存着 null / 数字 / 字符串时,后面按对象取字段会直接抛(null 尤其),
+  // 那就成了「记忆坏掉 → 白屏」。这里挡住,并按「记忆坏了」报出去。
+  if (raw === null || typeof raw !== "object") {
+    onIssue?.({
+      key: UI_PREF_KEY,
+      op: "read",
+      reason: `本机存的界面偏好不是预期格式(${raw === null ? "null" : typeof raw})`,
+    });
+    return {};
+  }
+  return raw as UiPref;
+}
+
+/** 写界面偏好。写不进去要报出去:本次仍然生效,但重启后会回到默认。 */
+export function saveUiPref(value: UiPref, onIssue?: (issue: PrefIssue) => void): void {
+  savePref(UI_PREF_KEY, value, onIssue);
+}
+
+/** 偏好失败 → 通知中心条目(零静默:降级必须有可见出口) */
+export function prefIssueNotice(issue: PrefIssue): NoticeDto {
+  const message =
+    issue.op === "read"
+      ? `读取本机界面偏好失败：${issue.reason}。已按默认值启动（侧栏展开、回到拷卡屏），` +
+        `上次的界面状态本次没有恢复。`
+      : `界面偏好没能存到本机：${issue.reason}。侧栏折叠、当前屏等设置本次仍然生效，` +
+        `但重启后会回到默认。`;
+  return {
+    level: "warning",
+    code: `pref-${issue.op}-failed`,
+    message,
+    occurredAt: new Date().toISOString(),
+  };
+}
 
 /** 把增量事件合并进文件列表；未在事件里出现的文件保持原样 */
 function mergeFiles(
@@ -442,6 +507,9 @@ export function reducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case "navigate":
       return { ...state, route: action.route };
+
+    case "sidebarToggled":
+      return { ...state, sidebarCollapsed: !state.sidebarCollapsed };
 
     case "loadStarted":
       return { ...state, loading: true, error: null };
@@ -816,20 +884,25 @@ export function StoreProvider({
   /** 测试可注入初始状态，跳过异步 bootstrap */
   preloaded?: Partial<AppState>;
 }) {
+  /*
+   * 读偏好发生在 useReducer 的初始化函数里,那时还没有 dispatch,报不出去。
+   * 先攒在 ref 上,挂载后由下面那条 effect 统一转成可见通知。
+   * (StrictMode 会把初始化函数跑两遍 → 同一条会攒两份,effect 里按
+   *  「哪个键的哪种操作」去重,不让用户看见 ×2。)
+   */
+  const prefIssuesRef = useRef<PrefIssue[]>([]);
+
   const [state, dispatch] = useReducer(
     reducer,
     undefined,
-    // 重启回到原地(评审 5.7):路由与当前项目从本地偏好恢复——
-    // 更新安装必然重启,每次都重选项目/重新导航是纯重复劳动。
+    // 重启回到原地(评审 5.7):路由、当前项目与侧栏折叠从本地偏好恢复——
+    // 更新安装必然重启,每次都重选项目/重新导航/重折侧栏是纯重复劳动。
     // 恢复的项目 id 若在新数据里不存在,bootstrapped 会按既有规则回退到首个。
     // 测试注入 preloaded 时不读偏好,保持用例相互隔离。
     () => {
       const restored =
         preloaded === undefined
-          ? loadPref<{ route?: RouteName; selectedProjectId?: string | null }>(
-              "ui",
-              {},
-            )
+          ? loadUiPref((issue) => prefIssuesRef.current.push(issue))
           : {};
       return {
         ...initialState,
@@ -839,24 +912,52 @@ export function StoreProvider({
         ...(restored.selectedProjectId
           ? { selectedProjectId: restored.selectedProjectId }
           : {}),
+        // 只认真正的 true:坏掉的记忆(字符串/数字)不该把侧栏折起来
+        ...(restored.sidebarCollapsed === true ? { sidebarCollapsed: true } : {}),
         ...preloaded,
         loading: preloaded ? false : initialState.loading,
       };
     },
   );
 
+  // 读偏好失败必须说出来:静默回落之后,「上次的界面状态没恢复」在用户眼里
+  // 只是「这软件记不住东西」,无从排查(零静默铁律)
+  useEffect(() => {
+    const issues = prefIssuesRef.current;
+    if (issues.length === 0) return;
+    prefIssuesRef.current = [];
+    const seen = new Set<string>();
+    for (const issue of issues) {
+      const key = `${issue.op}:${issue.key}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      dispatch({ type: "noticeReceived", notice: prefIssueNotice(issue) });
+    }
+  }, []);
+
   const skipBootstrap = preloaded !== undefined;
   const [reloadToken, setReloadToken] = useState(0);
   const reload = useCallback(() => setReloadToken((n) => n + 1), []);
 
-  // 路由/当前项目随用随存(评审 5.7);测试注入态不落盘
+  // 路由/当前项目/侧栏折叠随用随存(评审 5.7);测试注入态不落盘。
+  // 写不进去也要出声:否则「折了侧栏、重启又展开了」是一件用户完全
+  // 解释不了的事(零静默)。同 code 的重复失败由通知中心折叠成一条 ×N。
   useEffect(() => {
     if (skipBootstrap) return;
-    savePref("ui", {
-      route: state.route,
-      selectedProjectId: state.selectedProjectId,
-    });
-  }, [skipBootstrap, state.route, state.selectedProjectId]);
+    saveUiPref(
+      {
+        route: state.route,
+        selectedProjectId: state.selectedProjectId,
+        sidebarCollapsed: state.sidebarCollapsed,
+      },
+      (issue) => dispatch({ type: "noticeReceived", notice: prefIssueNotice(issue) }),
+    );
+  }, [
+    skipBootstrap,
+    state.route,
+    state.selectedProjectId,
+    state.sidebarCollapsed,
+  ]);
 
   // DEV 专用:浏览器预览/截图脚本的状态注入句柄(生产构建整段剔除,不改行为)
   const devStateRef = useRef(state);
