@@ -11,6 +11,7 @@ import {
   mockVolumes,
   mockWorkstation,
 } from "../api/mock";
+import { focusablesIn } from "../lib/focusTrap";
 import { currentTimeSlot, todayCompactDate } from "../lib/naming";
 import type { CopyProgressEvent, CopyTaskPreview, SourcePlan } from "../api/types";
 
@@ -122,8 +123,32 @@ describe("拷卡任务面板", () => {
     expect(nasRow.placeholder).toContain("自动推导");
 
     expect(screen.queryByLabelText("第 2 个目的地路径")).toBeNull();
-    // 双备份用灰字引导,不用空行逼人处理
-    expect(screen.getByText(/建议再加一块本地\/移动盘/)).toBeDefined();
+    // 双备份用灰字引导,不用空行逼人处理。这句引导全屏只此一份:
+    // 以前 hero 摘要里还有一句意思相同、措辞不同的孪生句
+    expect(screen.getAllByText(/建议再加一块本地\/移动盘/)).toHaveLength(1);
+  });
+
+  it("目的地就在 hero 那张卡里当场改，不是只读摘要 + 跳转", async () => {
+    // 钉住这次搬家:hero 右侧曾经只是只读摘要 + 一个「设置」按钮,按下去把
+    // 焦点甩到下半区老远的编辑处。谁再把编辑本体搬回 <form> 里,这条先红。
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    const dests = screen.getByTestId("copy-dests");
+    expect(dests.closest(".copy-stage"), "目的地编辑应当在 hero 里").not.toBeNull();
+    expect(dests.closest("#copy-form"), "不该退回下半区的拷卡设置表单").toBeNull();
+    // 「开始拷卡」与它同处一张卡:改完就在原地开跑,中间没有一跳
+    expect(screen.getByTestId("copy-start").closest(".copy-stage__node--dest")).toBe(
+      dests.closest(".copy-stage__node--dest"),
+    );
+
+    // 就地可改:不必先去点任何「设置」把自己送到别处
+    await fillDestinations(user);
+    await user.click(within(dests).getByRole("button", { name: "添加目的地" }));
+    const added = screen.getByLabelText("第 3 个目的地路径") as HTMLInputElement;
+    expect(added.closest(".copy-stage")).not.toBeNull();
+    await user.type(added, "/Volumes/BK-3");
+    expect(added.value).toBe("/Volumes/BK-3");
   });
 
   it("手动加的目的地行留空时逐行标红，不进确认步骤", async () => {
@@ -177,6 +202,45 @@ describe("拷卡任务面板", () => {
     expect(screen.getByLabelText("内容标签")).toBeDefined();
     const group = screen.getByRole("group", { name: "任务切换" });
     expect(within(group).getAllByRole("button")).toHaveLength(mockCopyTasks.length);
+  });
+
+  it("确认屏开着时目的地整组锁死（hero 一直在，改得动就等于清单和确认屏不一致）", async () => {
+    // 源卷早就 disabled={confirming} 了。目的地搬进 hero 之后同样会在确认期间
+    // 继续显示,不锁就能一边看着「将要执行的清单」一边把它改掉。
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+
+    const dests = screen.getByTestId("copy-dests") as HTMLFieldSetElement;
+    expect(dests.disabled).toBe(false);
+    expect(screen.queryByTestId("copy-dests-locked")).toBeNull();
+
+    await user.click(screen.getByRole("radio", { name: "选择源卷 NIKON_Z9" }));
+    await addTag(user, "下午径赛");
+    await fillDestinations(user);
+    await user.click(screen.getByRole("button", { name: "开始拷卡" }));
+    expect(screen.getByText("确认拷卡信息")).toBeDefined();
+
+    // fieldset 一次锁住整组:类型下拉、路径框、选盘、删除、添加目的地
+    expect(dests.disabled).toBe(true);
+    for (const el of within(dests).getAllByRole("button")) {
+      expect((el as HTMLButtonElement).matches(":disabled"), el.textContent ?? "").toBe(
+        true,
+      );
+    }
+    expect(
+      (screen.getByLabelText("第 2 个目的地路径") as HTMLInputElement).matches(
+        ":disabled",
+      ),
+    ).toBe(true);
+
+    // 锁了必须说得出「谁锁的、怎么解」:控件的 disabled 态在输入框上几乎
+    // 看不出来,不写这一行就是静默降级
+    expect(screen.getByTestId("copy-dests-locked").textContent).toContain("返回修改");
+
+    // 返回修改后必须重新解锁,否则就成了单向的死锁
+    await user.click(screen.getByRole("button", { name: "返回修改" }));
+    expect(dests.disabled).toBe(false);
+    expect(screen.queryByTestId("copy-dests-locked")).toBeNull();
   });
 
   it("双确认填齐后建立任务并置顶选中", async () => {
@@ -1996,5 +2060,268 @@ describe("★ E10 文件夹行的读屏名不许吞掉可见 meta", () => {
     const clip = folderCheckbox("DCIM/100MSDCF").getAttribute("aria-label") ?? "";
     expect(clip).toContain("3 个文件");
     expect(clip).not.toContain("含子目录");
+  }, 20000);
+});
+
+/* ------------------------------------------------------------------ *
+ * ★ 双确认：整屏替换 → 弹窗
+ *
+ * 改成弹窗之后新出现的两类风险，各由下面一个 describe 钉住：
+ *   ① 它必须是**真模态**——遮罩只是"看着挡住了"，键盘照样能走到背后去；
+ *   ② 弹窗更窄，「没滚到改名清单那一段就按了确认」变成默认路径。
+ * ------------------------------------------------------------------ */
+
+/** 选卷 → 填齐必填 → 开始拷卡 → 拿到弹窗节点 */
+async function openConfirmDialog(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole("radio", { name: "选择源卷 NIKON_Z9" }));
+  await addTag(user, "下午径赛");
+  await fillDestinations(user);
+  await user.click(screen.getByTestId("copy-start"));
+  return await screen.findByTestId("copy-confirm-dialog");
+}
+
+describe("★ 双确认弹窗是真模态（焦点圈定 / Esc / 背景锁定）", () => {
+  it("开屏焦点进弹窗本体，Tab 圈在里面出不去", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+    const dialog = await openConfirmDialog(user);
+    await confirmReady();
+
+    expect(dialog.getAttribute("role")).toBe("dialog");
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    // 读屏开屏第一句就是这个标题，指到不存在的 id 等于没标
+    const labelId = dialog.getAttribute("aria-labelledby");
+    expect(labelId).toBeTruthy();
+    expect(document.getElementById(labelId!)?.textContent).toBe("确认拷卡信息");
+
+    // 取焦落在弹窗**本体**：开屏就把焦点摆在「确认开始」上等于给回车留口子
+    expect(document.activeElement).toBe(dialog);
+
+    const items = focusablesIn(dialog);
+    expect(items.length, "弹窗里至少有「返回修改」「确认开始」两个").toBeGreaterThanOrEqual(2);
+
+    // 从容器往里走
+    await user.tab();
+    expect(document.activeElement).toBe(items[0]);
+
+    // 末项再 Tab 必须绕回首项，而不是溜到遮罩背后的表单/侧栏上
+    items[items.length - 1].focus();
+    await user.tab();
+    expect(document.activeElement).toBe(items[0]);
+
+    // 反向同理
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(items[items.length - 1]);
+
+    // 连按也出不去：被聚焦却看不见的按钮按回车照样执行
+    for (let i = 0; i < items.length + 3; i += 1) {
+      await user.tab();
+      expect(
+        dialog.contains(document.activeElement),
+        `第 ${i + 1} 次 Tab 之后焦点跑到了弹窗外：${
+          (document.activeElement as HTMLElement | null)?.textContent ?? "(null)"
+        }`,
+      ).toBe(true);
+    }
+  }, 20000);
+
+  it("Esc = 返回修改：退回表单、解锁、绝不开跑，焦点还给「开始拷卡」", async () => {
+    const user = userEvent.setup();
+    const spy = vi.spyOn(api, "startCopyTask");
+    render(<App preloaded={preloaded} />);
+    await openConfirmDialog(user);
+    await confirmReady();
+
+    await user.keyboard("{Escape}");
+
+    // ★ 先钉最要命的那条：Esc 绝不能变成「开始」。
+    //   放在最前面，是为了让它失败时的报错直接点名这件事，而不是先被
+    //   「弹窗还在」这种更表层的差异盖过去。
+    expect(spy, "Esc 触发了拷贝任务——误触一次就是几百 GB").not.toHaveBeenCalled();
+    // 「返回修改」那条路的其余后果也都要成立，Esc 不是另一种半吊子的关闭
+    expect(screen.queryByTestId("copy-confirm-dialog")).toBeNull();
+    expect(screen.getByLabelText("内容标签")).toBeDefined();
+    expect((screen.getByTestId("copy-dests") as HTMLFieldSetElement).disabled).toBe(
+      false,
+    );
+    expect(screen.queryByTestId("copy-dests-locked")).toBeNull();
+    // 焦点还回触发者：掉到 body 上的话键盘流整条断掉，而屏上没有任何迹象
+    expect(document.activeElement).toBe(screen.getByTestId("copy-start"));
+    spy.mockRestore();
+  }, 20000);
+
+  it("PLAN_CHANGED 之后弹窗还开着，此时 Esc 仍是「返回修改」，不是「重试开始」", async () => {
+    const user = userEvent.setup();
+    const planSpy = vi
+      .spyOn(api, "planSourceSelection")
+      .mockResolvedValueOnce(plan({ fileCount: 5, planDigest: "digest-1" }))
+      .mockResolvedValue(plan({ fileCount: 7, planDigest: "digest-2" }));
+    const startSpy = vi
+      .spyOn(api, "startCopyTask")
+      .mockRejectedValue(new Error("PLAN_CHANGED: 卡上的内容变了"));
+
+    render(<App preloaded={preloaded} />);
+    await openConfirmDialog(user);
+    await confirmReady();
+    await user.click(screen.getByTestId("copy-confirm-start"));
+    await screen.findByTestId("copy-plan-changed");
+    // 换发新 requestId 之后弹窗仍开着，等人重新过目
+    expect(screen.getByTestId("copy-confirm-dialog")).toBeDefined();
+    expect(startSpy).toHaveBeenCalledTimes(1);
+
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByTestId("copy-confirm-dialog")).toBeNull();
+    // 这一刻更不许有第二种含义：Esc 不会替用户"再试一次"
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText("内容标签")).toBeDefined();
+
+    planSpy.mockRestore();
+    startSpy.mockRestore();
+  }, 25000);
+
+  it("弹窗开着时背后的目的地仍然锁死，锁定说明在弹窗之外看得见（遮罩不是锁）", async () => {
+    const user = userEvent.setup();
+    render(<App preloaded={preloaded} />);
+    const dialog = await openConfirmDialog(user);
+
+    const dests = screen.getByTestId("copy-dests") as HTMLFieldSetElement;
+    expect(dests.disabled).toBe(true);
+    // 它是**背景**里的东西，不是弹窗内容：遮罩挡得住鼠标，挡不住"这是干嘛的"
+    expect(dialog.contains(dests)).toBe(false);
+
+    const note = screen.getByTestId("copy-dests-locked");
+    expect(dialog.contains(note), "锁定说明必须留在被锁的那组旁边").toBe(false);
+    expect(note.textContent).toContain("返回修改");
+
+    // 触发者同样锁着：确认期间不许从背后再发起一次
+    expect((screen.getByTestId("copy-start") as HTMLButtonElement).disabled).toBe(true);
+  }, 20000);
+});
+
+describe("★ 弹窗里的关键数字必须不用滚就看得见", () => {
+  /**
+   * 判据是**结构近似**，不是几何：jsdom 没有布局引擎，量不出「在不在可视区」。
+   *
+   * 这里钉的是「三个数字落在那条固定底栏里、且**不在**唯一会滚的容器里」。
+   * 它与 CSS 契约里 `.copy-confirm` 的三段行（auto / minmax(0,1fr) / auto）
+   * 合起来才等价于几何结论：底栏是 auto 行、正文是可压缩的 1fr 行，
+   * 于是无论正文多长，底栏都贴着弹窗下沿、始终在一屏之内。
+   * 真几何（底栏 bottom ≤ 视口、只有正文那一个容器真能滚）由 e2e 的
+   * 浮层探针在 Chrome 里量，见 e2e/specs/smoke.e2e.mjs 的「双确认弹窗」配方。
+   */
+  const bigPlan = (over: Partial<SourcePlan> = {}) =>
+    plan({
+      fileCount: 620,
+      totalBytes: 1234567890,
+      renamedFiles: Array.from({ length: 300 }, (_, i) => ({
+        sourceRel: `DCIM/10${i % 2}MSDCF/C${String(i).padStart(4, "0")}.MP4`,
+        targetRel: `10${i % 2}MSDCF_C${String(i).padStart(4, "0")}.MP4`,
+      })),
+      hiddenSkipped: 4,
+      hiddenSamples: [".DS_Store", ".Trashes"],
+      ...over,
+    });
+
+  it("300 条改名也一样：规模 / 改名条数 / 被排除条数都在固定底栏，不在滚动区里", async () => {
+    const user = userEvent.setup();
+    const planSpy = vi
+      .spyOn(api, "planSourceSelection")
+      .mockResolvedValue(bigPlan());
+    render(<App preloaded={preloaded} />);
+    const dialog = await openConfirmDialog(user);
+    await confirmReady();
+
+    const foot = screen.getByTestId("copy-confirm-foot");
+    const scroll = screen.getByTestId("copy-confirm-scroll");
+
+    // 底栏与滚动区是弹窗下面两个互不包含的兄弟——这是「不用滚」的结构前提
+    expect(dialog.contains(foot)).toBe(true);
+    expect(dialog.contains(scroll)).toBe(true);
+    expect(scroll.contains(foot)).toBe(false);
+    expect(foot.contains(scroll)).toBe(false);
+
+    for (const id of [
+      "confirm-plan-scale",
+      "confirm-renames-figure",
+      "confirm-hidden-figure",
+    ]) {
+      const el = screen.getByTestId(id);
+      expect(foot.contains(el), `${id} 必须钉在固定底栏里`).toBe(true);
+      expect(
+        scroll.contains(el),
+        `${id} 落进了会滚的容器：内容一长就可能没滚到就按了确认`,
+      ).toBe(false);
+    }
+
+    // 数字本身要对得上，不能是三句永远为真的空话
+    expect(screen.getByTestId("confirm-plan-scale").textContent).toContain("620 个文件");
+    expect(screen.getByTestId("confirm-renames-figure").textContent).toContain(
+      "300 个文件将被系统自动改名",
+    );
+    expect(screen.getByTestId("confirm-hidden-figure").textContent).toContain(
+      "4 个系统项被排除",
+    );
+
+    // 「确认开始」与这三个数字同框：想按到它就必然看见它们
+    expect(foot.contains(screen.getByTestId("copy-confirm-start"))).toBe(true);
+
+    // 明细则允许藏：默认只列 5 条，其余靠展开；而且它确实待在会滚的那一边
+    expect(screen.getAllByTestId("confirm-rename-item")).toHaveLength(5);
+    expect(scroll.contains(screen.getByTestId("confirm-renames"))).toBe(true);
+    expect(scroll.contains(screen.getByTestId("confirm-hidden-skipped"))).toBe(true);
+
+    // 展开到全部 300 条之后，底栏那三个数字**一个都不许**掉进滚动区
+    await user.click(screen.getByTestId("confirm-renames-expand"));
+    expect(screen.getAllByTestId("confirm-rename-item")).toHaveLength(300);
+    for (const id of [
+      "confirm-plan-scale",
+      "confirm-renames-figure",
+      "confirm-hidden-figure",
+    ]) {
+      expect(foot.contains(screen.getByTestId(id)), `展开后 ${id} 掉出了底栏`).toBe(true);
+    }
+
+    planSpy.mockRestore();
+  }, 30000);
+
+  it("0 条也照样出数：数字缺席比数字为 0 更容易被读成「这项不用管」", async () => {
+    const user = userEvent.setup();
+    const planSpy = vi
+      .spyOn(api, "planSourceSelection")
+      .mockResolvedValue(plan({ fileCount: 12, renamedFiles: [], hiddenSkipped: 0 }));
+    render(<App preloaded={preloaded} />);
+    await openConfirmDialog(user);
+    await confirmReady();
+
+    const foot = screen.getByTestId("copy-confirm-foot");
+    expect(screen.getByTestId("confirm-renames-figure").textContent).toContain(
+      "没有文件被改名",
+    );
+    expect(screen.getByTestId("confirm-hidden-figure").textContent).toContain(
+      "没有系统项被排除",
+    );
+    expect(foot.contains(screen.getByTestId("confirm-renames-figure"))).toBe(true);
+    expect(foot.contains(screen.getByTestId("confirm-hidden-figure"))).toBe(true);
+
+    planSpy.mockRestore();
+  }, 20000);
+
+  it("核算失败时底栏说出「算不出来」，不留一片空白冒充「没有改名」", async () => {
+    const user = userEvent.setup();
+    const planSpy = vi
+      .spyOn(api, "planSourceSelection")
+      .mockRejectedValue(new Error("卡掉线了"));
+    render(<App preloaded={preloaded} />);
+    await openConfirmDialog(user);
+
+    const failed = await screen.findByTestId("confirm-figures-failed");
+    expect(screen.getByTestId("copy-confirm-foot").contains(failed)).toBe(true);
+    expect(screen.queryByTestId("confirm-renames-figure")).toBeNull();
+    expect(
+      (screen.getByTestId("copy-confirm-start") as HTMLButtonElement).disabled,
+    ).toBe(true);
+
+    planSpy.mockRestore();
   }, 20000);
 });

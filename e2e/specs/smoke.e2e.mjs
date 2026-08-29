@@ -243,6 +243,42 @@ const LAYER_RECIPES = [
     pinned: null,
     unmask: "",
   },
+  /*
+   * 拷卡双确认弹窗。它与上面那份「对话框」是**同一族(.overlay)的另一种形状**,
+   * 所以两份都要跑:通用 `.dialog` 自己就是滚动容器,而这一个是三段式——
+   * 头/底钉死、只有正文滚。
+   *
+   * 这一族真正要守的不变式,就是本次改动的理由:
+   * 改名条数(「系统替用户改了文件名」的唯一告知)与「确认开始」同在底栏,
+   * **正文再长,底栏也必须整条在视口内**。整屏版靠页面滚动兜着,搬进更窄的
+   * 弹窗后,「没滚到那一段就按了确认」会变成默认路径,所以这条得有人量。
+   *
+   * 没有 unmask 是对的:这里没有"兄弟兜底"可拆。`.dialog` 自己的
+   * `overflow-y: auto` 不会替 `.copy-confirm` 遮丑——三段行一旦被写坏,
+   * 会滚的就变成 `.dialog` 本身(探针第 3 条点名 live 容器不对),
+   * 底栏跟着被推进滚动内容里(第 4 条抓 bottom 超出视口)。两条同时判红。
+   */
+  {
+    name: "双确认弹窗",
+    layer: "overlay",
+    covers: "overlay",
+    html:
+      '<div class="dialog dialog--xwide copy-confirm">' +
+      '<div class="copy-confirm__head">确认拷卡信息</div>' +
+      '<div class="copy-confirm__body">__TALL__</div>' +
+      '<div class="copy-confirm__foot">' +
+      '<div class="copy-confirm__figures">' +
+      '<span class="copy-figure copy-figure--warn">300 个文件将被系统自动改名</span>' +
+      '<span class="copy-figure">4 个系统项被排除</span>' +
+      "</div>" +
+      '<div class="copy-confirm__actions">' +
+      '<button type="button" class="btn">返回修改</button>' +
+      '<button type="button" class="btn">确认开始</button>' +
+      "</div></div></div>",
+    scroller: ".copy-confirm__body",
+    pinned: ".copy-confirm__foot",
+    unmask: "",
+  },
   {
     name: "连拍组全屏层",
     layer: "group-layer",

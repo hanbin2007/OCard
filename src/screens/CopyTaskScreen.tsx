@@ -48,7 +48,6 @@ import {
   TASK_STATE_LABEL,
   TASK_STATE_TONE,
 } from "../lib/labels";
-import { prefersReducedMotion } from "../lib/motion";
 import {
   buildCopyPrefix,
   buildCopyTargetPath,
@@ -58,6 +57,7 @@ import {
   TIME_SLOTS,
   type TimeSlot,
 } from "../lib/naming";
+import { useModalFocus } from "../lib/focusTrap";
 import { loadPref, savePref } from "../lib/prefs";
 import { colorOfTag, joinTagsAsNote, nextTagColor } from "../lib/tags";
 import { validateStartCopy } from "../lib/validation";
@@ -400,9 +400,6 @@ export function CopyTaskScreen() {
   const [fileTotal, setFileTotal] = useState(0);
   const [filesLoading, setFilesLoading] = useState(false);
 
-  /** hero 的「设置」按钮把焦点送到下半区的目的地编辑处 */
-  const destsRef = useRef<HTMLDivElement | null>(null);
-
   const { activities: remoteActivities, unavailable: remoteUnavailable } =
     useRemoteActivity(project?.id ?? null);
 
@@ -703,22 +700,6 @@ export function CopyTaskScreen() {
     setSelectedFolders((prev) =>
       checked ? [...prev, relPath] : prev.filter((p) => p !== relPath),
     );
-  }
-
-  /** hero 里点「设置」把用户带到下半区的目的地编辑区 */
-  function focusDestinations() {
-    const el = destsRef.current;
-    if (!el) return;
-    try {
-      // jsdom / 老内核没有 scrollIntoView；动效偏好由 base.css 的全局闸门兜底
-      el.scrollIntoView?.({
-        block: "center",
-        behavior: prefersReducedMotion() ? "auto" : "smooth",
-      });
-    } catch {
-      // 滚动不是关键路径，失败也要把焦点送到位
-    }
-    el.querySelector<HTMLElement>("input:not([disabled]), button:not([disabled])")?.focus();
   }
 
   /** 进度事件驱动的重拉节流：拷贝中每 ~200ms 一条事件，不能每条都打一次 IPC */
@@ -1059,8 +1040,19 @@ export function CopyTaskScreen() {
     await Promise.all([fetchPreview(draft), fetchPlan(draft)]);
   }
 
+  /**
+   * 「返回修改」/Esc 关掉弹窗之后,焦点要还给「开始拷卡」——见下面那个
+   * effect 里的说明。只在**确实关掉了一个开着的弹窗**时才立旗:
+   * `startNextCard()` 在没有草稿时也会顺手调 `leaveConfirm()`,
+   * 那种情况下不该有任何焦点跳动。
+   */
+  const restoreStartFocusRef = useRef(false);
+  /** 弹窗的触发者。关闭后焦点还回它这里(它在确认期间是 disabled 的) */
+  const startButtonRef = useRef<HTMLButtonElement>(null);
+
   /** 「返回修改」：作废这份草稿与它所有在飞的请求 */
   function leaveConfirm() {
+    restoreStartFocusRef.current = confirmDraft !== null;
     nextConfirmId();
     setConfirmDraft(null);
     setPreview(null);
@@ -1069,6 +1061,53 @@ export function CopyTaskScreen() {
     setPlanFailedFor(null);
     setPlanChangedFor(null);
   }
+
+  /**
+   * 双确认弹窗的焦点管理。走 `lib/focusTrap` 的公用实现,不再手写一份
+   * (AuditLogDrawer 手抄过 66 行,已经删掉)。
+   *
+   * **Esc = 「返回修改」**,与那个按钮完全等价。理由:这一层根本没有
+   * 「什么都不做地关掉」这个语义——要么回去改,要么按下去开跑。Esc 若只是
+   * 悄悄把弹窗收掉、把草稿留在原地,用户会以为自己取消了某件事,而实际上
+   * 什么都没取消;所以它必须走同一条作废草稿的路,让状态和按钮完全一致。
+   * 反过来,Esc **绝不能**触发「确认开始」:误触一次就是几百 GB 的拷贝任务。
+   * `PLAN_CHANGED` 之后弹窗仍开着(换了新 requestId 等人重新过目),此时
+   * Esc 依然是「返回修改」——那一刻更不该有第二种含义。
+   *
+   * 取焦显式指向弹窗本体(而不是层内第一个可聚焦元素):层内第一个按钮可能是
+   * 「重试解析」甚至「确认开始」,开屏就把焦点摆在动作上等于给回车留了口子;
+   * 落在容器上则读屏会先念出标题,Tab 再按文档序走进内容。
+   */
+  const confirmDialogRef = useRef<HTMLDivElement>(null);
+  useModalFocus({
+    ref: confirmDialogRef,
+    active: confirmDraft !== null && project !== null,
+    onEscape: leaveConfirm,
+    initialFocus: confirmDialogRef,
+  });
+
+  /**
+   * 关闭后把焦点还给「开始拷卡」。
+   *
+   * `useModalFocus` 自己也会还原焦点,但**在这一处还不到位**:它记的触发者是
+   * 开屏那一刻的 `document.activeElement`,而「开始拷卡」正是在同一次提交里
+   * 变成 `disabled={confirming || busy}` 的——浏览器会把 disabled 元素的焦点
+   * 踢到 `body`,于是 focusTrap 记到的触发者是 body,它的注释里写得很清楚
+   * 「body 不算触发者」,只好什么都不做,焦点最终落在 body 上:方向键、Esc、
+   * 快捷键全部失灵,而屏上没有任何迹象说明为什么。
+   *
+   * 这里不重写焦点圈定(那是 focusTrap 的活),只补上「还到哪」这一件事。
+   * 声明顺序在 `useModalFocus` 之后 = 本 effect 的 body 后跑 = 它说了算。
+   *
+   * jsdom 看不出这个差别(它不实现「元素被禁用即失焦」),所以对应的用例在
+   * 两种实现下都会绿。真正验收这条的是 Chrome 实测:1440/1280/1100 三档
+   * 宽度下按 Esc 之后 `document.activeElement` 都是「开始拷卡」按钮。
+   */
+  useEffect(() => {
+    if (confirming || !restoreStartFocusRef.current) return;
+    restoreStartFocusRef.current = false;
+    startButtonRef.current?.focus();
+  }, [confirming]);
 
   /** 拷完一张接着拷下一张(评审 1.6):清源卷,保留相机/标签库/目的地 */
   function startNextCard() {
@@ -1630,54 +1669,169 @@ export function CopyTaskScreen() {
                   <div className="copy-stage__art">
                     <IllStorageTarget kind={heroDestKind} />
                   </div>
+                  {/* 编辑本体就长在这张卡里。这里以前只是个只读摘要 + 一个「设置」
+                      按钮,按下去把焦点甩到屏幕下方老远的真正编辑处——一张
+                      「看得见却改不了、要跳到别处改」的卡片,只是白白多出的一跳。
+                      用户最初的手绘草图里,右边本来就是「盘的图示 + 选择框」:
+                      编辑本体本来就该长在图示旁边。 */}
                   <div className="copy-stage__box">
                     <div className="copy-stage__box-head">
-                      <span className="copy-stage__box-title">目的地</span>
-                      <button
-                        type="button"
-                        className="btn btn--sm push-right"
-                        data-testid="copy-dests-jump"
-                        disabled={confirming}
-                        onClick={focusDestinations}
-                      >
-                        设置
-                      </button>
+                      <span className="copy-stage__box-title" id="copy-dests-label">
+                        目的地
+                      </span>
                     </div>
-                    <ul className="copy-dest-summary" data-testid="copy-dest-summary">
-                      {dests.map((d) => (
-                        <li key={d.id} className="copy-dest-summary__item">
-                          <Badge>{DESTINATION_KIND_LABEL[d.kind]}</Badge>
-                          {d.kind === "nas" ? (
-                            <span className="copy-dest-summary__path truncate">
-                              由项目结构自动推导
-                            </span>
-                          ) : d.path ? (
-                            <span
-                              className="copy-dest-summary__path truncate"
-                              title={d.path}
-                            >
-                              {d.path}
-                            </span>
-                          ) : (
-                            <span className="copy-dest-summary__path text-warn">
-                              未填写路径
-                            </span>
-                          )}
-                        </li>
-                      ))}
-                    </ul>
-                    {dests.length < 2 ? (
-                      /* 与下半区那句引导措辞不同,避免同一句话在一屏里出现两遍 */
-                      <p className="copy-stage__note">
-                        当前只有 1 份备份，点「设置」可再加一块盘
+                    {confirming ? (
+                      /* 锁了就得说明白「谁锁的、怎么解」。控件自己的 disabled 态在
+                         输入框上几乎看不出来,不写这一行,用户只会对着一张点不动的
+                         卡片以为界面坏了——这正是本项目不许的静默降级。 */
+                      <p
+                        className="copy-stage__note"
+                        role="status"
+                        data-testid="copy-dests-locked"
+                      >
+                        核对中已锁定，点下方「返回修改」可继续改
                       </p>
                     ) : null}
+                    {/* 确认屏开着时整组锁死。hero 在确认期间照常显示,而确认屏的
+                        全部价值就是「展示的清单 = 将要执行的清单」——源卷早就
+                        disabled 了,目的地不能是漏网的那个。锁在 fieldset 上而不是
+                        逐个控件传 disabled:以后往这组里加控件的人不必记得再传一次,
+                        结构上漏不掉。 */}
+                    <fieldset
+                      className="copy-dests"
+                      data-testid="copy-dests"
+                      aria-labelledby="copy-dests-label"
+                      disabled={confirming}
+                    >
+                      {dests.map((dest, index) => (
+                        <div key={dest.id}>
+                          <div className="dest-row">
+                            <Select
+                              ariaLabel={`第 ${index + 1} 个目的地类型`}
+                              value={dest.kind}
+                              onChange={(next) => {
+                                const kind = next as DestinationKind;
+                                setDests((prev) =>
+                                  prev.map((d) =>
+                                    d.id === dest.id ? { ...d, kind } : d,
+                                  ),
+                                );
+                              }}
+                              options={(
+                                Object.keys(
+                                  DESTINATION_KIND_LABEL,
+                                ) as DestinationKind[]
+                              ).map((kind) => ({
+                                value: kind,
+                                label: DESTINATION_KIND_LABEL[kind],
+                              }))}
+                            />
+                            <PathField
+                              /* 已经不在 <form> 里了:隐式提交只认表单归属,不认 DOM
+                                 嵌套,回车提交要靠这一行才保得住 */
+                              formId="copy-form"
+                              value={dest.kind === "nas" ? "" : dest.path}
+                              ariaLabel={`第 ${index + 1} 个目的地路径`}
+                              /* NAS 目的地由项目结构推导，用户填了也会被后端忽略 */
+                              readOnly={dest.kind === "nas"}
+                              disabled={dest.kind === "nas"}
+                              invalid={Boolean(
+                                submitted &&
+                                  validation.errors.destinationAt?.[index],
+                              )}
+                              placeholder={
+                                dest.kind === "nas"
+                                  ? "由项目结构自动推导"
+                                  : "选择或粘贴目标文件夹路径"
+                              }
+                              pickerTitle={`选择第 ${index + 1} 个目的地文件夹`}
+                              onChange={(path) => {
+                                setDests((prev) =>
+                                  prev.map((d) =>
+                                    d.id === dest.id ? { ...d, path } : d,
+                                  ),
+                                );
+                              }}
+                            />
+                            {dest.kind !== "nas" ? (
+                              /* 备份盘就在已挂载卷里(评审 1.2):选卷即得根路径,
+                                 不必进文件系统翻。源卷与系统盘不在候选之列。 */
+                              <Select
+                                ariaLabel={`第 ${index + 1} 个目的地从已挂载卷选择`}
+                                value=""
+                                placeholder="选盘…"
+                                onChange={(mount) => {
+                                  if (!mount) return;
+                                  setDests((prev) =>
+                                    prev.map((d) =>
+                                      d.id === dest.id ? { ...d, path: mount } : d,
+                                    ),
+                                  );
+                                }}
+                                options={volumes
+                                  .filter((v) => !v.isSystem && v.id !== volumeId)
+                                  .map((v) => ({
+                                    value: v.mountPath,
+                                    label: `${v.name}（剩 ${formatBytes(
+                                      v.capacityBytes - v.usedBytes,
+                                      0,
+                                    )}）`,
+                                  }))}
+                              />
+                            ) : null}
+                            <button
+                              type="button"
+                              className="btn btn--ghost btn--icon"
+                              aria-label={`删除第 ${index + 1} 个目的地`}
+                              onClick={() =>
+                                setDests((prev) =>
+                                  prev.filter((d) => d.id !== dest.id),
+                                )
+                              }
+                            >
+                              <IconTrash />
+                            </button>
+                          </div>
+                          {submitted &&
+                          validation.errors.destinationAt?.[index] ? (
+                            <div className="dest-row__error">
+                              <span className="field__error" role="alert">
+                                {validation.errors.destinationAt[index]}
+                              </span>
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
+                      <div className="row-inline">
+                        <button
+                          type="button"
+                          className="btn btn--sm"
+                          onClick={() =>
+                            setDests((prev) => [...prev, newDest("external")])
+                          }
+                        >
+                          <IconPlus />
+                          添加目的地
+                        </button>
+                        {dests.length < 2 ? (
+                          <span className="text-xs dim">
+                            建议再加一块本地/移动盘做第二份备份
+                          </span>
+                        ) : null}
+                      </div>
+                      {submitted && validation.errors.destinations ? (
+                        <span className="field__error" role="alert">
+                          {validation.errors.destinations}
+                        </span>
+                      ) : null}
+                    </fieldset>
                   </div>
                   <button
                     type="submit"
                     form="copy-form"
                     className="btn copy-stage__start"
                     data-testid="copy-start"
+                    ref={startButtonRef}
                     disabled={confirming || busy}
                   >
                     开始拷卡
@@ -1686,649 +1840,149 @@ export function CopyTaskScreen() {
               </section>
             ) : null}
 
-            {confirmDraft && project ? (
-              /* ---------- 第二步：双确认（通栏，改名清单要地方） ----------
-                 这一整块**只读 confirmDraft 与绑定在它上面的 preview/plan**。
-                 一旦有一处退回去读当前表单，「展示的清单 = 将要执行的清单」
-                 这条承诺就破了，而双确认屏的全部价值就是这条承诺。 */
-              <div className="copy-confirm">
-                <div className="card">
-                  <div className="card__head">
-                    <span className="card__title">确认拷卡信息</span>
-                    <span className="card__hint">摄影师与 DIT 共同核对</span>
-                  </div>
-                  <div className="card__body">
-                    <div className="copy-confirm__grid">
-                      <div className="stack stack--lg">
-                        {/* 流程辅助图：把「源读一次、多目的地、双端校验」画成实物流向。
-                            目的地取真实落盘清单（几路画几路），等 preview 解析出来 */}
-                        {activePreview ? (
-                          <div className="copy-flow">
-                            <IllCopyFlow
-                              destinations={activePreview.destinations.map((d) => ({
-                                kind: d.kind,
-                                label: DESTINATION_KIND_LABEL[d.kind],
-                              }))}
-                            />
-                          </div>
-                        ) : null}
-                        <div className="dl">
-                          <div className="dl__row">
-                            <span className="dl__key">项目</span>
-                            <span className="dl__val mono">{project.folderName}</span>
-                          </div>
-                          <div className="dl__row">
-                            <span className="dl__key">源卷</span>
-                            <span className="dl__val mono">
-                              {confirmDraft.volumeName}（{confirmDraft.volumeMountPath}）
-                            </span>
-                          </div>
-                          <div className="dl__row">
-                            <span className="dl__key">拷贝范围</span>
-                            <span
-                              className="dl__val"
-                              data-testid="confirm-source-scope"
-                            >
-                              {confirmDraft.sourceFolders.length === 0 ? (
-                                "整卷（保留卡内原有层级）"
-                              ) : (
-                                <>
-                                  <span>
-                                    {confirmDraft.sourceFolders.length}{" "}
-                                    个文件夹，扁平化落盘（不保留文件夹名与层级）
-                                  </span>
-                                  <span className="copy-confirm__folders mono">
-                                    {/* 卷根是空串,直接 join 会渲染成一段空白 */}
-                                    {formatScopeFolders(confirmDraft.sourceFolders).text}
-                                  </span>
-                                </>
-                              )}
-                            </span>
-                          </div>
-                          <div className="dl__row">
-                            <span className="dl__key">相机</span>
-                            <span className="dl__val mono">
-                              {confirmDraft.cameraCode}
-                            </span>
-                          </div>
-                          <div className="dl__row">
-                            <span className="dl__key">目标夹</span>
-                            <span
-                              className="dl__val mono"
-                              data-testid="confirm-target-folder"
-                            >
-                              {activePreview ? activePreview.targetFolder : "解析中…"}
-                            </span>
-                          </div>
-                          <div className="dl__row">
-                            <span className="dl__key">内容标签</span>
-                            <span className="dl__val">
-                              <span className="tag-row" data-testid="confirm-tags">
-                                {confirmDraft.tags.map((name) => (
-                                  <TagChip
-                                    key={name}
-                                    name={name}
-                                    color={colorOfTag(settings?.tags ?? [], name)}
-                                  />
-                                ))}
-                              </span>
-                            </span>
-                          </div>
-                          {project.scenario === "A" ? (
-                            <div className="dl__row">
-                              <span className="dl__key">拷完转代理</span>
-                              <span className="dl__val" data-testid="confirm-auto-proxy">
-                                {confirmDraft.autoProxy
-                                  ? "是，拷完自动派发转码作业"
-                                  : "否"}
-                              </span>
-                            </div>
-                          ) : null}
-                          <div className="dl__row">
-                            <span className="dl__key">实际落盘</span>
-                            <span className="dl__val" data-testid="confirm-destinations">
-                              {previewFailed ? (
-                                <span className="text-warn" role="alert">
-                                  落盘路径解析失败(详见右下角提示)。表单没改的话不必退回,{" "}
-                                  <button
-                                    type="button"
-                                    className="btn btn--sm"
-                                    data-testid="copy-preview-retry"
-                                    onClick={() => void fetchPreview(confirmDraft)}
-                                  >
-                                    重试解析
-                                  </button>
-                                </span>
-                              ) : activePreview ? (
-                                activePreview.destinations.map((d) => (
-                                  <span key={d.id} className="dest-line__path">
-                                    {DESTINATION_KIND_LABEL[d.kind]} · {d.path}
-                                    <br />
-                                  </span>
-                                ))
-                              ) : (
-                                <span className="dim">解析中…</span>
-                              )}
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* ---- 规模 + 改名清单：零静默的主战场 ---- */}
-                      <div className="stack stack--lg">
-                        {planChanged ? (
-                          /* 后端拒了这次提交：卡上内容在双确认之后变了。
-                             绝不自动重试——重试等于替用户批准一份他没看过的
-                             清单。这里重新核算，让他重新过一遍。 */
-                          <div
-                            className="notice notice--danger"
-                            role="alert"
-                            data-testid="copy-plan-changed"
-                          >
-                            <strong>
-                              {planChangedCause
-                                ? "本次提交被拒：批准的那份计划已经不成立"
-                                : "卡上的内容在你确认之后变了"}
-                            </strong>
-                            <span>
-                              {/* 后端点名到具体原因(甚至具体文件)的那句话原样展示。
-                                  笼统的「内容变了」会把人引向错误的排查方向——
-                                  实际是「文件被改过」却让人去翻读卡器。 */}
-                              {planChangedCause ||
-                                "可能是换了卡、文件被增删，或有别的程序在写这张卡。"}
-                              {" "}这次<strong>没有</strong>开跑。
-                              下面是重新核算出的范围与改名清单，请重新核对后再确认。
-                            </span>
-                          </div>
-                        ) : null}
-                        {planFailed ? (
-                          <div
-                            className="notice notice--danger"
-                            role="alert"
-                            data-testid="copy-plan-error"
-                          >
-                            <strong>无法核算本次拷贝范围</strong>
-                            <span>
-                              没有文件数与改名清单就开跑，
-                              等于让系统替你改文件名而你看不见。
-                              这里不会自动退回整卷继续——请重试；仍失败就「返回修改」。
-                            </span>
-                            <div>
-                              <button
-                                type="button"
-                                className="btn btn--sm"
-                                data-testid="copy-plan-retry"
-                                onClick={() => void fetchPlan(confirmDraft)}
-                              >
-                                重试核算
-                              </button>
-                            </div>
-                          </div>
-                        ) : activePlan ? (
-                          <>
-                            <div className="copy-plan">
-                              <span className="copy-plan__label">本次将拷</span>
-                              <span
-                                className="copy-plan__value"
-                                data-testid="confirm-plan-scale"
-                              >
-                                {activePlan.fileCount} 个文件 ·{" "}
-                                {formatBytes(activePlan.totalBytes)}
-                              </span>
-                            </div>
-
-                            {activePlan.fileCount === 0 ? (
-                              /* 只勾了「只有子目录、没有直接子文件」的父目录时
-                                 会走到这:照跑只会建一个空目标夹,而用户以为
-                                 卡已经拷完了。这是最容易踩的规则,必须拦住。 */
-                              <div
-                                className="notice notice--warn"
-                                role="alert"
-                                data-testid="confirm-plan-empty"
-                              >
-                                <strong>这次一个文件都不会拷</strong>
-                                <span>
-                                  勾中的文件夹没有直接子文件（多半只含子目录）。
-                                  子目录不递归，要拷它就得在列表里单独勾上它自己。
-                                  请「返回修改」重选。
-                                </span>
-                              </div>
-                            ) : null}
-
-                            {activePlan.hiddenSkipped > 0 ? (
-                              /* 被排除的东西不进计划，任务却照样报 100%。配上
-                                 「本卡可格式化」那句话就是引导用户格式化掉没备份
-                                 的东西——必须在确认前说出来。
-
-                                 口径已变(2026-08-28):曾经是「以点开头一律跳过」,
-                                 那会把 `.clip.mov` 这类合法素材静默漏掉;现在只排除
-                                 明确列举的系统项。文案跟着改准——说成「点开头的都不拷」
-                                 会让人白白去给素材改名。 */
-                              <div
-                                className="notice notice--warn"
-                                role="alert"
-                                data-testid="confirm-hidden-skipped"
-                              >
-                                <strong>
-                                  {activePlan.hiddenSkipped} 个系统项不在本次范围内
-                                </strong>
-                                <span>
-                                  指废纸篓、索引数据库、`.DS_Store` 这类由操作系统或
-                                  NAS 自己生成的记账文件。它们不会被拷贝，也不计入
-                                  「全部校验通过」
-                                  {activePlan.hiddenSamples.length > 0
-                                    ? `——例如：${activePlan.hiddenSamples.join("、")}。`
-                                    : "。"}
-                                  你的素材不受影响：以点开头的素材文件（如
-                                  `.clip.mov`）现在会照常拷贝，不必改名。
-                                </span>
-                              </div>
-                            ) : null}
-
-                            {activePlan.renamedFiles.length === 0 ? (
-                              <p
-                                className="text-xs dim"
-                                data-testid="confirm-renames-none"
-                              >
-                                没有重名，所有文件名一个字都不改。
-                              </p>
-                            ) : (
-                              <div
-                                className="notice notice--warn"
-                                role="alert"
-                                data-testid="confirm-renames"
-                              >
-                                <strong>
-                                  {activePlan.renamedFiles.length} 个文件将被系统自动改名
-                                </strong>
-                                <span>
-                                  扁平化后这些文件名会撞车，
-                                  系统给它们加了「最短可区分前缀」。
-                                  这是系统替你改文件名，务必逐条核对。
-                                </span>
-                                <ul className="copy-renames">
-                                  {(renamesExpanded
-                                    ? activePlan.renamedFiles
-                                    : activePlan.renamedFiles.slice(0, RENAME_PREVIEW)
-                                  ).map((r) => (
-                                    <li
-                                      key={r.sourceRel}
-                                      className="copy-renames__item"
-                                      data-testid="confirm-rename-item"
-                                    >
-                                      <span className="copy-renames__from mono">
-                                        {r.sourceRel}
-                                      </span>
-                                      <span className="copy-renames__arrow">→</span>
-                                      <span className="copy-renames__to mono">
-                                        {r.targetRel}
-                                      </span>
-                                    </li>
-                                  ))}
-                                </ul>
-                                {activePlan.renamedFiles.length > RENAME_PREVIEW &&
-                                !renamesExpanded ? (
-                                  <div>
-                                    <button
-                                      type="button"
-                                      className="btn btn--sm"
-                                      data-testid="confirm-renames-expand"
-                                      onClick={() => setRenamesExpanded(true)}
-                                    >
-                                      展开查看全部 {activePlan.renamedFiles.length} 条
-                                    </button>
-                                  </div>
-                                ) : null}
-                              </div>
-                            )}
-                          </>
-                        ) : (
-                          <p className="text-xs dim" data-testid="confirm-plan-loading">
-                            正在核算本次拷贝范围…
-                          </p>
-                        )}
-
-                        <p className="text-xs dim">
-                          确认后开始读卡。校验全部通过前请勿拔卡，OCard 不会代为格式化。
-                        </p>
-
-                        {confirmDraft.volumeIsSystem ? (
-                          /* 过滤只是「藏」,这里是「拦」:用户显式打开开关选了
-                             系统盘,确认屏必须再敲一次警钟(opus 评审 P2)。
-                             判据也走草稿:这条警告说的是**将要拷的那个卷** */
-                          <div
-                            className="notice notice--danger"
-                            role="alert"
-                            data-testid="copy-system-volume-warning"
-                          >
-                            <strong>源卷是系统内置盘</strong>
-                            <span>
-                              「{confirmDraft.volumeName}（{confirmDraft.volumeMountPath}
-                              ）」是本机系统盘,
-                              不是相机存储卡。把整台电脑的磁盘当卡拷几乎肯定是误选,
-                              请返回重选源卷。
-                            </span>
-                          </div>
-                        ) : null}
-
-                        {remoteSameVolume ? (
-                          <div
-                            className="notice notice--warn"
-                            role="alert"
-                            data-testid="copy-same-volume-warning"
-                          >
-                            <strong>该卡可能正被他机拷贝</strong>
-                            <span>
-                              {remoteSameVolume.machine}（操作人 {remoteSameVolume.operator}）
-                              正在拷同名卷「{remoteSameVolume.volume}」。
-                              请与对方确认后再继续，避免重复拷同一张卡。
-                            </span>
-                          </div>
-                        ) : null}
-
-                        <div className="row-inline">
-                          <button
-                            type="button"
-                            className="btn"
-                            /* 返回即作废这份草稿:它那两个还在飞的请求落地后
-                               再也写不进任何状态(E1 的时序就是从这里被打开的) */
-                            onClick={leaveConfirm}
-                          >
-                            返回修改
-                          </button>
-                          <button
-                            type="button"
-                            data-testid="copy-confirm-start"
-                            className="btn copy-stage__start"
-                            onClick={confirmAndStart}
-                            /* 没有 plan 就没有改名清单可看——此时开跑就是静默改名;
-                               核算出 0 个文件也不放行,那只会建一个空目标夹。
-                               这里判的是 activePlan/activePreview:属于**这份草稿**
-                               的那两份,别的草稿的结果一律不算数 */
-                            disabled={
-                              busy ||
-                              !activePreview ||
-                              !activePlan ||
-                              activePlan.fileCount === 0
-                            }
-                          >
-                            {busy ? "正在建立任务…" : "确认开始"}
-                          </button>
-                        </div>
+            <div className="copy__form">
+              <div className="card">
+                <div className="card__head">
+                  <span className="card__title">
+                    {project ? "拷卡设置" : "发起拷卡"}
+                  </span>
+                  <span className="card__hint">
+                    {project ? "目的地与转代理按项目记住" : "先选项目"}
+                  </span>
+                </div>
+                <div className="card__body">
+                  {!project ? (
+                    <div className="stack">
+                      <p className="text-sm" role="alert">
+                        尚未选择项目，无法发起拷卡。
+                      </p>
+                      <div>
+                        <button
+                          type="button"
+                          className="btn"
+                          onClick={() => void bridge.openManager()}
+                        >
+                          去选择项目
+                        </button>
                       </div>
                     </div>
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="copy__form">
-                <div className="card">
-                  <div className="card__head">
-                    <span className="card__title">
-                      {project ? "拷卡设置" : "发起拷卡"}
-                    </span>
-                    <span className="card__hint">
-                      {project ? "目的地与转代理按项目记住" : "先选项目"}
-                    </span>
-                  </div>
-                  <div className="card__body">
-                    {!project ? (
-                      <div className="stack">
-                        <p className="text-sm" role="alert">
-                          尚未选择项目，无法发起拷卡。
-                        </p>
-                        <div>
-                          <button
-                            type="button"
-                            className="btn"
-                            onClick={() => void bridge.openManager()}
-                          >
-                            去选择项目
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <form
-                        id="copy-form"
-                        className="stack stack--lg"
-                        onSubmit={(e) => {
-                          e.preventDefault();
-                          void requestConfirm();
-                        }}
+                  ) : (
+                    <form
+                      id="copy-form"
+                      className="stack stack--lg"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        void requestConfirm();
+                      }}
+                    >
+                      <Field
+                        label="对应相机"
+                        htmlFor="copy-camera"
+                        error={submitted ? validation.errors.cameraId : undefined}
                       >
-                        <Field
-                          label="对应相机"
-                          htmlFor="copy-camera"
-                          error={submitted ? validation.errors.cameraId : undefined}
-                        >
-                          <Select
-                            id="copy-camera"
-                            testId="copy-camera-select"
-                            value={cameraId}
-                            onChange={setCameraId}
-                            options={cameras.map((c) => ({
-                              value: c.id,
-                              label: `${c.model} · ${c.code}`,
-                            }))}
+                        <Select
+                          id="copy-camera"
+                          testId="copy-camera-select"
+                          value={cameraId}
+                          onChange={setCameraId}
+                          options={cameras.map((c) => ({
+                            value: c.id,
+                            label: `${c.model} · ${c.code}`,
+                          }))}
+                        />
+                      </Field>
+
+                      <Field
+                        label={
+                          project.scenario === "A" ? "目标夹日期" : "目标夹时段"
+                        }
+                        htmlFor="copy-prefix"
+                        hint={`默认本机今天,落在「${copyTargetParent(project.scenario)}」下`}
+                        error={submitted ? validation.errors.targetPrefix : undefined}
+                      >
+                        <div className="prefix-picker">
+                          <input
+                            id="copy-prefix"
+                            data-testid="copy-prefix-date"
+                            className="input input--mono prefix-picker__date"
+                            type="date"
+                            value={prefixIso}
+                            onChange={(e) => setPrefixIso(e.currentTarget.value)}
                           />
-                        </Field>
-
-                        <Field
-                          label={
-                            project.scenario === "A" ? "目标夹日期" : "目标夹时段"
-                          }
-                          htmlFor="copy-prefix"
-                          hint={`默认本机今天,落在「${copyTargetParent(project.scenario)}」下`}
-                          error={submitted ? validation.errors.targetPrefix : undefined}
-                        >
-                          <div className="prefix-picker">
-                            <input
-                              id="copy-prefix"
-                              data-testid="copy-prefix-date"
-                              className="input input--mono prefix-picker__date"
-                              type="date"
-                              value={prefixIso}
-                              onChange={(e) => setPrefixIso(e.currentTarget.value)}
-                            />
-                            {project.scenario === "B" ? (
-                              <div
-                                className="seg"
-                                role="group"
-                                aria-label="时段"
-                                data-testid="copy-prefix-slot"
-                              >
-                                {TIME_SLOTS.map((value) => (
-                                  <button
-                                    key={value}
-                                    type="button"
-                                    className="seg__btn"
-                                    aria-pressed={slot === value}
-                                    onClick={() => setSlot(value)}
-                                  >
-                                    {value}
-                                  </button>
-                                ))}
-                              </div>
-                            ) : null}
-                            <span
-                              className="text-xs dim mono"
-                              data-testid="copy-prefix-value"
+                          {project.scenario === "B" ? (
+                            <div
+                              className="seg"
+                              role="group"
+                              aria-label="时段"
+                              data-testid="copy-prefix-slot"
                             >
-                              {targetPrefix || "—"}
-                            </span>
-                          </div>
-                        </Field>
-
-                        <div className="code-preview">
-                          <span className="code-preview__label">目标路径预览</span>
+                              {TIME_SLOTS.map((value) => (
+                                <button
+                                  key={value}
+                                  type="button"
+                                  className="seg__btn"
+                                  aria-pressed={slot === value}
+                                  onClick={() => setSlot(value)}
+                                >
+                                  {value}
+                                </button>
+                              ))}
+                            </div>
+                          ) : null}
                           <span
-                            className={`code-preview__value${targetPath ? "" : " code-preview__value--empty"}`}
-                            data-testid="copy-target-preview"
+                            className="text-xs dim mono"
+                            data-testid="copy-prefix-value"
                           >
-                            {targetPath || "选择相机后生成"}
+                            {targetPrefix || "—"}
                           </span>
                         </div>
+                      </Field>
 
-                        <Field
-                          label="内容标签"
-                          htmlFor="copy-tags"
-                          hint="规范要求「适当记录」；标签随项目走，各工作站共用一套"
-                          error={submitted ? validation.errors.tags : undefined}
+                      <div className="code-preview">
+                        <span className="code-preview__label">目标路径预览</span>
+                        <span
+                          className={`code-preview__value${targetPath ? "" : " code-preview__value--empty"}`}
+                          data-testid="copy-target-preview"
                         >
-                          <TagPicker
-                            id="copy-tags"
-                            testId="copy-tags"
-                            value={tags}
-                            onChange={setTags}
-                            library={settings?.tags ?? []}
-                            onCreateTag={createTag}
-                            invalid={Boolean(submitted && validation.errors.tags)}
-                          />
-                        </Field>
+                          {targetPath || "选择相机后生成"}
+                        </span>
+                      </div>
 
-                        {project.scenario === "A" ? (
-                          <Checkbox
-                            testId="copy-auto-proxy"
-                            checked={autoProxy}
-                            onChange={setAutoProxy}
-                          >
-                            拷完自动转代理（转入「4. 转码素材」）
-                          </Checkbox>
-                        ) : null}
+                      <Field
+                        label="内容标签"
+                        htmlFor="copy-tags"
+                        hint="规范要求「适当记录」；标签随项目走，各工作站共用一套"
+                        error={submitted ? validation.errors.tags : undefined}
+                      >
+                        <TagPicker
+                          id="copy-tags"
+                          testId="copy-tags"
+                          value={tags}
+                          onChange={setTags}
+                          library={settings?.tags ?? []}
+                          onCreateTag={createTag}
+                          invalid={Boolean(submitted && validation.errors.tags)}
+                        />
+                      </Field>
 
-                        <div className="field" ref={destsRef}>
-                          <span className="field__label">目的地</span>
-                          <div className="stack stack--sm">
-                            {dests.map((dest, index) => (
-                              <div key={dest.id}>
-                                <div className="dest-row">
-                                  <Select
-                                    ariaLabel={`第 ${index + 1} 个目的地类型`}
-                                    value={dest.kind}
-                                    onChange={(next) => {
-                                      const kind = next as DestinationKind;
-                                      setDests((prev) =>
-                                        prev.map((d) =>
-                                          d.id === dest.id ? { ...d, kind } : d,
-                                        ),
-                                      );
-                                    }}
-                                    options={(
-                                      Object.keys(
-                                        DESTINATION_KIND_LABEL,
-                                      ) as DestinationKind[]
-                                    ).map((kind) => ({
-                                      value: kind,
-                                      label: DESTINATION_KIND_LABEL[kind],
-                                    }))}
-                                  />
-                                  <PathField
-                                    value={dest.kind === "nas" ? "" : dest.path}
-                                    ariaLabel={`第 ${index + 1} 个目的地路径`}
-                                    /* NAS 目的地由项目结构推导，用户填了也会被后端忽略 */
-                                    readOnly={dest.kind === "nas"}
-                                    disabled={dest.kind === "nas"}
-                                    invalid={Boolean(
-                                      submitted &&
-                                        validation.errors.destinationAt?.[index],
-                                    )}
-                                    placeholder={
-                                      dest.kind === "nas"
-                                        ? "由项目结构自动推导"
-                                        : "选择或粘贴目标文件夹路径"
-                                    }
-                                    pickerTitle={`选择第 ${index + 1} 个目的地文件夹`}
-                                    onChange={(path) => {
-                                      setDests((prev) =>
-                                        prev.map((d) =>
-                                          d.id === dest.id ? { ...d, path } : d,
-                                        ),
-                                      );
-                                    }}
-                                  />
-                                  {dest.kind !== "nas" ? (
-                                    /* 备份盘就在已挂载卷里(评审 1.2):选卷即得根路径,
-                                       不必进文件系统翻。源卷与系统盘不在候选之列。 */
-                                    <Select
-                                      ariaLabel={`第 ${index + 1} 个目的地从已挂载卷选择`}
-                                      value=""
-                                      placeholder="选盘…"
-                                      onChange={(mount) => {
-                                        if (!mount) return;
-                                        setDests((prev) =>
-                                          prev.map((d) =>
-                                            d.id === dest.id ? { ...d, path: mount } : d,
-                                          ),
-                                        );
-                                      }}
-                                      options={volumes
-                                        .filter((v) => !v.isSystem && v.id !== volumeId)
-                                        .map((v) => ({
-                                          value: v.mountPath,
-                                          label: `${v.name}（剩 ${formatBytes(
-                                            v.capacityBytes - v.usedBytes,
-                                            0,
-                                          )}）`,
-                                        }))}
-                                    />
-                                  ) : null}
-                                  <button
-                                    type="button"
-                                    className="btn btn--ghost btn--icon"
-                                    aria-label={`删除第 ${index + 1} 个目的地`}
-                                    onClick={() =>
-                                      setDests((prev) =>
-                                        prev.filter((d) => d.id !== dest.id),
-                                      )
-                                    }
-                                  >
-                                    <IconTrash />
-                                  </button>
-                                </div>
-                                {submitted &&
-                                validation.errors.destinationAt?.[index] ? (
-                                  <div className="dest-row__error">
-                                    <span className="field__error" role="alert">
-                                      {validation.errors.destinationAt[index]}
-                                    </span>
-                                  </div>
-                                ) : null}
-                              </div>
-                            ))}
-                            <div className="row-inline">
-                              <button
-                                type="button"
-                                className="btn btn--sm"
-                                onClick={() =>
-                                  setDests((prev) => [...prev, newDest("external")])
-                                }
-                              >
-                                <IconPlus />
-                                添加目的地
-                              </button>
-                              {dests.length < 2 ? (
-                                <span className="text-xs dim">
-                                  建议再加一块本地/移动盘做第二份备份
-                                </span>
-                              ) : null}
-                            </div>
-                            {submitted && validation.errors.destinations ? (
-                              <span className="field__error" role="alert">
-                                {validation.errors.destinations}
-                              </span>
-                            ) : null}
-                          </div>
-                        </div>
-                      </form>
-                    )}
-                  </div>
+                      {project.scenario === "A" ? (
+                        <Checkbox
+                          testId="copy-auto-proxy"
+                          checked={autoProxy}
+                          onChange={setAutoProxy}
+                        >
+                          拷完自动转代理（转入「4. 转码素材」）
+                        </Checkbox>
+                      ) : null}
+                    </form>
+                  )}
                 </div>
               </div>
-            )}
+            </div>
 
-            <div
-              className={`copy__tasks${confirming && project ? " copy__tasks--wide" : ""}`}
-            >
+            {/* 双确认从「整屏替换下半区」改成弹窗之后,任务区不再需要在确认期间
+                通栏让位:表单一直待在左列,版面在确认前后不再跳动 */}
+            <div className="copy__tasks">
               <div className="tasks__tabs" role="group" aria-label="任务切换">
                 {projectTasks.map((t) => (
                   <button
@@ -2689,6 +2343,441 @@ export function CopyTaskScreen() {
           </div>
         </div>
       </div>
+
+      {confirmDraft && project ? (
+        /* ---------- 第二步：双确认（弹窗） ----------
+           这一整块**只读 confirmDraft 与绑定在它上面的 preview/plan**。
+           一旦有一处退回去读当前表单，「展示的清单 = 将要执行的清单」
+           这条承诺就破了，而双确认屏的全部价值就是这条承诺。
+
+           为什么长在这里(与 ConfirmDialog 并列,在 .content 之外)而不是留在
+           .copy 栅格里:
+             ① 它是 position:fixed 的模态。挂在滚动容器 .content 内部时,
+                滚轮会顺着 **DOM 祖先链**把背后的页面滚起来——遮罩底下的内容
+                一边被压暗一边在动,读起来像界面失控。挪到 .content 之外,
+                祖先链上只剩全局禁滚的 body,背景就真的不动了。
+             ② TARGET_EXISTS 的二次确认(ConfirmDialog,同样是 .overlay z=50)
+                必须盖在本弹窗之上才点得到;同层先后看**书写次序**,
+                所以它必须排在本块之后。 */
+        <div className="overlay" data-testid="copy-confirm-overlay">
+          <div
+            className="dialog dialog--xwide copy-confirm"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="copy-confirm-title"
+            data-testid="copy-confirm-dialog"
+            ref={confirmDialogRef}
+            tabIndex={-1}
+          >
+            <div className="copy-confirm__head">
+              <h2 className="dialog__title" id="copy-confirm-title">
+                确认拷卡信息
+              </h2>
+              <span className="card__hint">摄影师与 DIT 共同核对</span>
+            </div>
+
+            {/* 唯一会滚的容器。三个关键数字**不在**这里——它们钉在底栏,
+                见 .copy-confirm__foot 处的说明 */}
+            <div className="copy-confirm__body" data-testid="copy-confirm-scroll">
+              <div className="copy-confirm__grid">
+                <div className="stack stack--lg">
+                  {/* 流程辅助图：把「源读一次、多目的地、双端校验」画成实物流向。
+                      目的地取真实落盘清单（几路画几路），等 preview 解析出来 */}
+                  {activePreview ? (
+                    <div className="copy-flow">
+                      <IllCopyFlow
+                        destinations={activePreview.destinations.map((d) => ({
+                          kind: d.kind,
+                          label: DESTINATION_KIND_LABEL[d.kind],
+                        }))}
+                      />
+                    </div>
+                  ) : null}
+                  <div className="dl">
+                    <div className="dl__row">
+                      <span className="dl__key">项目</span>
+                      <span className="dl__val mono">{project.folderName}</span>
+                    </div>
+                    <div className="dl__row">
+                      <span className="dl__key">源卷</span>
+                      <span className="dl__val mono">
+                        {confirmDraft.volumeName}（{confirmDraft.volumeMountPath}）
+                      </span>
+                    </div>
+                    <div className="dl__row">
+                      <span className="dl__key">拷贝范围</span>
+                      <span className="dl__val" data-testid="confirm-source-scope">
+                        {confirmDraft.sourceFolders.length === 0 ? (
+                          "整卷（保留卡内原有层级）"
+                        ) : (
+                          <>
+                            <span>
+                              {confirmDraft.sourceFolders.length}{" "}
+                              个文件夹，扁平化落盘（不保留文件夹名与层级）
+                            </span>
+                            <span className="copy-confirm__folders mono">
+                              {/* 卷根是空串,直接 join 会渲染成一段空白 */}
+                              {formatScopeFolders(confirmDraft.sourceFolders).text}
+                            </span>
+                          </>
+                        )}
+                      </span>
+                    </div>
+                    <div className="dl__row">
+                      <span className="dl__key">相机</span>
+                      <span className="dl__val mono">{confirmDraft.cameraCode}</span>
+                    </div>
+                    <div className="dl__row">
+                      <span className="dl__key">目标夹</span>
+                      <span
+                        className="dl__val mono"
+                        data-testid="confirm-target-folder"
+                      >
+                        {activePreview ? activePreview.targetFolder : "解析中…"}
+                      </span>
+                    </div>
+                    <div className="dl__row">
+                      <span className="dl__key">内容标签</span>
+                      <span className="dl__val">
+                        <span className="tag-row" data-testid="confirm-tags">
+                          {confirmDraft.tags.map((name) => (
+                            <TagChip
+                              key={name}
+                              name={name}
+                              color={colorOfTag(settings?.tags ?? [], name)}
+                            />
+                          ))}
+                        </span>
+                      </span>
+                    </div>
+                    {project.scenario === "A" ? (
+                      <div className="dl__row">
+                        <span className="dl__key">拷完转代理</span>
+                        <span className="dl__val" data-testid="confirm-auto-proxy">
+                          {confirmDraft.autoProxy ? "是，拷完自动派发转码作业" : "否"}
+                        </span>
+                      </div>
+                    ) : null}
+                    <div className="dl__row">
+                      <span className="dl__key">实际落盘</span>
+                      <span className="dl__val" data-testid="confirm-destinations">
+                        {previewFailed ? (
+                          <span className="text-warn" role="alert">
+                            落盘路径解析失败(详见右下角提示)。表单没改的话不必退回,{" "}
+                            <button
+                              type="button"
+                              className="btn btn--sm"
+                              data-testid="copy-preview-retry"
+                              onClick={() => void fetchPreview(confirmDraft)}
+                            >
+                              重试解析
+                            </button>
+                          </span>
+                        ) : activePreview ? (
+                          activePreview.destinations.map((d) => (
+                            <span key={d.id} className="dest-line__path">
+                              {DESTINATION_KIND_LABEL[d.kind]} · {d.path}
+                              <br />
+                            </span>
+                          ))
+                        ) : (
+                          <span className="dim">解析中…</span>
+                        )}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* ---- 明细：零静默的主战场（条数在底栏，这里放为什么与逐条） ---- */}
+                <div className="stack stack--lg">
+                  {planChanged ? (
+                    /* 后端拒了这次提交：卡上内容在双确认之后变了。
+                       绝不自动重试——重试等于替用户批准一份他没看过的
+                       清单。这里重新核算，让他重新过一遍。 */
+                    <div
+                      className="notice notice--danger"
+                      role="alert"
+                      data-testid="copy-plan-changed"
+                    >
+                      <strong>
+                        {planChangedCause
+                          ? "本次提交被拒：批准的那份计划已经不成立"
+                          : "卡上的内容在你确认之后变了"}
+                      </strong>
+                      <span>
+                        {/* 后端点名到具体原因(甚至具体文件)的那句话原样展示。
+                            笼统的「内容变了」会把人引向错误的排查方向——
+                            实际是「文件被改过」却让人去翻读卡器。 */}
+                        {planChangedCause ||
+                          "可能是换了卡、文件被增删，或有别的程序在写这张卡。"}
+                        {" "}这次<strong>没有</strong>开跑。
+                        下面是重新核算出的范围与改名清单，请重新核对后再确认。
+                      </span>
+                    </div>
+                  ) : null}
+                  {planFailed ? (
+                    <div
+                      className="notice notice--danger"
+                      role="alert"
+                      data-testid="copy-plan-error"
+                    >
+                      <strong>无法核算本次拷贝范围</strong>
+                      <span>
+                        没有文件数与改名清单就开跑，
+                        等于让系统替你改文件名而你看不见。
+                        这里不会自动退回整卷继续——请重试；仍失败就「返回修改」。
+                      </span>
+                      <div>
+                        <button
+                          type="button"
+                          className="btn btn--sm"
+                          data-testid="copy-plan-retry"
+                          onClick={() => void fetchPlan(confirmDraft)}
+                        >
+                          重试核算
+                        </button>
+                      </div>
+                    </div>
+                  ) : activePlan ? (
+                    <>
+                      {activePlan.fileCount === 0 ? (
+                        /* 只勾了「只有子目录、没有直接子文件」的父目录时
+                           会走到这:照跑只会建一个空目标夹,而用户以为
+                           卡已经拷完了。这是最容易踩的规则,必须拦住。 */
+                        <div
+                          className="notice notice--warn"
+                          role="alert"
+                          data-testid="confirm-plan-empty"
+                        >
+                          <strong>这次一个文件都不会拷</strong>
+                          <span>
+                            勾中的文件夹没有直接子文件（多半只含子目录）。
+                            子目录不递归，要拷它就得在列表里单独勾上它自己。
+                            请「返回修改」重选。
+                          </span>
+                        </div>
+                      ) : null}
+
+                      {activePlan.hiddenSkipped > 0 ? (
+                        /* 被排除的东西不进计划，任务却照样报 100%。配上
+                           「本卡可格式化」那句话就是引导用户格式化掉没备份
+                           的东西——必须在确认前说出来。
+
+                           口径已变(2026-08-28):曾经是「以点开头一律跳过」,
+                           那会把 `.clip.mov` 这类合法素材静默漏掉;现在只排除
+                           明确列举的系统项。文案跟着改准——说成「点开头的都不拷」
+                           会让人白白去给素材改名。 */
+                        <div
+                          className="notice notice--warn"
+                          role="alert"
+                          data-testid="confirm-hidden-skipped"
+                        >
+                          <strong>
+                            {activePlan.hiddenSkipped} 个系统项不在本次范围内
+                          </strong>
+                          <span>
+                            指废纸篓、索引数据库、`.DS_Store` 这类由操作系统或
+                            NAS 自己生成的记账文件。它们不会被拷贝，也不计入
+                            「全部校验通过」
+                            {activePlan.hiddenSamples.length > 0
+                              ? `——例如：${activePlan.hiddenSamples.join("、")}。`
+                              : "。"}
+                            你的素材不受影响：以点开头的素材文件（如
+                            `.clip.mov`）现在会照常拷贝，不必改名。
+                          </span>
+                        </div>
+                      ) : null}
+
+                      {activePlan.renamedFiles.length === 0 ? (
+                        <p className="text-xs dim" data-testid="confirm-renames-none">
+                          没有重名，所有文件名一个字都不改。
+                        </p>
+                      ) : (
+                        <div
+                          className="notice notice--warn"
+                          role="alert"
+                          data-testid="confirm-renames"
+                        >
+                          <strong>
+                            {activePlan.renamedFiles.length} 个文件将被系统自动改名
+                          </strong>
+                          <span>
+                            扁平化后这些文件名会撞车，
+                            系统给它们加了「最短可区分前缀」。
+                            这是系统替你改文件名，务必逐条核对。
+                          </span>
+                          <ul className="copy-renames">
+                            {(renamesExpanded
+                              ? activePlan.renamedFiles
+                              : activePlan.renamedFiles.slice(0, RENAME_PREVIEW)
+                            ).map((r) => (
+                              <li
+                                key={r.sourceRel}
+                                className="copy-renames__item"
+                                data-testid="confirm-rename-item"
+                              >
+                                <span className="copy-renames__from mono">
+                                  {r.sourceRel}
+                                </span>
+                                <span className="copy-renames__arrow">→</span>
+                                <span className="copy-renames__to mono">
+                                  {r.targetRel}
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                          {activePlan.renamedFiles.length > RENAME_PREVIEW &&
+                          !renamesExpanded ? (
+                            <div>
+                              <button
+                                type="button"
+                                className="btn btn--sm"
+                                data-testid="confirm-renames-expand"
+                                onClick={() => setRenamesExpanded(true)}
+                              >
+                                展开查看全部 {activePlan.renamedFiles.length} 条
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+                      )}
+                    </>
+                  ) : null}
+
+                  <p className="text-xs dim">
+                    确认后开始读卡。校验全部通过前请勿拔卡，OCard 不会代为格式化。
+                  </p>
+
+                  {confirmDraft.volumeIsSystem ? (
+                    /* 过滤只是「藏」,这里是「拦」:用户显式打开开关选了
+                       系统盘,确认屏必须再敲一次警钟(opus 评审 P2)。
+                       判据也走草稿:这条警告说的是**将要拷的那个卷** */
+                    <div
+                      className="notice notice--danger"
+                      role="alert"
+                      data-testid="copy-system-volume-warning"
+                    >
+                      <strong>源卷是系统内置盘</strong>
+                      <span>
+                        「{confirmDraft.volumeName}（{confirmDraft.volumeMountPath}
+                        ）」是本机系统盘,
+                        不是相机存储卡。把整台电脑的磁盘当卡拷几乎肯定是误选,
+                        请返回重选源卷。
+                      </span>
+                    </div>
+                  ) : null}
+
+                  {remoteSameVolume ? (
+                    <div
+                      className="notice notice--warn"
+                      role="alert"
+                      data-testid="copy-same-volume-warning"
+                    >
+                      <strong>该卡可能正被他机拷贝</strong>
+                      <span>
+                        {remoteSameVolume.machine}（操作人 {remoteSameVolume.operator}）
+                        正在拷同名卷「{remoteSameVolume.volume}」。
+                        请与对方确认后再继续，避免重复拷同一张卡。
+                      </span>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+
+            {/* ---- 底栏：三个数字 + 两个动作,永远不滚 ----
+
+                整屏版靠页面滚动,内容再长也能一路滚到底、顺路看见改名清单;
+                搬进更窄的弹窗后,「没滚到那一段就按了确认」变成默认路径。
+                而扁平化重名改名是**系统替用户改了文件名**,必须在他按下
+                「确认开始」之前明示(零静默铁律)。
+
+                所以规模、改名条数、被排除的系统项条数三个数字固定在这里,
+                与「确认开始」同框:想按到那个按钮就必然看见它们。为什么、
+                改了哪些、被排除的是什么,留在上面可滚可折叠的正文里。
+                数字始终在眼前,细节才允许藏。 */}
+            <div className="copy-confirm__foot" data-testid="copy-confirm-foot">
+              <div className="copy-confirm__figures">
+                {planFailed ? (
+                  /* 核算失败时这三个数字根本不存在。留空 = 让人以为「没有改名」,
+                     所以这里必须把「算不出来」本身说出来 */
+                  <span
+                    className="copy-figure copy-figure--danger"
+                    data-testid="confirm-figures-failed"
+                  >
+                    规模与改名清单核算失败，详情与重试见上方
+                  </span>
+                ) : activePlan ? (
+                  <>
+                    <div className="copy-plan">
+                      <span className="copy-plan__label">本次将拷</span>
+                      <span
+                        className="copy-plan__value"
+                        data-testid="confirm-plan-scale"
+                      >
+                        {activePlan.fileCount} 个文件 ·{" "}
+                        {formatBytes(activePlan.totalBytes)}
+                      </span>
+                    </div>
+                    <span
+                      className={`copy-figure${
+                        activePlan.renamedFiles.length > 0 ? " copy-figure--warn" : ""
+                      }`}
+                      data-testid="confirm-renames-figure"
+                    >
+                      {activePlan.renamedFiles.length > 0
+                        ? `${activePlan.renamedFiles.length} 个文件将被系统自动改名`
+                        : "没有文件被改名"}
+                    </span>
+                    <span
+                      className={`copy-figure${
+                        activePlan.hiddenSkipped > 0 ? " copy-figure--warn" : ""
+                      }`}
+                      data-testid="confirm-hidden-figure"
+                    >
+                      {activePlan.hiddenSkipped > 0
+                        ? `${activePlan.hiddenSkipped} 个系统项被排除`
+                        : "没有系统项被排除"}
+                    </span>
+                  </>
+                ) : (
+                  <span className="copy-figure" data-testid="confirm-plan-loading">
+                    正在核算本次拷贝范围…
+                  </span>
+                )}
+              </div>
+
+              <div className="copy-confirm__actions">
+                <button
+                  type="button"
+                  className="btn"
+                  /* 返回即作废这份草稿:它那两个还在飞的请求落地后
+                     再也写不进任何状态(E1 的时序就是从这里被打开的)。
+                     Esc 走的也是这一条(见 useModalFocus 处的说明) */
+                  onClick={leaveConfirm}
+                >
+                  返回修改
+                </button>
+                <button
+                  type="button"
+                  data-testid="copy-confirm-start"
+                  className="btn copy-stage__start"
+                  onClick={confirmAndStart}
+                  /* 没有 plan 就没有改名清单可看——此时开跑就是静默改名;
+                     核算出 0 个文件也不放行,那只会建一个空目标夹。
+                     这里判的是 activePlan/activePreview:属于**这份草稿**
+                     的那两份,别的草稿的结果一律不算数 */
+                  disabled={
+                    busy || !activePreview || !activePlan || activePlan.fileCount === 0
+                  }
+                >
+                  {busy ? "正在建立任务…" : "确认开始"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       <ConfirmDialog request={confirm} onCancel={() => setConfirm(null)} />
     </>

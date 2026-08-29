@@ -277,17 +277,13 @@
   }
 }
 
-/* 任务区（右列）。双确认屏通栏时它整体换到下一整行,
-   否则会被挤进 380px 的表单列里。 */
+/* 任务区（右列）。双确认改成弹窗之后这里不再有「通栏让位」的形态:
+   表单一直待在左列,确认前后版面不跳。 */
 .copy__tasks {
   display: grid;
   gap: var(--space-4);
   align-content: start;
   min-width: 0;
-}
-
-.copy__tasks--wide {
-  grid-column: 1 / -1;
 }
 
 /* ---------- 拷卡 hero：存储卡 →（管道）→ 目的地 ---------- */
@@ -342,6 +338,27 @@
 .copy-stage__note {
   font-size: var(--text-2xs);
   color: var(--text-tertiary);
+}
+
+/* 目的地编辑本体（原本在下半区的「拷卡设置」里，现在就长在 hero 右侧这张卡）。
+   fieldset 只用来做「确认屏开着时整组锁死」的开关，视觉上不该有任何存在感：
+   浏览器默认给它 border/padding/margin，还给 min-inline-size: min-content
+   ——最后这条是窄栏杀手，它会让整列被最长的一行内容顶开、把 hero 撑破。 */
+.copy-dests {
+  display: grid;
+  gap: var(--space-2);
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+/* 锁上了就要一眼看得出来。控件各自的 disabled 态在这组里几乎不起作用
+   ——全 App 的 .input 压根没有 disabled 样式,光靠它,一张锁死的卡片跟
+   能编辑的卡片长得一模一样。整组压一档透明度,配合上面那行说明,
+   才不至于让人对着点不动的控件以为界面坏了。 */
+.copy-dests:disabled {
+  opacity: 0.75;
 }
 
 .copy-stage__flow {
@@ -527,37 +544,111 @@
   }
 }
 
-/* ---- hero 里的目的地摘要（增删改在下半区的设置里） ---- */
+/* ---------- 双确认弹窗（.dialog.dialog--xwide.copy-confirm） ---------- */
 
-.copy-dest-summary {
+/*
+ * 三段式：头与底钉死，只有正文滚。
+ *
+ * 为什么必须是三段而不是「一个能滚的对话框」:
+ * 改名清单是「系统替用户改了文件名」的唯一告知处,条数上百时整份内容远超
+ * 一屏。此前它是通栏的整屏内容,靠页面滚动一路滚到底,顺路就把清单看了;
+ * 搬进更窄的弹窗后,「没滚到那一段就按了确认」变成默认路径。所以规模、
+ * 改名条数、被排除的系统项条数三个数字固定在底栏,与「确认开始」同框——
+ * 想按到按钮就必然看见它们;明细留在正文里,允许滚、允许折叠。
+ *
+ * 承重件是正文那条 `minmax(0, 1fr)`:min 若取内容尺寸(裸 1fr / auto),
+ * 几百条改名会把这一行撑到内容高度,.dialog 的 max-height:100% 兜不住,
+ * 底栏连同那三个数字一起被顶出视口——正是本段要防的事。
+ * (同一条定律的另外两个案例见 overflow.test.ts 抬头:.overlay 的行、
+ *  .drawer 的正文行。)
+ */
+.copy-confirm {
   display: grid;
-  gap: var(--space-2);
-  min-width: 0;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  /* 内边距下放给三段各自持有：正文滚动时头/底的分隔线才贴得住弹窗边缘 */
+  padding: 0;
 }
 
-.copy-dest-summary__item {
+.copy-confirm__head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border);
+}
+
+/* 弹窗里唯一真正会滚的容器。auto 而不是 scroll：内容不够高时不出条 */
+.copy-confirm__body {
+  overflow-y: auto;
+  padding: var(--space-5);
+  /* 滚到底不把滚动传给背后的壳。弹窗现在长在 .content 之外,祖先链上
+     只有全局禁滚的 body,这条是给「哪天有人又把它挪回滚动容器里」留的护栏 */
+  overscroll-behavior: contain;
+}
+
+.copy-confirm__foot {
   display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
-  gap: var(--space-2);
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border-top: 1px solid var(--border);
+  /* 与 .drawer__foot 同一套：底栏比正文沉一档，读作「这一条不跟着滚」 */
+  background: var(--bg);
+}
+
+.copy-confirm__figures {
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  gap: var(--space-2) var(--space-3);
 }
 
-.copy-dest-summary__path {
-  font-family: var(--font-mono);
-  font-size: var(--text-2xs);
+.copy-confirm__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+/* 底栏里的单个数字。0 态也要有一条（「没有文件被改名」）：
+   数字缺席比数字为 0 更容易被读成「这项不用管」 */
+.copy-figure {
+  padding: 2px var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
   color: var(--text-secondary);
 }
 
-/* ---------- 双确认屏（通栏：改名清单要地方） ---------- */
+/* 与 .notice--warn / --danger 同一套配色：底栏的数字和正文里那条明细
+   是同一件事的两个粒度，颜色对不上就得让人重新判断一次轻重 */
+.copy-figure--warn {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
 
-.copy-confirm {
-  grid-column: 1 / -1;
+.copy-figure--danger {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .copy-confirm__grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: var(--space-6);
+  /*
+   * 两栏各自贴顶,不许被对方拉长。
+   *
+   * 默认的 align-items: stretch 会把两栏都拉到「这一行」的高度,而这一行的
+   * 高度由**更长的那栏**决定。改名清单展开到 300 条之后右栏 6700px,左栏
+   * (.stack → .dl 两级都是 grid)跟着被拉成 6700px,再把这份高度平分给
+   * 「项目/源卷/相机/目标夹/…」——Chrome 实测每行 468px,读起来是一串
+   * 悬在空处、彼此隔着大半屏的字。
+   *
+   * 这条以前不发作,只是因为 .copy-renames 自己 max-height:240px 封了顶;
+   * 那层嵌套滚动去掉之后(见上面的说明),右栏才第一次真的能长这么高。
+   */
+  align-items: start;
 }
 
 .copy-confirm__folders {
@@ -588,13 +679,20 @@
   color: var(--text-primary);
 }
 
-/* 改名清单:条数可能上百,列表自滚;但「共几条」永远写在上方标题里 */
+/*
+ * 改名清单。条数可能上百,但它**不再自己滚**。
+ *
+ * 从前它 `max-height:240px; overflow-y:auto` 是因为整屏版里它外面只有页面
+ * 滚动;搬进弹窗后,它外面已经有 .copy-confirm__body 在滚,再套一层就是
+ * 嵌套滚动:滚轮停在清单上时滚的是内层,滚到底才「跳」给外层,而两层的
+ * 滚动条在这么小的区域里几乎分不清。长度改由「默认只列 5 条 + 展开查看
+ * 全部 N 条」控制(明细可以折叠),溢出统一交给弹窗正文那一个滚动容器。
+ * 「共几条」始终写在底栏那条数字上,与滚不滚无关。
+ */
 .copy-renames {
   display: grid;
   gap: var(--space-1);
   margin-top: var(--space-1);
-  max-height: 240px;
-  overflow-y: auto;
 }
 
 .copy-renames__item {
@@ -622,17 +720,32 @@
 
 /* 宽屏:左边核对项目/路径,右边核对规模与改名,两栏并读 */
 @media (min-width: 1000px) {
+  .copy-confirm__grid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+
+/* hero 的三列。断点是 1080 而不是跟着上面那条 1000:三列的下限加起来是
+   240 + 220 + 260 + 两道 20px 间距 = 760px,再叠上 hero 内边距 42、内容区
+   内边距 48、侧栏 220,窗口得有 1070px 才装得下。挂在 1000 上时
+   1000–1070 这一段会横向溢出(实测 25px)。主窗口 minWidth 是 1100,
+   真机永远够——这里只是把「够不够」写进结构,不靠人记。 */
+@media (min-width: 1080px) {
+  /* 目的地那列从只读摘要变成了编辑本体,是三列里唯一要输入的一列,
+     所以**下限**从 240 提到 260:卡片内边距 24 + 删除列 32 之外,路径框
+     还得剩下读得出一个真实路径的宽度。实测最小窗宽 1100 下三列是
+     240 / 250 / 260,路径输入框 162px(已含「浏览…」按钮)——够用。
+     宽处的权重一个没动:实测默认窗宽 1400 下仍是 333 / 383 / 333,
+     目的地列 333px 就能让路径框拿到 286px,再从中间那列要地方只会把
+     「235 MB/s」「约 3 分 24 秒」压成折行——那是拿仪表的可读性,换目的地
+     根本用不上的富余。 */
   .copy-stage {
-    grid-template-columns: minmax(240px, 1fr) minmax(220px, 1.15fr) minmax(240px, 1fr);
+    grid-template-columns: minmax(240px, 1fr) minmax(220px, 1.15fr) minmax(260px, 1fr);
     align-items: start;
   }
 
   .copy-stage__flow {
     align-self: center;
-  }
-
-  .copy-confirm__grid {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
 }
 
@@ -771,44 +884,50 @@
   color: var(--text-tertiary);
 }
 
-/* 目的地类型列宽:实测「NAS 主备份」文字 74px + 触发器内边距 36px
-   (左 12 + 右 24,右侧给折叠箭头留位)= 110px。原来的 96px 放不下,
-   下拉按钮和菜单项都被截成「NAS ...」。120px 留 10px 余量。
-   三处共用同一变量,改一处即可,不会再漂移。 */
-.dest-row,
-.dest-row__error {
-  --dest-kind-col: 120px;
-}
+/* 目的地行有三种形态,靠子元素个数自己认领,不靠调用处再传修饰类:
+     2 个 = 新建项目向导的备份盘（路径 + 删除）
+     3 个 = 拷卡的 NAS 行（类型 + 路径 + 删除）
+     4 个 = 拷卡的非 NAS 行（类型 + 路径 + 选盘 + 删除）
+   拷卡那两种现在长在 hero 的右列里,而右列只是三列中的一列(实测 1400
+   窗宽下 ~333px、1100 最小窗宽下 ~250px)。横着排「类型 + 路径 + 浏览…
+   + 删除」在这个宽度下必然把路径压死:实测 1400 下路径输入框只剩 68px、
+   1280 下只剩 30px,就是上一轮「压成 /Vol」的老病。所以路径独占一行——
+   路径是这一行的主角,不该给类型下拉和快捷入口让位。 */
 
-.dest-row__error {
-  padding: var(--space-1) 0 0 calc(var(--dest-kind-col) + var(--space-2));
-}
-
+/* 「NAS 主备份」6 个中文字 74px + 触发器内边距 36px(左 12 + 右 24,
+   右侧给折叠箭头留位)= 110px,取 120px 留余量。低于它下拉会被截成
+   「NAS ...」。注意它现在是**下限**不是定宽:窄了会截断,宽了没坏处,
+   所以写成 minmax() 的下界,列宽自己按容器伸缩。 */
 .dest-row {
+  --dest-kind-col: 120px;
+
   display: grid;
-  grid-template-columns: var(--dest-kind-col) minmax(0, 1fr) 32px;
+  grid-template-columns: minmax(var(--dest-kind-col), 1fr) 32px;
   gap: var(--space-2);
   align-items: center;
 }
 
-/* 非 NAS 目的地多一个「选盘…」快捷选择(评审 1.2)。
-   它不再占第三列:设置列只有 380px,减去卡片内边距约 300px,
-   120(类型) + 116(选盘) + 32(删除) + 三道 8px 间距 = 292px,
-   路径输入框只剩几十像素,实测被压成「/Vol」。改成把「选盘…」放到
-   路径框下面自成一行——路径是这行的主角,不该给快捷入口让位。 */
-.dest-row:has(> :nth-child(4)) {
-  grid-template-columns: var(--dest-kind-col) minmax(0, 1fr) 32px;
+/* 删除键永远钉在第一行右上角:两种拷卡形态里它都是最后一个子元素,
+   用 :last-child 认领,不必按个数各写一遍(也就不会因为漏改而漂移) */
+.dest-row:has(> :nth-child(3)) > :last-child {
+  grid-area: 1 / 2;
 }
 
+/* 路径:整整一行,横跨类型列与删除列 */
+.dest-row:has(> :nth-child(3)) > :nth-child(2) {
+  grid-area: 2 / 1 / auto / -1;
+}
+
+/* 「选盘…」快捷选择(评审 1.2):备份盘就在已挂载卷里,选卷即得根路径,
+   不必进文件系统翻。它排在路径下面第三行,只占类型列(不越到删除列下方),
+   于是和上面的类型下拉左右对齐——路径那行才是唯一横贯整行的 */
 .dest-row:has(> :nth-child(4)) > :nth-child(3) {
-  grid-row: 2;
-  grid-column: 2;
-  justify-self: start;
+  grid-area: 3 / 1;
 }
 
-.dest-row:has(> :nth-child(4)) > :nth-child(4) {
-  grid-row: 1;
-  grid-column: 3;
+/* 逐行错误提示跟路径左对齐——路径现在从最左侧起排,不再缩进一个类型列 */
+.dest-row__error {
+  padding: var(--space-1) 0 0;
 }
 
 /* ---- 拷卡仪表：百分比与速度。整块已上移到 hero 的管道上方,

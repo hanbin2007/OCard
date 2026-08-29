@@ -12,6 +12,7 @@ import { isAbsoluteNasRoot } from "../lib/validation";
 
 export function PathField({
   id,
+  formId,
   value,
   onChange,
   placeholder,
@@ -23,6 +24,12 @@ export function PathField({
   ariaLabel,
 }: {
   id?: string;
+  /**
+   * 归属表单的 id。给**渲染在 <form> 之外**却仍属于那张表单的路径框用：
+   * 隐式提交（在文本框里按回车 = 点提交按钮）只认表单归属，不认 DOM 嵌套，
+   * 所以把框搬出 form 之后必须显式认领，否则回车会静悄悄地什么都不做。
+   */
+  formId?: string;
   value: string;
   onChange: (next: string) => void;
   placeholder?: string;
@@ -65,6 +72,7 @@ export function PathField({
       <div className="path-field__row">
         <input
           id={id}
+          {...(formId ? { form: formId } : {})}
           data-testid={testId}
           className={`input input--mono${invalid ? " input--invalid" : ""}`}
           type="text"
