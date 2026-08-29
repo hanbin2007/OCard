@@ -66,12 +66,23 @@
   overflow-y: auto;
 }
 
+/*
+ * 单列时**不写** `min-height: 0`（它只属于双列，见文件末尾那条查询）。
+ *
+ * 病历（900×800 实测，接上全分辨率后当场暴露）：单列的 .gallery__main 是
+ * 两条 auto 行（大图 / 详情）共分 215px，装不下。`min-height: 0` 把大图这一行的
+ * 最小尺寸抹成 0，于是网格把全部空间判给了详情面板，**大图那一栏被压成 0**，
+ * 画框只剩 26px 的内边距和描边——里头那张图整个看不见。
+ * 单列的口径本来就是「两块竖着摞、整块一起滚」（.gallery__main 有
+ * overflow-y: auto），大图这一块该按 clamp 给的高度占住位置，让页面去滚，
+ * 而不是把自己让没。
+ * 从前没人报，只因为那时框里挂的是 8×6 缩略图：压没了也看不出压没了什么。
+ */
 .gallery__stage {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
   min-width: 0;
-  min-height: 0;
 }
 
 .gallery__stage-head {
@@ -89,12 +100,75 @@
 }
 
 /*
+ * 「画框里那张到底是什么」。
+ *
+ * 守的是用户报的那条：画框 1008×396（1600×913 窗口实测），挂的却是 320px
+ * 缩略图，看起来"没撑满"。
+ * 现在大图区接了全分辨率解码（见 GalleryView 的 GalleryStage），而在全尺寸
+ * 换上之前、以及 RAW 内嵌预览这类"换上了也不够用"的情形，都必须当面说清。
+ * 全尺寸到位且是原始像素时（且仅在那时）这条整个不渲染。
+ *
+ * 为什么不直接复用 .lightbox__notice（文案倒是复用的，是同一个 previewNotice）：
+ * 那一条住在 components.css，形状是全屏层里的一条**通栏**（无圆角、靠
+ * border-bottom 与身下的 stage 接上）。画廊不是浮层，它这一栏是 flex 列 + gap，
+ * 提示条底下隔着 8px 才是圆角画框——通栏那身打扮在这里接不上任何东西。
+ * 所以照 gallery.css 自己的 .gallery__alert 做同结构的一条：色调层用同一批
+ * token，形状随本表。
+ *
+ * flex: 0 0 auto 不是装饰：这一栏的弹性额度归画框，提示条一旦被压扁就是
+ * "降级提示看不见"，等于没提示。长文案（RAW 那句带两组尺寸）照样换行撑高。
+ */
+.gallery__notice {
+  flex: 0 0 auto;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  /* 长文案在窄窗里要能换行，不能把提示挤没 */
+  overflow-wrap: anywhere;
+}
+
+/* info：只是交代来路，没有哪一维降级——用告警色会让人以为这张不能用 */
+.gallery__notice--info {
+  border-color: var(--notice-info);
+  background: var(--accent-soft);
+  color: var(--text-secondary);
+}
+
+.gallery__notice--warn {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-weight: var(--weight-medium);
+}
+
+.gallery__notice--danger {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-weight: var(--weight-medium);
+}
+
+/*
  * 画框。单列时给一个**确定**高度：大图靠 max-height:100% 收缩，
  * 父级高度是 auto 的话这条约束会自我循环，图片会按原始像素撑爆版面。
  * clamp 的上下限兼顾矮窗口（不至于只剩一条缝）与大屏（不至于顶满一屏）。
  */
 .gallery__frame {
   display: grid;
+  /*
+   * 一行，而且这一行**不许**被内容顶大（minmax 的下限是 0，不是 auto）。
+   *
+   * 病历（大图接上全分辨率之后当场量到，Chrome 1600×913 / 双列态）：
+   * 隐式行是 auto，网格子项的"自动最小尺寸"又是内容尺寸，于是行被 1600×1067
+   * 的原图顶到 654.9px；`max-height: 100%` 再去解百分比时，参照的已经是被顶大的
+   * 那一行 —— 等于没约束。画框本身只有 377.8px，多出来的 301px 被
+   * `overflow: hidden` 剪掉：图是撑满了，代价是**上下各切掉一截**。
+   * 选片时看一张被裁过的图判构图，是把"没撑满"换成了更坏的一种错。
+   * 从前没暴露，只因为那时挂进来的是 8×6 的缩略图，怎么都顶不大这一行。
+   */
+  grid-template-rows: minmax(0, 1fr);
   place-items: center;
   gap: var(--space-2);
   height: clamp(200px, 46vh, 560px);
@@ -107,6 +181,16 @@
   overflow: hidden;
 }
 
+/*
+ * 大图：**只缩不放**，这一条是故意的，别"顺手修好"。
+ *
+ * 用户报过「大图没撑满」，真因是那时挂的是 320px 缩略图（现在大图区已接
+ * 全分辨率解码，全尺寸一到位它本来就比画框大，contain 自然填满，不需要
+ * width/height:100%）。但缩略图阶段**不许**用 width:100% 把它拉满：
+ * 320px 拉到 1008px 看起来像一张真预览，而选片在这里判的就是虚实与对焦——
+ * 那不是修 bug，是把 bug 做得更像样。小图就该看着像小图，
+ * 缺的那句话由 .gallery__notice 当面说。
+ */
 .gallery__image {
   max-width: 100%;
   max-height: 100%;
@@ -337,6 +421,16 @@ img.gallery__image {
     grid-template-columns: minmax(0, 1fr) 320px;
     align-items: stretch;
     overflow: hidden;
+  }
+
+  /*
+   * 双列**才**允许大图这一栏比内容矮：这一档 .gallery__main 是 overflow:hidden，
+   * 滚动责任交给了两栏各自，大图栏必须能被压到行高之内，画框的 flex:1 1 auto
+   * 才有得可缩。单列不写这一条（那边要的是「占住位置、让页面滚」），
+   * 理由见上面 .gallery__stage 处那段病历。
+   */
+  .gallery__stage {
+    min-height: 0;
   }
 
   .gallery__frame {

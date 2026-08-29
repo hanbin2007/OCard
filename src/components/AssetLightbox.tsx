@@ -54,11 +54,21 @@ const SWAP_DURATION_MS = 350;
  */
 export const FULL_PREVIEW_DELAY_MS = 150;
 
-/** 缩略图最长边（与 Rust 侧 `media::THUMB_MAX_EDGE` 同一个数，改一处要改两处） */
-const THUMB_MAX_EDGE = 320;
+/**
+ * 缩略图最长边（与 Rust 侧 `media::THUMB_MAX_EDGE` 同一个数，改一处要改两处）。
+ *
+ * 导出给画廊模式的大图区复用：那边也要在标题里说清「你现在看的是 320px 缩略图」。
+ * 各写一份数字 = 后端改了 THUMB_MAX_EDGE 之后有一处会继续报旧数。
+ */
+export const THUMB_MAX_EDGE = 320;
 
-/** 全尺寸取图的状态机。三种终态各自对应界面上一句不同的话。 */
-type FullState =
+/**
+ * 全尺寸取图的状态机。三种终态各自对应界面上一句不同的话。
+ *
+ * 导出只为让画廊模式复用同一套 `previewNotice`：类型不共享的话，
+ * 那边要么自造一份结构相同的（改一处漏一处），要么把 notice 也抄一份。
+ */
+export type FullState =
   | { phase: "loading" }
   | { phase: "ready"; preview: FullPreview }
   | { phase: "failed"; message: string };
@@ -478,7 +488,12 @@ export function AssetLightbox({
         ) : null}
         {/* 网格里有的状态,大图里必须也有(评审 D1) */}
         <span className="lightbox__badges" data-testid="lightbox-badges">
-          <JudgementBadges judgement={asset.judgement} />
+          {/* 「建议保留」是**组内**首选,只有翻页范围就是那一组时才有比较对象;
+              从网格直接进来的大图翻的是全库,挂上去就成了没有参照的角标 */}
+          <JudgementBadges
+            judgement={asset.judgement}
+            showSuggestedKeep={Boolean(scopeLabel)}
+          />
           {curated ? <Badge tone="ok">已精选</Badge> : null}
           {marked ? <Badge tone="danger">已标删</Badge> : null}
         </span>

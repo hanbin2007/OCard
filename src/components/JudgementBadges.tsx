@@ -12,14 +12,28 @@ export const LOW_SCORE_AT = 25;
 
 export function JudgementBadges({
   judgement,
+  showSuggestedKeep = false,
 }: {
   judgement?: SortingAsset["judgement"];
+  /**
+   * 是否呈现「建议保留」。**默认不呈现**,只有能同时看见同组其他张的地方
+   * 才该传 true(即连拍组的全屏铺开层)。
+   *
+   * 后端的 `suggested_keep` 语义是「**组内**首选」——无组的单张一律为 false
+   * (analysis.rs 明写「无组时高分单张也不标,避免噪声」)。所以把它挂在网格的
+   * 折叠组格子上,读者看到的是一个没有比较对象的「建议保留」:既不知道它在跟谁比,
+   * 也会误以为其余没这个角标的照片是「不建议保留」。默认关掉是 fail-closed:
+   * 新加的调用点不会又把它漏到组外面去。
+   */
+  showSuggestedKeep?: boolean;
 }) {
   if (!judgement) return null;
   const faces = judgement.faces;
   return (
     <span className="asset__judge" data-testid="asset-judgement">
-      {judgement.suggestedKeep ? <Badge tone="ok">建议保留</Badge> : null}
+      {showSuggestedKeep && judgement.suggestedKeep ? (
+        <Badge tone="ok">建议保留</Badge>
+      ) : null}
       {/*
         只有"确实检出了脸"才出角标。
         faces == null 是**检测不可用**、0 是**确实没有脸**，两者都不出角标：

@@ -13,11 +13,13 @@
  * 不去 document 上抢键；处理掉的按键才 stopPropagation，没处理的（如 Shift+D
  * 提交待删清单）原样交还给上层。
  *
- * 零静默在这个组件里有三条具体落点（评审 D1/D2）：
+ * 零静默在这个组件里有四条具体落点（评审 D1/D2）：
  * ① 网格提示条上写着的键（X / Esc）在画廊里没有语义 —— 那也要**说出来**，
  *    不能按下去 DOM 一动不动；
  * ② 素材是分页加载的，位置栏只敢说「已加载多少」，不许把它说成「共多少」；
- * ③ 翻到已加载的尾部不许静默停住，要么续拉、要么说清还差多少张。
+ * ③ 翻到已加载的尾部不许静默停住，要么续拉、要么说清还差多少张；
+ * ④ 大图区现在走全分辨率解码，而「现在挂的是缩略图还是全尺寸」必须写在脸上
+ *    （见下面的 `GalleryStage`）。
  */
 
 import {
@@ -31,10 +33,18 @@ import {
   type JSX,
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
+import { loadFullPreview } from "../api";
 import type { SortingAsset, SortingCategory } from "../api/types";
 import { formatBytes, formatTimestamp } from "../lib/format";
 import { animateOnce } from "../lib/motion";
 import { resolveShortcut, shouldYieldShortcut } from "../lib/sorting";
+import { useSelectedProject } from "../state/store";
+import {
+  FULL_PREVIEW_DELAY_MS,
+  previewNotice,
+  THUMB_MAX_EDGE,
+  type FullState,
+} from "./AssetLightbox";
 import { JudgementBadges } from "./JudgementBadges";
 import { Badge, EmptyState, Kbd } from "./ui";
 
@@ -742,29 +752,18 @@ export function GalleryView({
             ) : null}
           </div>
 
-          <div className="gallery__frame">
-            {active.thumbReady && active.thumbnail ? (
-              <StageImage
-                key={active.id}
-                asset={active}
-                mediaRef={stageRef}
-                onOpenFullscreen={onOpenFullscreen}
-                onThumbError={onThumbError}
-                onThumbLoad={onThumbLoad}
-              />
-            ) : (
-              /* 缩略图还没出来：说清是「还没做」而不是「没有图」 */
-              <div
-                ref={(node) => {
-                  stageRef.current = node;
-                }}
-                className="gallery__image gallery__image--empty"
-                data-testid="gallery-no-image"
-              >
-                <span className="text-sm dim">该文件尚未生成预览（索引中）</span>
-              </div>
-            )}
-          </div>
+          {/*
+            提示条 + 画框由 GalleryStage 一起渲染：提示条说的是「画框里那张
+            到底是什么」，必须紧挨着它、又在它**上方**（框内会被
+            .gallery__frame 的 place-items:center 与 overflow:hidden 吞掉）。
+          */}
+          <GalleryStage
+            asset={active}
+            mediaRef={stageRef}
+            onOpenFullscreen={onOpenFullscreen}
+            onThumbError={onThumbError}
+            onThumbLoad={onThumbLoad}
+          />
         </section>
 
         <aside className="gallery__detail" aria-label="素材详情">
@@ -1007,10 +1006,38 @@ export function GalleryView({
 }
 
 /**
- * 大图。取图失败要与「还没生成」分开说：前者是缓存失效/被清，
- * 后者是索引还没跑到——用户的下一步动作完全不同。
+ * 大图区：提示条 + 画框 + 画框里的那一张。
+ *
+ * ## 为什么这里也要全分辨率（修用户报的「画廊大图没撑满」）
+ *
+ * 实测（Chrome 1600×913 窗口）：`.gallery__frame` 的内容区是 982×370，而挂进去的
+ * `asset.thumbnail` 长边只有 320px（浏览器 mock 里更是 8×6 的占位块）。
+ * `.gallery__image` 写的是 `max-width/max-height: 100%` + `object-fit: contain`，
+ * 这套约束**只缩不放**，于是一张缩略图就飘在框中央——读起来就是「没撑满」。
+ *
+ * 所以真因不是布局，是**图太小**。修法与全屏预览同一条（见 AssetLightbox 顶部）：
+ * 先挂已有缩略图不白屏，同时按需解全尺寸，解好换上；全尺寸一到位，它本来就比
+ * 画框大，`object-fit: contain` 自然把框填满，**不需要**给图加
+ * `width:100%/height:100%`。
+ *
+ * 反过来说：全尺寸没到位时**绝不**把缩略图拉伸撑满。把 320px 拉到 982px，
+ * 看起来就像一张真预览，而选片在大图上判的恰恰是虚实与对焦——
+ * 那不是修这个 bug，那是把这个 bug 做得更像样。缩略图阶段一律保持
+ * `max-*: 100%`（小图就是小图），同时由提示条当面说清「现在这张判不了虚实」。
+ *
+ * ## 为什么提示条在这个组件里
+ *
+ * 它说的是「画框里那张到底是什么」，必须与画框相邻且在其**上方**：
+ * 放进框里会被 `.gallery__frame` 的 `place-items: center` / `overflow: hidden`
+ * 吞掉。文案与四档 RAW adequacy 的判定直接复用全屏预览那份 `previewNotice`——
+ * 两处各写一份中文，早晚漂移成两套口径，而这条提示的全部价值就在于它说的是实话。
+ *
+ * ## 不动的地方
+ *
+ * 胶片条那排 `gallery__shot-thumb` 仍然是缩略图：那里 104×60，缩略图正合适，
+ * 上千格全量解全尺寸是把内存往死里烧。全尺寸只给主图区。
  */
-function StageImage({
+function GalleryStage({
   asset,
   mediaRef,
   onOpenFullscreen,
@@ -1023,43 +1050,192 @@ function StageImage({
   onThumbError: () => void;
   onThumbLoad: () => void;
 }) {
+  /** thumb:// 取图失败（缓存被清/失效）——与「还没生成」是两件事 */
   const [failed, setFailed] = useState(false);
+  const [full, setFull] = useState<FullState>({ phase: "loading" });
 
-  if (failed) {
-    return (
-      <div
-        ref={(node) => {
-          mediaRef.current = node;
-        }}
-        className="gallery__image gallery__image--empty"
-        data-testid="gallery-image-failed"
-        role="status"
-      >
-        <span className="text-sm">预览不可用</span>
-        <span className="text-xs dim">
-          缩略图取不到（缓存已失效或被清理）。原始文件不受影响，重新索引后可恢复。
-        </span>
-      </div>
-    );
+  /*
+   * 换素材时**在同一次渲染里**把两个状态清掉（React 官方的
+   * "adjusting state when a prop changes"）。
+   *
+   * 为什么不放进 effect：effect 在提交之后才跑，中间会有一帧把**上一张**的
+   * 全尺寸像素配到**这一张**的文件名、大小、判定旁边。那一帧看不出异常，
+   * 却正好是「界面显示 A、说的是 B」——本组件通篇在防的就是这个。
+   * 也因此这里不用 key 重挂：同一个实例活着，下面那条 live 竞态闸才是
+   * 真正在挡慢响应的东西，而不是靠"组件正好被卸载了"侥幸挡住。
+   */
+  const [shownFor, setShownFor] = useState(asset.id);
+  if (shownFor !== asset.id) {
+    setShownFor(asset.id);
+    setFull({ phase: "loading" });
+    setFailed(false);
   }
 
+  /*
+   * 全尺寸取图。projectId 从 store 取：上层只传素材，而后端要按项目定位文件。
+   * 画廊与全屏大图同在 StoreProvider 内，取法与 AssetLightbox 一致。
+   */
+  const projectId = useSelectedProject()?.id ?? null;
+  useEffect(() => {
+    /*
+     * live 是这条竞态的全部答案（照抄 AssetLightbox）：换到下一张时上一次
+     * effect 先 cleanup，它那份 live 变 false，于是**慢半拍才回来的上一张
+     * 结果被丢弃**，不会盖住眼前这张。画廊里方向键一路扫过去，慢响应回来
+     * 得比全屏预览还乱，这道闸只能更紧不能更松。
+     */
+    let live = true;
+    setFull({ phase: "loading" });
+    if (!projectId) {
+      // 没有当前项目 = 取不到原图。这也要说出来，不能停在缩略图装作没事
+      setFull({
+        phase: "failed",
+        message: "当前没有选定项目，取不到全尺寸原图",
+      });
+      return;
+    }
+    /*
+     * 延迟发请求：按住方向键扫图时，掠过的每一张都发一次整幅解码会把 CPU 和
+     * 内存吃光。常量与全屏预览共用一个（import 来的），不另立一份。
+     */
+    const timer = setTimeout(() => {
+      loadFullPreview(projectId, asset.id).then(
+        (preview) => {
+          if (live) setFull({ phase: "ready", preview });
+        },
+        (e: unknown) => {
+          if (!live) return;
+          const message =
+            e instanceof Error ? e.message : typeof e === "string" ? e : String(e);
+          setFull({
+            phase: "failed",
+            message: message || "全尺寸原图加载失败（后端没有给出原因）",
+          });
+        },
+      );
+    }, FULL_PREVIEW_DELAY_MS);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [asset.id, projectId]);
+
+  const hasThumb = Boolean(asset.thumbReady && asset.thumbnail && !failed);
+  const showFull = full.phase === "ready";
+  const notice = previewNotice(full, hasThumb);
+  /** 有东西可看 = 全尺寸到位，或者还有缩略图顶着 */
+  const hasImage = showFull || hasThumb;
+
+  /*
+   * 「你现在看的到底是什么」写进 title。
+   *
+   * 原文案是写死的「点击看全屏（缩略图预览，清晰度有限）」——全尺寸接上之后
+   * 那句话在一半时间里是假的。视频帧与 RAW 内嵌预览也**不许**说成「原图」：
+   * 那是同一类谎话换个说法（与 AssetLightbox 的放大提示同一口径）。
+   */
+  const seeing =
+    full.phase === "ready"
+      ? `${
+          full.preview.kind === "videoFrame"
+            ? "视频里的这一帧"
+            : full.preview.kind === "rawEmbedded"
+              ? "相机内嵌预览"
+              : "全尺寸原图"
+        } ${full.preview.width}×${full.preview.height}`
+      : hasThumb
+        ? `${THUMB_MAX_EDGE}px 缩略图，${
+            full.phase === "failed"
+              ? "全尺寸原图没解出来"
+              : "全尺寸原图解码中"
+          }，清晰度不足以判断虚实`
+        : "还没有可显示的图";
+  const title = onOpenFullscreen
+    ? `点击看全屏（当前显示：${seeing}）`
+    : `当前显示：${seeing}`;
+
   return (
-    <img
-      ref={(node) => {
-        mediaRef.current = node;
-      }}
-      className="gallery__image"
-      src={asset.thumbnail}
-      alt={asset.fileName}
-      data-testid="gallery-image"
-      title={onOpenFullscreen ? "点击看全屏（缩略图预览，清晰度有限）" : undefined}
-      onClick={onOpenFullscreen}
-      onError={() => {
-        setFailed(true);
-        onThumbError();
-      }}
-      onLoad={onThumbLoad}
-    />
+    <>
+      {/*
+        全尺寸到位且是原始像素时（且仅在那时）这条整个不渲染。
+        提前消失 = 用户拿 320px 缩略图当原图判虚实 = 这个 bug 没修。
+      */}
+      {notice ? (
+        <div
+          className={`gallery__notice gallery__notice--${notice.tone}`}
+          data-testid="gallery-preview-notice"
+          data-tone={notice.tone}
+          role="status"
+          aria-live="polite"
+        >
+          {notice.text}
+        </div>
+      ) : null}
+
+      <div className="gallery__frame">
+        {hasImage ? (
+          <img
+            ref={(node) => {
+              mediaRef.current = node;
+            }}
+            className="gallery__image"
+            src={showFull ? full.preview.url : asset.thumbnail}
+            alt={asset.fileName}
+            data-testid="gallery-image"
+            /* 测试与实测都要能一眼分辨「现在挂的是哪一路图」 */
+            data-source={showFull ? "full" : "thumb"}
+            title={title}
+            onClick={onOpenFullscreen}
+            onError={() => {
+              if (showFull) {
+                /*
+                 * preview:// 读不出来（本机预览缓存被清、协议闸拒绝）：
+                 * 退回缩略图并把话说破。**不**回调 onThumbError——
+                 * 那个计数器数的是缩略图连续失败，用来判断缩略图缓存是不是
+                 * 整体坏了；把全尺寸的失败混进去会让它误报。
+                 */
+                setFull({
+                  phase: "failed",
+                  message:
+                    "全尺寸原图读取失败（本机预览缓存可能已被清理）；切走再切回来可重试",
+                });
+              } else {
+                setFailed(true);
+                onThumbError();
+              }
+            }}
+            onLoad={() => {
+              // 同理：只有缩略图真的载入成功，才算「缩略图缓存是好的」
+              if (!showFull) onThumbLoad();
+            }}
+          />
+        ) : failed ? (
+          <div
+            ref={(node) => {
+              mediaRef.current = node;
+            }}
+            className="gallery__image gallery__image--empty"
+            data-testid="gallery-image-failed"
+            role="status"
+          >
+            <span className="text-sm">预览不可用</span>
+            <span className="text-xs dim">
+              缩略图取不到（缓存已失效或被清理）。原始文件不受影响，重新索引后可恢复。
+            </span>
+          </div>
+        ) : (
+          /* 缩略图还没出来：说清是「还没做」而不是「没有图」。
+             此时全尺寸那一路仍在跑，进展由上面的提示条负责说 */
+          <div
+            ref={(node) => {
+              mediaRef.current = node;
+            }}
+            className="gallery__image gallery__image--empty"
+            data-testid="gallery-no-image"
+          >
+            <span className="text-sm dim">该文件尚未生成预览（索引中）</span>
+          </div>
+        )}
+      </div>
+    </>
   );
 }
 

@@ -3084,7 +3084,8 @@ function GroupLayer({
               onThumbLoad={onThumbLoad}
             />
             <span className="asset__name truncate">{asset.fileName}</span>
-            <JudgementBadges judgement={asset.judgement} />
+            {/* 只有这一层能同时看见同组其他张,「建议保留」才有比较对象 */}
+            <JudgementBadges judgement={asset.judgement} showSuggestedKeep />
             {curatedIds.has(asset.id) ? (
               <span
                 className="asset__flag asset__flag--curated"

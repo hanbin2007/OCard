@@ -1448,6 +1448,12 @@
   display: flex;
   flex-direction: column;
   background: var(--overlay);
+  /* 背景压暗之外再加一层虚化:全屏看片时身后的网格、色块、文字都在抢注意力,
+     而这一层的全部意义就是「只看这一张」。半透明遮罩挡得住亮度挡不住结构,
+     虚化才真正把背后那些边缘线收掉。
+     `backdrop-filter` 只允许出现在铺满视口的浮层上(tokens.test 按选择器判):
+     普通屏内容用它既是性能负担,也会把本该实心的面做成磨砂,层次全乱。 */
+  backdrop-filter: blur(18px) saturate(120%);
   animation: scrim-in var(--dur-quick) var(--ease-out);
 }
 
@@ -1634,6 +1640,12 @@
   display: flex;
   flex-direction: column;
   background: var(--overlay);
+  /* 背景压暗之外再加一层虚化:全屏看片时身后的网格、色块、文字都在抢注意力,
+     而这一层的全部意义就是「只看这一张」。半透明遮罩挡得住亮度挡不住结构,
+     虚化才真正把背后那些边缘线收掉。
+     `backdrop-filter` 只允许出现在铺满视口的浮层上(tokens.test 按选择器判):
+     普通屏内容用它既是性能负担,也会把本该实心的面做成磨砂,层次全乱。 */
+  backdrop-filter: blur(18px) saturate(120%);
   animation: scrim-in var(--dur-quick) var(--ease-out);
 }
 

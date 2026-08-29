@@ -1,15 +1,29 @@
 /**
  * 画廊模式（Loupe 视图）的行为闸门。
  *
- * 重点不是"渲染出来了没有"，而是两条会真出事的口径：
+ * 重点不是"渲染出来了没有"，而是三条会真出事的口径：
  * ① 打标键作用的必须是**你看见的那张**（与 Lightbox 同一判例，评审 3.2）；
- * ② 任何缺图、失败、回退都必须在界面上说出来，不许静默留白。
+ * ② 任何缺图、失败、回退都必须在界面上说出来，不许静默留白；
+ * ③ 大图区显示的到底是 320px 缩略图还是全尺寸原图，必须写在脸上——
+ *    这是「画廊大图没撑满」那条 bug 的真身（图太小，不是布局），
+ *    也是最容易在后续改动里悄悄退化回去的一处。
  */
 
-import { cleanup, createEvent, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  createEvent,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { SortingAsset, SortingCategory } from "../api/types";
+import type { ReactElement, ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as api from "../api";
+import { mockProjects } from "../api/mock";
+import type { FullPreview, SortingAsset, SortingCategory } from "../api/types";
+import { StoreProvider } from "../state/store";
 import {
   GalleryView,
   StripShot,
@@ -20,6 +34,14 @@ import {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+});
+
+const project = mockProjects[0];
+
+// 默认让全尺寸解码停在半路（见 stallFullPreview）：不打桩的话每条用例都会
+// 真去跑 mock 后端那几百毫秒的定时器，测试跑完还在往已卸载的树里塞状态
+beforeEach(() => {
+  stallFullPreview();
 });
 
 function makeAsset(id: string, over: Partial<SortingAsset> = {}): SortingAsset {
@@ -64,6 +86,31 @@ const CATEGORIES: SortingCategory[] = [
   { id: "cat-other", name: "其他", folderName: "其他", kind: "other", count: 0 },
 ];
 
+/**
+ * 大图区要按项目 id 去后端取全尺寸原图，所以画廊必须挂在 StoreProvider 下
+ * （实机上它本来就在里面）。rerender 也一并包起来：不包的话上层一次重渲染
+ * 就把 provider 摘掉了，报错还会指向一个与本用例无关的地方。
+ */
+function wrap(node: ReactNode) {
+  return (
+    <StoreProvider preloaded={{ projects: [project], selectedProjectId: project.id }}>
+      {node}
+    </StoreProvider>
+  );
+}
+
+/**
+ * 全尺寸解码默认"永远没回来"。
+ *
+ * 这样每条用例的默认场景就是**最危险的那一刻**：画面上挂着 320px 缩略图，
+ * 而用户以为自己在看大图。要验换上之后的行为，用例自己再 spy 一次。
+ */
+function stallFullPreview() {
+  return vi
+    .spyOn(api, "loadFullPreview")
+    .mockReturnValue(new Promise<FullPreview>(() => {}));
+}
+
 function renderGallery(over: Partial<GalleryViewProps> = {}) {
   // 显式给出签名：不带类型参数的 vi.fn() 推不出调用签名，装不进 GalleryViewProps
   const handlers = {
@@ -84,8 +131,13 @@ function renderGallery(over: Partial<GalleryViewProps> = {}) {
     ...handlers,
     ...over,
   };
-  const view = render(<GalleryView {...props} />);
-  return { ...view, handlers, props };
+  const view = render(wrap(<GalleryView {...props} />));
+  return {
+    ...view,
+    rerender: (node: ReactElement) => view.rerender(wrap(node)),
+    handlers,
+    props,
+  };
 }
 
 /** 往画廊根节点上发一次按键（根节点就是快捷键的挂载点） */
@@ -849,5 +901,326 @@ describe("画廊模式：胶片条窗口化（评审 D3）", () => {
     fireEvent.click(screen.getAllByTestId("gallery-shot")[2]);
     expect(fresh).toHaveBeenCalledWith(ASSETS[2].id);
     expect(props.onCursorChange).not.toHaveBeenCalled();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 画廊大图的全分辨率（用户报的「画廊模式下上方大图没撑满」）
+ *
+ * 真因不是布局：实测画框 1008×429，而挂进去的 `asset.thumbnail` 长边只有
+ * 320px，`.gallery__image` 的 `max-*: 100%` + `object-fit: contain` 只缩不放，
+ * 于是缩略图飘在框中央。修法与全屏预览同一条——把全尺寸解码接上来。
+ *
+ * 这一组用例钉的是接上之后**不许退化成另一种骗法**：
+ *  ① 全尺寸没到位时不许把缩略图拉伸撑满（拉满看着像真预览，判虚实照样判不了）；
+ *  ② 没到位期间提示一直在，到位且是原始像素时才消失；
+ *  ③ 各类失败/降级各说各的，不静默停在缩略图上；
+ *  ④ 切素材时上一张的慢响应必须被丢弃。
+ * ------------------------------------------------------------------ */
+
+function fullOf(url: string, patch: Partial<FullPreview> = {}): FullPreview {
+  return {
+    url,
+    width: 6000,
+    height: 4000,
+    sourceWidth: 6000,
+    sourceHeight: 4000,
+    downscaled: false,
+    fromCache: false,
+    kind: "original",
+    frameAtSec: null,
+    durationSec: null,
+    rawAdequacy: null,
+    rawWarning: null,
+    ...patch,
+  };
+}
+
+/** 相机内嵌的「半幅」预览：换上来了 ≠ 够判虚实 */
+function rawReduced(): FullPreview {
+  return fullOf("preview://localhost/raaaaaaaaaaaaaaa.jpg", {
+    kind: "rawEmbedded",
+    rawAdequacy: "reduced",
+    rawWarning:
+      "这是相机内嵌的「半幅」预览（4128×2752，原始尺寸 8256×5504），不是全分辨率原图：" +
+      "构图和明显跑焦看得出，细微的虚实判不准——要抠对焦请用 RAW 处理软件",
+  });
+}
+
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  // 未处理的 rejection 会污染整跑；空 catch 只为静音，断言仍然看界面说了什么
+  promise.catch(() => {});
+  return { promise, resolve, reject };
+}
+
+const img = () => screen.getByTestId("gallery-image") as HTMLImageElement;
+const preview = () => screen.queryByTestId("gallery-preview-notice");
+
+describe("画廊大图：全分辨率", () => {
+  it("先挂缩略图并说破，全尺寸到位后换上、提示消失", async () => {
+    const d = deferred<FullPreview>();
+    const spy = stallFullPreview().mockReturnValue(d.promise);
+    renderGallery({ cursorId: ASSETS[0].id });
+
+    // ① 立刻有东西看，而且明确标着这是缩略图这一路
+    expect(img().getAttribute("data-source")).toBe("thumb");
+    expect(img().getAttribute("src")).toBe(ASSETS[0].thumbnail);
+    expect(preview()?.textContent).toContain("缩略图");
+    expect(preview()?.textContent).toContain("判断虚实");
+    expect(preview()?.getAttribute("data-tone")).toBe("warn");
+
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    expect(spy).toHaveBeenCalledWith(project.id, ASSETS[0].id);
+
+    // ② 全尺寸到位：换上原图，提示消失
+    d.resolve(fullOf("preview://localhost/aaaaaaaaaaaaaaaa.jpg"));
+    await waitFor(() => expect(img().getAttribute("data-source")).toBe("full"));
+    expect(img().getAttribute("src")).toBe(
+      "preview://localhost/aaaaaaaaaaaaaaaa.jpg",
+    );
+    expect(
+      preview(),
+      "全尺寸原图已到位且是原始像素，这是唯一该闭嘴的情形",
+    ).toBeNull();
+  });
+
+  it("★ 全尺寸没到位期间提示一直在——提前消失等于这个 bug 没修", async () => {
+    const spy = stallFullPreview();
+    renderGallery();
+
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    for (let i = 0; i < 3; i++) {
+      await new Promise((r) => setTimeout(r, 40));
+      expect(
+        preview()?.textContent,
+        "全尺寸还没换上，提示不许消失",
+      ).toContain("缩略图");
+      expect(img().getAttribute("data-source")).toBe("thumb");
+    }
+  });
+
+  it("★ 缩略图阶段不许被拉伸撑满：小图就该看着像小图", async () => {
+    stallFullPreview();
+    renderGallery();
+
+    // 把 320px 拉到 1008px 会让人以为这是一张真预览，而虚实照样判不了——
+    // 那不是修 bug，是把 bug 做得更像样。撑满只能靠**真的换上大图**。
+    const el = img();
+    expect(el.getAttribute("data-source")).toBe("thumb");
+    expect(el.className, "缩略图阶段不许挂任何拉伸用的修饰类").toBe(
+      "gallery__image",
+    );
+    expect(el.style.width, "不许用行内样式把缩略图撑满").toBe("");
+    expect(el.style.height).toBe("");
+    expect(el.style.objectFit).toBe("");
+  });
+
+  it("★ 切换素材时，上一张慢半拍的结果被丢弃，不会盖住眼前这张", async () => {
+    const first = deferred<FullPreview>();
+    const second = deferred<FullPreview>();
+    const spy = stallFullPreview().mockImplementation(
+      (_projectId: string, assetId: string) =>
+        assetId === ASSETS[0].id ? first.promise : second.promise,
+    );
+    const { rerender, props } = renderGallery({ cursorId: ASSETS[0].id });
+    await waitFor(() =>
+      expect(spy).toHaveBeenCalledWith(project.id, ASSETS[0].id),
+    );
+
+    // 还没回来就翻到下一张
+    rerender(<GalleryView {...props} cursorId={ASSETS[1].id} />);
+    await waitFor(() =>
+      expect(spy).toHaveBeenCalledWith(project.id, ASSETS[1].id),
+    );
+
+    // 上一张这时才回来：必须被丢弃，否则 A 的像素会配在 B 的文件名旁边
+    first.resolve(fullOf("preview://localhost/1111111111111111.jpg"));
+    await new Promise((r) => setTimeout(r, 60));
+    expect(
+      img().getAttribute("src"),
+      "上一张的慢响应绝不许盖住眼前这张",
+    ).toBe(ASSETS[1].thumbnail);
+    expect(img().getAttribute("data-source")).toBe("thumb");
+    expect(preview()?.textContent).toContain("缩略图");
+
+    // 眼前这张回来了才换上
+    second.resolve(fullOf("preview://localhost/2222222222222222.jpg"));
+    await waitFor(() =>
+      expect(img().getAttribute("src")).toBe(
+        "preview://localhost/2222222222222222.jpg",
+      ),
+    );
+    expect(preview()).toBeNull();
+  });
+
+  it("失败各说各的话，并且明说「你现在看的还是缩略图」", async () => {
+    const cases = [
+      {
+        name: "超出尺寸上限",
+        message:
+          "原图 14000×10000（约 1.4 亿像素）超过全尺寸解码上限 1.2 亿像素——再解会把内存吃爆，已停在缩略图",
+        expect: "1.2 亿像素",
+      },
+      {
+        name: "解码失败",
+        message: "全尺寸解码失败（文件可能损坏或被截断）: unexpected end of file",
+        expect: "损坏",
+      },
+    ];
+    const seen = new Set<string>();
+    for (const c of cases) {
+      stallFullPreview().mockRejectedValue(new Error(c.message));
+      const view = renderGallery();
+      await waitFor(() =>
+        expect(preview()?.getAttribute("data-tone")).toBe("danger"),
+      );
+      const text = preview()?.textContent ?? "";
+      expect(text, `${c.name} 要点名具体原因，不能笼统一句「加载失败」`).toContain(
+        c.expect,
+      );
+      expect(
+        text,
+        `${c.name}：失败后停在缩略图这件事本身也必须说破`,
+      ).toContain("仍是 320px 缩略图");
+      expect(
+        img().getAttribute("data-source"),
+        "解不出来就退回缩略图，但不许装作没事",
+      ).toBe("thumb");
+      seen.add(text);
+      view.unmount();
+      vi.restoreAllMocks();
+    }
+    expect(seen.size, "两类失败说了同一句话，等于没分类").toBe(2);
+  });
+
+  it("没有选定项目时也说出来，不静默停在缩略图上", async () => {
+    render(
+      <StoreProvider preloaded={{ projects: [], selectedProjectId: null }}>
+        <GalleryView
+          assets={ASSETS}
+          cursorId={ASSETS[0].id}
+          onCursorChange={() => {}}
+          categories={CATEGORIES}
+          markedSet={new Set<string>()}
+          curatedIds={new Set<string>()}
+          onThumbError={() => {}}
+          onThumbLoad={() => {}}
+        />
+      </StoreProvider>,
+    );
+
+    await waitFor(() =>
+      expect(preview()?.getAttribute("data-tone")).toBe("danger"),
+    );
+    expect(preview()?.textContent).toContain("当前没有选定项目");
+  });
+
+  it("★ RAW 半幅预览换上来之后警示仍在——换上了 ≠ 够判虚实", async () => {
+    stallFullPreview().mockResolvedValue(rawReduced());
+    renderGallery();
+
+    await waitFor(() => expect(img().getAttribute("data-source")).toBe("full"));
+    const text = preview()?.textContent ?? "";
+    expect(text, "换上之后警示消失，等于换个方式继续骗用户").toContain(
+      "4128×2752",
+    );
+    expect(text).toContain("机内渲染");
+    expect(preview()?.getAttribute("data-tone")).toBe("warn");
+    expect(
+      img().getAttribute("title"),
+      "内嵌预览不许在标题里被说成「全尺寸原图」",
+    ).toContain("相机内嵌预览");
+  });
+
+  it("标题跟着实情走：缩略图阶段说清判不了虚实，换上后报的是真尺寸", async () => {
+    const d = deferred<FullPreview>();
+    stallFullPreview().mockReturnValue(d.promise);
+    renderGallery();
+
+    const before = img().getAttribute("title") ?? "";
+    expect(before).toContain("点击看全屏");
+    expect(before, "旧文案「缩略图预览，清晰度有限」现在要说得更死").toContain(
+      "320px 缩略图",
+    );
+    expect(before).toContain("清晰度不足以判断虚实");
+
+    d.resolve(fullOf("preview://localhost/5555555555555555.jpg"));
+    await waitFor(() => expect(img().getAttribute("data-source")).toBe("full"));
+    const after = img().getAttribute("title") ?? "";
+    expect(after).toContain("全尺寸原图 6000×4000");
+    expect(after, "换上之后还写着「清晰度不足」就是又一句假话").not.toContain(
+      "清晰度不足",
+    );
+  });
+
+  it("★ 胶片条那排仍然是缩略图，全尺寸只给主图区", async () => {
+    stallFullPreview().mockResolvedValue(
+      fullOf("preview://localhost/6666666666666666.jpg"),
+    );
+    renderGallery();
+    await waitFor(() => expect(img().getAttribute("data-source")).toBe("full"));
+
+    // 上千格各解一张全尺寸 = 把内存往死里烧；104×60 的格子也用不着
+    for (const thumb of screen.getAllByTestId("gallery-shot-thumb")) {
+      expect(thumb.getAttribute("src")).toMatch(/^thumb:\/\//);
+      expect(thumb.getAttribute("src")).not.toContain("preview://");
+    }
+  });
+
+  it("全尺寸文件读不出来时退回缩略图并说破，且不误报缩略图失败", async () => {
+    stallFullPreview().mockResolvedValue(
+      fullOf("preview://localhost/7777777777777777.jpg"),
+    );
+    const { handlers } = renderGallery();
+    await waitFor(() => expect(img().getAttribute("data-source")).toBe("full"));
+
+    // preview:// 404（本机预览缓存被清 / 协议闸拒绝）
+    fireEvent.error(img());
+    await waitFor(() => expect(img().getAttribute("data-source")).toBe("thumb"));
+    expect(preview()?.getAttribute("data-tone")).toBe("danger");
+    expect(preview()?.textContent).toContain("全尺寸原图读取失败");
+    // onThumbError 数的是**缩略图**连续失败，用来判断缩略图缓存整体坏没坏；
+    // 把全尺寸的失败混进去会让它误报
+    expect(handlers.onThumbError).not.toHaveBeenCalled();
+  });
+
+  it("缩略图取不到但全尺寸到位：显示全尺寸，不再退成占位", async () => {
+    const d = deferred<FullPreview>();
+    stallFullPreview().mockReturnValue(d.promise);
+    const { handlers } = renderGallery();
+
+    fireEvent.error(img());
+    expect(handlers.onThumbError).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("gallery-image-failed").textContent).toContain(
+      "缓存已失效或被清理",
+    );
+
+    d.resolve(fullOf("preview://localhost/8888888888888888.jpg"));
+    await waitFor(() => expect(img().getAttribute("data-source")).toBe("full"));
+    expect(screen.queryByTestId("gallery-image-failed")).toBeNull();
+    // 缩略图这一路坏了，但全尺寸是好的：既然有真图可看就该看真图
+    expect(preview()).toBeNull();
+  });
+
+  it("缩略图还没生成时：占位说「索引中」，提示条说全尺寸正在解", async () => {
+    const assets = [makeAsset("待分类/B0001.CR3", { thumbReady: false })];
+    const d = deferred<FullPreview>();
+    stallFullPreview().mockReturnValue(d.promise);
+    renderGallery({ assets, cursorId: assets[0].id });
+
+    expect(screen.getByTestId("gallery-no-image").textContent).toContain("索引中");
+    expect(preview()?.textContent).toContain("正在解码全尺寸原图");
+    expect(preview()?.getAttribute("data-tone")).toBe("info");
+
+    // 缩略图没有不代表全尺寸也没有：解出来了照样要显示
+    d.resolve(fullOf("preview://localhost/9999999999999999.jpg"));
+    await waitFor(() => expect(img().getAttribute("data-source")).toBe("full"));
+    expect(screen.queryByTestId("gallery-no-image")).toBeNull();
   });
 });

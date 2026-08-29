@@ -176,7 +176,35 @@ describe("主题令牌", () => {
     expect(shadows.every((v) => v === "var(--shadow-overlay)")).toBe(true);
     expect(screens).not.toContain("box-shadow");
     expect(shells).not.toContain("box-shadow");
-    expect(screens).not.toContain("backdrop-filter");
+  });
+
+  /**
+   * `backdrop-filter` 只许出现在**铺满视口的浮层**上。
+   *
+   * 原来这条写成「screens.css 里一个都不许有」。那是把「普通屏内容不许磨砂玻璃」
+   * 这个意图,用「哪个文件」来近似——而 `.lightbox` / `.group-layer` 这两个
+   * 全屏浮层恰恰就住在 screens.css 里,于是正当用法被一并禁掉了。
+   * 改成按**选择器主语**判:意图不变,近似换成判据本身。
+   *
+   * 为什么普通内容不许:它对每一帧都要重新采样身后的像素,是实打实的性能负担;
+   * 而且会把本该实心的面做成半透,四级灰阶台阶(shell → sidebar → content →
+   * panel)当场糊成一片,层次全乱。
+   */
+  it("backdrop-filter 只许用在铺满视口的浮层上", async () => {
+    const { RULES, where } = await import("./_css-contract");
+    // 允许名单 = 铺满视口、且已在 stacking 名册里登记的那几层
+    const FULLSCREEN_LAYERS = new Set(["lightbox", "group-layer", "overlay"]);
+    const strays = RULES.filter((r) =>
+      r.decls.some((d) => d.prop === "backdrop-filter"),
+    )
+      .filter((r) => ![...r.subjectClasses].some((c) => FULLSCREEN_LAYERS.has(c)))
+      .map(where);
+    expect(
+      strays,
+      "backdrop-filter 只许用在铺满视口的浮层上(见本用例的注释)。" +
+        "若确实新增了一层全屏浮层,把它的类名加进 FULLSCREEN_LAYERS," +
+        "并确认它也登记进了 stacking.test 的 LAYERS 名册",
+    ).toEqual([]);
   });
 
   it("字体栈全部是系统字体，不引 webfont", () => {
