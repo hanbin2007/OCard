@@ -148,9 +148,14 @@ export async function createProjectViaWizard(name, scenario) {
     throw new Error(`${err.message}${last}\n现场: ${detail}`);
   }
   await retryOn('[data-testid="np-submit"]', (el) => el.click());
-  // 创建成功 → 主窗口显示并选中新项目;主窗口侧栏有「项目管理」入口
+  // 创建成功 → 主窗口显示并选中新项目;主窗口侧栏有「项目管理」入口。
+  // 主窗口刚显示时 store 还在拉项目列表、顶栏的项目芯片会被重渲染一次:直接
+  // waitForExist 会撞上 stale element(CI 上 86f7b85 那次就是这么红的),用会重新
+  // 定位元素的 retryOn 等它稳定
   await switchToWindowWith('[data-testid="nav-manager"]', 30000);
-  await $('[data-testid="current-project-chip"]').waitForExist({ timeout: 20000 });
+  await retryOn('[data-testid="current-project-chip"]', async (el) => {
+    if (!(await el.isDisplayed())) throw new Error("项目芯片还没显示");
+  });
 }
 
 /** 从主窗口侧栏打开欢迎/项目管理窗口,并切到「所有项目」列表 */
