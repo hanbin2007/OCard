@@ -270,8 +270,8 @@ describe("主题令牌", () => {
     );
     expect(custom(".welcome-shell", "--welcome-topbar-offset"), "无顶栏的视图默认偏移 0").toBe("0px");
     expect(
-      custom('.welcome-shell[data-view="manager"]', "--welcome-topbar-offset"),
-      "只有项目管理视图(有顶栏)才让开顶栏",
+      custom(".welcome-shell[data-topbar]", "--welcome-topbar-offset"),
+      "只有真的渲染了顶栏的视图才让开顶栏",
     ).toContain("--topbar-height");
     expect(custom(".welcome-shell__drag", "height"), "拖动条高度与 toast 让开的量必须是同一个变量").toContain(
       "--welcome-drag-height",

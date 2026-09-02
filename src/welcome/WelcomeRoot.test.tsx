@@ -111,6 +111,22 @@ describe("欢迎页(仿 Xcode)", () => {
     await user.click(screen.getByTestId("welcome-back"));
     expect(screen.getByTestId("welcome-home")).toBeDefined();
   });
+
+  /** CSS 那一半由 tokens 契约测试锁住;这里锁属性那一半——删掉 data-topbar,
+   *  toast 就永久压回铃铛上,而 CSS 测试照样绿。 */
+  it("只有真的渲染了顶栏的项目管理视图才打 data-topbar", async () => {
+    const user = userEvent.setup();
+    renderWelcome(base);
+    const shell = () => screen.getByTestId("welcome-root");
+    expect(shell().hasAttribute("data-topbar"), "首页没有顶栏").toBe(false);
+
+    await user.click(screen.getByTestId("welcome-browse-all"));
+    expect(shell().getAttribute("data-view")).toBe("manager");
+    expect(shell().hasAttribute("data-topbar"), "项目管理视图有顶栏").toBe(true);
+
+    await user.click(screen.getByTestId("welcome-back"));
+    expect(shell().hasAttribute("data-topbar")).toBe(false);
+  });
 });
 
 describe("新项目引导(六步)", () => {

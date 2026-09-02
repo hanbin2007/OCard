@@ -1078,9 +1078,16 @@ fn save_proxy_state<R: tauri::Runtime>(
         // 写在栅栏内:持有 Held 本身挡不住「进程休眠超过 TTL 后被接管」,栅栏在落盘前
         // 持锁核对 token,不是自己的就不写(codex r6)
         let fence = lease.fence()?;
-        let saved = crate::core::manifest::save(project_root, &fresh).map(|_| ());
+        crate::core::manifest::save(project_root, &fresh)?;
+        // 落盘后复核栅栏:被外部回收 = 这次写回不可信,按失败处理并说出来
+        if !fence.still_mine() {
+            return Err(crate::core::CoreError::Busy(
+                "落盘期间租约接管锁被外部回收(存储的时钟不准,或锁目录被人动过),这次写回不可信"
+                    .into(),
+            ));
+        }
         drop(fence);
-        saved
+        Ok(())
     });
     let ok = match result {
         Ok(()) => true,
@@ -1095,7 +1102,13 @@ fn save_proxy_state<R: tauri::Runtime>(
     };
     // 释放要有判定:只靠 Drop 的话「没删掉 / 被接管」就成了无声
     let lease_file = lease.path().to_path_buf();
-    super::tasks::report_lease_release(app, lease.release(), &lease_file);
+    super::tasks::report_lease_release(
+        app,
+        lease.release(),
+        &lease_file,
+        "自动转代理状态写回",
+        false,
+    );
     ok
 }
 

@@ -344,7 +344,13 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
         // 重新 acquire,被自己这份挡住,而报文说的是「稍后点继续」(codex r6)
         if let Some(lease) = handle_for_spawn_error.lease_slot().take() {
             let lease_file = lease.path().to_path_buf();
-            report_lease_release(&app_for_spawn_error, lease.release(), &lease_file);
+            report_lease_release(
+                &app_for_spawn_error,
+                lease.release(),
+                &lease_file,
+                "拷卡线程启动失败、回滚",
+                false,
+            );
         }
         let (id, pid) = {
             let mut s = handle_for_spawn_error.snap();
@@ -552,7 +558,7 @@ fn run_worker<R: tauri::Runtime>(
     // 把意图写明,并顺手自查一次——删不掉时别人要白等 TTL,用户有权知道
     let outcome = run_worker_locked(app, handle, &mut m, &lease);
     let lease_file = lease.path().to_path_buf();
-    report_lease_release(app, lease.release(), &lease_file);
+    report_lease_release(app, lease.release(), &lease_file, "任务结束", true);
     outcome
 }
 
@@ -563,6 +569,10 @@ pub(crate) fn report_lease_release<R: tauri::Runtime>(
     app: &AppHandle<R>,
     released: crate::core::lease::Released,
     lease_file: &Path,
+    // 报文的口径:「任务结束」/「自动转代理状态写回」/「拷卡线程启动失败、回滚」——
+    // 三处复用同一段判定,但只有 worker 那一路真的有任务被暂停
+    what: &str,
+    task_paused: bool,
 ) {
     match released {
         crate::core::lease::Released::Removed => {}
@@ -576,7 +586,7 @@ pub(crate) fn report_lease_release<R: tauri::Runtime>(
                 app,
                 "task-lease-left-behind",
                 format!(
-                    "任务结束后没能删掉自己的租约文件({why}):{}。别的机器在 {} 分钟内、本机在本次运行期间续这个任务都会被它挡住;重启 OCard 或手动删除该文件可立刻解锁",
+                    "{what}后没能删掉自己的租约文件({why}):{}。别的机器在 {} 分钟内、本机在本次运行期间续这个任务都会被它挡住;重启 OCard 或手动删除该文件可立刻解锁",
                     lease_file.display(),
                     crate::core::lease::LEASE_TTL.num_minutes()
                 ),
@@ -595,8 +605,13 @@ pub(crate) fn report_lease_release<R: tauri::Runtime>(
             // 用户得知道从某一刻起这份进度可能有另一处在写
             super::notify::warn(
                 app,
-                "task-lease-lost",
-                "任务结束时发现租约已被别的进程接管(本机心跳没有及时发现)。请核对另一处的进度,再决定在哪边续传".into(),
+                // 只有 worker 那一路真的「已暂停」;别的调用方用另一个 code,标题才不撒谎
+                if task_paused {
+                    "task-lease-lost"
+                } else {
+                    "task-lease-lost-outside-run"
+                },
+                format!("{what}时发现租约已被别的进程接管(本机心跳没有及时发现)。请核对另一处的进度,再决定在哪边续传"),
             );
         }
         crate::core::lease::Released::Unverified(why)
@@ -607,7 +622,7 @@ pub(crate) fn report_lease_release<R: tauri::Runtime>(
                 app,
                 "task-lease-left-behind",
                 format!(
-                    "任务结束时没能确认租约文件的归属({why}),没有删除:{}。它可能仍是本进程的(别的机器要等 {} 分钟、本机重启 OCard 后可续),也可能已被别的进程接管——删除前请先确认没有别的 OCard 在跑这个任务",
+                    "{what}时没能确认租约文件的归属({why}),没有删除:{}。它可能仍是本进程的(别的机器要等 {} 分钟、本机重启 OCard 后可续),也可能已被别的进程接管——删除前请先确认没有别的 OCard 在跑这个任务",
                     lease_file.display(),
                     crate::core::lease::LEASE_TTL.num_minutes()
                 ),

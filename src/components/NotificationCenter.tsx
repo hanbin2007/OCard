@@ -98,6 +98,8 @@ const NOTICE_TITLES: Record<string, string> = {
   "task-lease-lost": "任务已被别的进程接管，已暂停",
   "task-lease-left-behind": "任务租约没能清掉",
   "task-lease-heartbeat-stuck": "租约心跳线程收尾迟到",
+  "task-lease-lost-outside-run": "写回期间租约被别的进程接管",
+  "copy-resume-lease-lock-broken": "租约锁目录异常，需人工清理",
   "copy-resume-lease-held": "任务正被别的进程执行，拒绝续传",
   "copy-resume-already-running": "上一次运行还没退出，本次「继续」未生效",
   "single-instance-refused": "OCard 已在运行",
@@ -118,7 +120,9 @@ const DIAGNOSTIC_CODES = new Set([
   "auto-proxy-deferred",
   "task-lease-lost",
   "task-lease-at-risk",
+  "task-lease-heartbeat-stuck",
   "copy-resume-lease-held",
+  "copy-resume-lease-lock-broken",
 ]);
 
 /**

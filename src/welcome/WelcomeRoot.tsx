@@ -29,6 +29,11 @@ export function WelcomeRoot() {
     state.workstation?.nasRoot?.trim() && state.workstation?.operator?.trim(),
   );
 
+  // 「有没有顶栏(也就有没有铃铛)」不等于「view 是不是 manager」:加载中 / 出错时
+  // 渲染的是卡片,没有 TopBar——此时 hasBell 为真会让 warning 六秒后收进一个不存在
+  // 的铃铛(消息消失),toast 也白白让开一个不存在的顶栏。两处都用这一个判据
+  const hasTopBar = !state.error && !state.loading && configured && view === "manager";
+
   let body: React.ReactNode;
   if (state.error) {
     body = (
@@ -114,7 +119,12 @@ export function WelcomeRoot() {
   }
 
   return (
-    <div className="welcome-shell" data-testid="welcome-root" data-view={view}>
+    <div
+      className="welcome-shell"
+      data-testid="welcome-root"
+      data-view={view}
+      data-topbar={hasTopBar ? "" : undefined}
+    >
       {/* 无边框窗口的拖动条;macOS 红绿灯悬浮其上 */}
       <div className="welcome-shell__drag" data-tauri-drag-region />
       {body}
@@ -124,7 +134,7 @@ export function WelcomeRoot() {
           新建向导 / 首跑设置 / 加载失败)里,warning 若按常规六秒自动收起,
           就是收进一个不存在的铃铛——消息只存在六秒然后再也找不回来,
           那是静默不是收纳。没铃铛时留到用户自己关掉。 */}
-      <NoticeToasts hasBell={view === "manager"} />
+      <NoticeToasts hasBell={hasTopBar} />
     </div>
   );
 }

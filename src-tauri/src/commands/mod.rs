@@ -2081,7 +2081,14 @@ pub fn resume_copy_task<R: tauri::Runtime>(
                     let s = handle.snap();
                     (s.id.clone(), s.project_id.clone())
                 };
-                notify::warn_for_task(&app, "copy-resume-lease-held", (&id, &pid), msg.clone());
+                // 锁目录异常(链接 / 异物)不是「别的进程在跑」:标题也要换,否则用户
+                // 先去别的机器上白找一圈
+                let code = if msg.starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) {
+                    "copy-resume-lease-lock-broken"
+                } else {
+                    "copy-resume-lease-held"
+                };
+                notify::warn_for_task(&app, code, (&id, &pid), msg.clone());
             }
             msg
         })?;
@@ -2448,9 +2455,16 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
     // **栅栏**内:持有 Held 本身挡不住「进程休眠超过 TTL 后被接管」,栅栏在落盘前
     // 持锁核对 token,不是自己的就不写(codex r6)
     let saved = lease.fence().and_then(|fence| {
-        let r = manifest::save(project_root, m);
+        let r = manifest::save(project_root, m)?;
+        // 落盘后复核栅栏:被外部回收 = 这次落盘期间可能有人接管,接管者的清单可能刚被
+        // 这次整份重写顶掉——按写失败处理并说出来,不能一声不吭(第九轮评审)
+        if !fence.still_mine() {
+            return Err(crate::core::CoreError::Busy(
+                "落盘期间租约接管锁被外部回收(存储的时钟不准,或锁目录被人动过),这次写回不可信;请确认没有别的 OCard 在跑这个任务".into(),
+            ));
+        }
         drop(fence);
-        r
+        Ok(r)
     });
     if let Err(e) = saved {
         let msg = format!(

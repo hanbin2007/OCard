@@ -319,6 +319,9 @@ fn disk_now(dir: &Path) -> Option<std::time::SystemTime> {
     t
 }
 
+/// acquire 因锁目录异常(链接 / 异物)而拒绝时报文的前缀:上层据此把通知换成
+/// 「需人工清理」的 code,而不是「任务正被别的进程执行」。
+pub const LOCK_DIR_BROKEN_PREFIX: &str = "租约锁目录异常";
 /// 锁目录不是普通目录(符号链接 / junction / 文件):不回收、不删、也不会自己好。
 const LOCK_DIR_NOT_A_DIR: &str = "不是普通目录(是符号链接 / junction 或文件)";
 /// 锁目录里有不是 OCard 写的条目:同上。
@@ -691,10 +694,11 @@ pub fn acquire_with(
                 TakeoverLock::path_for(&path).display()
             )));
         }
-        // 零静默:这种锁目录不会自己好,说成「别人正在接管」会让人去别的机器上白找
+        // 零静默:这种锁目录不会自己好,说成「别人正在接管」会让人去别的机器上白找。
+        // 报文以 LOCK_DIR_BROKEN_PREFIX 开头:上层据此换一个通知 code / 标题
         Take::Refused(why) => {
             return Err(super::CoreError::Busy(format!(
-                "这个拷卡任务的租约接管锁目录{why},已拒绝回收;这种情况不会自己好,请人工检查并清理该目录后再试:{}",
+                "{LOCK_DIR_BROKEN_PREFIX}:这个拷卡任务的租约接管锁目录{why},已拒绝回收;这种情况不会自己好,请人工检查并清理该目录后再试:{}",
                 TakeoverLock::path_for(&path).display()
             )));
         }
@@ -763,8 +767,11 @@ enum Existing {
     Fresh,
 }
 
-/// 判断顺序有讲究:先看过期,再看是不是本机残留——「同机 pid 是活着的 OCard 但
-/// token 不同」在最后,那是真的有人在跑。
+/// 判断顺序有讲究:**先判本机残留,再判按时钟过期**——残留不走观察期(acquire
+/// 也跳过它),先判过期会把一份心跳也超过 TTL 的残留落到 TakeOverByClock,而它没被
+/// 观察过 → 「观察结果一致」那道闸永远不满足 → 永久 Busy,任务在本机再也续不上
+/// (第八轮评审抓到的回归;`a_dead_local_lease_older_than_the_ttl_is_still_taken_over_immediately`
+/// 守着它)。「同机 pid 是活着的 OCard 但 token 不同」在最后,那是真的有人在跑。
 fn classify_existing(
     path: &Path,
     machine_id: &str,
@@ -826,14 +833,25 @@ impl Shared {
         self.epoch.elapsed().as_millis() as u64
     }
 
-    /// 排到本进程内使用目录锁的轮次(阻塞直到轮到)。
-    fn take_turn(self: &Arc<Self>) -> IoTurn {
+    /// 排到本进程内使用目录锁的轮次。**有界**等待:持轮次的那一方可能正卡在半死
+    /// 的 SMB 上几分钟,无界等会让栅栏无声挂起——没有进度、没有通知、暂停也轮询不到。
+    /// 超时返回 `None`,调用方按「没拿到锁」如实处理。
+    fn take_turn(self: &Arc<Self>, patience: std::time::Duration) -> Option<IoTurn> {
+        let deadline = std::time::Instant::now() + patience;
         let mut busy = lock_or_recover(&self.io_busy);
         while *busy {
-            busy = self.io_free.wait(busy).unwrap_or_else(|p| p.into_inner());
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            busy = self
+                .io_free
+                .wait_timeout(busy, left)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
         }
         *busy = true;
-        IoTurn(self.clone())
+        Some(IoTurn(self.clone()))
     }
 }
 
@@ -1005,7 +1023,11 @@ impl Held {
         // 先排**本进程内**的队:心跳线程与栅栏抢的是同一把目录锁。不排队就是自己和
         // 自己抢——慢 NAS 上心跳一拍(读→写→回读)就能耗尽栅栏的耐心,任务无故中止,
         // 报文还把人支去别的机器查进度(第八轮评审)。排了队,目录锁只剩别的进程来抢
-        let turn = self.shared.take_turn();
+        let Some(turn) = self.shared.take_turn(self.timing.heartbeat_every * 3) else {
+            return Err(super::CoreError::Busy(
+                "落盘前排队等本机心跳线程让出租约锁超时(它多半卡在存储的一次读写上),本次不写;为安全起见已停下,进度保存到上一个文件,可续传".into(),
+            ));
+        };
         // 约 5 秒耐心(默认节奏):别的进程一次接管只要几十毫秒;残留的锁目录两分钟
         // 才可回收,那种情况等不到,只能停下(可续传)——但要如实说,不是「被接管」
         let tries = (self.timing.heartbeat_every.as_millis() as u32 * 10 / 50).clamp(8, 100);
@@ -1105,9 +1127,11 @@ impl Held {
         let guard = match TakeoverLock::take_with_patience(&self.path, tries) {
             Ok(Take::Got(g)) => g,
             Ok(Take::Held) => {
-                return Released::NoLock(
-                    "释放时没能拿到接管锁(别的进程正在接管,或锁目录残留)".into(),
-                )
+                return Released::NoLock(if heartbeat_stuck {
+                    "释放时没能拿到接管锁——本机的心跳线程 5 秒内没退出,多半是它还持着锁(卡在存储上);它醒来会看到停止标志并自己删掉租约,不必手动处理".into()
+                } else {
+                    "释放时没能拿到接管锁(别的进程正在接管,或锁目录残留)".into()
+                })
             }
             Ok(Take::Refused(why)) => {
                 return Released::NoLock(format!(
@@ -1184,8 +1208,12 @@ fn heartbeat_loop(path: &Path, me: &Lease, timing: Timing, shared: &Arc<Shared>)
         }
         since_beat = std::time::Duration::ZERO;
 
-        // 与栅栏(清单落盘)在进程内排队,别自己和自己抢目录锁
-        let _turn = shared.take_turn();
+        // 与栅栏(清单落盘)在进程内排队,别自己和自己抢目录锁;等不到就下一拍再来
+        // (回到循环顶先看 stop)
+        let Some(_turn) = shared.take_turn(timing.heartbeat_every * 3) else {
+            fail("等本进程的清单落盘让出租约锁超时,本拍跳过".into());
+            continue;
+        };
         let guard = match TakeoverLock::take_with_patience(path, 3) {
             Ok(Take::Got(g)) => g,
             Ok(Take::Held) => {
@@ -1230,11 +1258,25 @@ fn heartbeat_loop(path: &Path, me: &Lease, timing: Timing, shared: &Arc<Shared>)
                 if shared.stop.load(Ordering::SeqCst) {
                     return;
                 }
+                // 锁还是不是我的:被回收了(休眠超过两分钟)就不许重建——此刻可能有人
+                // 正在接管,重建会顶掉它刚要建的那份
+                if !guard.still_mine() {
+                    fail("接管锁在本拍期间被回收,本拍不重建".into());
+                    continue;
+                }
                 // **不替换式地**重建。建不成 = 别人已经建了他的 → 回读判 Lost
                 let mut beat = me.clone();
                 beat.heartbeat_at = chrono::Utc::now().to_rfc3339();
                 match try_create(path, &beat) {
                     Ok(true) => {
+                        // 与正常写那一支同样的撤回:释放路径已经放手(等不到卡在 NAS 上
+                        // 的我们),这一拍建出来的租约会挡别人 30 分钟——还是我的就删
+                        if shared.stop.load(Ordering::SeqCst) {
+                            if matches!(read_lease(path), Some(l) if l.token == me.token) {
+                                let _ = std::fs::remove_file(path);
+                            }
+                            return;
+                        }
                         shared.last_ok_ms.store(shared.now_ms(), Ordering::Relaxed);
                         *lock_or_recover(&shared.last_err) = None;
                     }
@@ -1845,6 +1887,31 @@ mod tests {
         assert!(
             matches!(held.poll(), LeaseStatus::Lost(_)),
             "栅栏发现被接管后 poll 也要说 Lost"
+        );
+    }
+
+    /// 进程内的排队是**有界**的:持轮次的一方卡在存储上时,第二个栅栏不能无声挂起
+    /// (没有进度、没有通知、暂停也轮询不到),要在有限时间内按「没拿到锁」如实报错。
+    /// 同线程先后取两次栅栏就是最直接的复现。
+    #[test]
+    fn a_second_fence_while_the_first_is_held_times_out_instead_of_hanging() {
+        let (_t, root, id) = setup();
+        let held = acquire_with(&root, &id, "MACHINE-A", "张三", FAST).unwrap();
+        let _first = held.fence().expect("第一道栅栏要能拿到");
+        let started = std::time::Instant::now();
+        let err = held.fence().unwrap_err();
+        assert!(
+            started.elapsed() < FAST.heartbeat_every * 10,
+            "第二道栅栏必须在有限时间内放弃,不许挂起"
+        );
+        assert!(matches!(err, super::super::CoreError::Busy(_)), "{err}");
+        assert!(
+            err.to_string().contains("超时"),
+            "要如实说是排队超时: {err}"
+        );
+        assert!(
+            !err.to_string().contains("被接管"),
+            "没有人接管,不许这么说: {err}"
         );
     }
 

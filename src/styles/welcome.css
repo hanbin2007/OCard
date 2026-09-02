@@ -21,11 +21,12 @@
   --welcome-drag-height: 36px;
   /* toast 还要让开的顶栏高度。只有项目管理视图渲染顶栏(新建 / 铃铛 / 设置在
      顶栏右侧),其余视图(首页 / 向导 / 首跑设置)没有顶栏,白白下移 46px 只会
-     更挡内容——所以默认 0,由 data-view 决定 */
+     更挡内容——所以默认 0,由 data-topbar(顶栏真的渲染了)决定;加载中 / 出错
+     的卡片视图即使 view 仍是 manager 也没有顶栏 */
   --welcome-topbar-offset: 0px;
 }
 
-.welcome-shell[data-view="manager"] {
+.welcome-shell[data-topbar] {
   --welcome-topbar-offset: var(--topbar-height);
 }
 

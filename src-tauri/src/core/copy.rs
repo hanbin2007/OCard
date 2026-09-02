@@ -1642,7 +1642,11 @@ fn copy_one(
             }
         }
         if pre_existing.len() == finals.len() {
-            // 所有目的地都已有同内容文件:无需写入;顺带清理本任务可能的残留 part(终验 #4)
+            // 所有目的地都已有同内容文件:无需写入;顺带清理本任务可能的残留 part(终验 #4)。
+            // 清之前查一次租约:同名 part 此刻可能是接管者正在写的
+            if !on_chunk(0) {
+                return Err(lease_abort());
+            }
             for f in &finals {
                 let _ = fs::remove_file(f.with_file_name(format!(
                     "{}.{task_tag}{PART_SUFFIX}",
@@ -1671,6 +1675,11 @@ fn copy_one(
 
     let mut src = File::open(&src_path)?;
     let result = (|| -> Result<String> {
+        // 源哈希 + 逐目的地哈希可能是好几分钟,期间没有块回调:建 part(先删同名残留)
+        // 之前再查一次租约,别把接管者正在写的那份删掉
+        if !on_chunk(0) {
+            return Err(lease_abort());
+        }
         let mut writers = Vec::with_capacity(parts.len());
         for (part, &i) in parts.iter().zip(&missing) {
             if let Some(parent) = part.parent() {
@@ -2067,17 +2076,28 @@ mod tests {
         assert_eq!(fences.get(), 1, "清单没变的文件不该逐个落盘;只有收尾那一次");
     }
 
-    /// 最后一块之后的回读校验、落位也要看租约:只在 delta 为 0 的检查点上说 Abort,
-    /// 文件必须停在落位之前——目的地不许出现正式名的文件,part 也要清掉。
+    /// 写 part 之前、回读校验之前、落位之前各有一个 delta 为 0 的租约检查点。只在
+    /// **第三个**(落位前)说 Abort:文件必须停在落位之前——目的地不许出现正式名的
+    /// 文件,part 也要清掉;并断言确实数到了三个,少任何一个检查点这里都红
+    /// (只在第一个 delta 0 上 Abort 的写法是假绿:落位前那个永远执行不到)。
     #[test]
     fn abort_at_the_post_write_checkpoint_stops_before_finalize() {
         let (_t, req, mut m, project) = setup();
         let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        let mut zeros = 0usize;
         let out = run_copy(&req, &plan, &mut m, &project, None, |p| match p {
-            Progress::BytesCopied { delta: 0, .. } => CopyControl::Abort,
+            Progress::BytesCopied { delta: 0, .. } => {
+                zeros += 1;
+                if zeros == 3 {
+                    CopyControl::Abort
+                } else {
+                    CopyControl::Continue
+                }
+            }
             _ => CopyControl::Continue,
         })
         .unwrap();
+        assert_eq!(zeros, 3, "写前 / 回读前 / 落位前三个检查点都要到");
         assert!(out.aborted && out.paused, "检查点上的 Abort 必须停下");
         assert!(
             matches!(out.files[0].status, FileStatus::AbortedMidFile),
