@@ -393,18 +393,13 @@ pub plan_digest: Option<String>,
 跟随一个指向祖先的链接会无限递归，指向项目外的链接会把外部文件算进角标，
 而正式扫描从来不跟随链接——两个数字都出自 OCard，却对不上。
 
-## 已知未修（留档，下一轮单独做）
+## 准备阶段的并发（0.4.4 起由任务租约挡住）
 
-`tasks.rs` 的 `Paused → Preparing → Running` 缺一个状态机 CAS。`running` 只是一个
-布尔，而 `resume_copy_task` 的「读 running → 重解析源卷 → 复扫刷新清单 → 写回
-`handle.plan`/快照 → `spawn_worker`」整段不是原子的：两个 resume 并发时两边都可能
-读到 `running == false`，于是准备阶段的副作用（清单写回、告警）可能重复。
-真正**两个 worker 同时拷**那一层由 `spawn_worker` 里的 `swap(true)` 挡住了。
-
-不在本轮修：正确的修法是把任务状态从布尔升级成状态机、让整个准备阶段跑在一次 CAS
-之内，改动横跨 `TaskHandle` / `resume_copy_task` / `rebuild_tasks` 与全部快照读写，
-与本轮的白名单/令牌修复混在一起会让评审无法归因。代码侧同样留了注释
-（`commands::tasks::spawn_worker`）。
+此前留档的「`Paused → Preparing → Running` 缺一个状态机 CAS」在 0.4.4 由任务租约
+（`core::lease`）解决：`resume_copy_task` 第一件事就是 `lease::acquire`，同进程并发的
+第二次 resume 在那里撞 Busy（pid 活着、token 不同），走不到复扫与写回；跨进程的第二次
+resume 同样被租约拒绝并可见地通知。`spawn_worker` 里的 `swap(true)` 只剩最后一道保险，
+守着「上一次运行还在收尾」这段时间里的重复「继续」。
 
 ## TypeScript 侧
 

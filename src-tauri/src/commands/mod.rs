@@ -2724,7 +2724,7 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
                 "manifest-suspect",
                 (mid, &p.folder_name),
                 format!(
-                    "「{}」下清单 {}… 写着已完成,但它旁边有「不可信」标记(上一次运行写完后发现租约锁已丢,这份内容可能盖掉了接管方的进度):已按未完成任务展示,续传会按哈希重新确认。标记内容:{}",
+                    "「{}」下清单 {}… 写着已完成,但它旁边有「不可信」标记、或标记读不出(标记是上一次运行写完后发现租约锁已丢时留下的,这份内容可能盖掉了接管方的进度):已按未完成任务展示,续传会按哈希重新确认。详情:{}",
                     p.folder_name,
                     &mid[..8.min(mid.len())],
                     why.trim()

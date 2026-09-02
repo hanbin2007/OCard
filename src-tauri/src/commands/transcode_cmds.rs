@@ -1228,7 +1228,7 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
             "auto-proxy-skipped-suspect",
             (&m.id, &project_id),
             format!(
-                "「{}」的清单旁有「不可信」标记({}),它写着已完成但可能是被迟到的写入顶回来的:本次不派发自动转代理;续传跑完、标记清掉后会再派发",
+                "「{}」的清单旁有「不可信」标记、或标记读不出({}),它写着已完成但可能是被迟到的写入顶回来的:本次不派发自动转代理;续传跑完、标记清掉后会再派发",
                 m.target_rel,
                 why.trim()
             ),

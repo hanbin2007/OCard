@@ -176,7 +176,7 @@ pub fn file_status_str(status: &copy::FileStatus) -> &'static str {
 
 /// 启动(或续跑)一个任务的后台工作线程。
 ///
-/// ## 已知未修:`Paused → Preparing → Running` 缺一个状态机 CAS(R12/R13 连续两轮被点名)
+/// ## 准备阶段的并发(R12/R13 曾点名缺状态机 CAS,0.4.4 起由租约挡住)
 ///
 /// `running` 只是一个布尔,但准备阶段的并发已经由**租约**挡住:`resume_copy_task` 第一件
 /// 事就是 `lease::acquire`,同进程第二次并发 resume 会在那里撞 Busy(pid 活着、token 不同),
@@ -224,7 +224,7 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
                 lease.release(),
                 &lease_file,
                 "重复的续传请求回滚",
-                true,
+                false,
                 Some((&id, &pid)),
             );
         }
@@ -349,7 +349,7 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
                     )
                 } else if paused
                     && matches!(e, crate::core::CoreError::Busy(_))
-                    && e.to_string().contains("租约")
+                    && (e.to_string().contains("租约") || e.to_string().contains("接管锁"))
                 {
                     // 租约原因的中止:上一条租约提示已经说了「先核对另一处」,这里不能反过来
                     // 让人「点继续」——照做会立刻撞上「任务正被别的进程执行,拒绝续传」

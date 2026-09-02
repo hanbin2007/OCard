@@ -1321,12 +1321,21 @@ fn save_within_fence(
     fence: Option<SaveFenceHook<'_>>,
     project_root: &Path,
     m: &CopyManifest,
+    // 收尾那次(全部按哈希确认)要先清「不可信」标记再写——但清是破坏性动作,必须在
+    // 栅栏内(token 已核对)做:栅栏之前清,一个已丢租约还没察觉的持有者会删掉接管者刚
+    // 写的标记(fable 终审)
+    clear_suspect_first: bool,
 ) -> std::result::Result<(super::fsx::WriteReport, PathBuf), String> {
     let guard = match fence.map(|f| f()) {
         None => None,
         Some(Ok(g)) => Some(g),
         Some(Err(e)) => return Err(e.to_string()),
     };
+    if clear_suspect_first {
+        if let Err(e) = manifest::clear_suspect(project_root, &m.id) {
+            log::warn!("清单不可信标记删不掉(收尾会再查一次并通知): {e}");
+        }
+    }
     let still_mine = || guard.as_ref().is_none_or(|g| g.still_mine());
     // 真正的写失败(IO)也用 Err(原因) 承载而不是 `?`:否则 reports 跟着丢,已拷完 /
     // 已失败文件一条审计都不写。任务落到暂停,清单还是上一次落盘的那份,可续传
@@ -1412,6 +1421,9 @@ pub fn run_copy(
     let mut abort_writes = false;
     let mut aborted = false;
     let mut abort_reason: Option<String> = None;
+    // 开跑就不算完成:续传一份带「不可信」标记的 completed=true 清单时,逐文件落盘不能把
+    // completed=true 连同半途的 entries 写回盘上
+    m.completed = false;
     // 本文件之后清单有没有改动:没改就不落盘、不取栅栏(续传按哈希确认的文件不改清单)
     let mut dirty = false;
     let total = plan.len();
@@ -1550,7 +1562,7 @@ pub fn run_copy(
         // 清单没变(续传时按哈希确认的文件不改清单)就不落盘、也不取栅栏:一次栅栏
         // 是 5 次 NAS 元数据往返,5000 个文件的续传白白多花两分钟
         if dirty {
-            match save_within_fence(fence, project_root, m) {
+            match save_within_fence(fence, project_root, m, false) {
                 // 栅栏不给(被接管 / 没拿到锁 / 锁目录不可用 / 改名前或落盘后发现被回收):
                 // 一律按中止处理,收尾照跑——reports / 审计 / 总账都保住,原因原样带给用户
                 Err(why) => {
@@ -1624,16 +1636,12 @@ pub fn run_copy(
             material_retries,
         });
     }
-    // 全部按哈希确认了:清单此刻就是事实,不可信标记(若有)在**这次落盘之前**清掉。
-    // 放在落盘之后清会有一个窗口:旧持有者的迟到写入恰好落在「我们的落盘」与「我们的清标记」
-    // 之间,它写下的标记被我们删掉、盘上却是它的旧清单——标记就这样静默失效(codex 终审 P0)。
-    // 先清再写:迟到写入落在清之后,它自己写的标记留着;落在写之后,标记也留着
-    if all_verified {
-        if let Err(e) = manifest::clear_suspect(project_root, &m.id) {
-            log::warn!("清单不可信标记删不掉(收尾会再查一次并通知): {e}");
-        }
-    }
-    match save_within_fence(fence, project_root, m) {
+    // 全部按哈希确认了:清单此刻就是事实,不可信标记(若有)在**这次落盘之前、栅栏之内**
+    // 清掉。放在落盘之后清会有一个窗口:旧持有者的迟到写入恰好落在「我们的落盘」与「我们的
+    // 清标记」之间,它写下的标记被我们删掉、盘上却是它的旧清单——标记就这样静默失效
+    // (codex 终审 P0)。先清再写:迟到写入落在清之后,它自己写的标记留着;落在写之后,
+    // 标记也留着
+    match save_within_fence(fence, project_root, m, all_verified) {
         Err(why) => {
             return Ok(CopyOutcome {
                 files: reports,
