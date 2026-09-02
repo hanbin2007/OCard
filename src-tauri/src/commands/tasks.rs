@@ -4,6 +4,7 @@ use super::dto::*;
 use crate::core::{copy, journal, manifest, naming, project};
 use chrono::Utc;
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -339,11 +340,20 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
         handle_for_spawn_error
             .running
             .store(false, Ordering::SeqCst);
+        // 续传阶段预先拿到的租约还在槽里、心跳还在跳:不释放的话下一次「继续」会先
+        // 重新 acquire,被自己这份挡住,而报文说的是「稍后点继续」(codex r6)
+        if let Some(lease) = handle_for_spawn_error.lease_slot().take() {
+            let lease_file = lease.path().to_path_buf();
+            report_lease_release(&app_for_spawn_error, lease.release(), &lease_file);
+        }
         let (id, pid) = {
-            let s = handle_for_spawn_error
-                .snapshot
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut s = handle_for_spawn_error.snap();
+            // 快照也要回到暂停:否则任务一直显示「运行中」,而根本没有线程在跑
+            s.state = "paused";
+            s.speed_bytes_per_sec = 0;
+            for d in s.destinations.iter_mut() {
+                d.state = "idle";
+            }
             (s.id.clone(), s.project_id.clone())
         };
         super::notify::error_for_task(
@@ -352,6 +362,11 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
             (&id, &pid),
             format!("拷卡线程没能启动(系统资源不足:{e}),任务仍是暂停状态,可稍后点「继续」"),
         );
+        let ev = {
+            let mut snap = handle_for_spawn_error.snap();
+            final_event(&mut snap, Vec::new())
+        };
+        let _ = app_for_spawn_error.emit(PROGRESS_EVENT, &ev);
     }
 }
 
@@ -537,7 +552,19 @@ fn run_worker<R: tauri::Runtime>(
     // 把意图写明,并顺手自查一次——删不掉时别人要白等 TTL,用户有权知道
     let outcome = run_worker_locked(app, handle, &mut m, &lease);
     let lease_file = lease.path().to_path_buf();
-    match lease.release() {
+    report_lease_release(app, lease.release(), &lease_file);
+    outcome
+}
+
+/// 释放判定的可见出口。`Held` 的 Drop 也会释放,但没人接结果——「没删掉 / 被接管
+/// / 心跳线程没退出」就成了无声。所有持有租约的路径(worker、续传准备、代理状态
+/// 保存、线程起不来时的回收)都走这里。
+pub(crate) fn report_lease_release<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    released: crate::core::lease::Released,
+    lease_file: &Path,
+) {
+    match released {
         crate::core::lease::Released::Removed => {}
         // 被接管:轮询阶段已经报过 task-lease-lost,这里不重复
         crate::core::lease::Released::TakenOver => {}
@@ -553,6 +580,14 @@ fn run_worker<R: tauri::Runtime>(
                     lease_file.display(),
                     crate::core::lease::LEASE_TTL.num_minutes()
                 ),
+            );
+        }
+        crate::core::lease::Released::RemovedHeartbeatStuck => {
+            // 删成了;只是心跳线程还卡在存储上。如实说,别混进「没敢删」那一桶
+            super::notify::warn(
+                app,
+                "task-lease-heartbeat-stuck",
+                "任务租约已正常删除,但本机的心跳线程 5 秒内没有退出(多半卡在存储的一次读写上)。它醒来后不会再写租约,只是本次收尾慢了些;若经常出现,说明这台机器到 NAS 的连接不稳".into(),
             );
         }
         crate::core::lease::Released::TakenOverUnnoticed => {
@@ -579,7 +614,6 @@ fn run_worker<R: tauri::Runtime>(
             );
         }
     }
-    outcome
 }
 
 fn run_worker_locked<R: tauri::Runtime>(
@@ -646,6 +680,11 @@ fn run_worker_locked<R: tauri::Runtime>(
         Default::default();
     let mut pending_contention: Vec<(copy::ContentionKind, String, u32)> = Vec::new();
     let mut lease_stop_reported = false;
+    // 租约原因的停止是**粘的**:一旦判了 Abort,后面每一次回调都答 Abort——poll()
+    // 若在一拍成功后翻回 Ok,收尾路径不该又变成「继续」。它与用户的暂停请求分开记:
+    // 此前借用 pause_requested,用户此刻点「继续」会被告知「已撤销暂停请求,接着跑」,
+    // 而那次运行正在中止,根本不会接着跑
+    let mut lease_aborted = false;
     // 当前文件已进快照的字节(块级 delta 累加);中途中止时要从快照里减回去
     let mut current_file_delta = 0u64;
     let task_for_notices = {
@@ -654,8 +693,10 @@ fn run_worker_locked<R: tauri::Runtime>(
     };
 
     // 写栅栏:每次落盘都在租约锁下核对 token(见 lease::Held::fence)
-    let fence = || -> crate::core::Result<Box<dyn std::any::Any>> {
-        lease.fence().map(|f| Box::new(f) as Box<dyn std::any::Any>)
+    let fence = || -> crate::core::Result<Box<dyn copy::SaveFenceGuard>> {
+        lease
+            .fence()
+            .map(|f| Box::new(f) as Box<dyn copy::SaveFenceGuard>)
     };
     let outcome = copy::run_copy(&req, &plan, m, &handle.project_root, Some(&fence), |p| {
         let mut changed: Vec<CopyFileItemDto> = Vec::new();
@@ -685,6 +726,11 @@ fn run_worker_locked<R: tauri::Runtime>(
                 }
                 copy::Progress::FileFinished { rel_path, status } => {
                     force_emit = true;
+                    if matches!(status, copy::FileStatus::Failed(_)) {
+                        // 失败的文件 part 已被引擎清掉:它的字节不能留在快照里,否则
+                        // 回读校验 / 落位阶段失败的大文件会让进度虚高、进度条能过 100%
+                        snap.copied_bytes = snap.copied_bytes.saturating_sub(current_file_delta);
+                    }
                     if !matches!(status, copy::FileStatus::AbortedMidFile) {
                         current_file_delta = 0; // 正常结束的文件,字节留在快照里
                     }
@@ -733,6 +779,9 @@ fn run_worker_locked<R: tauri::Runtime>(
         // 租约状态轮询(心跳由独立线程推进,这里只看结论)。两种情况都要**立刻**停,
         // 而且不再写清单(CopyControl::Abort):Lost = 别人已合法接管,再写就是把人家
         // 记下的进度整份顶掉;AtRisk = 心跳很久没成功,再拷下去很快就会变成 Lost
+        if lease_aborted {
+            return copy::CopyControl::Abort;
+        }
         let lease_verdict = match lease.poll() {
             crate::core::lease::LeaseStatus::Ok => None,
             crate::core::lease::LeaseStatus::Lost(who) => {
@@ -765,7 +814,7 @@ fn run_worker_locked<R: tauri::Runtime>(
             }
         };
         if let Some(abort) = lease_verdict {
-            handle.pause_requested.store(true, Ordering::SeqCst);
+            lease_aborted = true;
             return abort;
         }
         if handle.pause_requested.load(Ordering::SeqCst) {
@@ -898,8 +947,12 @@ fn run_worker_locked<R: tauri::Runtime>(
         );
     }
     if outcome.aborted {
-        // 审计与总账已经写完,现在才把「租约没了」抛上去让任务落到暂停
-        return Err(copy::lease_abort());
+        // 审计与总账已经写完,现在才把原因抛上去让任务落到暂停。引擎给了具体原因
+        // (栅栏拒绝 / 没拿到锁 / 栅栏被回收)就用它:没拿到锁 ≠ 被接管,不能一律说成后者
+        return Err(match outcome.abort_reason.clone() {
+            Some(why) => crate::core::CoreError::Busy(why),
+            None => copy::lease_abort(),
+        });
     }
     Ok(())
 }

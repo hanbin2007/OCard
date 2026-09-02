@@ -2163,7 +2163,7 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         // 并落盘——只改内存会留下 `planned.size = 旧值` / `entry.size = 新值` /
         // `completed = true` 的自相矛盾清单。
         let mut m = m;
-        let plan = refresh_resume_plan(&app, &mut m, &handle.project_root, &resolved)?;
+        let plan = refresh_resume_plan(&app, &mut m, &handle.project_root, &resolved, &lease)?;
         let mut snap = handle.snap();
         let old: std::collections::HashMap<String, &'static str> = snap
             .files
@@ -2205,6 +2205,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
     m: &mut manifest::CopyManifest,
     project_root: &Path,
     source_root: &Path,
+    lease: &crate::core::lease::Held,
 ) -> CmdResult<Vec<copy::PlannedFile>> {
     let selection = copy::SourceSelection::from_folders(m.source_selection.clone());
     if matches!(selection, copy::SourceSelection::WholeVolume) {
@@ -2242,7 +2243,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
             &plan,
             m.scan_policy_version,
         );
-        persist_refreshed_plan(app, m, project_root, &plan)?;
+        persist_refreshed_plan(app, m, project_root, &plan, lease)?;
         return Ok(plan);
     }
 
@@ -2312,7 +2313,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
                     ),
                 );
             }
-            persist_refreshed_plan(app, m, project_root, &plan)?;
+            persist_refreshed_plan(app, m, project_root, &plan, lease)?;
         }
         Err(e) => notify::warn(
             app,
@@ -2432,6 +2433,7 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
     m: &mut manifest::CopyManifest,
     project_root: &Path,
     plan: &[copy::PlannedFile],
+    lease: &crate::core::lease::Held,
 ) -> CmdResult<()> {
     let refreshed: Vec<manifest::PlannedFile> =
         plan.iter().map(manifest::PlannedFile::from_plan).collect();
@@ -2442,10 +2444,15 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
     // 计划变了就还没跑完:`completed` 必须跟着回落,否则会留下
     // 「清单说完成了、里面却有未验证项」的自相矛盾状态
     m.completed = false;
-    // 调用方(resume_copy_task)已经持有这个任务的租约,这次写在保护内。
-    // 此前这里是「先看有没有活租约、再写」——检查与写之间仍有窗口;现在
-    // 租约在读清单之前就拿到了,窗口不存在
-    if let Err(e) = manifest::save(project_root, m) {
+    // 调用方(resume_copy_task)已经持有这个任务的租约,这次写在保护内;而且写在
+    // **栅栏**内:持有 Held 本身挡不住「进程休眠超过 TTL 后被接管」,栅栏在落盘前
+    // 持锁核对 token,不是自己的就不写(codex r6)
+    let saved = lease.fence().and_then(|fence| {
+        let r = manifest::save(project_root, m);
+        drop(fence);
+        r
+    });
+    if let Err(e) = saved {
         let msg = format!(
             "续传前刷新的文件清单**未能**写回拷卡清单,已拒绝续传(继续跑会让审计范围与实际拷贝范围对不上:\
              worker 用的是刷新后的新清单,磁盘上却还是旧的那份)。请排查目的地/NAS 是否可写后重试: {e}"

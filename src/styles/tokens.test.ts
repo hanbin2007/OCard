@@ -251,8 +251,31 @@ describe("主题令牌", () => {
     expect(decl("bottom"), "必须把默认的 bottom 让开").toBe("auto");
     // 只让开拖动条还不够:项目管理视图的顶栏(新建 / 铃铛 / 设置)就在拖动条下面,
     // toast 压上去会把铃铛盖住——而 error toast 不自动消失
-    expect(decl("top"), "top 必须让开拖动条和顶栏").toContain("--topbar-height");
-    expect(decl("top")).toContain("--welcome-drag-height");
+    // 断言规范化后的整条 calc,不只是「含这两个变量」:改成减法、乘 0、错误的 max()
+    // 都还含这两个名字(codex r6)
+    expect(decl("top")?.replace(/\s+/g, ""), "top 必须是拖动条 + 顶栏偏移 + 间距").toBe(
+      "calc(var(--welcome-drag-height)+var(--welcome-topbar-offset)+var(--space-3))",
+    );
+    // 变量得真有定义:calc() 里一个悬空变量会让整条 top 在计算值阶段失效 →
+    // top: auto + bottom: auto = fixed 定位的 toast 回到静态位置(页面底部),
+    // 正是这条规则要防的那一幕——而只查文本的断言照样绿
+    // 同一选择器可能有多条规则(.welcome-shell 的布局与变量分开写),要合起来找
+    const custom = (selector: string, prop: string) =>
+      RULES.filter((r) => r.selector.trim() === selector)
+        .flatMap((r) => r.decls)
+        .find((d) => d.prop === prop)
+        ?.value.trim();
+    expect(custom(".welcome-shell", "--welcome-drag-height"), "拖动条高度要在 .welcome-shell 上定义").toMatch(
+      /^\d+px$/,
+    );
+    expect(custom(".welcome-shell", "--welcome-topbar-offset"), "无顶栏的视图默认偏移 0").toBe("0px");
+    expect(
+      custom('.welcome-shell[data-view="manager"]', "--welcome-topbar-offset"),
+      "只有项目管理视图(有顶栏)才让开顶栏",
+    ).toContain("--topbar-height");
+    expect(custom(".welcome-shell__drag", "height"), "拖动条高度与 toast 让开的量必须是同一个变量").toContain(
+      "--welcome-drag-height",
+    );
   });
 
   it("字体栈全部是系统字体，不引 webfont", () => {

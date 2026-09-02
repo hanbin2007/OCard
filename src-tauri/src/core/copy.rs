@@ -62,6 +62,10 @@ pub struct CopyOutcome {
     /// 用 outcome 而不是 Err 承载:收尾(已失败文件的审计、占用总账)必须照跑,
     /// 否则那几条「哪个文件为什么失败」的记录就跟着 Err 一起消失了。
     pub aborted: bool,
+    /// 中止的具体原因(写栅栏拒绝 / 拿不到锁 / 落盘期间栅栏被回收)。`None` = 由
+    /// 进度回调的 Abort 决定(上层自己知道为什么)。上层报给用户的必须是这一句,
+    /// 而不是一律说「租约已被接管」——没拿到锁 ≠ 被接管。
+    pub abort_reason: Option<String>,
     /// 写清单时为躲开「目标被占用」而重试的总轮数(见 [`Progress::Contention`])。
     pub write_retries: u32,
     /// **素材文件**落位改名时同样原因的重试总轮数。分开记是因为两者的分量不同:
@@ -1206,7 +1210,12 @@ pub fn file_done(
 /// 回调返回 [`CopyControl::Pause`] 时在当前文件完成后停下,manifest 保证可续传。
 /// 落盘前取一次写栅栏(见 `lease::Held::fence`)。`None` = 不设栅栏(测试 / 无租约场景)。
 /// 返回 `Err(Busy)` = 租约已不是自己的,这次**不写**,按 Abort 处理。
-pub type SaveFenceHook<'a> = &'a dyn Fn() -> Result<Box<dyn std::any::Any>>;
+/// 写栅栏的凭证:落盘之后还能问一句「栅栏还是不是我的」。
+pub trait SaveFenceGuard {
+    fn still_mine(&self) -> bool;
+}
+
+pub type SaveFenceHook<'a> = &'a dyn Fn() -> Result<Box<dyn SaveFenceGuard>>;
 
 pub fn run_copy(
     req: &CopyRequest,
@@ -1260,6 +1269,9 @@ pub fn run_copy(
     // 租约丢了(或马上要丢):从此一个字节都不许再写进清单
     let mut abort_writes = false;
     let mut aborted = false;
+    let mut abort_reason: Option<String> = None;
+    // 本文件之后清单有没有改动:没改就不落盘、不取栅栏(续传按哈希确认的文件不改清单)
+    let mut dirty = false;
     let total = plan.len();
 
     for (index, item) in plan.iter().enumerate() {
@@ -1334,6 +1346,7 @@ pub fn run_copy(
                             xxh3,
                             verified: true,
                         });
+                        dirty = true;
                         bytes_copied += size;
                         FileStatus::Copied
                     }
@@ -1354,6 +1367,7 @@ pub fn run_copy(
                             xxh3: String::new(),
                             verified: false,
                         });
+                        dirty = true;
                         FileStatus::Failed(e.to_string())
                     }
                 }
@@ -1390,12 +1404,52 @@ pub fn run_copy(
             break;
         }
         // 逐文件落盘,任意时刻中断都可续传。落盘在写栅栏内:AboutToSave 只是看
-        // 缓存,从它说「还是我的」到真正写完之间接管者可以完成一次接管
-        let _fence = match fence.map(|f| f()) {
-            None => None,
-            Some(Ok(g)) => Some(g),
-            Some(Err(super::CoreError::Busy(_))) => {
-                // 中止前把这个文件的终态发出去:界面得把它刷回 pending / 记下失败
+        // 缓存,从它说「还是我的」到真正写完之间接管者可以完成一次接管。
+        // 清单没变(续传时按哈希确认的文件不改清单)就不落盘、也不取栅栏:一次栅栏
+        // 是 5 次 NAS 元数据往返,5000 个文件的续传白白多花两分钟
+        if dirty {
+            let fence_guard = match fence.map(|f| f()) {
+                None => None,
+                Some(Ok(g)) => Some(g),
+                // 栅栏不给(被接管 / 没拿到锁 / 锁目录不可用 / 建锁目录出错):一律按
+                // 中止处理,收尾照跑——此前非 Busy 的错误走 return Err,整批 reports
+                // 跟着丢,已失败文件一条审计都不写
+                Some(Err(e)) => {
+                    abort_reason = Some(e.to_string());
+                    // 中止前把这个文件的终态发出去:界面得把它刷回 pending / 记下失败
+                    let _ = progress(Progress::FileFinished {
+                        rel_path: rel,
+                        status: &status,
+                    });
+                    reports.push(FileReport {
+                        rel_path: rel.clone(),
+                        source_rel: src_rel.clone(),
+                        size,
+                        status,
+                    });
+                    aborted = true;
+                    break;
+                }
+            };
+            let (wr, mpath) = manifest::save(project_root, m)?;
+            // 落盘之后再问一句栅栏还是不是我的:被外部回收了 = 这次落盘期间可能有人
+            // 接管,这份清单不可信,停下并说明
+            let fence_reclaimed = fence_guard.as_ref().is_some_and(|g| !g.still_mine());
+            drop(fence_guard);
+            dirty = false;
+            if wr.retries > 0 {
+                write_retries += wr.retries;
+                // 零静默:第一次就报,不等任务结束(见 Progress::WriteContention)
+                let _ = progress(Progress::Contention {
+                    kind: ContentionKind::Manifest,
+                    path: &mpath,
+                    retries: wr.retries,
+                });
+            }
+            if fence_reclaimed {
+                abort_reason = Some(
+                    "落盘期间租约接管锁被外部回收(存储的时钟不准,或锁目录被人动过),这次落盘不可信,已停下;请核对是否有别的进程在跑这个任务,再决定在哪边续传".into(),
+                );
                 let _ = progress(Progress::FileFinished {
                     rel_path: rel,
                     status: &status,
@@ -1409,18 +1463,6 @@ pub fn run_copy(
                 aborted = true;
                 break;
             }
-            Some(Err(e)) => return Err(e),
-        };
-        let (wr, mpath) = manifest::save(project_root, m)?;
-        drop(_fence);
-        if wr.retries > 0 {
-            write_retries += wr.retries;
-            // 零静默:第一次就报,不等任务结束(见 Progress::WriteContention)
-            let _ = progress(Progress::Contention {
-                kind: ContentionKind::Manifest,
-                path: &mpath,
-                retries: wr.retries,
-            });
         }
         control = progress(Progress::FileFinished {
             rel_path: rel,
@@ -1458,6 +1500,7 @@ pub fn run_copy(
             all_verified: false,
             paused: true,
             aborted: true,
+            abort_reason,
             write_retries,
             material_retries,
         });
@@ -1465,18 +1508,18 @@ pub fn run_copy(
     let _fence = match fence.map(|f| f()) {
         None => None,
         Some(Ok(g)) => Some(g),
-        Some(Err(super::CoreError::Busy(_))) => {
+        Some(Err(e)) => {
             return Ok(CopyOutcome {
                 files: reports,
                 bytes_copied,
                 all_verified: false,
                 paused: true,
                 aborted: true,
+                abort_reason: Some(e.to_string()),
                 write_retries,
                 material_retries,
             });
         }
-        Some(Err(e)) => return Err(e),
     };
     let (wr, mpath) = manifest::save(project_root, m)?;
     drop(_fence);
@@ -1495,6 +1538,7 @@ pub fn run_copy(
         all_verified,
         paused,
         aborted: false,
+        abort_reason: None,
         write_retries,
         material_retries,
     })
@@ -1683,6 +1727,12 @@ fn copy_one(
         }
 
         // 逐目的地回读校验(绕页缓存,尽量读介质而非内存,M2 技术债)
+        // 最后一块之后还有回读校验、落位、失败清理三段,此前它们都不再看租约:
+        // 一个卡了很久(整机休眠)的旧持有者恢复后会拿接管者正在写的同名 part 去
+        // 改名 / 删除。回读前、落位前各查一次(delta 0 只是让上层跑一次租约轮询)
+        if !on_chunk(0) {
+            return Err(lease_abort());
+        }
         for part in &parts {
             let dest_hash = hash::xxh3_file_uncached(part)?;
             if dest_hash != src_hash {
@@ -1696,6 +1746,9 @@ fn copy_one(
         // (mtime/atime 三平台;创建时间 mac/win——用户明确要求,Linux btime
         //  不可设置为声明边界;失败计数聚合为可见 warning,不阻塞拷贝;
         //  快照在读源之前采集,见 copy_one 开头)
+        if !on_chunk(0) {
+            return Err(lease_abort());
+        }
         for (part, &i) in parts.iter().zip(&missing) {
             finalize_no_replace(part, &finals[i], retried)?;
             if let Some(m) = &src_meta {
@@ -1895,6 +1948,151 @@ mod tests {
     }
 
     /// 租约丢了之后**一个字节都不许再写进清单**——租约存在的唯一理由就是防这个。
+    struct FakeFence {
+        alive: bool,
+    }
+    impl SaveFenceGuard for FakeFence {
+        fn still_mine(&self) -> bool {
+            self.alive
+        }
+    }
+
+    /// 栅栏说「已被接管」:清单一个字节不许写、结果标 aborted+paused、那个文件的终态
+    /// 要发出去(界面靠它刷状态)、原因要带在 outcome 上。此前这两条分支零覆盖:把
+    /// 「拿不到栅栏照写」的变异放进去,448 条测试一条都不红。
+    #[test]
+    fn a_refused_save_fence_stops_the_run_without_writing_the_manifest() {
+        let (_t, req, mut m, project) = setup();
+        let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        let manifest_file = manifest::manifest_dir(&project).join(format!("{}.json", m.id));
+        let fence = || -> super::super::Result<Box<dyn SaveFenceGuard>> {
+            Err(super::super::CoreError::Busy(
+                "落盘前发现租约已被 李四@MACHINE-B 接管,本次不写".into(),
+            ))
+        };
+        let mut finished = 0usize;
+        let out = run_copy(&req, &plan, &mut m, &project, Some(&fence), |p| {
+            if let Progress::FileFinished { .. } = p {
+                finished += 1;
+            }
+            CopyControl::Continue
+        })
+        .expect("栅栏拒绝用 outcome 承载,不是 Err");
+        assert!(out.aborted && out.paused && !out.all_verified);
+        assert!(!manifest_file.exists(), "栅栏拒绝之后仍写了清单");
+        assert_eq!(out.files.len(), 1, "已拷完的那个文件要进 reports(审计靠它)");
+        assert_eq!(finished, 1, "中止前要把那个文件的终态发出去");
+        assert!(
+            out.abort_reason.as_deref().unwrap_or("").contains("李四"),
+            "原因要原样带上: {:?}",
+            out.abort_reason
+        );
+    }
+
+    /// 栅栏抛的不是 Busy(NAS 建锁目录时 EACCES 之类):同样按中止处理,已拷完/已失败
+    /// 文件的记录必须保住——此前是 return Err,整批 reports 跟着丢,审计一条都不写。
+    #[test]
+    fn a_fence_io_error_still_keeps_the_reports_and_aborts() {
+        let (_t, req, mut m, project) = setup();
+        let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        let manifest_file = manifest::manifest_dir(&project).join(format!("{}.json", m.id));
+        let fence = || -> super::super::Result<Box<dyn SaveFenceGuard>> {
+            Err(super::super::CoreError::Invalid(
+                "创建租约接管锁: 拒绝访问".into(),
+            ))
+        };
+        let out = run_copy(&req, &plan, &mut m, &project, Some(&fence), |_| {
+            CopyControl::Continue
+        })
+        .expect("非 Busy 的栅栏错误也不许把 reports 丢掉");
+        assert!(out.aborted && out.paused);
+        assert_eq!(out.files.len(), 1);
+        assert!(!manifest_file.exists());
+        assert!(
+            out.abort_reason.as_deref().unwrap_or("").contains("接管锁"),
+            "{:?}",
+            out.abort_reason
+        );
+    }
+
+    /// 落盘期间栅栏被外部回收:这次落盘不可信,停下并说明(清单已经写了,不假装没写)。
+    #[test]
+    fn a_fence_reclaimed_during_the_save_aborts_the_run() {
+        let (_t, req, mut m, project) = setup();
+        let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        let manifest_file = manifest::manifest_dir(&project).join(format!("{}.json", m.id));
+        let fence = || -> super::super::Result<Box<dyn SaveFenceGuard>> {
+            Ok(Box::new(FakeFence { alive: false }))
+        };
+        let out = run_copy(&req, &plan, &mut m, &project, Some(&fence), |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
+        assert!(out.aborted && out.paused, "栅栏被回收必须停下");
+        assert_eq!(out.files.len(), 1);
+        assert!(manifest_file.exists(), "那一次落盘已经发生,不假装没写");
+        assert!(
+            out.abort_reason.as_deref().unwrap_or("").contains("回收"),
+            "{:?}",
+            out.abort_reason
+        );
+    }
+
+    /// 续传时全部按哈希确认、清单没变:逐文件不落盘、不取栅栏。一次栅栏是 5 次 NAS
+    /// 元数据往返,5000 个文件的续传白白多花两分钟——只有收尾那一次要写。
+    #[test]
+    fn an_unchanged_manifest_is_not_rewritten_per_file_on_resume() {
+        let (_t, req, mut m, project) = setup();
+        let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        assert!(plan.len() >= 2);
+        run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
+
+        let fences = std::cell::Cell::new(0usize);
+        let fence = || -> super::super::Result<Box<dyn SaveFenceGuard>> {
+            fences.set(fences.get() + 1);
+            Ok(Box::new(FakeFence { alive: true }))
+        };
+        let out = run_copy(&req, &plan, &mut m, &project, Some(&fence), |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
+        assert!(out
+            .files
+            .iter()
+            .all(|f| matches!(f.status, FileStatus::SkippedResume)));
+        assert!(out.all_verified);
+        assert_eq!(fences.get(), 1, "清单没变的文件不该逐个落盘;只有收尾那一次");
+    }
+
+    /// 最后一块之后的回读校验、落位也要看租约:只在 delta 为 0 的检查点上说 Abort,
+    /// 文件必须停在落位之前——目的地不许出现正式名的文件,part 也要清掉。
+    #[test]
+    fn abort_at_the_post_write_checkpoint_stops_before_finalize() {
+        let (_t, req, mut m, project) = setup();
+        let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        let out = run_copy(&req, &plan, &mut m, &project, None, |p| match p {
+            Progress::BytesCopied { delta: 0, .. } => CopyControl::Abort,
+            _ => CopyControl::Continue,
+        })
+        .unwrap();
+        assert!(out.aborted && out.paused, "检查点上的 Abort 必须停下");
+        assert!(
+            matches!(out.files[0].status, FileStatus::AbortedMidFile),
+            "检查点停下的不是这个文件的失败: {:?}",
+            out.files[0].status
+        );
+        let landed = req.destinations[0].join(&plan[0].target_rel);
+        assert!(!landed.exists(), "落位前就该停,目的地不许出现正式名文件");
+        let part_left = std::fs::read_dir(landed.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains(PART_SUFFIX));
+        assert!(!part_left, "停下要清掉自己的 part");
+    }
+
     /// 此前 Lost 只置 pause_requested,当前文件拷完照样 save 一次、收尾再 save 一次,
     /// 把接管方记下的进度整份顶掉;而 task-lease-lost 的报文还向用户承诺「已停下」。
     #[test]

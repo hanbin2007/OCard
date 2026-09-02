@@ -1050,11 +1050,17 @@ fn save_proxy_state<R: tauri::Runtime>(
     // 短期持有真正的租约,而不是 live_holder 这种「检查后写」:worker 收尾那次
     // save 写的正是 completed=true,续传刷新又会把 completed 打回 false——写集合
     // 并不像此前注释说的那样不相交。Busy 就是可见出口;写完 Held 一 drop 就释放
-    let _lease = match crate::core::lease::acquire(project_root, id, machine_id, "") {
+    // 报文里带清单身份:同 code 的通知 30 秒内会合并,两份清单同时出事时正文得分得清
+    let which: String = id.chars().take(8).collect();
+    let lease = match crate::core::lease::acquire(project_root, id, machine_id, "") {
         Ok(mut h) => {
             // 接管别人/自己残留的租约是「系统替用户做了决定」:这里也必须说
             if let Some(note) = h.took_over_stale.take() {
-                notify::warn(app, "task-lease-taken-over", note);
+                notify::warn(
+                    app,
+                    "task-lease-taken-over",
+                    format!("清单 {which}…:{note}"),
+                );
             }
             h
         }
@@ -1062,26 +1068,35 @@ fn save_proxy_state<R: tauri::Runtime>(
             notify::warn(
                 app,
                 "auto-proxy-state-unsaved",
-                format!("自动转代理{what}没有写回:{e}。{consequence}"),
+                format!("清单 {which}… 的自动转代理{what}没有写回:{e}。{consequence}"),
             );
             return false;
         }
     };
     let result = crate::core::manifest::load(project_root, id).and_then(|mut fresh| {
         mutate(&mut fresh);
-        crate::core::manifest::save(project_root, &fresh).map(|_| ())
+        // 写在栅栏内:持有 Held 本身挡不住「进程休眠超过 TTL 后被接管」,栅栏在落盘前
+        // 持锁核对 token,不是自己的就不写(codex r6)
+        let fence = lease.fence()?;
+        let saved = crate::core::manifest::save(project_root, &fresh).map(|_| ());
+        drop(fence);
+        saved
     });
-    match result {
+    let ok = match result {
         Ok(()) => true,
         Err(e) => {
             notify::warn(
                 app,
                 "auto-proxy-state-unsaved",
-                format!("自动转代理{what}写入失败({e})。{consequence}"),
+                format!("清单 {which}… 的自动转代理{what}写入失败({e})。{consequence}"),
             );
             false
         }
-    }
+    };
+    // 释放要有判定:只靠 Drop 的话「没删掉 / 被接管」就成了无声
+    let lease_file = lease.path().to_path_buf();
+    super::tasks::report_lease_release(app, lease.release(), &lease_file);
+    ok
 }
 
 pub fn dispatch_auto_proxy<R: tauri::Runtime>(

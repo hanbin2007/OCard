@@ -76,7 +76,8 @@ pub fn emit_notice_for<R: tauri::Runtime>(
     // 先入积压再发事件:前端监听尚未就绪时(启动窗口)也不丢,
     // 就绪后经 list_notices 回放(codex 收口验证 P1:启动丢信)。
     if let Some(state) = app.try_state::<super::AppState>() {
-        let mut backlog = state.notices.lock().unwrap();
+        // 中毒也照用:通知中心是最后一条可见通道,不能因为别处 panic 过就跟着炸
+        let mut backlog = state.notices.lock().unwrap_or_else(|p| p.into_inner());
         let now = Utc::now();
         let merged = backlog
             .iter_mut()
@@ -108,7 +109,11 @@ pub fn emit_notice_for<R: tauri::Runtime>(
 /// 回放积压通知(前端启动订阅就绪后调用一次补账)。
 #[tauri::command(async)]
 pub fn list_notices(state: tauri::State<super::AppState>) -> Vec<NoticeDto> {
-    state.notices.lock().unwrap().clone()
+    state
+        .notices
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
 }
 
 pub fn warn<R: tauri::Runtime>(app: &AppHandle<R>, code: &str, message: String) {

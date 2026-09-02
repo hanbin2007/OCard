@@ -1391,6 +1391,22 @@ fn source_folder_commands_wired_through_real_handler() {
 /// 续传前的清单刷新:整卷保持历史行为(重扫 ∪ 锁定清单),
 /// 按文件夹则只认开拷时锁定的落点——卡上新增的文件不悄悄带进来,
 /// 但必须发用户可见的告警(零静默:跳过任何东西都要说)。
+/// 续传计划刷新现在要求调用方持有任务租约(计划落盘在写栅栏内)。测试里每次调用
+/// 短期持有一份、用完即释放——同一份清单在一个测试里会被刷新多次。
+fn refresh_with_lease<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    m: &mut crate::core::manifest::CopyManifest,
+    project_root: &std::path::Path,
+    card: &std::path::Path,
+) -> Result<Vec<crate::core::copy::PlannedFile>, String> {
+    let _ = std::fs::create_dir_all(crate::core::manifest::manifest_dir(project_root));
+    let lease = crate::core::lease::acquire(project_root, &m.id, "TEST-MACHINE", "t")
+        .expect("测试用的任务租约必须能拿到");
+    let r = crate::commands::refresh_resume_plan(app, m, project_root, card, &lease);
+    lease.release();
+    r
+}
+
 #[test]
 fn resume_plan_refresh_locks_targets_for_folder_selection() {
     use crate::core::manifest::{CopyManifest, PlannedFile};
@@ -1420,7 +1436,7 @@ fn resume_plan_refresh_locks_targets_for_folder_selection() {
             source_mtime_ns: 0,
         },
     ];
-    let plan = crate::commands::refresh_resume_plan(app, &mut whole, &project_root, &card).unwrap();
+    let plan = refresh_with_lease(app, &mut whole, &project_root, &card).unwrap();
     let mut rels: Vec<&str> = plan.iter().map(|p| p.target_rel.as_str()).collect();
     rels.sort();
     assert_eq!(rels, vec!["D/a.jpg", "D/新来的.jpg", "D/没了.jpg"]);
@@ -1438,8 +1454,7 @@ fn resume_plan_refresh_locks_targets_for_folder_selection() {
         source_rel: "D/a.jpg".into(),
         source_mtime_ns: 0,
     }];
-    let plan =
-        crate::commands::refresh_resume_plan(app, &mut folder, &project_root, &card).unwrap();
+    let plan = refresh_with_lease(app, &mut folder, &project_root, &card).unwrap();
     assert_eq!(plan.len(), 1, "新增文件不得改动锁定的清单: {plan:?}");
     assert_eq!(plan[0].source_rel, "D/a.jpg");
     assert_eq!(plan[0].target_rel, "a.jpg");
@@ -1458,8 +1473,7 @@ fn resume_plan_refresh_locks_targets_for_folder_selection() {
     folder.completed = true; // 模拟「上一轮跑完标了完成」的清单
     crate::core::manifest::save(&project_root, &folder).unwrap();
     std::fs::write(card.join("D/a.jpg"), vec![9u8; 25]).unwrap();
-    let plan =
-        crate::commands::refresh_resume_plan(app, &mut folder, &project_root, &card).unwrap();
+    let plan = refresh_with_lease(app, &mut folder, &project_root, &card).unwrap();
     assert_eq!(plan[0].size, 25, "尺寸必须跟上源文件的实际变化");
     assert_eq!(plan[0].target_rel, "a.jpg", "落点仍沿用锁定值");
     let notices = invoke(&window, "list_notices", json!({})).unwrap();
@@ -1501,7 +1515,7 @@ fn resume_plan_refresh_locks_targets_for_folder_selection() {
     )
     .unwrap();
     drop(f);
-    crate::commands::refresh_resume_plan(app, &mut folder, &project_root, &card).unwrap();
+    refresh_with_lease(app, &mut folder, &project_root, &card).unwrap();
     let notices = invoke(&window, "list_notices", json!({})).unwrap();
     assert!(
         notices
@@ -1546,8 +1560,7 @@ fn resume_explains_files_that_appeared_because_the_scan_policy_widened() {
         source_rel: "D/a.jpg".into(),
         source_mtime_ns: 0,
     }];
-    let plan =
-        crate::commands::refresh_resume_plan(app, &mut folder, &project_root, &card).unwrap();
+    let plan = refresh_with_lease(app, &mut folder, &project_root, &card).unwrap();
     assert_eq!(plan.len(), 1, "锁定的清单不受影响: {plan:?}");
     let notices = invoke(&window, "list_notices", json!({})).unwrap();
     let msg = notices
@@ -1580,7 +1593,7 @@ fn resume_explains_files_that_appeared_because_the_scan_policy_widened() {
         source_rel: String::new(),
         source_mtime_ns: 0,
     }];
-    let plan = crate::commands::refresh_resume_plan(app, &mut whole, &project_root, &card).unwrap();
+    let plan = refresh_with_lease(app, &mut whole, &project_root, &card).unwrap();
     assert_eq!(plan.len(), 2, "整卷续传会把它带上: {plan:?}");
     let notices = invoke(&window, "list_notices", json!({})).unwrap();
     let msg = notices
@@ -1616,7 +1629,7 @@ fn resume_explains_files_that_appeared_because_the_scan_policy_widened() {
         source_rel: "D/a.jpg".into(),
         source_mtime_ns: 0,
     }];
-    crate::commands::refresh_resume_plan(app, &mut fresh, &project_root, &card).unwrap();
+    refresh_with_lease(app, &mut fresh, &project_root, &card).unwrap();
     let notices = invoke(&window, "list_notices", json!({})).unwrap();
     let msg = notices
         .as_array()
@@ -1650,11 +1663,13 @@ fn resume_refuses_when_the_refreshed_manifest_cannot_be_persisted() {
     std::fs::write(card.join("D/a.jpg"), vec![1u8; 999]).unwrap();
 
     let project_root = tmp.path().join("proj-nopersist");
-    // 把 `.ocard/manifests` 占成一个**普通文件**:manifest::save 必然失败
-    std::fs::create_dir_all(project_root.join(".ocard")).unwrap();
-    std::fs::write(project_root.join(".ocard/manifests"), b"not a dir").unwrap();
-
     let mut m = CopyManifest::new("t", "card", "A7M4_A_ZS", "ZS", "");
+    // 把清单文件的落点占成一个**目录**:manifest::save 的改名必然失败,而同目录里的
+    // 租约文件不受影响(刷新计划现在要求持有租约;此前是把整个 manifests 占成文件,
+    // 那样连租约都拿不到,考不到「写不回就拒绝」这一支)
+    let manifests = crate::core::manifest::manifest_dir(&project_root);
+    std::fs::create_dir_all(manifests.join(format!("{}.json", m.id))).unwrap();
+
     m.source_selection = vec!["D".into()];
     m.planned = vec![PlannedFile {
         rel_path: "a.jpg".into(),
@@ -1662,8 +1677,8 @@ fn resume_refuses_when_the_refreshed_manifest_cannot_be_persisted() {
         source_rel: "D/a.jpg".into(),
         source_mtime_ns: 0,
     }];
-    let e = crate::commands::refresh_resume_plan(app, &mut m, &project_root, &card)
-        .expect_err("写不回清单就不许续传");
+    let e =
+        refresh_with_lease(app, &mut m, &project_root, &card).expect_err("写不回清单就不许续传");
     assert!(
         e.contains("拒绝续传") && e.contains("审计范围"),
         "必须说清为什么拒绝: {e}"
@@ -1716,7 +1731,7 @@ fn whole_volume_resume_reports_baseline_changes_before_overwriting_them() {
             source_mtime_ns: crate::core::media::mtime_nanos(&swapped_meta) + 1_000_000_000,
         },
     ];
-    crate::commands::refresh_resume_plan(app, &mut m, &project_root, &card).unwrap();
+    refresh_with_lease(app, &mut m, &project_root, &card).unwrap();
 
     let notices = invoke(&window, "list_notices", json!({})).unwrap();
     let find = |code: &str| -> String {
@@ -2603,7 +2618,7 @@ fn scan_skip_counters_are_drained_on_failure_paths() {
         source_rel: "A/real.jpg".into(),
         source_mtime_ns: 0,
     }];
-    crate::commands::refresh_resume_plan(app, &mut m, &project_root, &card).unwrap();
+    refresh_with_lease(app, &mut m, &project_root, &card).unwrap();
     assert_eq!(
         copy::take_scan_symlinks_skipped(),
         0,
@@ -2619,7 +2634,7 @@ fn scan_skip_counters_are_drained_on_failure_paths() {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(card.join("A"), std::fs::Permissions::from_mode(0o000)).unwrap();
     let mut whole = crate::core::manifest::CopyManifest::new("t", "card", "A7M4_A_ZS", "ZS", "");
-    let r = crate::commands::refresh_resume_plan(app, &mut whole, &project_root, &card);
+    let r = refresh_with_lease(app, &mut whole, &project_root, &card);
     std::fs::set_permissions(card.join("A"), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(r.is_err(), "读不动的子目录必须让整卷复扫失败");
     assert_eq!(

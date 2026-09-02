@@ -114,7 +114,7 @@ export function WelcomeRoot() {
   }
 
   return (
-    <div className="welcome-shell" data-testid="welcome-root">
+    <div className="welcome-shell" data-testid="welcome-root" data-view={view}>
       {/* 无边框窗口的拖动条;macOS 红绿灯悬浮其上 */}
       <div className="welcome-shell__drag" data-tauri-drag-region />
       {body}

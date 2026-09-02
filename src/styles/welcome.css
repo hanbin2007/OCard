@@ -19,6 +19,14 @@
 .welcome-shell {
   /* 顶部拖动条的高度;toast 的落点也要让开它——同一个数只写一处 */
   --welcome-drag-height: 36px;
+  /* toast 还要让开的顶栏高度。只有项目管理视图渲染顶栏(新建 / 铃铛 / 设置在
+     顶栏右侧),其余视图(首页 / 向导 / 首跑设置)没有顶栏,白白下移 46px 只会
+     更挡内容——所以默认 0,由 data-view 决定 */
+  --welcome-topbar-offset: 0px;
+}
+
+.welcome-shell[data-view="manager"] {
+  --welcome-topbar-offset: var(--topbar-height);
 }
 
 .welcome-shell__drag {
@@ -35,7 +43,9 @@
   /* 让开拖动条**和**项目管理视图的顶栏(新建 / 铃铛 / 设置在顶栏右侧):
      只让开拖动条时,toast 正压在铃铛上——而 error toast 不自动消失,
      铃铛是那个视图里唯一能翻回历史通知的入口 */
-  top: calc(var(--welcome-drag-height) + var(--topbar-height) + var(--space-3));
+  top: calc(
+    var(--welcome-drag-height) + var(--welcome-topbar-offset) + var(--space-3)
+  );
   bottom: auto;
 }
 
