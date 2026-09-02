@@ -1241,6 +1241,7 @@ pub fn sweep_stale_parts(
     }
     let ours_dash = format!("{task_prefix}-");
     let keep = format!("{task_prefix}-{keep_run_tag}");
+    let lock_suffix = format!(".publish{}", super::fsx::TMP_SUFFIX);
     let is_ours_stale_tag = |tag: &str| -> bool {
         // 旧格式(≤0.4.3):正好等于前缀;新格式:`<前缀>-<8 位 run>`,且不是本轮的
         tag == task_prefix
@@ -1274,6 +1275,33 @@ pub fn sweep_stale_parts(
             };
             let name = e.file_name();
             let name = name.to_string_lossy();
+            // 最后一级回退留下的发布锁残留(`.<计划文件名>.publish.ocardtmp`,崩溃在建锁与删锁
+            // 之间):启动清扫只扫清单目录,交付目录里的由这里收——按存放它的盘的时钟量年龄,
+            // 超过两分钟才算残留;探针写不进就不下结论
+            if let Some(locked_name) = name
+                .strip_prefix('.')
+                .and_then(|n| n.strip_suffix(lock_suffix.as_str()))
+            {
+                if names.contains(locked_name) {
+                    let path = e.path();
+                    let age_ok = match (
+                        e.metadata().and_then(|m| m.modified()),
+                        super::lease::nas_now(&dir),
+                    ) {
+                        (Ok(t), Some(now)) => now
+                            .duration_since(t)
+                            .is_ok_and(|age| age > std::time::Duration::from_secs(120)),
+                        _ => false,
+                    };
+                    if age_ok && still_mine() {
+                        match fs::remove_file(&path) {
+                            Ok(()) => swept.removed.push(path),
+                            Err(err) => swept.failed.push((path, super::error::explain_io(&err))),
+                        }
+                    }
+                }
+                continue;
+            }
             let Some(stem_and_tag) = name.strip_suffix(PART_SUFFIX) else {
                 continue;
             };
@@ -1988,6 +2016,17 @@ fn finalize_no_replace(part: &Path, fin: &Path, retried: &mut ContentionTally) -
             }
             Ok(())
         }
+        // 撞上别的发布者的发布锁、占用重试完还在:不是权限 / 杀软,也不计入 IO 连败——
+        // 是「另一个任务正在往同一路径发布」(或两分钟内的崩溃残留锁),要人去核对,不是查权限
+        Err(f) if f.source.to_string().contains(super::fsx::PUBLISH_LOCK_HELD) => {
+            Err(super::CoreError::Invalid(format!(
+                "目标路径正被另一个任务发布(或该路径上有两分钟内的崩溃残留发布锁),已重试 {} 轮仍被占着,拒绝落位: {}。请确认没有别的 OCard 在往这个目录拷同名文件;确认后可删除同目录下的 .{}.publish{} 再续传",
+                f.retries,
+                fin.display(),
+                fin.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                super::fsx::TMP_SUFFIX
+            )))
+        }
         Err(f) if f.source.kind() == std::io::ErrorKind::AlreadyExists => {
             Err(super::CoreError::Invalid(format!(
                 "目标在拷贝期间被其他任务写入,拒绝覆盖: {}",
@@ -2481,7 +2520,8 @@ mod tests {
         let card = t.path().join("card");
         std::fs::create_dir_all(card.join("DCIM")).unwrap();
         let src = card.join("DCIM/BIG.MP4");
-        std::fs::write(&src, vec![b'A'; 3 * 1024 * 1024]).unwrap();
+        // 大于 BUF_SIZE:改写要真的落在「读到一半」;否则第一次 read 就读完,考的只剩 mtime
+        std::fs::write(&src, vec![b'A'; BUF_SIZE + 1024 * 1024]).unwrap();
         let dest = t.path().join("dest");
         std::fs::create_dir_all(&dest).unwrap();
         let project = t.path().join("proj");
@@ -2500,8 +2540,16 @@ mod tests {
             if let Progress::BytesCopied { delta, .. } = p {
                 if delta > 0 && !rewritten.get() {
                     rewritten.set(true);
-                    // 等长、内容不同的原位改写(mtime 随之变化)
-                    std::fs::write(&src, vec![b'B'; 3 * 1024 * 1024]).unwrap();
+                    // 等长、内容不同的原位改写;mtime 显式拨到 +1s,不押文件系统的时间粒度
+                    // (Windows NTFS 15.6ms 节拍、FAT 2 秒)
+                    std::fs::write(&src, vec![b'B'; BUF_SIZE + 1024 * 1024]).unwrap();
+                    let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&src)
+                        .unwrap()
+                        .set_times(std::fs::FileTimes::new().set_modified(bumped))
+                        .unwrap();
                 }
             }
             CopyControl::Continue

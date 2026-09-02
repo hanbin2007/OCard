@@ -252,6 +252,7 @@ pub fn start_analysis<R: tauri::Runtime>(
                 cache_skipped_lines: skipped,
             };
             if !result.failed.is_empty() {
+                super::sorting_cmds::notify_if_unsafe_fallback(&body_app);
                 notify::warn(
                     &body_app,
                     "analysis-partial",

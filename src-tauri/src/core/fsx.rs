@@ -240,43 +240,69 @@ fn rename_no_replace_with(
 /// 崩溃残留的锁按年龄(两分钟)回收。
 fn checked_rename_under_publish_lock(src: &Path, dst: &Path) -> io::Result<()> {
     let lock = publish_lock_path(dst);
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock)
-    {
-        Ok(f) => drop(f),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            let stale = fs::metadata(&lock)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
-                .is_some_and(|age| age > std::time::Duration::from_secs(120));
-            if stale {
-                let _ = fs::remove_file(&lock);
-                match fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&lock)
-                {
-                    Ok(f) => drop(f),
-                    Err(e) => return Err(publish_lock_busy(e)),
-                }
-            } else {
-                return Err(publish_lock_busy(e));
+    let dir = dst.parent().unwrap_or(Path::new("."));
+    let mut claimed_stale = false;
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+        {
+            Ok(f) => {
+                drop(f);
+                break;
             }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && !claimed_stale => {
+                // 陈旧(崩溃残留)才回收。年龄用**存放它的那块盘**的时钟量(与 lease 模块同一把
+                // 尺子):本机比 NAS 快两分钟以上时,按本机时钟每一把刚建的锁都「陈旧」,锁会
+                // 无声失效;探针写不进就不下结论、不回收(fail-closed)
+                let stale = match (
+                    fs::metadata(&lock).and_then(|m| m.modified()),
+                    super::lease::nas_now(dir),
+                ) {
+                    (Ok(t), Some(now)) => now
+                        .duration_since(t)
+                        .is_ok_and(|age| age > std::time::Duration::from_secs(120)),
+                    _ => false,
+                };
+                if !stale {
+                    return Err(publish_lock_busy(e));
+                }
+                // 回收要先**认领**:两个回收者同时 remove + create_new 会都成功(第二个删掉的是
+                // 第一个刚建的锁)。rename 到带 nonce 的名字只会有一个赢家;输家 NotFound → 重来
+                let claim = lock.with_file_name(format!(
+                    ".{}.reclaim.{}{TMP_SUFFIX}",
+                    lock.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    &uuid::Uuid::new_v4().simple().to_string()[..8]
+                ));
+                match fs::rename(&lock, &claim) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&claim);
+                    }
+                    Err(re) if re.kind() == io::ErrorKind::NotFound => {}
+                    Err(re) => return Err(publish_lock_busy(re)),
+                }
+                claimed_stale = true; // 只回收一次;再撞上就是别人刚建的新鲜锁
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(publish_lock_busy(e)),
+            Err(e) => return Err(e),
         }
-        Err(e) => return Err(e),
     }
     let r = if dst.exists() {
         Err(io::Error::from(io::ErrorKind::AlreadyExists))
     } else {
         fs::rename(src, dst)
     };
-    let _ = retry_contended(|| match fs::remove_file(&lock) {
+    if let Err(f) = retry_contended(|| match fs::remove_file(&lock) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         r => r,
-    });
+    }) {
+        // 交付目录里的锁残留没有启动清扫认得(只扫清单目录),开拷前的 part 清扫会顺手收;
+        // 删不掉至少要说
+        log::warn!("发布锁没删掉 {}: {}", lock.display(), f.source);
+    }
     r
 }
 
@@ -289,12 +315,15 @@ fn publish_lock_path(dst: &Path) -> std::path::PathBuf {
     dst.with_file_name(format!(".{name}.publish{TMP_SUFFIX}"))
 }
 
+/// 「另一个发布者持着发布锁」的报文标记:调用方据此把它从「权限 / 杀软」里分出来。
+pub const PUBLISH_LOCK_HELD: &str = "目标路径正被另一个发布者持有发布锁";
+
 /// 别的发布者正持着这个目标路径的发布锁:按「占用」上抛(PermissionDenied 在 is_contention
 /// 名单里),调用方的占用重试会再来几轮;重试完还在就是 AlreadyExists 级别的冲突。
 fn publish_lock_busy(e: io::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
-        format!("目标路径正被另一个发布者持有发布锁:{e}"),
+        format!("{PUBLISH_LOCK_HELD}:{e}"),
     )
 }
 
