@@ -207,6 +207,35 @@ describe("主题令牌", () => {
     ).toEqual([]);
   });
 
+  /**
+   * 通知/toast 的正文必须能换行、能断长路径。
+   *
+   * 0.4.3 现场事故的收尾:后端把报错报文分成三行写(发生了什么 / 原因 /
+   * 下一步),但 `.toast__message` 没有 `white-space: pre-wrap`,HTML 把 \n 折成
+   * 空格,三行挤成一坨三百字的长句;而 `.toast` 是 `overflow: hidden`,报文里
+   * 那句 `\\NAS01\\Projects\\...\\abc.json` 没有天然断词点,直接被横向裁掉——
+   * 「到底是哪个文件」这条最要紧的信息,恰好在最该被看见的地方看不见。
+   */
+  it("通知正文保留换行、长路径能断行", async () => {
+    const { RULES, where } = await import("./_css-contract");
+    for (const cls of ["toast__message", "notice-item__message"]) {
+      const own = RULES.filter((r) => r.subjectClasses.has(cls));
+      expect(own.length, `.${cls} 没有任何规则?`).toBeGreaterThan(0);
+      for (const prop of ["white-space", "overflow-wrap"]) {
+        const hit = own.find((r) => r.decls.some((d) => d.prop === prop));
+        expect(
+          hit ? where(hit) : null,
+          `.${cls} 缺 ${prop}:报错报文会被折成一坨/长路径会被裁掉`,
+        ).not.toBeNull();
+      }
+      const ws = own
+        .flatMap((r) => r.decls)
+        .filter((d) => d.prop === "white-space")
+        .map((d) => d.value.trim());
+      expect(ws, `.${cls} 的 white-space 必须保留换行`).toContain("pre-wrap");
+    }
+  });
+
   it("字体栈全部是系统字体，不引 webfont", () => {
     expect(css).not.toContain("@font-face");
     expect(css).not.toContain("fonts.googleapis");

@@ -26,6 +26,19 @@ pub struct NoticeDto {
     /// 合并窗口内的重复次数(≥2 时出现;前端展示「×N」)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repeats: Option<u32>,
+    /// 这条通知说的是哪个拷卡任务(有的话)。
+    ///
+    /// 两个用途,都实打实:
+    /// ① **合并键的一部分**。并行拷卡在本项目里是常态,三张卡因为 NAS 抖动同时
+    ///    暂停时,只按 code+level 合并会折成一条、正文是最后那个任务的——
+    ///    另外两个任务的暂停在界面上无声。
+    /// ② 前端据此渲染「查看任务」按钮。此前 `copy-task-paused` 的报文末尾写着
+    ///    「点『继续』」,而界面上没有一个按钮能把人带到那个「继续」跟前。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// 任务所属项目。跳转前要先切到它,否则「查看任务」会落在别的项目上。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 pub fn emit_notice<R: tauri::Runtime>(
@@ -33,6 +46,17 @@ pub fn emit_notice<R: tauri::Runtime>(
     level: &'static str,
     code: &str,
     message: String,
+) {
+    emit_notice_for(app, level, code, message, None, None);
+}
+
+pub fn emit_notice_for<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    level: &'static str,
+    code: &str,
+    message: String,
+    task_id: Option<String>,
+    project_id: Option<String>,
 ) {
     // 每条通知镜像进运行日志(v0.3.1:事后排障可复原用户当时看到了什么)
     match level {
@@ -46,6 +70,8 @@ pub fn emit_notice<R: tauri::Runtime>(
         message,
         occurred_at: Utc::now().to_rfc3339(),
         repeats: None,
+        task_id,
+        project_id,
     };
     // 先入积压再发事件:前端监听尚未就绪时(启动窗口)也不丢,
     // 就绪后经 list_notices 回放(codex 收口验证 P1:启动丢信)。
@@ -56,7 +82,8 @@ pub fn emit_notice<R: tauri::Runtime>(
             .iter_mut()
             .rev()
             .take(64)
-            .find(|n| n.code == dto.code && n.level == dto.level)
+            // 合并键带上 task_id:并行拷卡是常态,三张卡同时暂停不能折成一条
+            .find(|n| n.code == dto.code && n.level == dto.level && n.task_id == dto.task_id)
             .filter(|n| {
                 chrono::DateTime::parse_from_rfc3339(&n.occurred_at)
                     .map(|ts| (now - ts.to_utc()).num_seconds() <= MERGE_WINDOW_SECS)
@@ -95,4 +122,37 @@ pub fn info<R: tauri::Runtime>(app: &AppHandle<R>, code: &str, message: String) 
 
 pub fn error<R: tauri::Runtime>(app: &AppHandle<R>, code: &str, message: String) {
     emit_notice(app, "error", code, message);
+}
+
+/// 带任务归属的 error / warning:界面据此给出「查看任务」,合并也按任务分开。
+pub fn error_for_task<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    code: &str,
+    task: (&str, &str),
+    message: String,
+) {
+    emit_notice_for(
+        app,
+        "error",
+        code,
+        message,
+        Some(task.0.to_string()),
+        Some(task.1.to_string()),
+    );
+}
+
+pub fn warn_for_task<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    code: &str,
+    task: (&str, &str),
+    message: String,
+) {
+    emit_notice_for(
+        app,
+        "warning",
+        code,
+        message,
+        Some(task.0.to_string()),
+        Some(task.1.to_string()),
+    );
 }

@@ -15,6 +15,7 @@ macro_rules! ocard_invoke_handler {
             $crate::commands::set_workstation_info,
             $crate::commands::get_project_settings,
             $crate::commands::save_project_settings,
+            $crate::commands::diag_cmds::export_diagnostics,
             $crate::commands::windows_cmds::open_project_window,
             $crate::commands::windows_cmds::open_manager_window,
             $crate::commands::windows_cmds::take_pending_open_project,
@@ -104,8 +105,54 @@ fn prune_rotated_logs(dir: &std::path::Path, keep: usize) {
     }
 }
 
+/// 日志落点。
+///
+/// **必须用 `targets()`(整体替换)而不是 `target()`(追加)**——0.4.3 的现场日志
+/// 每一行都出现两次,原因就在这:插件的默认 targets 是
+/// `[Stdout, LogDir { file_name: None }]`,`file_name: None` 解析成
+/// **应用名** `OCard.log`;我们又追加了一个 `ocard.log`。Windows(NTFS)与
+/// macOS(APFS)默认大小写不敏感,两个 target 其实开的是**同一个文件**,
+/// 于是两个 writer 各写一遍。
+///
+/// 后果不只是难看:单文件 5MB 一轮转,双写让历史消耗速度翻倍——事故发生后
+/// 想翻日志时,能翻的窗口只有本该的一半。这正是排障最需要它的时候。
+fn log_target_kinds() -> Vec<tauri_plugin_log::TargetKind> {
+    use tauri_plugin_log::TargetKind;
+    vec![
+        // 开发时看着方便;打包后 Windows 上没有控制台,写了也不去哪儿
+        TargetKind::Stdout,
+        TargetKind::LogDir {
+            file_name: Some(LOG_FILE_NAME.into()),
+        },
+    ]
+}
+
+/// 运行日志的文件名(不含扩展名)。诊断报告按它去取日志尾巴,别处改了这里也要改。
+pub(crate) const LOG_FILE_NAME: &str = "ocard";
+
+fn log_targets() -> Vec<tauri_plugin_log::Target> {
+    log_target_kinds()
+        .into_iter()
+        .map(tauri_plugin_log::Target::new)
+        .collect()
+}
+
 pub fn run() {
     tauri::Builder::default()
+        // **必须第一个注册**(上游要求)。
+        //
+        // 同机开两个 OCard 是「两个进程同时写同一份拷卡清单」唯一现实的入口:
+        // 两个进程都会重建出同一个暂停任务,都看得见同一个挂载点,而清单落盘
+        // 是整份覆盖——后写的把先写的整份顶掉,且不报任何错(见 core::lease)。
+        // 租约是第二道闸;这一道从源头上不让第二个进程起来。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // 第二次启动:把已经开着的窗口顶到前面来,别让用户以为没反应
+            let focused = app
+                .webview_windows()
+                .values()
+                .any(|w| w.set_focus().is_ok() && w.unminimize().is_ok());
+            log::info!("已有实例在运行,拒绝第二个实例(前置已开窗口: {focused})");
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         // 原生文件夹选择器(UX 波):所有手填路径处都必须能 UI 选目录
@@ -114,11 +161,7 @@ pub fn run() {
         // 启动期修剪),级别 Info;业务可见性仍以通知中心为准,日志是事后排障用
         .plugin(
             tauri_plugin_log::Builder::new()
-                .target(tauri_plugin_log::Target::new(
-                    tauri_plugin_log::TargetKind::LogDir {
-                        file_name: Some("ocard".into()),
-                    },
-                ))
+                .targets(log_targets())
                 .level(log::LevelFilter::Info)
                 .max_file_size(5_000_000)
                 .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
@@ -477,4 +520,66 @@ pub fn run() {
         .invoke_handler(crate::ocard_invoke_handler!())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod log_target_tests {
+    use tauri_plugin_log::TargetKind;
+
+    /// 0.4.3 现场日志每行出现两次的回归网。
+    ///
+    /// 退回 `Builder::target(...)`(追加)时,`targets` 里会同时存在
+    /// `LogDir { file_name: None }`(= 应用名 `OCard.log`)和
+    /// `LogDir { file_name: Some("ocard") }`;二者在 Windows/macOS 的
+    /// 大小写不敏感文件系统上是同一个文件。这里按**大小写折叠后的文件名**判重,
+    /// 而不是按 `file_name` 字面值——`None` 与 `Some("ocard")` 字面上不同,
+    /// 落地却撞在一起,只比字面值抓不到这个 bug。
+    #[test]
+    fn no_two_log_targets_land_on_the_same_file() {
+        // 打包名(tauri.conf.json 的 productName);file_name: None 就解析成它
+        const APP_NAME: &str = "OCard";
+        let mut seen: Vec<String> = Vec::new();
+        for kind in super::log_target_kinds() {
+            let name = match &kind {
+                TargetKind::LogDir { file_name } | TargetKind::Folder { file_name, .. } => {
+                    file_name.clone().unwrap_or_else(|| APP_NAME.to_string())
+                }
+                _ => continue, // Stdout/Stderr/Webview 不落文件
+            };
+            let key = name.to_lowercase();
+            assert!(
+                !seen.contains(&key),
+                "两个日志 target 落在同一个文件上(大小写不敏感文件系统):{name};\
+                 每行会被写两遍,5MB 轮转吃掉一半可追溯窗口"
+            );
+            seen.push(key);
+        }
+        assert_eq!(seen.len(), 1, "应当只有一个落文件的日志 target:{seen:?}");
+    }
+
+    /// 默认 targets 里那个 `LogDir { file_name: None }` 一旦漏进来,上面那条
+    /// 就该红。这里把它显式加进去自检一遍,证明守卫不是恒真。
+    #[test]
+    fn the_guard_actually_catches_the_default_logdir_target() {
+        const APP_NAME: &str = "OCard";
+        let kinds = [
+            TargetKind::LogDir { file_name: None },
+            TargetKind::LogDir {
+                file_name: Some(super::LOG_FILE_NAME.into()),
+            },
+        ];
+        let names: Vec<String> = kinds
+            .iter()
+            .filter_map(|k| match k {
+                TargetKind::LogDir { file_name } => Some(
+                    file_name
+                        .clone()
+                        .unwrap_or_else(|| APP_NAME.to_string())
+                        .to_lowercase(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names[0], names[1], "OCard.log 与 ocard.log 折叠后必须同名");
+    }
 }

@@ -1465,6 +1465,13 @@
   font-size: var(--text-xs);
   color: var(--text-secondary);
   line-height: var(--leading-normal);
+  /* 后端的报错报文是分行写的（「发生了什么 / 原因 / 下一步」各占一行）。
+     HTML 默认把 \n 折成空格，三行会挤成一坨三百字的长句——现场 DIT 不会读完。 */
+  white-space: pre-wrap;
+  /* 报文里带的是 `\\NAS01\Projects\...\abc.json` 这种纯 ASCII 长路径，
+     没有天然换行机会点。.toast 是 overflow:hidden，不给断词机会就会被横向裁掉——
+     这波修复最核心的产出（到底是哪个文件）恰好在最该被看见的地方看不见。 */
+  overflow-wrap: anywhere;
 }
 
 .notice-item__code,

@@ -815,6 +815,24 @@ export function getAppVersion(): Promise<string> {
 }
 
 /**
+ * 导出诊断报告：把版本 / 系统 / 任务状态 / 通知记录 / 运行日志尾巴写成一个
+ * 纯文本文件，落在「下载」里并在文件管理器中选中它。返回文件完整路径。
+ *
+ * 在这之前，出错时用户手上除了一句报错什么都没有——运行日志躺在系统的
+ * 应用日志目录里，界面上一个入口都没有。
+ */
+export function exportDiagnostics(): Promise<ExportedReport> {
+  if (IS_TAURI) return ipc("export_diagnostics");
+  return reply({ path: "/tmp/OCard-诊断报告-mock.txt", revealed: true });
+}
+
+/**
+ * `revealed` 必须回给界面：文件管理器没弹出来时，界面不能还写着「已打开」——
+ * 用户会盯着屏幕等一个不会来的窗口。
+ */
+export type ExportedReport = { path: string; revealed: boolean };
+
+/**
  * 安装已下载好的更新并重启。
  * 有拷卡任务在跑时后端会拒绝，并返回中文原因——直接展示给用户。
  */

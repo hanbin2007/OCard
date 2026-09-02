@@ -8,6 +8,7 @@ pub mod fsx;
 pub mod hash;
 pub mod jobs;
 pub mod journal;
+pub mod lease;
 pub mod machine;
 pub mod manifest;
 pub mod media;

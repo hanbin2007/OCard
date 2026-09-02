@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { NoticeToasts } from "./NotificationCenter";
 import { StoreProvider } from "../state/store";
+import { WindowBridgeProvider } from "../state/windowBridge";
 import * as api from "../api";
 import { mockProjects, mockWorkstation } from "../api/mock";
 import type { NoticeDto } from "../api/types";
@@ -780,7 +781,11 @@ describe("★ 没有铃铛的窗口里,warning 不许自动消失", () => {
     try {
       render(
         <StoreProvider preloaded={{ ...preloaded, notices: [] }}>
-          <NoticeToasts hasBell={false} />
+          {/* 「查看任务」按窗口角色渲染(欢迎窗口里它是死按钮),
+              所以 NoticeToasts 需要 WindowBridge 在场 */}
+          <WindowBridgeProvider role="welcome">
+            <NoticeToasts hasBell={false} />
+          </WindowBridgeProvider>
         </StoreProvider>,
       );
       send(notice({ level: "warning", code: "pref-write-failed" }));
@@ -800,7 +805,9 @@ describe("★ 没有铃铛的窗口里,warning 不许自动消失", () => {
     try {
       render(
         <StoreProvider preloaded={{ ...preloaded, notices: [] }}>
-          <NoticeToasts hasBell />
+          <WindowBridgeProvider role="main">
+            <NoticeToasts hasBell />
+          </WindowBridgeProvider>
         </StoreProvider>,
       );
       send(notice({ level: "warning", code: "pref-write-failed" }));
@@ -811,5 +818,65 @@ describe("★ 没有铃铛的窗口里,warning 不许自动消失", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+/* 0.4.3 现场事故的界面侧回归网。 */
+describe("拷卡中断的提示", () => {
+  it("暂停通知带任务引用时给出「查看任务」——报文让人点继续，就得有路走过去", async () => {
+    render(<App preloaded={preloaded} />);
+    await act(async () => {
+      send({
+        level: "error",
+        code: "copy-task-paused",
+        message: "拷卡任务「0831上午」已中断并转入暂停\n原因:写入拷卡清单失败",
+        occurredAt: new Date().toISOString(),
+        taskId: "task-1",
+      });
+    });
+    const toast = await screen.findByTestId("notice-toast-error");
+    expect(toast.textContent).toContain("拷卡已中断，可从断点续传");
+    expect(screen.getByTestId("notice-toast-goto-task")).toBeDefined();
+  });
+
+  it("出事的卡片上直接有「导出诊断报告」，不用去翻三级菜单", async () => {
+    render(<App preloaded={preloaded} />);
+    await act(async () => {
+      send({
+        level: "error",
+        code: "copy-task-paused",
+        message: "拷卡任务已中断",
+        occurredAt: new Date().toISOString(),
+        taskId: "task-1",
+      });
+    });
+    await screen.findByTestId("notice-toast-error");
+    expect(screen.getByTestId("notice-export-report")).toBeDefined();
+  });
+
+  it("并行拷卡:两个任务同时暂停，各自成条，不许折成一条", async () => {
+    render(<App preloaded={preloaded} />);
+    const at = new Date().toISOString();
+    await act(async () => {
+      send({
+        level: "error",
+        code: "copy-task-paused",
+        message: "A 卡中断",
+        occurredAt: at,
+        taskId: "task-a",
+      });
+      send({
+        level: "error",
+        code: "copy-task-paused",
+        message: "B 卡中断",
+        occurredAt: at,
+        taskId: "task-b",
+      });
+    });
+    const toasts = await screen.findAllByTestId("notice-toast-error");
+    expect(toasts).toHaveLength(2);
+    const text = toasts.map((t) => t.textContent).join("|");
+    expect(text).toContain("A 卡中断");
+    expect(text).toContain("B 卡中断");
   });
 });

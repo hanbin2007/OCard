@@ -1419,7 +1419,9 @@ fn resume_plan_refresh_locks_targets_for_folder_selection() {
             source_mtime_ns: 0,
         },
     ];
-    let plan = crate::commands::refresh_resume_plan(app, &mut whole, &project_root, &card).unwrap();
+    let plan =
+        crate::commands::refresh_resume_plan(app, &mut whole, &project_root, &card, "TEST-MACHINE")
+            .unwrap();
     let mut rels: Vec<&str> = plan.iter().map(|p| p.target_rel.as_str()).collect();
     rels.sort();
     assert_eq!(rels, vec!["D/a.jpg", "D/新来的.jpg", "D/没了.jpg"]);
@@ -1437,8 +1439,14 @@ fn resume_plan_refresh_locks_targets_for_folder_selection() {
         source_rel: "D/a.jpg".into(),
         source_mtime_ns: 0,
     }];
-    let plan =
-        crate::commands::refresh_resume_plan(app, &mut folder, &project_root, &card).unwrap();
+    let plan = crate::commands::refresh_resume_plan(
+        app,
+        &mut folder,
+        &project_root,
+        &card,
+        "TEST-MACHINE",
+    )
+    .unwrap();
     assert_eq!(plan.len(), 1, "新增文件不得改动锁定的清单: {plan:?}");
     assert_eq!(plan[0].source_rel, "D/a.jpg");
     assert_eq!(plan[0].target_rel, "a.jpg");
@@ -1457,8 +1465,14 @@ fn resume_plan_refresh_locks_targets_for_folder_selection() {
     folder.completed = true; // 模拟「上一轮跑完标了完成」的清单
     crate::core::manifest::save(&project_root, &folder).unwrap();
     std::fs::write(card.join("D/a.jpg"), vec![9u8; 25]).unwrap();
-    let plan =
-        crate::commands::refresh_resume_plan(app, &mut folder, &project_root, &card).unwrap();
+    let plan = crate::commands::refresh_resume_plan(
+        app,
+        &mut folder,
+        &project_root,
+        &card,
+        "TEST-MACHINE",
+    )
+    .unwrap();
     assert_eq!(plan[0].size, 25, "尺寸必须跟上源文件的实际变化");
     assert_eq!(plan[0].target_rel, "a.jpg", "落点仍沿用锁定值");
     let notices = invoke(&window, "list_notices", json!({})).unwrap();
@@ -1500,7 +1514,8 @@ fn resume_plan_refresh_locks_targets_for_folder_selection() {
     )
     .unwrap();
     drop(f);
-    crate::commands::refresh_resume_plan(app, &mut folder, &project_root, &card).unwrap();
+    crate::commands::refresh_resume_plan(app, &mut folder, &project_root, &card, "TEST-MACHINE")
+        .unwrap();
     let notices = invoke(&window, "list_notices", json!({})).unwrap();
     assert!(
         notices
@@ -1545,8 +1560,14 @@ fn resume_explains_files_that_appeared_because_the_scan_policy_widened() {
         source_rel: "D/a.jpg".into(),
         source_mtime_ns: 0,
     }];
-    let plan =
-        crate::commands::refresh_resume_plan(app, &mut folder, &project_root, &card).unwrap();
+    let plan = crate::commands::refresh_resume_plan(
+        app,
+        &mut folder,
+        &project_root,
+        &card,
+        "TEST-MACHINE",
+    )
+    .unwrap();
     assert_eq!(plan.len(), 1, "锁定的清单不受影响: {plan:?}");
     let notices = invoke(&window, "list_notices", json!({})).unwrap();
     let msg = notices
@@ -1579,7 +1600,9 @@ fn resume_explains_files_that_appeared_because_the_scan_policy_widened() {
         source_rel: String::new(),
         source_mtime_ns: 0,
     }];
-    let plan = crate::commands::refresh_resume_plan(app, &mut whole, &project_root, &card).unwrap();
+    let plan =
+        crate::commands::refresh_resume_plan(app, &mut whole, &project_root, &card, "TEST-MACHINE")
+            .unwrap();
     assert_eq!(plan.len(), 2, "整卷续传会把它带上: {plan:?}");
     let notices = invoke(&window, "list_notices", json!({})).unwrap();
     let msg = notices
@@ -1615,7 +1638,8 @@ fn resume_explains_files_that_appeared_because_the_scan_policy_widened() {
         source_rel: "D/a.jpg".into(),
         source_mtime_ns: 0,
     }];
-    crate::commands::refresh_resume_plan(app, &mut fresh, &project_root, &card).unwrap();
+    crate::commands::refresh_resume_plan(app, &mut fresh, &project_root, &card, "TEST-MACHINE")
+        .unwrap();
     let notices = invoke(&window, "list_notices", json!({})).unwrap();
     let msg = notices
         .as_array()
@@ -1661,7 +1685,7 @@ fn resume_refuses_when_the_refreshed_manifest_cannot_be_persisted() {
         source_rel: "D/a.jpg".into(),
         source_mtime_ns: 0,
     }];
-    let e = crate::commands::refresh_resume_plan(app, &mut m, &project_root, &card)
+    let e = crate::commands::refresh_resume_plan(app, &mut m, &project_root, &card, "TEST-MACHINE")
         .expect_err("写不回清单就不许续传");
     assert!(
         e.contains("拒绝续传") && e.contains("审计范围"),
@@ -1715,7 +1739,8 @@ fn whole_volume_resume_reports_baseline_changes_before_overwriting_them() {
             source_mtime_ns: crate::core::media::mtime_nanos(&swapped_meta) + 1_000_000_000,
         },
     ];
-    crate::commands::refresh_resume_plan(app, &mut m, &project_root, &card).unwrap();
+    crate::commands::refresh_resume_plan(app, &mut m, &project_root, &card, "TEST-MACHINE")
+        .unwrap();
 
     let notices = invoke(&window, "list_notices", json!({})).unwrap();
     let find = |code: &str| -> String {
@@ -2601,7 +2626,8 @@ fn scan_skip_counters_are_drained_on_failure_paths() {
         source_rel: "A/real.jpg".into(),
         source_mtime_ns: 0,
     }];
-    crate::commands::refresh_resume_plan(app, &mut m, &project_root, &card).unwrap();
+    crate::commands::refresh_resume_plan(app, &mut m, &project_root, &card, "TEST-MACHINE")
+        .unwrap();
     assert_eq!(
         copy::take_scan_symlinks_skipped(),
         0,
@@ -2617,7 +2643,8 @@ fn scan_skip_counters_are_drained_on_failure_paths() {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(card.join("A"), std::fs::Permissions::from_mode(0o000)).unwrap();
     let mut whole = crate::core::manifest::CopyManifest::new("t", "card", "A7M4_A_ZS", "ZS", "");
-    let r = crate::commands::refresh_resume_plan(app, &mut whole, &project_root, &card);
+    let r =
+        crate::commands::refresh_resume_plan(app, &mut whole, &project_root, &card, "TEST-MACHINE");
     std::fs::set_permissions(card.join("A"), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(r.is_err(), "读不动的子目录必须让整卷复扫失败");
     assert_eq!(
@@ -3411,6 +3438,319 @@ fn full_preview_decodes_heif_with_real_ffmpeg() {
             assert_eq!(got["kind"], "original", "{got}");
         } else {
             eprintln!("跳过真 HEIC 分支:sips 不可用");
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ *
+ * 诊断报告导出(0.4.3 现场事故的后续):报错能看见但取不走,排障只能靠猜。
+ * 这里考的是**报告里真有排障要用的东西**——只断言「命令返回 Ok」的话,
+ * 一份空文件照样绿。
+ * ------------------------------------------------------------------ */
+#[test]
+fn diagnostics_report_carries_what_triage_actually_needs() {
+    let (window, _tmp, nas) = mock_app();
+    let app = window.app_handle();
+
+    // 造一条现场:界面上出现过的那句报错必须能在报告里找回来
+    crate::commands::notify::error(
+        app,
+        "copy-task-paused",
+        "拷卡任务「0831上午_DJIMINI4P_B_LQX」已中断并转入暂停".into(),
+    );
+
+    let state = app.state::<AppState>();
+    let report = crate::commands::diag_cmds::build_report(app, &state);
+
+    assert!(
+        report.contains(env!("CARGO_PKG_VERSION")),
+        "要有版本号:\n{report}"
+    );
+    assert!(report.contains("TEST-MACHINE"), "要有机器 ID:\n{report}");
+    assert!(report.contains("集成测试"), "要有操作人:\n{report}");
+    assert!(
+        report.contains(&nas.display().to_string()),
+        "要有 NAS 根路径:\n{report}"
+    );
+    assert!(
+        report.contains("NAS 可达     : 可达"),
+        "要探一次可达性:\n{report}"
+    );
+    assert!(
+        report.contains("0831上午_DJIMINI4P_B_LQX"),
+        "界面上出现过的报错必须在报告里找得回来:\n{report}"
+    );
+    assert!(
+        report.contains("copy-task-paused"),
+        "通知 code 是分类的依据:\n{report}"
+    );
+    // 抬头必须逐项写明带出去了什么——让人知道自己在往外发什么。
+    // 只写一句「不含素材内容」是不够的:操作人姓名、机器 ID、日志全文都在里面
+    for item in ["操作人姓名", "机器 ID", "不含素材文件本身", "运行日志"] {
+        assert!(report.contains(item), "抬头漏了「{item}」:\n{report}");
+    }
+}
+
+/// 报告里必须真的有「哪个文件为什么失败」。
+///
+/// 这是评审抓到的 P0:`build_report` 原先走 `TaskManager::snapshots()`,而它过
+/// `summary_of` 会把 `files` 清空——于是「文件 N」恒为 0、失败明细一个字节都不
+/// 输出。一个拷了 400 个、失败 12 个的任务在报告里干干净净,那不是缺信息,
+/// 是主动误导。本测试从 TaskManager 一路考到报告正文。
+#[test]
+fn diagnostics_report_names_the_files_that_failed_and_why() {
+    use crate::commands::dto::{CopyFileItemDto, CopyTaskDto};
+    let (window, _tmp, _nas) = mock_app();
+    let app = window.app_handle();
+    let state = app.state::<AppState>();
+
+    let snap = CopyTaskDto {
+        id: "task-diag-1".into(),
+        project_id: "proj-1".into(),
+        volume_id: "/Volumes/CARD".into(),
+        volume_name: "CARD".into(),
+        camera_id: "cam-1".into(),
+        camera_code: "DJIMINI4P".into(),
+        note: String::new(),
+        tags: Vec::new(),
+        target_folder: "0831上午_DJIMINI4P_B_LQX".into(),
+        source_folders: Vec::new(),
+        scan_policy_version: 1,
+        destinations: Vec::new(),
+        files: Vec::new(),
+        file_count: None,
+        status_counts: None,
+        total_bytes: 2,
+        copied_bytes: 1,
+        speed_bytes_per_sec: 0,
+        state: "paused",
+        progress_revision: Some(1),
+        operator: "集成测试".into(),
+        started_at: "2026-08-31T03:32:00Z".into(),
+        finished_at: None,
+    };
+    let mut snap = snap;
+    snap.files = vec![
+        CopyFileItemDto {
+            status: "verified",
+            ..item("DCIM/100MEDIA/DJI_0001.MP4")
+        },
+        CopyFileItemDto {
+            status: "failed",
+            error: Some("写入失败: 拒绝访问(系统错误码 5)".into()),
+            ..item("DCIM/100MEDIA/DJI_0002.MP4")
+        },
+    ];
+    state.tasks.insert(
+        snap.id.clone(),
+        std::sync::Arc::new(crate::commands::tasks::TaskHandle {
+            pause_requested: Default::default(),
+            running: Default::default(),
+            snapshot: std::sync::Mutex::new(snap),
+            project_root: std::path::PathBuf::from("/nowhere"),
+            manifest_id: "m".into(),
+            source_root: std::sync::Mutex::new(std::path::PathBuf::from("/card")),
+            plan: Default::default(),
+            dest_targets: Vec::new(),
+            machine_id: "TEST-MACHINE".into(),
+            config_dir: std::path::PathBuf::from("/nowhere"),
+        }),
+    );
+
+    let report = crate::commands::diag_cmds::build_report(app, &state);
+    assert!(
+        report.contains("DJI_0002.MP4"),
+        "失败文件必须点名:\n{report}"
+    );
+    assert!(
+        report.contains("系统错误码 5"),
+        "失败原因原文必须留住:\n{report}"
+    );
+    assert!(
+        report.contains("失败 1"),
+        "总账要对得上(status_counts):\n{report}"
+    );
+    assert!(
+        !report.contains("/ 文件 0"),
+        "文件数不许恒为 0(那正是 snapshots() 清空 files 的症状):\n{report}"
+    );
+}
+
+fn item(path: &str) -> crate::commands::dto::CopyFileItemDto {
+    crate::commands::dto::CopyFileItemDto {
+        id: path.into(),
+        path: path.into(),
+        name: path.rsplit('/').next().unwrap_or(path).into(),
+        size_bytes: 1,
+        status: "pending",
+        hash: None,
+        error: None,
+        targets: None,
+    }
+}
+
+/// NAS 掉线时报告本身不能跟着废掉:那正是最需要它的时候。
+#[test]
+fn diagnostics_report_still_builds_when_the_nas_is_gone() {
+    let (window, tmp, nas) = mock_app();
+    let app = window.app_handle();
+    std::fs::remove_dir_all(&nas).unwrap();
+
+    let state = app.state::<AppState>();
+    let report = crate::commands::diag_cmds::build_report(app, &state);
+    assert!(report.contains("NAS 可达     : 不可达"), "{report}");
+    assert!(report.contains("重新挂载"), "不可达也要给下一步:\n{report}");
+    drop(tmp);
+}
+
+/* ------------------------------------------------------------------ *
+ * 任务租约:同一份清单同时只允许一个进程写。
+ *
+ * 清单落盘是**整份覆盖**,两处同时写时后写的会把先写的整份顶掉;而自从临时
+ * 文件名改成唯一的之后,这件事连个错都不报了——更干净,也更难发现。
+ * ------------------------------------------------------------------ */
+
+/// 续传前刷新计划这一步发生在 worker 起来**之前**,不在租约保护内,
+/// 而另一个进程的 worker 可能正跑着这个任务。去掉这道闸时本测试红。
+#[test]
+fn refreshing_the_plan_refuses_while_another_process_holds_the_task() {
+    use crate::core::lease::{lease_path, Lease};
+    let (window, _tmp, nas) = mock_app();
+    let app = window.app_handle();
+    let project_root = nas.join("proj");
+    std::fs::create_dir_all(crate::core::manifest::manifest_dir(&project_root)).unwrap();
+
+    let mut m =
+        crate::core::manifest::CopyManifest::new("1. 待分类/x", "CARD", "A_B_C", "张三", "");
+    crate::core::manifest::save(&project_root, &m).unwrap();
+
+    // 另一台机器(或同机另一个进程)的**活**租约
+    let other = Lease {
+        machine_id: "OTHER-MACHINE".into(),
+        pid: 4242,
+        operator: "李四".into(),
+        heartbeat_at: chrono::Utc::now().to_rfc3339(),
+    };
+    std::fs::write(
+        lease_path(&project_root, &m.id),
+        serde_json::to_vec(&other).unwrap(),
+    )
+    .unwrap();
+
+    let plan = vec![crate::core::copy::PlannedFile {
+        source_rel: "A.MP4".into(),
+        target_rel: "A.MP4".into(),
+        size: 1,
+        source_mtime_ns: 0,
+    }];
+    let err = crate::commands::persist_refreshed_plan(app, &mut m, &project_root, &plan, "ME")
+        .unwrap_err();
+    assert!(err.contains("正被"), "要拒绝并说清是谁占着: {err}");
+    assert!(err.contains("李四"), "{err}");
+
+    // 磁盘上的清单一个字节都不许被动过
+    let on_disk = crate::core::manifest::load(&project_root, &m.id).unwrap();
+    assert!(
+        on_disk.planned.is_empty(),
+        "被拒绝之后还是把计划写进去了——这正是要防的整份覆盖"
+    );
+}
+
+/// 租约过期(上次异常退出)不该永久堵死任务:放行,但接管要有可见说明。
+#[test]
+fn refreshing_the_plan_proceeds_when_the_other_lease_is_stale() {
+    use crate::core::lease::{lease_path, Lease, LEASE_TTL};
+    let (window, _tmp, nas) = mock_app();
+    let app = window.app_handle();
+    let project_root = nas.join("proj2");
+    std::fs::create_dir_all(crate::core::manifest::manifest_dir(&project_root)).unwrap();
+
+    let mut m =
+        crate::core::manifest::CopyManifest::new("1. 待分类/x", "CARD", "A_B_C", "张三", "");
+    crate::core::manifest::save(&project_root, &m).unwrap();
+    let dead = Lease {
+        machine_id: "OTHER-MACHINE".into(),
+        pid: 4242,
+        operator: "李四".into(),
+        heartbeat_at: (chrono::Utc::now() - LEASE_TTL - chrono::Duration::minutes(1)).to_rfc3339(),
+    };
+    std::fs::write(
+        lease_path(&project_root, &m.id),
+        serde_json::to_vec(&dead).unwrap(),
+    )
+    .unwrap();
+
+    let plan = vec![crate::core::copy::PlannedFile {
+        source_rel: "A.MP4".into(),
+        target_rel: "A.MP4".into(),
+        size: 1,
+        source_mtime_ns: 0,
+    }];
+    crate::commands::persist_refreshed_plan(app, &mut m, &project_root, &plan, "ME")
+        .expect("过期租约不该永久堵死续传");
+    assert_eq!(
+        crate::core::manifest::load(&project_root, &m.id)
+            .unwrap()
+            .planned
+            .len(),
+        1
+    );
+}
+
+/* ------------------------------------------------------------------ *
+ * 启动期残留临时文件清扫
+ * ------------------------------------------------------------------ */
+
+#[test]
+fn the_sweep_removes_only_old_orphans_and_never_swallows_a_scan_failure() {
+    use crate::commands::{sweep_stale_temp_files, SweepTally};
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("manifests");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let old = dir.join(".m.json.deadbeef.ocardtmp");
+    let fresh = dir.join(".m.json.cafebabe.ocardtmp");
+    let real = dir.join("m.json");
+    for p in [&old, &fresh, &real] {
+        std::fs::write(p, b"{}").unwrap();
+    }
+    // 把 old 的 mtime 推到两小时前(门槛是一小时)
+    let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(two_hours_ago))
+        .unwrap();
+
+    let mut tally = SweepTally::default();
+    sweep_stale_temp_files(&dir, &mut tally);
+    assert_eq!(tally.removed, 1, "只该清掉过了门槛的那个");
+    assert!(!old.exists(), "旧残留没被清掉");
+    assert!(
+        fresh.exists(),
+        "刚写出来的临时文件被清掉了——那可能是另一个进程**此刻**正在写的那一个"
+    );
+    assert!(real.exists(), "正式清单被误删");
+
+    // 目录不存在 = 这个项目还没拷过卡,不是故障,不许计数
+    let mut t2 = SweepTally::default();
+    sweep_stale_temp_files(&tmp.path().join("nope"), &mut t2);
+    assert_eq!((t2.removed, t2.stuck), (0, 0), "目录不存在不该算成故障");
+
+    // 其余错误(权限不足 / NAS 半死)必须留下痕迹:吞掉就是无提示 fail-open
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } != 0 {
+            let locked = tmp.path().join("locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let mut t3 = SweepTally::default();
+            sweep_stale_temp_files(&locked, &mut t3);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(t3.stuck, 1, "扫不动必须计数并上报,不能一声不吭");
+            assert_eq!(t3.trouble.len(), 1, "要点名是哪个目录");
         }
     }
 }

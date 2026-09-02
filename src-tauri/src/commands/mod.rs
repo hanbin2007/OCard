@@ -9,6 +9,7 @@
 //! 新增命令必须沿用 `(async)`,除非确有主线程需求并写明原因。
 
 pub mod analysis_cmds;
+pub mod diag_cmds;
 pub mod dto;
 pub mod finalcut_cmds;
 #[cfg(all(test, not(windows)))]
@@ -2131,7 +2132,13 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         // 并落盘——只改内存会留下 `planned.size = 旧值` / `entry.size = 新值` /
         // `completed = true` 的自相矛盾清单。
         let mut m = m;
-        let plan = refresh_resume_plan(&app, &mut m, &handle.project_root, &resolved)?;
+        let plan = refresh_resume_plan(
+            &app,
+            &mut m,
+            &handle.project_root,
+            &resolved,
+            &handle.machine_id,
+        )?;
         let mut snap = handle.snapshot.lock().unwrap();
         let old: std::collections::HashMap<String, &'static str> = snap
             .files
@@ -2171,6 +2178,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
     m: &mut manifest::CopyManifest,
     project_root: &Path,
     source_root: &Path,
+    machine_id: &str,
 ) -> CmdResult<Vec<copy::PlannedFile>> {
     let selection = copy::SourceSelection::from_folders(m.source_selection.clone());
     if matches!(selection, copy::SourceSelection::WholeVolume) {
@@ -2208,7 +2216,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
             &plan,
             m.scan_policy_version,
         );
-        persist_refreshed_plan(app, m, project_root, &plan)?;
+        persist_refreshed_plan(app, m, project_root, &plan, machine_id)?;
         return Ok(plan);
     }
 
@@ -2278,7 +2286,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
                     ),
                 );
             }
-            persist_refreshed_plan(app, m, project_root, &plan)?;
+            persist_refreshed_plan(app, m, project_root, &plan, machine_id)?;
         }
         Err(e) => notify::warn(
             app,
@@ -2398,6 +2406,7 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
     m: &mut manifest::CopyManifest,
     project_root: &Path,
     plan: &[copy::PlannedFile],
+    machine_id: &str,
 ) -> CmdResult<()> {
     let refreshed: Vec<manifest::PlannedFile> =
         plan.iter().map(manifest::PlannedFile::from_plan).collect();
@@ -2408,6 +2417,15 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
     // 计划变了就还没跑完:`completed` 必须跟着回落,否则会留下
     // 「清单说完成了、里面却有未验证项」的自相矛盾状态
     m.completed = false;
+    // 这一步在 worker 起来**之前**,不在租约保护内——而另一个进程的 worker
+    // 可能正跑着这个任务。整份覆盖会把人家已经记下的 entries 顶掉,还不报错。
+    if let Some(who) = crate::core::lease::live_holder(project_root, &m.id, machine_id) {
+        let msg = format!(
+            "这个拷卡任务正被 {who} 执行中,拒绝在这里改写它的清单——两处同时写会让一方的记录被整份顶掉。请在那边继续,或等它结束后再试"
+        );
+        notify::warn(app, "copy-resume-lease-held", msg.clone());
+        return Err(msg);
+    }
     if let Err(e) = manifest::save(project_root, m) {
         let msg = format!(
             "续传前刷新的文件清单**未能**写回拷卡清单,已拒绝续传(继续跑会让审计范围与实际拷贝范围对不上:\
@@ -2421,6 +2439,100 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
 
 /// 启动时从各项目未完成的 manifest 重建 paused 任务(评审 H3/P0-3):
 /// 崩溃/重启后任务不再消失,可从任务列表续传。
+/// 残留临时文件的存活门槛。比任何一次正常的「写→改名」都长得多,
+/// 又短到不会让垃圾在 NAS 上过夜。
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// 清掉原子写留下的孤儿临时文件。
+///
+/// [`crate::core::fsx::write_atomic`] 用**唯一**临时名(修的是「两处同时写会
+/// 互相截断」),代价是:进程在「写完临时文件」和「改名」之间被杀掉/断电/
+/// NAS 断连时,那个文件永远留在盘上,而且每次都是新名字——**无界累积**,
+/// 每个还都是一份完整清单。旧的固定名至少会被下一次覆盖掉。
+///
+/// 零静默:清了几个要说一声,清不掉也要说一声。
+#[derive(Default)]
+pub(crate) struct SweepTally {
+    pub removed: usize,
+    pub stuck: usize,
+    /// 出问题的目录(删不掉 / 扫不动),报文里要点名——「把目录加进排除项」
+    /// 这条建议,没有目录用户不知道该加哪个
+    pub trouble: Vec<String>,
+}
+
+pub(crate) fn sweep_stale_temp_files(dir: &std::path::Path, tally: &mut SweepTally) {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        // 目录不存在 = 这个项目还没拷过卡,正常
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        // 其余(权限不足、NAS 半死)是真的没扫成:吞掉就是无提示 fail-open
+        Err(_) => {
+            tally.stuck += 1;
+            tally.trouble.push(dir.display().to_string());
+            return;
+        }
+    };
+    let now = std::time::SystemTime::now();
+    let (mut removed, mut stuck) = (0usize, 0usize);
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.starts_with('.') || !name.ends_with(crate::core::fsx::TMP_SUFFIX) {
+            continue;
+        }
+        let old_enough = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > STALE_TEMP_AGE);
+        if !old_enough {
+            continue; // 可能是另一台机器**此刻**正在写的那一个
+        }
+        match std::fs::remove_file(e.path()) {
+            Ok(()) => removed += 1,
+            Err(_) => stuck += 1,
+        }
+    }
+    tally.removed += removed;
+    tally.stuck += stuck;
+    if stuck > 0 {
+        tally.trouble.push(dir.display().to_string());
+    }
+}
+
+/// 把全部项目的清扫结果**汇总成一条**再发。
+///
+/// 逐项目发会被通知的 30 秒合并窗口折成一条,而合并只保留最后一条的正文——
+/// 项目 A 清了 7 个、B 清了 1 个、C 清了 3 个,用户看到的是「清理了 3 个(C 的路径)×3」,
+/// 前两个的数量和路径全丢。「删不掉」那条尤其需要点名目录。
+fn report_sweep<R: tauri::Runtime>(app: &AppHandle<R>, tally: &SweepTally) {
+    if tally.removed > 0 {
+        notify::info(
+            app,
+            "stale-temp-swept",
+            format!("清理了 {} 个上次异常退出留下的临时清单文件", tally.removed),
+        );
+    }
+    if tally.stuck > 0 {
+        let dirs = tally.trouble.iter().take(5).cloned().collect::<Vec<_>>();
+        let more = tally.trouble.len().saturating_sub(dirs.len());
+        notify::warn(
+            app,
+            "stale-temp-stuck",
+            format!(
+                "{} 处残留的临时清单文件没能清掉(权限不足、被占用,或目录读不动),已留在盘上:{}{}",
+                tally.stuck,
+                dirs.join("、"),
+                if more > 0 {
+                    format!(" 等 {} 处", tally.trouble.len())
+                } else {
+                    String::new()
+                }
+            ),
+        );
+    }
+}
+
 pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
     // 经统一入口:配置损坏/权限错误也要上报(codex 六轮:此处曾漏)
     let Some(nas) = load_config(app, state).nas_root else {
@@ -2440,7 +2552,9 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
     notice_catalog_warnings(app, &scan.warnings);
     let projects = scan.projects;
     let vols = volumes::list_volumes();
+    let mut sweep = SweepTally::default();
     for p in projects {
+        sweep_stale_temp_files(&manifest::manifest_dir(&p.root), &mut sweep);
         let list = match manifest::list(&p.root) {
             Ok(l) => l,
             Err(_) => {
@@ -2604,6 +2718,8 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
             state.tasks.insert(m.id.clone(), handle);
         }
     }
+    // 全部项目扫完再汇总成一条:逐项目发会被 30 秒合并窗口折掉计数和目录
+    report_sweep(app, &sweep);
 }
 
 /// 单文件重试:失败文件在 manifest 中未验证,重跑任务即只补拷这些文件。

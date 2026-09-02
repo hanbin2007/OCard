@@ -229,21 +229,93 @@ pub fn manifest_dir(project_root: &Path) -> PathBuf {
     project_root.join(STATE_DIR).join(MANIFEST_DIR)
 }
 
-pub fn save(project_root: &Path, m: &CopyManifest) -> Result<()> {
+/// 清单落盘。**每拷完一个文件调一次**——所以它既是热路径,也是整个拷卡任务里
+/// 唯一会把中断上抛成硬错误的 IO(逐文件的失败都收进 `FileStatus::Failed`)。
+///
+/// 0.4.3 事故:这里此前是固定临时名 + 裸 `fs::rename`,Windows 上目标只要被
+/// 杀毒软件/索引开着就 `ACCESS_DENIED(5)`,整个任务当场中断,而报文只有
+/// 「IO 错误: 拒绝访问。 (os error 5)」。现在走 [`fsx::write_atomic`](唯一临时名 +
+/// 占用重试),真失败时报文带路径与下一步,并保持 IO 口径(可续传)。
+///
+/// # 已知边界:跨进程没有事务
+///
+/// 这是**整份覆盖**,不是读-改-写事务。同一个 manifest id 被两个进程同时写时
+/// (唯一现实场景:同一个暂停任务在两台工作站上各点了一次「继续」),后写的
+/// 整份顶掉先写的,`entries` / `completed` 都可能回退。
+///
+/// 唯一临时名修好了「互相截断出一份坏 JSON」——那个至少会当场报错;换来的是
+/// 每次 rename 发布的都是一份**完整自洽**的快照,于是丢更新变得**安静**了。
+/// 更干净,但也更难发现。真正的解法是给清单加 revision/CAS 或跨进程 owner
+/// lease,覆盖整个「读取—修改—保存」;那是独立一轮的事,与本波混做会让评审
+/// 无法归因。在那之前:**不要在两台机器上同时续同一个任务**。
+/// (`manifest.rs` 的 owner lease 已在契约文档「已知未修」一节留档。)
+pub fn save(project_root: &Path, m: &CopyManifest) -> Result<(super::fsx::WriteReport, PathBuf)> {
     let dir = manifest_dir(project_root);
     // R2 P0:`.ocard`/`manifests` 中间段防符号链接偷渡,落地闸后再写
-    super::paths::ensure_dir_within(project_root, &dir).map_err(super::CoreError::Invalid)?;
-    let tmp = dir.join(format!("{}.json.tmp", m.id));
-    fs::write(&tmp, serde_json::to_vec_pretty(m)?)?;
-    fs::rename(&tmp, dir.join(format!("{}.json", m.id)))?;
-    Ok(())
+    // 分类版:NAS 抖动/杀软占用要判成**可续传**的 IO,不是死路(见 paths::GateError)
+    super::paths::ensure_dir_within_core(project_root, &dir)?;
+    let path = manifest_path(project_root, &m.id)?;
+    let bytes = serde_json::to_vec_pretty(m)?;
+    match super::fsx::write_atomic(&path, &bytes) {
+        Ok(r) => Ok((r, path)),
+        // 报文带上「已重试 N 轮」:那是系统替用户排除掉「没有写权限」那一支的硬证据
+        Err(f) => Err(super::CoreError::io_detail_retried(
+            "写入拷卡清单",
+            &path,
+            &f,
+        )),
+    }
+}
+
+/// 由清单 id 拼出落点,并把 id 当**不可信输入**过闸。
+///
+/// `CopyManifest.id` 来自 NAS 上的 JSON——那是一份别人能改、也可能损坏的文件。
+/// 此前它直接参与路径拼接,而 `save` 只检查了 `.ocard/manifests` 这个目录本身:
+/// 一份 `id` 被改成 `../../..../x` 的清单,能让本进程把 JSON 原子覆盖到项目
+/// 之外任何可写的位置。续传与启动补投都会读这个 id。
+///
+/// 三层闸:① id 必须是 UUID(引擎自己生成的形状);② 拼出来的必须仍是
+/// `manifests/` 的直接子项;③ 最终路径过 `assert_within`。
+fn manifest_path(project_root: &Path, id: &str) -> Result<PathBuf> {
+    // 必须是**规范连字符形式**(36 位)。`Uuid::parse_str` 还接受 32 位无连字符、
+    // `{...}` 花括号、以及 `urn:uuid:...`——后两种带着 `{}` 和 `:`,在 Windows 上
+    // `:` 是备用数据流(ADS)的分隔符,落点会变成对另一个文件的流写入,
+    // 报错方向完全指偏。引擎自己生成的一律是 36 位形式,收紧不影响任何真实清单。
+    if id.len() != 36 || uuid::Uuid::parse_str(id).is_err() {
+        return Err(super::CoreError::Invalid(format!(
+            "拷卡清单 id 不是合法 UUID,拒绝按它拼路径(清单可能已损坏或被篡改): {id}"
+        )));
+    }
+    let dir = manifest_dir(project_root);
+    let path = dir.join(format!("{id}.json"));
+    // UUID 里不可能有分隔符,这条按说到不了;留着是因为闸的价值在于
+    // 「形状检查哪天被放宽了也还有人兜底」,而不是「现在正好够用」
+    if path.parent() != Some(dir.as_path()) {
+        return Err(super::CoreError::Invalid(format!(
+            "拷卡清单落点逃出了清单目录,拒绝: {}",
+            path.display()
+        )));
+    }
+    super::paths::assert_within_core(project_root, &path)?;
+    Ok(path)
 }
 
 pub fn load(project_root: &Path, id: &str) -> Result<CopyManifest> {
-    let path = manifest_dir(project_root).join(format!("{id}.json"));
-    // R4(终审 P0-3):清单读取过 canonical 只读闸(清单驱动 resume,是高危输入)
-    super::paths::assert_within(project_root, &path).map_err(super::CoreError::Invalid)?;
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
+    // R4(终审 P0-3):清单读取过 canonical 只读闸(清单驱动 resume,是高危输入);
+    // id 本身也是不可信输入,形状闸见 [`manifest_path`]
+    let path = manifest_path(project_root, id)?;
+    let bytes =
+        fs::read(&path).map_err(|e| super::CoreError::io_detail("读取拷卡清单", &path, &e))?;
+    let m: CopyManifest = serde_json::from_slice(&bytes)?;
+    // 文件名与内容里的 id 必须一致:不一致说明这份清单被搬过/改过,而 `save`
+    // 是按**内容里的 id** 定落点的——放行等于让一次读把后续的写引到别处
+    if m.id != id {
+        return Err(super::CoreError::Invalid(format!(
+            "拷卡清单内容的 id({})与文件名({id})不一致,拒绝使用(清单可能已损坏或被篡改)",
+            m.id
+        )));
+    }
+    Ok(m)
 }
 
 /// 清单列表 + 健康度(损坏清单计数必须上报,零静默原则)。
@@ -262,7 +334,7 @@ pub fn list(project_root: &Path) -> Result<ManifestList> {
     }
     // R5 终审:目录整段 + 逐文件闸——清单驱动 resume/统计/auto_proxy,
     // 任何一环经链接读入外部内容都不许
-    super::paths::assert_within(project_root, &dir).map_err(super::CoreError::Invalid)?;
+    super::paths::assert_within_core(project_root, &dir)?;
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         if super::paths::is_symlink(&path) {
@@ -285,6 +357,139 @@ pub fn list(project_root: &Path) -> Result<ManifestList> {
 
 #[cfg(test)]
 mod tests {
+    /// 0.4.3 现场:Windows 上这里失败,用户看到的全部信息是
+    /// 「IO 错误: 拒绝访问。 (os error 5)」——哪个文件、该做什么,一个字都没有。
+    /// `save` 退回裸 `fs::write` + `fs::rename`(即 `CoreError::Io`)时本测试红。
+    #[test]
+    #[cfg(unix)]
+    fn save_failure_says_which_file_and_what_to_do() {
+        use std::os::unix::fs::PermissionsExt;
+        // root 无视权限位:0o500 拦不住它,save 会成功,unwrap_err() 就 panic。
+        // CI 容器默认 root 时这条是定时炸弹(评审点名)。
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("跳过:root 无视目录权限位,造不出这个场景");
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let dir = manifest_dir(&project);
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = sample();
+        // 目录不可写 = 建不了临时文件,与 NAS 上拒绝访问同一条错误路径
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let err = save(&project, &m).unwrap_err();
+        // 恢复权限,免得 TempDir 清理失败
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let msg = err.to_string();
+        assert!(err.is_io(), "仍须是 IO 口径(可续传): {msg}");
+        assert!(msg.contains("写入拷卡清单"), "要说清是哪一步: {msg}");
+        assert!(
+            msg.contains(&format!("{}.json", m.id)),
+            "要说清是哪个文件: {msg}"
+        );
+        let must_mention = if cfg!(windows) {
+            "杀毒软件"
+        } else {
+            "权限"
+        };
+        assert!(msg.contains(must_mention), "要给下一步: {msg}");
+        assert!(!msg.starts_with("IO 错误:"), "退回天书报文了: {msg}");
+    }
+
+    /// 清单 id 来自 NAS 上可被改写的 JSON,却参与路径拼接。
+    /// 去掉 UUID 形状闸时本测试红——那一去就能让一份被改过的清单
+    /// 把 JSON 原子覆盖到项目之外任何可写的位置。
+    #[test]
+    fn a_tampered_manifest_id_cannot_steer_the_write_out_of_the_project() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(manifest_dir(&project)).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim.json"), b"original").unwrap();
+
+        for evil in [
+            "../../outside/victim",
+            "../../../outside/victim",
+            "/etc/passwd",
+            "not-a-uuid",
+            // parse_str 接受的另外三种形状:32 位无连字符、花括号、URN。
+            // 后两种带 `{}` / `:`,Windows 上 `:` 会变成 ADS 分隔符
+            "urn:uuid:67e55044-10b1-426f-9247-bb680e5fe0c8",
+            "{67e55044-10b1-426f-9247-bb680e5fe0c8}",
+            "67e5504410b1426f9247bb680e5fe0c8",
+        ] {
+            let mut m = sample();
+            m.id = evil.to_string();
+            let err = save(&project, &m).unwrap_err();
+            assert!(
+                !err.is_io(),
+                "路径逃逸是死路,不该被判成可续传的 IO 问题: {err}"
+            );
+            assert!(err.to_string().contains("拒绝"), "{err}");
+        }
+        assert_eq!(
+            std::fs::read(outside.join("victim.json")).unwrap(),
+            b"original",
+            "项目外的文件被改写了"
+        );
+    }
+
+    /// 文件名与内容里的 id 对不上时必须拒绝:`save` 是按**内容里的 id** 定落点的,
+    /// 放行等于让一次读把后续的写引到别处。
+    #[test]
+    fn load_refuses_a_manifest_whose_inner_id_does_not_match_its_file_name() {
+        let tmp = tempdir().unwrap();
+        let mut m = sample();
+        save(tmp.path(), &m).unwrap();
+        let real_id = m.id.clone();
+        // 把内容里的 id 换成另一个合法 UUID,文件名不动
+        m.id = uuid::Uuid::new_v4().to_string();
+        std::fs::write(
+            manifest_dir(tmp.path()).join(format!("{real_id}.json")),
+            serde_json::to_vec(&m).unwrap(),
+        )
+        .unwrap();
+
+        let err = load(tmp.path(), &real_id).unwrap_err();
+        assert!(err.to_string().contains("不一致"), "{err}");
+    }
+
+    /// 项目根整个不见了(NAS 掉线)= **可续传**的 IO 问题,不是死路。
+    ///
+    /// 这条钉的是路径闸的错误分类:`ensure_dir_within` 会做 `canonicalize` +
+    /// `create_dir_all`,把它们的 IO 失败一律 `format!` 成 `Invalid` 时本测试红——
+    /// 那一步会让「NAS 抖了一下」被判成任务终结,用户被迫整卡重拷。
+    #[test]
+    fn a_vanished_project_root_is_a_resumable_io_problem_not_a_dead_end() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path().join("gone");
+        let err = save(&project, &sample()).unwrap_err();
+        assert!(
+            err.is_io(),
+            "NAS 掉线必须判成可续传的 IO 中断,而不是死路: {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("重新挂载"), "要给下一步: {msg}");
+        assert!(!msg.starts_with("根目录解析失败:"), "退回天书报文了: {msg}");
+    }
+
+    /// 临时文件不许留在 NAS 上(旧实现失败后 `<id>.json.tmp` 就那么躺着)。
+    #[test]
+    fn save_leaves_no_temp_file_behind() {
+        let tmp = tempdir().unwrap();
+        let m = sample();
+        save(tmp.path(), &m).unwrap();
+        let junk: Vec<String> = std::fs::read_dir(manifest_dir(tmp.path()))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n != &format!("{}.json", m.id))
+            .collect();
+        assert!(junk.is_empty(), "清单目录里有残留: {junk:?}");
+    }
+
     use super::*;
     use tempfile::tempdir;
 

@@ -8,12 +8,14 @@
  * - 对**未知 code 通用呈现**：后端随时会加新 code，前端不做白名单
  */
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import * as api from "../api";
 import { IconBell, IconClose } from "./Icon";
 import { formatTimestamp } from "../lib/format";
 import { withViewTransition } from "../lib/motion";
 import type { NoticeLevel } from "../api/types";
 import { useStore, type NoticeEntry } from "../state/store";
+import { useWindowRole } from "../state/windowBridge";
 
 /** warning / info 在即时呈现区停留多久后自动收进铃铛（error 永不自动收起） */
 const AUTO_HIDE_MS = 6000;
@@ -74,7 +76,90 @@ const NOTICE_TITLES: Record<string, string> = {
   "copy-task-failed": "拷卡失败",
   /* 后端在部分拷贝完成时另发的告警:卡上还有没拷的内容 */
   "copy-partial-scope-done": "部分拷贝完成，请勿格式化",
+  /* 「暂停」和「失败」是两件事:前者已拷部分完好、点继续就接着走,后者要人介入。
+     0.4.3 现场这条落在通用回落上，用户看到的抬头就是干巴巴一句「发生错误」。 */
+  "copy-task-paused": "拷卡已中断，可从断点续传",
+  "copy-task-aborted": "拷卡中断",
+  /* 写状态文件被别的程序占住(杀毒/索引):这次重试成功了，但它预告下一次可能真断 */
+  "fs-write-contention": "写状态文件被占用",
+  "fs-write-contention-total": "本次拷卡多次被占用拖慢",
+  "material-rename-contention": "素材落位被占用拖慢",
+  "auto-proxy-deferred": "自动转代理未派发",
+  "stale-temp-swept": "已清理上次的残留临时文件",
+  "stale-temp-stuck": "残留临时文件删不掉",
+  "diagnostics-dir-fallback": "诊断报告换了存放位置",
+  /* 抬头必须自己表态:这是一条 warning,写成「诊断报告已生成」会被一扫而过,
+     而它真正要说的是「文件夹没弹出来,得你自己去找」 */
+  "diagnostics-reveal-failed": "诊断报告已生成，但没能打开文件夹",
 };
+
+/**
+ * 出这些错时，用户第一件该做的事就是把现场发出来。
+ * 与其在报文里用文字把人支到「设置 → 关于与更新 → 导出诊断报告」三级菜单，
+ * 不如就在出事的这张卡片上放一个按钮——0.4.3 现场那位并不是不知道路，
+ * 是当时手忙脚乱。
+ */
+const DIAGNOSTIC_CODES = new Set([
+  "copy-task-paused",
+  "copy-task-aborted",
+  "copy-task-failed",
+  "fs-write-contention",
+  "material-rename-contention",
+  "auto-proxy-deferred",
+]);
+
+/**
+ * 就地导出诊断报告。放在出事的那张卡片上，而不是让用户去翻三级菜单。
+ *
+ * 三种结果各有各的呈现:成功给路径(得知道去哪儿找才发得出来)、
+ * 生成了但文件夹没弹出来、彻底失败给原因。没有一种是「点了没反应」。
+ */
+function ExportReportButton() {
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState<
+    { ok: true; path: string; revealed: boolean } | { ok: false; reason: string } | null
+  >(null);
+
+  if (done?.ok) {
+    return (
+      <p className="toast__message" data-testid="notice-export-done">
+        诊断报告已导出：{done.path}
+        {done.revealed ? "（文件夹已打开）" : "（文件夹没能自动打开，请按上面的路径找）"}
+      </p>
+    );
+  }
+  return (
+    <>
+      <button
+        type="button"
+        className="btn btn--sm"
+        data-testid="notice-export-report"
+        disabled={busy}
+        onClick={() => {
+          if (busy) return;
+          setBusy(true);
+          void api
+            .exportDiagnostics()
+            .then((r) => setDone({ ok: true, ...r }))
+            .catch((err: unknown) =>
+              setDone({
+                ok: false,
+                reason: err instanceof Error ? err.message : String(err),
+              }),
+            )
+            .finally(() => setBusy(false));
+        }}
+      >
+        {busy ? "正在导出…" : "导出诊断报告"}
+      </button>
+      {done && !done.ok ? (
+        <p className="toast__message" data-testid="notice-export-error" role="alert">
+          导出诊断报告失败：{done.reason}
+        </p>
+      ) : null}
+    </>
+  );
+}
 
 /** 未知 code 也要有体面的抬头，不能露出空白 */
 const FALLBACK_TITLES: Record<NoticeLevel, string> = {
@@ -88,6 +173,26 @@ function noticeTitle(entry: NoticeEntry): string {
 }
 
 /** 通知带任务引用时的「查看任务」跳转:切项目→选任务→进拷卡屏 */
+/**
+ * 这个窗口里点「查看任务」到底有没有用。
+ *
+ * 后端的通知广播到**所有** webview，欢迎/项目管理窗口也渲染 toast。而
+ * `useGoToTask` 靠 dispatch `navigate: "copy"` 生效——`WelcomeRoot` 按本地
+ * `view` 分支渲染、根本不消费 route，按钮点下去什么都不会发生。
+ *
+ * 判据用窗口角色而不是「store 里有没有这个任务」：两个窗口共用同一个 store，
+ * 任务列表在哪边都可能是满的，按任务判会在欢迎窗口里照样渲染出死按钮。
+ */
+function useCanGoToTask() {
+  // 不抛的版本：通知中心是零静默的最后一道出口，不能因为某处渲染它时
+  // 没包 Provider 就整个炸掉。拿不到角色 → 不渲染按钮（fail-closed）。
+  const role = useWindowRole();
+  return useCallback(
+    (entry: NoticeEntry) => role === "main" && Boolean(entry.taskId),
+    [role],
+  );
+}
+
 function useGoToTask() {
   const { state, dispatch } = useStore();
   return useCallback(
@@ -118,6 +223,7 @@ function NoticeBanner({
 }) {
   const { dispatch } = useStore();
   const goToTask = useGoToTask();
+  const canGoToTask = useCanGoToTask();
   const isError = entry.level === "error";
 
   useEffect(() => {
@@ -156,7 +262,8 @@ function NoticeBanner({
           ) : null}
         </div>
         <p className="toast__message">{entry.message}</p>
-        {entry.taskId ? (
+        {DIAGNOSTIC_CODES.has(entry.code) ? <ExportReportButton /> : null}
+        {canGoToTask(entry) ? (
           <button
             type="button"
             className="btn btn--sm"
@@ -220,6 +327,7 @@ export function NoticeToasts({ hasBell = true }: { hasBell?: boolean } = {}) {
 export function NoticeBell() {
   const { state, dispatch } = useStore();
   const goToTask = useGoToTask();
+  const canGoToTask = useCanGoToTask();
   const { notices, noticesOpen } = state;
   const unread = notices.filter((n) => !n.read).length;
   // 只有尚未确认的 error 才让徽标转红
@@ -333,7 +441,10 @@ export function NoticeBell() {
                       </span>
                     </div>
                     <p className="notice-item__message">{entry.message}</p>
-                    {entry.taskId ? (
+                    {/* toast 只显示最新 3 条 live,error 被「全部确认」一键清掉之后
+                        人又得回三级菜单——面板项上也得有这个按钮 */}
+                    {DIAGNOSTIC_CODES.has(entry.code) ? <ExportReportButton /> : null}
+                    {canGoToTask(entry) ? (
                       <button
                         type="button"
                         className="btn btn--sm"

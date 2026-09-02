@@ -193,54 +193,150 @@ mod windows_tests {
 /// 最后整体复核一次(防创建期间被替换)。canonicalize→写入之间的
 /// 极窄窗口是无锁共享盘的固有边界,已在评审收敛文档声明。
 pub(crate) fn ensure_dir_within(root: &Path, dir: &Path) -> Result<(), String> {
-    let canon_root = std::fs::canonicalize(root).map_err(|e| format!("根目录解析失败: {e}"))?;
+    ensure_dir_within_gated(root, dir).map_err(GateError::into_message)
+}
+
+/// 闸失败的两种性质。分开是因为下游处置完全不同:
+///
+/// - `Refused` = 路径逃逸/形状不对。**确定性拒绝**,重试只会一直撞同一堵墙。
+/// - `Io` = 底层 IO 失败(NAS 抖了一下、杀毒软件占着、共享会话过期)。
+///   **可续传**:排除原因后接着拷就是。
+///
+/// 0.4.3 事故收尾时发现的坑:这两道闸此前把所有失败都 `format!` 成 `String`
+/// 交给 `CoreError::Invalid`,于是「`canonicalize` 撞上 NAS 抖动」被判成死路——
+/// 任务终结、不可续传,报文还是 `根目录解析失败: 拒绝访问。 (os error 5)`
+/// 这种天书。跟这波要消灭的那句是同一个病。
+pub(crate) enum GateError {
+    Refused(String),
+    Io {
+        what: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl GateError {
+    /// 老调用方口径:压回一句话。
+    ///
+    /// 措辞比改造前**更全**(多了路径),不是逐字一致——String 版还有 20 多个
+    /// 调用方(整理、交付打包、转码输出目录…),它们的报文都跟着变好了一点,
+    /// 但**都还没做 IO/逃逸的分类**:NAS 抖动时那几条路仍会吐出无下一步的句子。
+    /// 那是下一轮的事,别让这个注释假装已经统一了。
+    fn into_message(self) -> String {
+        match self {
+            Self::Refused(m) => m,
+            Self::Io { what, path, source } => {
+                format!("{what}失败: {} — {source}", path.display())
+            }
+        }
+    }
+
+    /// 分类口径:逃逸 → `Invalid`(死路),IO → `IoDetail`(可续传 + 人话)。
+    pub(crate) fn into_core(self) -> super::CoreError {
+        match self {
+            Self::Refused(m) => super::CoreError::Invalid(m),
+            Self::Io { what, path, source } => super::CoreError::io_detail(what, &path, &source),
+        }
+    }
+}
+
+fn ensure_dir_within_gated(root: &Path, dir: &Path) -> Result<(), GateError> {
+    let canon_root = std::fs::canonicalize(root).map_err(|e| GateError::Io {
+        what: "解析项目根目录",
+        path: root.to_path_buf(),
+        source: e,
+    })?;
     let root_key = comparison_key(&canon_root);
     let mut probe = dir.to_path_buf();
     while !probe.exists() {
         match probe.parent() {
             Some(p) => probe = p.to_path_buf(),
-            None => return Err(format!("目录不在任何已存在路径下: {}", dir.display())),
+            None => {
+                return Err(GateError::Refused(format!(
+                    "目录不在任何已存在路径下: {}",
+                    dir.display()
+                )))
+            }
         }
     }
-    let canon_probe = std::fs::canonicalize(&probe).map_err(|e| format!("目录解析失败: {e}"))?;
+    let canon_probe = std::fs::canonicalize(&probe).map_err(|e| GateError::Io {
+        what: "解析目录",
+        path: probe.clone(),
+        source: e,
+    })?;
     if !comparison_key(&canon_probe).starts_with(&root_key) {
-        return Err(format!(
+        return Err(GateError::Refused(format!(
             "目录实际位置在根之外(疑似被符号链接替换),拒绝写入: {}",
             dir.display()
-        ));
+        )));
     }
-    std::fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {e}"))?;
-    let canon = std::fs::canonicalize(dir).map_err(|e| format!("目录解析失败: {e}"))?;
+    std::fs::create_dir_all(dir).map_err(|e| GateError::Io {
+        what: "创建目录",
+        path: dir.to_path_buf(),
+        source: e,
+    })?;
+    let canon = std::fs::canonicalize(dir).map_err(|e| GateError::Io {
+        what: "解析目录",
+        path: dir.to_path_buf(),
+        source: e,
+    })?;
     if !comparison_key(&canon).starts_with(&root_key) {
-        return Err(format!(
+        return Err(GateError::Refused(format!(
             "目录实际位置在根之外(疑似被符号链接替换),拒绝写入: {}",
             dir.display()
-        ));
+        )));
     }
     Ok(())
+}
+
+/// [`ensure_dir_within`] 的分类版:IO 失败保持可续传口径并带人话。
+pub(crate) fn ensure_dir_within_core(root: &Path, dir: &Path) -> super::Result<()> {
+    ensure_dir_within_gated(root, dir).map_err(GateError::into_core)
 }
 
 /// 只读落点闸(R2 P0:`.ocard` 链中间组件可被替换为符号链接):
 /// 把 target 的「最深已存在祖先」canonicalize 后断言仍在 root 之内。
 /// 与 [`ensure_dir_within`] 同源,但不产生任何副作用(读路径用)。
 pub(crate) fn assert_within(root: &Path, target: &Path) -> Result<(), String> {
-    let canon_root = std::fs::canonicalize(root).map_err(|e| format!("根目录解析失败: {e}"))?;
+    assert_within_gated(root, target).map_err(GateError::into_message)
+}
+
+/// [`assert_within`] 的分类版:IO 失败保持可续传口径并带人话。
+pub(crate) fn assert_within_core(root: &Path, target: &Path) -> super::Result<()> {
+    assert_within_gated(root, target).map_err(GateError::into_core)
+}
+
+fn assert_within_gated(root: &Path, target: &Path) -> Result<(), GateError> {
+    let canon_root = std::fs::canonicalize(root).map_err(|e| GateError::Io {
+        what: "解析项目根目录",
+        path: root.to_path_buf(),
+        source: e,
+    })?;
     let root_key = comparison_key(&canon_root);
     let mut probe = target.to_path_buf();
     while !probe.exists() {
         match probe.parent() {
             Some(p) => probe = p.to_path_buf(),
-            None => return Err(format!("路径不在任何已存在位置下: {}", target.display())),
+            None => {
+                return Err(GateError::Refused(format!(
+                    "路径不在任何已存在位置下: {}",
+                    target.display()
+                )))
+            }
         }
     }
-    let canon = std::fs::canonicalize(&probe).map_err(|e| format!("路径解析失败: {e}"))?;
+    let canon = std::fs::canonicalize(&probe).map_err(|e| GateError::Io {
+        what: "解析路径",
+        path: probe.clone(),
+        source: e,
+    })?;
     if comparison_key(&canon).starts_with(&root_key) {
         Ok(())
     } else {
-        Err(format!(
+        Err(GateError::Refused(format!(
             "路径实际位置在根之外(疑似符号链接),拒绝: {}",
             target.display()
-        ))
+        )))
     }
 }
 

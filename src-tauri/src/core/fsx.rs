@@ -368,3 +368,439 @@ mod times_tests {
         );
     }
 }
+
+/* ------------------------------------------------------------------ *
+ * 原子写(替换语义)。0.4.3 现场事故:Windows 上拷卡跑到一半整任务中断,
+ * 报文只有「IO 错误: 拒绝访问。 (os error 5)」——既没说是哪个文件,
+ * 也没说该做什么。查下来是 `manifest::save` 的 `fs::write` + `fs::rename`:
+ *
+ * ① Windows 的 rename 是 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`(std 在拿到
+ *    AccessDenied 后还会试一次 `FileRenameInfoEx` 的 POSIX 语义,但 SMB 上
+ *    未必支持)。目标文件只要**被别的进程开着**且对方没给 FILE_SHARE_DELETE,
+ *    就 ACCESS_DENIED(5)。杀毒软件、Windows Search、NAS 自己的索引在文件刚
+ *    落地时抢着扫,是常态。POSIX 的 rename 不受打开句柄影响,所以
+ *    macOS/Linux 上一次都没见过。
+ * ② 清单是**每拷完一个文件就重写一次**的,一张两千个文件的卡就有两千次机会。
+ * ③ 临时名固定成 `<id>.json.tmp`:同一任务被两处同时写时会互相截断,
+ *    失败后临时文件还留在 NAS 上没人清。
+ *
+ * 对策:唯一临时名 + 对「占用类」错误做有界重试。Windows 把「有人占着」和
+ * 「你真没权限」压在同一个错误码 5 上,从错误码分不开——只能靠重试分:
+ * 重试后成功 = 占用,重试到底 = 真的写不了。
+ *
+ * **边界(不要过度承诺)**:这里的「原子」是**可见性原子**——读者要么看到旧的
+ * 完整内容,要么看到新的完整内容,绝不会看到写了一半的。它**不是掉电原子**:
+ * 没有 `sync_all`,也没有对目录项 fsync,断电后 rename 有可能先于数据落盘。
+ * 按「每拷一个文件存一次」的频率,逐次 fsync 的代价在 NAS 上不可接受。
+ * ------------------------------------------------------------------ */
+
+/// 重试节奏(毫秒)。总计约 1.6s:够躲开杀毒软件的扫描窗口,又不至于让
+/// 「真的没权限」这种确定性失败在界面上卡住太久。
+///
+/// 带抖动(见 [`backoff_with_jitter`]):两个进程同时撞上占用时,固定节奏会让
+/// 它们在完全相同的时刻重试,锁步互相踩。
+const WRITE_RETRY_BACKOFF_MS: [u64; 5] = [20, 60, 150, 400, 900];
+
+/// 这次失败像不像「现在有人占着,等一下就好」。
+///
+/// Windows:`ERROR_ACCESS_DENIED(5)`(替换正被打开的目标)、
+/// `ERROR_SHARING_VIOLATION(32)`、`ERROR_LOCK_VIOLATION(33)`。
+/// POSIX 上 `PermissionDenied` 基本是确定性的,但 SMB/NFS 客户端会在
+/// 会话重连的窗口里短暂返回 EACCES,重试同样划算。
+fn is_contention(e: &io::Error) -> bool {
+    if matches!(
+        e.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ResourceBusy
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        matches!(e.raw_os_error(), Some(5) | Some(32) | Some(33))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// 第 `attempt` 次重试等多久。基数取自 [`WRITE_RETRY_BACKOFF_MS`],再叠 ±25%
+/// 的抖动打散并发重试的锁步。抖动源用 uuid 的低位——这里不需要密码学随机,
+/// 只需要两个进程不同步。
+fn backoff_with_jitter(attempt: usize) -> std::time::Duration {
+    let base = WRITE_RETRY_BACKOFF_MS[attempt];
+    let noise = u128::from_le_bytes(*uuid::Uuid::new_v4().as_bytes()) as u64;
+    // base/2 的一半 = ±25%
+    let spread = (base / 2).max(1);
+    let delta = noise % spread.max(1);
+    std::time::Duration::from_millis(base - spread / 2 + delta)
+}
+
+/// 本次写入用的临时文件名。**每次调用都不同**:固定临时名是 0.4.3 事故的
+/// 第三个因子——同一目标被两处同时写时会互相截断,失败后还留垃圾在 NAS 上。
+///
+/// 名字形状 `.<目标名>.<8 位十六进制>.tmp`,并统一以 [`TMP_SUFFIX`] 结尾,
+/// 好让启动期的残留清扫认得出它。用 8 位而不是完整 uuid 是因为路径长度:
+/// 36 位 uuid 会比目标名多出 41 个字符,项目路径深的 NAS 上原本能过 MAX_PATH
+/// 的清单会因为临时名超长而失败,报的还是「路径不存在」这种完全错误的方向。
+fn tmp_name_for(path: &Path) -> std::path::PathBuf {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "out".into());
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    dir.join(format!(".{stem}.{tag}{TMP_SUFFIX}"))
+}
+
+/// 原子写的临时文件后缀。启动期残留清扫按它识别(见 `commands::sweep_stale_temp_files`)。
+pub const TMP_SUFFIX: &str = ".ocardtmp";
+
+/// 一次原子写的结果:成功,外加**这次**为了躲开占用重试了几轮。
+///
+/// 重试次数按调用返回而不是进全局计数器(评审):`WRITE_CONTENTION` 那种
+/// 进程级 static 会被拷卡/分类/转码三条路径互相抢走,谁先结束谁把计数领走,
+/// 告警就归因到了错误的操作上——「把项目目录加进白名单」这条建议,用户
+/// 因此不知道该加哪个目录。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteReport {
+    pub retries: u32,
+}
+
+/// 原子写(替换语义):唯一临时文件 → 落盘 → rename 顶掉旧文件。
+/// 占用类失败自动重试;失败时不留临时文件。
+///
+/// **只重试 rename,不重试写**(评审):临时文件是新建的唯一名,写它失败
+/// 基本只有确定性原因(目录没权限、盘满、路径超长),重试纯属白等;而反复
+/// 重写还会一次次重新触发杀毒软件对新文件的扫描,让重试自我续期。
+///
+/// 与 [`rename_no_replace`] 的分工:那个是**绝不覆盖**(拷贝落点,覆盖=毁素材);
+/// 这个是**就要覆盖**(清单/状态文件,新版本本来就该顶掉旧版本)。
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<WriteReport, RetryFailure> {
+    write_atomic_with(path, bytes, |from, to| fs::rename(from, to))
+}
+
+/// [`write_atomic`] 的本体,`rename` 可注入。
+///
+/// 存在只为一件事:让「write_atomic 到底有没有真的走重试」可以被直接断言。
+/// 评审两路都指出过——只考 `retry_contended` 的话,把 `write_atomic` 里的
+/// 重试拆掉换成裸 `fs::rename`,测试照样全绿。
+fn write_atomic_with(
+    path: &Path,
+    bytes: &[u8],
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<WriteReport, RetryFailure> {
+    let tmp = tmp_name_for(path);
+    if let Err(e) = fs::write(&tmp, bytes) {
+        cleanup_tmp(&tmp);
+        // 临时文件是**新建的唯一名**,写它失败只有确定性原因(目录没权限、
+        // 盘满、路径超长),一轮都没重试过
+        return Err(RetryFailure {
+            retries: 0,
+            source: e,
+        });
+    }
+
+    match retry_contended(|| rename(&tmp, path)) {
+        Ok(retries) => Ok(WriteReport { retries }),
+        Err(e) => {
+            cleanup_tmp(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// 对「占用类」失败做有界重试,返回**重试轮数**(0 = 一次就成)。
+///
+/// 重试语义整个装在这里,不散在调用点上:这样它能被直接考——「失败两次、
+/// 第三次成功」「一直失败要原样上抛」「确定性错误一次都不重试」三条路,
+/// 都不需要真的去锁一个文件。评审两路都指出过:守卫全落在成功路径上时,
+/// 把整个循环删掉照样绿。
+/// 一次失败,外加**失败前已经重试了几轮**。
+///
+/// 轮数在失败路径上尤其值钱,而那恰恰是它此前被丢掉的地方:重试满 5 轮仍被拒,
+/// 意味着系统已经用一秒半替用户排除掉了「真的没有写权限」那一支——真没权限的话
+/// 第一次就失败,而且不会因为等一会儿就变。报文若不说这句,用户还得自己在
+/// 「有人占着」和「没权限」两条分支里猜,那正是 0.4.3 事故里最贵的一步。
+#[derive(Debug)]
+pub struct RetryFailure {
+    pub retries: u32,
+    pub source: io::Error,
+}
+
+impl RetryFailure {
+    /// 拼进报文的那半句(没重试过就是空串)。
+    pub fn note(&self) -> String {
+        if self.retries == 0 {
+            String::new()
+        } else {
+            format!(
+                "(已自动重试 {} 轮、等了约 {:.1} 秒,占用一直没退——基本可以排除「没有写权限」,\
+                 那种情况第一次就会失败且不会自行好转)",
+                self.retries,
+                WRITE_RETRY_BACKOFF_MS[..self.retries as usize]
+                    .iter()
+                    .sum::<u64>() as f64
+                    / 1000.0
+            )
+        }
+    }
+}
+
+pub fn retry_contended(mut op: impl FnMut() -> io::Result<()>) -> Result<u32, RetryFailure> {
+    let mut attempt = 0usize;
+    loop {
+        match op() {
+            Ok(()) => return Ok(attempt as u32),
+            Err(e) => {
+                if attempt >= WRITE_RETRY_BACKOFF_MS.len() || !is_contention(&e) {
+                    return Err(RetryFailure {
+                        retries: attempt as u32,
+                        source: e,
+                    });
+                }
+                std::thread::sleep(backoff_with_jitter(attempt));
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// 清理没能改名成功的临时文件。清不掉要说话:NAS 上攒下无人认领的临时文件
+/// 是**无界**的(每次都是新名字),而它们每个都是一份完整清单。
+fn cleanup_tmp(tmp: &Path) {
+    match fs::remove_file(tmp) {
+        Ok(()) => {}
+        // 本来就不在(写都没成功)——正常
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("原子写的临时文件清不掉,已留在盘上: {} — {e}", tmp.display()),
+    }
+}
+
+#[cfg(test)]
+mod write_atomic_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// 目标目录里除 `keep` 之外的东西(= 残留临时文件)。
+    fn strays(dir: &Path, keep: &str) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n != keep)
+            .collect()
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_temp_files() {
+        let tmp = tempdir().unwrap();
+        let p = tmp.path().join("m.json");
+        assert_eq!(write_atomic(&p, b"v1").unwrap().retries, 0);
+        assert_eq!(fs::read(&p).unwrap(), b"v1");
+        // 替换语义:第二次要顶掉第一次(与 rename_no_replace 相反)
+        write_atomic(&p, b"v2").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"v2");
+
+        let leftovers = strays(tmp.path(), "m.json");
+        assert!(leftovers.is_empty(), "临时文件必须清干净: {leftovers:?}");
+    }
+
+    /// 临时名退回固定名(如 `<id>.json.tmp`)时本测试红——考的是真实实现,
+    /// 不是 uuid 本身。
+    #[test]
+    fn write_atomic_uses_a_unique_temp_name_per_call() {
+        let dir = Path::new("/x/y");
+        let a = tmp_name_for(&dir.join("m.json"));
+        let b = tmp_name_for(&dir.join("m.json"));
+        assert_ne!(a, b, "同一目标两次写必须用不同的临时名");
+        assert_eq!(
+            a.parent(),
+            Some(dir),
+            "临时文件必须与目标同目录,rename 才是原子的"
+        );
+        for p in [&a, &b] {
+            let n = p.file_name().unwrap().to_string_lossy();
+            assert!(
+                n.starts_with('.') && n.ends_with(TMP_SUFFIX),
+                "临时名形状不对(启动期清扫按它识别残留): {n}"
+            );
+            // MAX_PATH:完整 uuid 会比目标名多出 41 个字符,项目路径深的 NAS 上
+            // 原本能过的清单会因为临时名超长而失败,还报成「路径不存在」
+            assert!(
+                n.len() <= "m.json".len() + 24,
+                "临时名比目标名长太多,深路径上会撞 MAX_PATH: {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_atomic_reports_hard_failures_instead_of_swallowing_them() {
+        // 目录不存在 = 确定性失败,必须原样上抛(不能因为重试机制把它吞成 Ok)
+        let tmp = tempdir().unwrap();
+        let e = write_atomic(&tmp.path().join("nope").join("m.json"), b"x").unwrap_err();
+        assert_eq!(e.source.kind(), io::ErrorKind::NotFound);
+        assert_eq!(e.retries, 0, "确定性失败不该报出重试轮数");
+    }
+
+    /* ---------------- 重试本身的正向覆盖 ----------------
+     *
+     * 评审两路都指出:此前那几条守卫全在成功路径上,把整个重试循环删掉照样绿。
+     * 重试是这波修复的核心,必须直接考「失败两次、第三次成功」这条路。
+     */
+
+    #[test]
+    fn retry_succeeds_after_transient_contention_and_counts_the_retries() {
+        let mut left = 2;
+        let n = retry_contended(|| {
+            if left > 0 {
+                left -= 1;
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(n, 2, "重试轮数要如实回报(告警的 ×N 全靠它)");
+    }
+
+    #[test]
+    fn retry_gives_up_after_the_backoff_table_and_returns_the_real_error() {
+        let mut calls = 0usize;
+        let e = retry_contended(|| {
+            calls += 1;
+            Err::<(), _>(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(
+            e.source.kind(),
+            io::ErrorKind::PermissionDenied,
+            "必须原样上抛真实错误"
+        );
+        assert_eq!(
+            e.retries,
+            WRITE_RETRY_BACKOFF_MS.len() as u32,
+            "失败时也要带上已重试的轮数——那是「已经替用户排除了『没有写权限』」的硬证据"
+        );
+        assert!(
+            e.note().contains("已自动重试"),
+            "报文要说得出这句: {}",
+            e.note()
+        );
+        assert_eq!(
+            calls,
+            WRITE_RETRY_BACKOFF_MS.len() + 1,
+            "首次 + 每一档退避各一次,不能无限重试"
+        );
+    }
+
+    /// 零覆盖保障不许被重试机制绕过:`AlreadyExists` = 目标已经被别人写了,
+    /// 重试只会不停撞同一堵墙,而这堵墙本身就是保障。素材落位走的就是这条路。
+    #[test]
+    fn already_exists_is_never_treated_as_contention() {
+        assert!(!is_contention(&io::Error::from(
+            io::ErrorKind::AlreadyExists
+        )));
+        let mut calls = 0usize;
+        let e = retry_contended(|| {
+            calls += 1;
+            Err::<(), _>(io::Error::from(io::ErrorKind::AlreadyExists))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1, "目标已存在时一次都不许重试");
+        assert_eq!(e.source.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn retry_does_not_touch_deterministic_failures() {
+        // 盘满/路径不存在这类重试一万次也一样,必须立刻返回——把它们也重试
+        // 会让确定性错误在界面上凭空卡住一秒多
+        let mut calls = 0usize;
+        let e = retry_contended(|| {
+            calls += 1;
+            Err::<(), _>(io::Error::from(io::ErrorKind::NotFound))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1, "非占用类错误一次都不许重试");
+        assert_eq!(e.source.kind(), io::ErrorKind::NotFound);
+        assert_eq!(e.retries, 0);
+        assert_eq!(e.note(), "", "没重试过就不许在报文里声称重试过");
+    }
+
+    /// `write_atomic` 自己有没有走重试。前两次 rename 报占用,第三次交给真的
+    /// `fs::rename`——文件必须换成新内容、重试轮数如实回报、临时文件清干净。
+    ///
+    /// (POSIX 上造不出「目录可写但 rename 被占用」的真实场景:创建临时文件和
+    /// rename 需要的是同一个目录写权限。所以这里注入 rename,而不是硬造锁。)
+    #[test]
+    fn write_atomic_itself_retries_the_rename_not_just_the_helper() {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("m.json");
+        fs::write(&target, b"old").unwrap();
+
+        let mut left = 2;
+        let report = write_atomic_with(&target, b"new", |from, to| {
+            if left > 0 {
+                left -= 1;
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                fs::rename(from, to)
+            }
+        })
+        .expect("占用退去后必须自己熬过去");
+
+        assert_eq!(
+            report.retries, 2,
+            "这次明明重试过两轮,却报了 {}",
+            report.retries
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert!(
+            strays(tmp.path(), "m.json").is_empty(),
+            "重试成功后不许留临时文件"
+        );
+    }
+
+    /// 一直占用:错误原样上抛,旧内容不动,临时文件不许留下。
+    #[test]
+    fn write_atomic_gives_up_cleanly_when_contention_never_lifts() {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("m.json");
+        fs::write(&target, b"old").unwrap();
+
+        let e = write_atomic_with(&target, b"new", |_, _| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+
+        assert_eq!(e.source.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&target).unwrap(), b"old", "失败不许动到旧内容");
+        assert!(
+            strays(tmp.path(), "m.json").is_empty(),
+            "失败后有残留临时文件(唯一名 = 无界累积)"
+        );
+    }
+
+    /// 熬不过去时:错误上抛,旧内容不动,且临时文件不许留在盘上
+    /// (唯一名 = 残留可以无界累积,每个都是一份完整清单)。
+    #[test]
+    #[cfg(unix)]
+    fn write_atomic_cleans_up_its_temp_file_when_it_finally_gives_up() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("跳过:root 无视目录权限位,造不出这个场景");
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("m");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("m.json");
+        fs::write(&target, b"old").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let e = write_atomic(&target, b"new").unwrap_err();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(e.source.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&target).unwrap(), b"old", "失败不许动到旧内容");
+        assert!(strays(&dir, "m.json").is_empty(), "失败后有残留临时文件");
+    }
+}

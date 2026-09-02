@@ -54,6 +54,11 @@ export function SettingsDialog() {
   const [diagnostics, setDiagnostics] = useState<string | null>(null);
   /** 「复制诊断信息」的回执:按过要看得出已进剪贴板(评审 #10) */
   const [diagCopied, setDiagCopied] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  /** 导出结果：成功给路径，失败给原因——两种都要落到界面上，不能只回一个静默的 no-op */
+  const [exported, setExported] = useState<
+    { ok: true; path: string; revealed: boolean } | { ok: false; reason: string } | null
+  >(null);
   /** 误点遮罩不丢输入(评审 #12):有未保存修改时给提示而不是直接关 */
   const [dirtyHint, setDirtyHint] = useState(false);
 
@@ -149,6 +154,9 @@ export function SettingsDialog() {
     if (!settingsOpen) return;
     let cancelled = false;
     setUpdateResult(null);
+    // 报告文件名带时间戳:挂着昨天那句「已导出到 …-20260830-….txt」,
+    // 用户很可能就照着把昨天那份发出去了
+    setExported(null);
     void (async () => {
       try {
         const v = await api.getAppVersion();
@@ -176,6 +184,26 @@ export function SettingsDialog() {
       setInstallError(err instanceof Error ? err.message : String(err));
     } finally {
       setInstalling(false);
+    }
+  }
+
+  /**
+   * 一键导出诊断报告。0.4.3 现场:Windows 拷卡中断,用户手上只有一句报错,
+   * 运行日志躺在系统日志目录里,界面上没有任何入口——能看见但取不走。
+   */
+  async function exportReport() {
+    if (exporting) return;
+    setExporting(true);
+    setExported(null);
+    try {
+      setExported({ ok: true, ...(await api.exportDiagnostics()) });
+    } catch (err) {
+      setExported({
+        ok: false,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setExporting(false);
     }
   }
 
@@ -488,6 +516,42 @@ export function SettingsDialog() {
                 role="alert"
               >
                 {installError}
+              </span>
+            ) : null}
+
+            <div className="row-inline">
+              <button
+                type="button"
+                className="btn btn--sm"
+                data-testid="settings-export-report"
+                disabled={exporting}
+                onClick={() => void exportReport()}
+              >
+                {exporting ? "正在导出…" : "导出诊断报告"}
+              </button>
+              <span className="text-xs muted">
+                出问题时点这里，把生成的 txt 发给维护者
+              </span>
+            </div>
+            {exported?.ok ? (
+              <span
+                className="text-xs muted"
+                data-testid="settings-export-report-done"
+                role="status"
+              >
+                已导出到 {exported.path}
+                {exported.revealed
+                  ? "（文件管理器已打开）"
+                  : "（文件管理器没能自动打开，请按上面的路径手动找）"}
+              </span>
+            ) : null}
+            {exported && !exported.ok ? (
+              <span
+                className="field__error"
+                data-testid="settings-export-report-error"
+                role="alert"
+              >
+                导出诊断报告失败：{exported.reason}
               </span>
             ) : null}
           </div>

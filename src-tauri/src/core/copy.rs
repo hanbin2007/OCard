@@ -55,6 +55,11 @@ pub struct CopyOutcome {
     pub all_verified: bool,
     /// 因暂停请求提前停止(文件边界处停,manifest 可续传)。
     pub paused: bool,
+    /// 写清单时为躲开「目标被占用」而重试的总轮数(见 [`Progress::Contention`])。
+    pub write_retries: u32,
+    /// **素材文件**落位改名时同样原因的重试总轮数。分开记是因为两者的分量不同:
+    /// 清单重写得起,素材落不了位才是要命的。
+    pub material_retries: u32,
 }
 
 /// 进度事件里的 `rel_path` 一律是**目标**相对路径:它同时是 manifest 键与
@@ -75,6 +80,22 @@ pub enum Progress<'a> {
     FileFinished {
         rel_path: &'a str,
         status: &'a FileStatus,
+    },
+    /// 落盘时被别的程序占着,重试 `retries` 轮后**成功**。`what` 说明是哪一步
+    /// (写清单 / 素材落位),`path` 是被占的那个文件——「把目录加进杀软排除项」
+    /// 这条建议,没有路径用户就不知道该加哪个目录。
+    ///
+    /// 结果是对的,所以它不是失败;但它解释了为什么慢,更预告了下一次可能
+    /// 直接中断整个任务——0.4.3 那次 Windows 中断就是这条没被提前说出来。
+    /// 零静默要求「第一次就说」,不是「任务做完再说」:一场两小时的拷卡里
+    /// 攒 500 次重试等于悄悄多花十几分钟,用户全程不知道为什么慢。
+    ///
+    /// 走任务级管道而不是进程级 static:后者会被拷卡/分类/转码三条路径互相
+    /// 抢走计数,并行两张卡时告警还会归因到错误的那张。
+    Contention {
+        what: &'static str,
+        path: &'a Path,
+        retries: u32,
     },
 }
 
@@ -1197,6 +1218,10 @@ pub fn run_copy(
     let mut paused = false;
     // 连续 IO 失败视为基础设施故障(NAS 断连),转入暂停而非全部标失败(评审复核 P1)
     let mut consecutive_io = 0usize;
+    // 写清单被占用后重试成功的总轮数(结果是对的,但要报给用户看,见 CopyOutcome)
+    let mut write_retries = 0u32;
+    // 素材文件落位改名被占用后重试的总轮数(同上,但这条是素材,更要紧)
+    let mut material_retries = 0u32;
     let total = plan.len();
 
     for (index, item) in plan.iter().enumerate() {
@@ -1205,6 +1230,8 @@ pub fn run_copy(
             paused = true;
             break;
         }
+        // 本文件素材落位的占用重试轮数(累加进 material_retries 并逐次上报)
+        let mut file_retries = 0u32;
         control = progress(Progress::FileStarted {
             rel_path: rel,
             index,
@@ -1242,6 +1269,7 @@ pub fn run_copy(
                             delta,
                         });
                     },
+                    &mut file_retries,
                 ) {
                     Ok(xxh3) => {
                         consecutive_io = 0;
@@ -1255,7 +1283,7 @@ pub fn run_copy(
                         FileStatus::Copied
                     }
                     Err(e) => {
-                        if matches!(e, super::CoreError::Io(_)) {
+                        if e.is_io() {
                             consecutive_io += 1;
                         } else {
                             consecutive_io = 0;
@@ -1271,8 +1299,26 @@ pub fn run_copy(
                 }
             }
         };
+        if file_retries > 0 {
+            material_retries += file_retries;
+            let dest0 = req.destinations.first().cloned().unwrap_or_default();
+            let _ = progress(Progress::Contention {
+                what: "素材文件落位改名",
+                path: &dest0,
+                retries: file_retries,
+            });
+        }
         // 逐文件落盘,任意时刻中断都可续传
-        manifest::save(project_root, m)?;
+        let (wr, mpath) = manifest::save(project_root, m)?;
+        if wr.retries > 0 {
+            write_retries += wr.retries;
+            // 零静默:第一次就报,不等任务结束(见 Progress::WriteContention)
+            let _ = progress(Progress::Contention {
+                what: "写入拷卡清单",
+                path: &mpath,
+                retries: wr.retries,
+            });
+        }
         control = progress(Progress::FileFinished {
             rel_path: rel,
             status: &status,
@@ -1296,13 +1342,23 @@ pub fn run_copy(
             .iter()
             .all(|r| !matches!(r.status, FileStatus::Failed(_)));
     m.completed = all_verified;
-    manifest::save(project_root, m)?;
+    let (wr, mpath) = manifest::save(project_root, m)?;
+    if wr.retries > 0 {
+        write_retries += wr.retries;
+        let _ = progress(Progress::Contention {
+            what: "写入拷卡清单",
+            path: &mpath,
+            retries: wr.retries,
+        });
+    }
 
     Ok(CopyOutcome {
         files: reports,
         bytes_copied,
         all_verified,
         paused,
+        write_retries,
+        material_retries,
     })
 }
 
@@ -1312,6 +1368,9 @@ pub fn run_copy(
 /// 临时文件名带任务标识,杜绝跨任务/跨工作站互写。
 /// 流程:读一次源、边读边算哈希、写缺失目的地的临时文件,
 /// 逐目的地回读校验,全部通过后统一改名。返回源文件 xxh3。
+// 参数确实多,但每一个都是这一步真正需要的输入,打包成结构体只会多一层间接;
+// 唯一的「新增」是 retried,而它是零静默要求的出参。
+#[allow(clippy::too_many_arguments)]
 fn copy_one(
     source_root: &Path,
     source_rel: &str,
@@ -1320,6 +1379,8 @@ fn copy_one(
     destinations: &[PathBuf],
     task_tag: &str,
     on_chunk: &mut dyn FnMut(u64),
+    // 素材落位时为躲开占用而重试的轮数,累加进来(零静默:上层要报给用户看)
+    retried: &mut u32,
 ) -> Result<String> {
     // R2 P0:两条 rel 都可能来自持久化清单(resume),被篡改为 `../../…` 即任意
     // 读写——源侧越界=任意读,目标侧越界=任意写,两侧都必须过闸。
@@ -1340,7 +1401,7 @@ fn copy_one(
     }
     // R4(终审 P0-2):末节点检查挡不住**祖先**链接(DCIM → 外部目录时,
     // planned 项经 resume 并回后仍会读到卡外)——canonical 断言真实位置在源根内
-    super::paths::assert_within(source_root, &src_path).map_err(super::CoreError::Invalid)?;
+    super::paths::assert_within_core(source_root, &src_path)?;
 
     // 时间戳快照由调用方在 file_done 源哈希之前采集传入(R5 三票 P1);
     // 获取失败计入保留失败聚合告警
@@ -1365,7 +1426,7 @@ fn copy_one(
                     f.display()
                 )));
             }
-            super::paths::assert_within(&destinations[i], f).map_err(super::CoreError::Invalid)?;
+            super::paths::assert_within_core(&destinations[i], f)?;
         }
     }
     let pre_existing: Vec<usize> = finals
@@ -1433,7 +1494,7 @@ fn copy_one(
                     )));
                 }
                 fs::create_dir_all(root)?;
-                super::paths::ensure_dir_within(root, parent).map_err(super::CoreError::Invalid)?;
+                super::paths::ensure_dir_within_core(root, parent)?;
             }
             // 同任务崩溃残留的 part 是自己的,清掉;create_new 拦截跨任务冲突
             let _ = fs::remove_file(part);
@@ -1486,7 +1547,7 @@ fn copy_one(
         //  不可设置为声明边界;失败计数聚合为可见 warning,不阻塞拷贝;
         //  快照在读源之前采集,见 copy_one 开头)
         for (part, &i) in parts.iter().zip(&missing) {
-            finalize_no_replace(part, &finals[i])?;
+            finalize_no_replace(part, &finals[i], retried)?;
             if let Some(m) = &src_meta {
                 super::fsx::preserve_times_counted(m, &finals[i]);
             }
@@ -1506,19 +1567,39 @@ fn copy_one(
 /// 优先 `hard_link`:目标已存在时原子失败,不可能覆盖;成功后删除 part 名。
 /// 文件系统不支持硬链接(部分 SMB/exFAT)时回退「存在性复查 + rename」,
 /// 该回退窗口为微秒级且长窗口已被入口 pre_existing 检查夹住。
-fn finalize_no_replace(part: &Path, fin: &Path) -> Result<()> {
+fn finalize_no_replace(part: &Path, fin: &Path, retried: &mut u32) -> Result<()> {
     // 平台原生 no-replace 原子改名(renamex_np/renameat2/MoveFileEx),
-    // 逐级回退见 fsx 模块(M2 技术债:替代此前的 hard_link 方案)
-    super::fsx::rename_no_replace(part, fin).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AlreadyExists {
-            super::CoreError::Invalid(format!(
+    // 逐级回退见 fsx 模块(M2 技术债:替代此前的 hard_link 方案)。
+    //
+    // **占用重试**:这里撞的是与 `manifest::save` 完全相同的 Windows 根因——
+    // `.ocardpart` 是刚写完刚关闭的新文件,实时杀毒软件正是这时候扑上去扫它,
+    // 改名就报 ACCESS_DENIED(5)/SHARING_VIOLATION(32)。而这条路径上的是**素材
+    // 文件**,比清单更要紧:连撞三次才转暂停,中间那两个文件会被标成失败。
+    //
+    // `AlreadyExists` 绝不重试:那是「目标已经被别人写了」,重试等于不停去撞
+    // 同一堵墙,而这堵墙本身就是零覆盖保障。
+    match super::fsx::retry_contended(|| super::fsx::rename_no_replace(part, fin)) {
+        Ok(retries) => {
+            *retried += retries;
+            Ok(())
+        }
+        Err(f) if f.source.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(super::CoreError::Invalid(format!(
                 "目标在拷贝期间被其他任务写入,拒绝覆盖: {}",
                 fin.display()
-            ))
-        } else {
-            super::CoreError::Io(e)
+            )))
         }
-    })
+        Err(f) => {
+            // 天书报文的另一半:此前这里抛的是裸 Io,逐文件失败原因就是
+            // 那句「IO 错误: 拒绝访问。 (os error 5)」
+            *retried += f.retries;
+            Err(super::CoreError::io_detail_retried(
+                "把临时文件改名为最终文件",
+                fin,
+                &f,
+            ))
+        }
+    }
 }
 
 /// 把 `/` 分隔的相对路径转为本平台路径。

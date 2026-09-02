@@ -85,6 +85,22 @@ impl TaskManager {
             .any(|h| h.running.load(Ordering::SeqCst))
     }
 
+    /// **含逐文件明细**的完整快照。只给诊断报告用。
+    ///
+    /// [`Self::snapshots`] 走 [`summary_of`],那一步会把 `files` 清空(列表契约:
+    /// 明细另有分页命令去取)。诊断报告拿它就永远是「文件 0、没有失败文件」——
+    /// 一个拷了 400 个文件、失败了 12 个的任务在报告里干干净净,
+    /// 那不是信息缺失,是主动误导。
+    pub fn detailed_snapshots(&self) -> Vec<CopyTaskDto> {
+        let map = self.inner.lock().unwrap();
+        let mut out: Vec<CopyTaskDto> = map
+            .values()
+            .map(|h| h.snapshot.lock().unwrap().clone())
+            .collect();
+        out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        out
+    }
+
     pub fn snapshots(&self, project_id: Option<&str>) -> Vec<CopyTaskDto> {
         let map = self.inner.lock().unwrap();
         let mut out: Vec<CopyTaskDto> = map
@@ -162,25 +178,33 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
         super::sorting_cmds::notify_if_unsafe_fallback(&app);
         // 拷完自动转代理(M3 T1.5):任务 done 且 manifest 带意图 → 派发作业
         if outcome.is_ok() && handle.snapshot.lock().unwrap().state == "done" {
-            if let Ok(m) = manifest::load(&handle.project_root, &handle.manifest_id) {
-                let (cfg, _) = crate::core::config::load_checked(&handle.config_dir);
-                super::transcode_cmds::dispatch_auto_proxy(
+            // 读不出清单就派不了自动转代理。此前是 `if let Ok(..)` 一声不吭:
+            // 任务显示完成、代理却始终不出现,用户没有任何解释可循
+            match manifest::load(&handle.project_root, &handle.manifest_id) {
+                Err(e) => super::notify::warn(
                     &app,
-                    &handle.project_root,
-                    &handle.machine_id,
-                    &handle.config_dir,
-                    &cfg.operator,
-                    &m,
-                );
+                    "auto-proxy-deferred",
+                    format!(
+                        "拷卡已完成,但读不出清单,自动转代理这一步没能派发(素材不受影响,下次启动会补投):{e}"
+                    ),
+                ),
+                Ok(m) => {
+                    let (cfg, _) = crate::core::config::load_checked(&handle.config_dir);
+                    super::transcode_cmds::dispatch_auto_proxy(
+                        &app,
+                        &handle.project_root,
+                        &handle.machine_id,
+                        &handle.config_dir,
+                        &cfg.operator,
+                        &m,
+                    );
+                }
             }
         }
         if let Err(e) = &outcome {
             let mut snap = handle.snapshot.lock().unwrap();
-            // IO 类错误(NAS 抖动/断连)是可恢复的暂停,不是死路(评审 H4)
-            if matches!(e, crate::core::CoreError::Io(_)) {
-                snap.state = "paused";
-            } else {
-                snap.state = "failed";
+            snap.state = state_after_error(e);
+            if snap.state == "failed" {
                 snap.finished_at = Some(Utc::now().to_rfc3339());
             }
             // 目的地状态与任务终态保持一致(终验缺陷 #3)
@@ -198,18 +222,31 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
                 d.error = Some(e.to_string());
             }
             let folder = snap.target_folder.clone();
+            let task_id = snap.id.clone();
+            let proj_id = snap.project_id.clone();
             let paused = snap.state == "paused";
             drop(snap);
             log::warn!("拷卡任务中断: {e}");
             // 零静默:整任务级的中断此前只写 stderr(notify 模块头写着「只写
             // stderr 不算提示」),用户只看到任务变红、没有一个失败文件、没有原因
-            super::notify::error(
+            // code 分两个:「可续传的暂停」和「真失败」在界面上是两件事,
+            // 压在同一个 code 下会被合并窗口折叠成一条,还共用一个抬头
+            // 带 task_id:界面才能给出「查看任务」把人送到那个「继续」跟前,
+            // 并行拷卡同时暂停时也不会被合并成一条
+            super::notify::error_for_task(
                 &app,
-                "copy-task-aborted",
                 if paused {
-                    format!("拷卡任务「{folder}」已中断并转入暂停(可续传): {e}")
+                    "copy-task-paused"
                 } else {
-                    format!("拷卡任务「{folder}」失败: {e}")
+                    "copy-task-aborted"
+                },
+                (&task_id, &proj_id),
+                if paused {
+                    format!(
+                        "拷卡任务「{folder}」已中断并转入暂停,已拷部分不会丢,排除原因后点「继续」即可从断点接着拷。\n原因:{e}\n{DIAG_HINT}"
+                    )
+                } else {
+                    format!("拷卡任务「{folder}」失败。\n原因:{e}\n{DIAG_HINT}")
                 },
             );
         }
@@ -348,12 +385,59 @@ pub fn append_audit<R: tauri::Runtime>(
     }
 }
 
+/// 中断之后任务落到哪个状态。
+///
+/// IO 类错误(NAS 抖一下、杀毒软件占一下清单文件)是**可恢复的暂停**,不是死路
+/// (评审 H4):已拷部分完好,点「继续」就从断点接着走。其余按失败终结。
+///
+/// 单独成函数只为一件事:判定必须走 [`CoreError::is_io`]。写成
+/// `matches!(e, CoreError::Io(_))` 会把带人话的 `IoDetail` 漏判成死路——
+/// 用户会被迫整卡重拷,而错的只是一次瞬时占用。
+fn state_after_error(e: &crate::core::CoreError) -> &'static str {
+    if e.is_io() {
+        "paused"
+    } else {
+        "failed"
+    }
+}
+
+/// 报错报文的固定尾巴。0.4.3 现场事故的真正痛点不是「看不见」,而是看见了也
+/// **取不走**:运行日志躺在系统日志目录里,界面上一个入口都没有,用户只能
+/// 把那一行报错抄给维护者。有了导出入口就得在出事的地方指过去。
+const DIAG_HINT: &str = "把现场发给维护者:设置 → 关于与更新 → 导出诊断报告。";
+
 fn run_worker<R: tauri::Runtime>(
     app: &AppHandle<R>,
     handle: &TaskHandle,
 ) -> crate::core::Result<()> {
     let mut m = manifest::load(&handle.project_root, &handle.manifest_id)?;
 
+    // 独占租约:同一个任务同时只允许一个进程写它的清单。
+    // 清单落盘是整份覆盖,两处同时写时后写的会把先写的**整份顶掉**,而且
+    // 自从临时名改成唯一的之后,这件事连个错都不报了(见 core::lease 模块头)。
+    let operator = handle.snapshot.lock().unwrap().operator.clone();
+    let mut lease = crate::core::lease::acquire(
+        &handle.project_root,
+        &handle.manifest_id,
+        &handle.machine_id,
+        &operator,
+    )?;
+    if let Some(note) = lease.took_over_stale.take() {
+        // 接管别人的租约是「系统替用户做了决定」,零静默要求说出来
+        super::notify::warn(app, "task-lease-taken-over", note);
+    }
+    // 从这里往下任何提前返回都必须先还租约,所以收尾统一走 finish()
+    let outcome = run_worker_locked(app, handle, &mut m, &mut lease);
+    lease.release();
+    outcome
+}
+
+fn run_worker_locked<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    handle: &TaskHandle,
+    m: &mut manifest::CopyManifest,
+    lease: &mut crate::core::lease::Held,
+) -> crate::core::Result<()> {
     let req = copy::CopyRequest {
         source_root: handle.source_root.lock().unwrap().clone(),
         destinations: handle.dest_targets.clone(),
@@ -392,7 +476,7 @@ fn run_worker<R: tauri::Runtime>(
         for f in snap.files.iter_mut() {
             // 轻量预判(仅 UI 快照口径);权威裁决在引擎 file_done(R5:免双重哈希)。
             // f.id 是**目标** rel,与 manifest 同口径
-            if copy::file_done_light(&m, &f.id, f.size_bytes, &req.destinations) {
+            if copy::file_done_light(m, &f.id, f.size_bytes, &req.destinations) {
                 f.status = "verified";
                 done_bytes += f.size_bytes;
             } else if f.status == "verified" {
@@ -405,14 +489,35 @@ fn run_worker<R: tauri::Runtime>(
     let mut last_emit = Instant::now();
     let mut window_bytes = 0u64;
     let mut window_start = Instant::now();
+    // 每类占用只发第一条(带路径,可执行);总数留给收尾那两条。
+    // 收集在这里、出锁之后再发:notify 会写日志 + app.emit,不该在持有
+    // snapshot 锁的时候做 IPC(同函数下面几行也是刻意先 drop 再 emit)
+    let mut contention_reported: std::collections::HashSet<&'static str> = Default::default();
+    let mut pending_contention: Vec<(&'static str, String, u32)> = Vec::new();
+    let mut lease_warned = false;
+    let task_for_notices = {
+        let s = handle.snapshot.lock().unwrap();
+        (s.id.clone(), s.project_id.clone())
+    };
 
-    let outcome = copy::run_copy(&req, &plan, &mut m, &handle.project_root, |p| {
+    let outcome = copy::run_copy(&req, &plan, m, &handle.project_root, |p| {
         let mut changed: Vec<CopyFileItemDto> = Vec::new();
         let mut force_emit = false;
         {
             let mut snap = handle.snapshot.lock().unwrap();
             match &p {
                 copy::Progress::Scanned { .. } | copy::Progress::FileStarted { .. } => {}
+                copy::Progress::Contention {
+                    what,
+                    path,
+                    retries,
+                } => {
+                    // 每类只报第一次:零静默要的是「当场知道」,不是把两小时里的
+                    // 每一次重试都堆进通知积压(总数由收尾那两条给)
+                    if contention_reported.insert(*what) {
+                        pending_contention.push((*what, path.display().to_string(), *retries));
+                    }
+                }
                 copy::Progress::BytesCopied { delta, .. } => {
                     snap.copied_bytes += delta;
                     window_bytes += delta;
@@ -439,6 +544,38 @@ fn run_worker<R: tauri::Runtime>(
                 let ev = progress_event(&mut snap, changed);
                 drop(snap);
                 let _ = app.emit(PROGRESS_EVENT, &ev);
+            }
+        }
+        // 锁已出:占用告警在这里发。notify 会写日志 + app.emit(IPC),
+        // 持着 snapshot 锁做这些事是全文件唯一的例外,不留
+        for (what, path, retries) in pending_contention.drain(..) {
+            super::notify::warn_for_task(
+                app,
+                "fs-write-contention",
+                (&task_for_notices.0, &task_for_notices.1),
+                format!(
+                    "{what}时被别的程序占着,重试 {retries} 轮后成功:{path}。多半是杀毒软件或 NAS 索引正在扫这个目录;若反复出现,把该目录加入杀毒软件排除项,否则下次可能直接中断任务"
+                ),
+            );
+        }
+        // 心跳(自带 30 秒节流)。写不动只告警不打断:租约是防并发写的,
+        // 不是拷贝本身的前提;为它把一个正常任务打断,代价远大于收益。
+        // 但也不静默——心跳停了之后别人可能接管,用户有权知道。
+        match lease.heartbeat() {
+            Ok(_) => {}
+            Err(e) => {
+                if !lease_warned {
+                    lease_warned = true;
+                    super::notify::warn_for_task(
+                        app,
+                        "task-lease-heartbeat-failed",
+                        (&task_for_notices.0, &task_for_notices.1),
+                        format!(
+                            "任务租约的心跳更新失败,拷贝继续,但超过 {} 分钟后别的进程可能接管这个任务并同时写清单:{e}",
+                            crate::core::lease::LEASE_TTL.num_minutes()
+                        ),
+                    );
+                }
             }
         }
         if handle.pause_requested.load(Ordering::SeqCst) {
@@ -479,6 +616,21 @@ fn run_worker<R: tauri::Runtime>(
             d.written_bytes = written;
         }
         // 终态事件由 spawn_worker 在 running=false 之后统一发出(复核 P1-9)
+    }
+
+    // 收尾总账:开头那条只报了第一次(带路径),这里给总数——用户要能判断
+    // 「偶发一次」和「五百次」的区别,后者说明这台机器上必须去改杀软配置
+    let total_retries = outcome.write_retries + outcome.material_retries;
+    if total_retries > 0 {
+        super::notify::warn_for_task(
+            app,
+            "fs-write-contention-total",
+            (&task_id, &task_for_notices.1),
+            format!(
+                "本次拷卡累计 {total_retries} 轮落盘重试(写清单 {} 轮、素材落位 {} 轮;每轮最多等 0.9 秒)。任务结果不受影响,但它解释了为什么慢;把项目目录加入杀毒软件排除项可以消掉",
+                outcome.write_retries, outcome.material_retries
+            ),
+        );
     }
 
     // 零静默中的最高危一条:部分拷贝完成时,`all_verified` 只代表**所选文件夹**
@@ -683,6 +835,30 @@ pub fn build_task(
 
 #[cfg(test)]
 mod tests {
+    /// 0.4.3 现场事故的回归网:`manifest::save` 的拒绝访问现在是 `IoDetail`,
+    /// 判定退回 `matches!(e, CoreError::Io(_))` 时本测试红——那一退就把
+    /// 「杀毒软件占了一下清单」判成死路,整卡素材被迫重拷。
+    #[test]
+    fn io_class_interruptions_pause_for_resume_everything_else_ends_the_task() {
+        use crate::core::CoreError;
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(super::state_after_error(&CoreError::Io(denied)), "paused");
+        assert_eq!(
+            super::state_after_error(&CoreError::io_detail(
+                "写入拷卡清单",
+                std::path::Path::new("Z:/p/.ocard/manifests/a.json"),
+                &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            )),
+            "paused",
+            "带人话的 IO 错误还是 IO 错误,必须可续传"
+        );
+        // 清单损坏/被篡改这类不是「等一下就好」,续传只会一直撞同一堵墙
+        assert_eq!(
+            super::state_after_error(&CoreError::Invalid("任务清单为空".into())),
+            "failed"
+        );
+    }
+
     use super::resolve_resume_source;
     use std::path::PathBuf;
 

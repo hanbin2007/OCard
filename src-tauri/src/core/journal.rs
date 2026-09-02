@@ -131,14 +131,14 @@ fn project_journal_dir(project_root: &Path) -> PathBuf {
 /// 项目级日志:追加(R2 P0:`.ocard`/`journal` 中间段防符号链接偷渡)。
 pub fn append(project_root: &Path, event: &Event) -> Result<()> {
     let dir = project_journal_dir(project_root);
-    super::paths::ensure_dir_within(project_root, &dir).map_err(super::CoreError::Invalid)?;
+    super::paths::ensure_dir_within_core(project_root, &dir)?;
     append_in(&dir, event)
 }
 
 /// 项目级日志:合并读取(R4:读路径同样过 canonical 只读闸)。
 pub fn read_all(project_root: &Path) -> Result<JournalRead> {
     let dir = project_journal_dir(project_root);
-    super::paths::assert_within(project_root, &dir).map_err(super::CoreError::Invalid)?;
+    super::paths::assert_within_core(project_root, &dir)?;
     read_all_in(&dir)
 }
 

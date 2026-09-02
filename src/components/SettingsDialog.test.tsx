@@ -445,6 +445,56 @@ describe("转码能力", () => {
       "已复制",
     );
   });
+
+  /* 0.4.3 现场:Windows 上拷卡中断,用户手上只有一句报错,运行日志躺在系统
+     日志目录里、界面上一个入口都没有——看得见但取不走。这两条锁住那个入口。 */
+  it("「导出诊断报告」给出报告落在哪里", async () => {
+    const spy = vi.spyOn(api, "exportDiagnostics").mockResolvedValue({
+      path: "C:/Users/dit/Downloads/OCard-诊断报告-20260831-010203.txt",
+      revealed: true,
+    });
+
+    const user = await openSettings2();
+    await user.click(screen.getByTestId("settings-export-report"));
+
+    const done = await screen.findByTestId("settings-export-report-done");
+    // 只说「已导出」等于没说:用户得知道去哪儿找这个文件才发得出来
+    expect(done.textContent).toContain("OCard-诊断报告-20260831-010203.txt");
+    spy.mockRestore();
+  });
+
+  /* 后端在 reveal 失败时仍返回 Ok(文件确实生成了),只多发一条 warning。
+     界面若无条件写「文件管理器已打开」,就和通知中心那句「没能打开」当面打架,
+     用户会盯着屏幕等一个不会来的窗口。 */
+  it("文件管理器没弹出来时，不许谎称已打开", async () => {
+    const spy = vi
+      .spyOn(api, "exportDiagnostics")
+      .mockResolvedValue({ path: "D:/Downloads/report.txt", revealed: false });
+
+    const user = await openSettings2();
+    await user.click(screen.getByTestId("settings-export-report"));
+
+    const done = await screen.findByTestId("settings-export-report-done");
+    expect(done.textContent).toContain("D:/Downloads/report.txt");
+    expect(done.textContent).toContain("没能自动打开");
+    expect(done.textContent).not.toContain("文件管理器已打开");
+    spy.mockRestore();
+  });
+
+  it("导出失败给出原因,不静默无事发生", async () => {
+    const spy = vi
+      .spyOn(api, "exportDiagnostics")
+      .mockRejectedValue(new Error("写入诊断报告失败: D:/Downloads —— 拒绝访问"));
+
+    const user = await openSettings2();
+    await user.click(screen.getByTestId("settings-export-report"));
+
+    const err = await screen.findByTestId("settings-export-report-error");
+    expect(err.textContent).toContain("拒绝访问");
+    expect(err.getAttribute("role")).toBe("alert");
+    expect(screen.queryByTestId("settings-export-report-done")).toBeNull();
+    spy.mockRestore();
+  });
 });
 
 describe("首跑引导", () => {

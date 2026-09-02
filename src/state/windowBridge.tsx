@@ -67,3 +67,14 @@ export function useWindowBridge(): WindowBridgeValue {
   if (!ctx) throw new Error("useWindowBridge 必须在 WindowBridgeProvider 内使用");
   return ctx;
 }
+
+/**
+ * 只问「这是哪个窗口」，**没有 Provider 时返回 null 而不是抛**。
+ *
+ * 给通知中心这类「在哪都可能被渲染」的组件用：它是零静默的最后一道出口，
+ * 因为少了一个 Provider 就整个炸掉，等于把所有提示一起炸没。拿到 null 的
+ * 调用方按「不知道 → 不做需要窗口能力的事」处理（fail-closed）。
+ */
+export function useWindowRole(): WindowBridgeValue["role"] | null {
+  return useContext(WindowBridgeContext)?.role ?? null;
+}

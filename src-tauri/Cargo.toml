@@ -60,6 +60,7 @@ unicode-normalization = "0.1.25"
 # 折叠需要 CaseFolding.txt 全表(千余条映射),手写既大又易错;caseless 只做折叠、
 # 唯一依赖是本仓已有的 unicode-normalization,无 build 脚本,是最小的正确解。
 caseless = "0.2.2"
+tauri-plugin-single-instance = "2.4.3"
 
 [dev-dependencies]
 tempfile = "3"
