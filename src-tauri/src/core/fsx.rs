@@ -40,10 +40,18 @@ fn is_unsupported(e: &io::Error) -> bool {
     }
     #[cfg(unix)]
     {
-        matches!(
-            e.raw_os_error(),
-            Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP | libc::EOPNOTSUPP | libc::EPERM)
-        )
+        // 用值比较而不是模式:Linux 上 ENOTSUP == EOPNOTSUPP,写成模式会是「不可达分支」
+        // (CI 的 -D warnings 抓到的),macOS 上两者不同
+        let code = e.raw_os_error();
+        [
+            libc::EINVAL,
+            libc::ENOSYS,
+            libc::ENOTSUP,
+            libc::EOPNOTSUPP,
+            libc::EPERM,
+        ]
+        .iter()
+        .any(|c| Some(*c) == code)
     }
     #[cfg(windows)]
     {
