@@ -1180,7 +1180,12 @@ pub fn file_done(
 /// 源稳定性基准与第一次读源之间的最小间隔:大于任何常见文件系统的时间戳粒度(FAT 2 秒、
 /// exFAT 10 ms、NTFS/APFS/ext4 亚微秒)。测试里为 0:测试自己造 mtime 差异。
 fn baseline_settle() -> std::time::Duration {
-    if cfg!(test) {
+    baseline_settle_for(cfg!(test))
+}
+
+/// 生产值必须大于 FAT 的 2 秒粒度,由测试守住(`cfg!(test)` 下恒为 0 的常量没人能考)。
+fn baseline_settle_for(in_tests: bool) -> std::time::Duration {
+    if in_tests {
         std::time::Duration::ZERO
     } else {
         std::time::Duration::from_millis(2500)
@@ -1626,7 +1631,7 @@ pub fn run_copy(
                 let now_ns = super::media::mtime_nanos(pre);
                 (pre.len() != item.size || now_ns != item.source_mtime_ns).then(|| {
                     format!(
-                        "源文件自规划扫描后已变化(大小 {} → {},修改时间 {} → {}),无法确认拷贝期间的稳定性基准,这个文件不拷: {src_rel}。请确认没有设备在写这张卡,重新扫描后再拷",
+                        "源文件自规划扫描后已变化(大小 {} → {},修改时间 {} → {}),无法确认拷贝期间的稳定性基准,这个文件不拷: {src_rel}。请确认没有设备在写这张卡,再点「继续」(会重新扫描)",
                         item.size,
                         pre.len(),
                         item.source_mtime_ns,
@@ -3680,6 +3685,14 @@ mod review_regression_tests {
             9000,
             &req.destinations
         ));
+    }
+
+    /// 稳定性基准与首次读源之间的间隔必须大于 FAT 的 2 秒时间戳粒度,否则同一时间槽内的
+    /// 等长原位改写前后 mtime 相等、挡不住。
+    #[test]
+    fn the_production_baseline_settle_exceeds_the_fat_timestamp_granularity() {
+        assert!(baseline_settle_for(false) > std::time::Duration::from_secs(2));
+        assert!(baseline_settle_for(true).is_zero());
     }
 
     /// codex 终审 r16:稳定性基准是规划扫描时观测的元数据;开拷时源与基准不一致 = 源自扫描

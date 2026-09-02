@@ -910,6 +910,9 @@ impl Drop for TakeoverLock {
                     lock_or_recover(my_orphaned_nonces())
                         .insert(name.to_string_lossy().into_owned());
                 }
+                // 这可能是本进程最后一次取这把锁(释放路径):进程内的残留表没机会自愈,
+                // 别的机器两分钟内会被它挡成「接管锁被别的进程持有」——本机用户要知道
+                super::fsx::note_leftover_temp(&self.nonce);
             }
         }
     }

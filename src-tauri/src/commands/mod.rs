@@ -2222,6 +2222,12 @@ pub fn resume_copy_task<R: tauri::Runtime>(
             .collect();
         snap.file_count = Some(plan.len());
         *handle.plan_guard() = plan;
+        // 准备阶段(刷新计划落盘、栅栏取锁)在这条命令线程上留下的线程局部降级:交给 worker
+        // 之前带 scope 取走——正常路径守卫不再 Drop,没有别的取走者(Fable 第 13 轮)
+        sorting_cmds::notify_if_unsafe_fallback_for(
+            &app,
+            Some((&task_id_for_lease, &project_id_for_lease)),
+        );
         // 准备完毕,租约交给 worker(它接手后一直持有到任务结束)
         *handle.lease_slot() = Some(keeper.into_lease());
     }
@@ -2365,7 +2371,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
             app,
             "copy-resume-rescan-failed",
             task,
-            format!("续传前复查源卷失败,已按开拷时锁定的清单继续(卡上新增的文件不会被发现): {e}"),
+            format!("续传前复查源卷失败,已按开拷时锁定的清单继续(卡上新增的文件不会被发现;若这份清单是旧版本写的、没有记录修改时间,拷贝期间的源稳定性只能按开拷快照判,同一时间槽内的等长改写挡不住): {e}"),
         ),
     }
     Ok(plan)

@@ -199,24 +199,17 @@ pub fn run() {
                 }));
             }
             let config_dir = app.path().app_config_dir()?;
-            // 轮转日志修剪:按修改时间只留最新 10 份(KeepAll 不自清)
-            if let Ok(log_dir) = app.path().app_log_dir() {
-                let failed = prune_rotated_logs(&log_dir, 10);
-                if !failed.is_empty() {
-                    // 句柄先绑成变量:通知 code 门禁只认调用点里第一个 `),` 之前的字面量
-                    let handle = app.handle();
-                    crate::commands::notify::warn(
-                        handle,
-                        "log-prune-failed",
-                        format!(
-                            "旧运行日志没能清理({} 项,例如 {}):日志会继续占用空间;请检查日志目录 {} 的权限或占用",
-                            failed.len(),
-                            failed[0],
-                            log_dir.display()
-                        ),
-                    );
-                }
-            }
+            // 轮转日志修剪:按修改时间只留最新 10 份(KeepAll 不自清)。失败列表先存着,
+            // 通知要等 `manage(AppState)` 之后再发——积压队列在 AppState 里,此刻发等于
+            // 没发(Fable 第 13 轮抓到)
+            let log_prune_failed: Option<(std::path::PathBuf, Vec<String>)> =
+                match app.path().app_log_dir() {
+                    Ok(log_dir) => {
+                        let failed = prune_rotated_logs(&log_dir, 10);
+                        (!failed.is_empty()).then_some((log_dir, failed))
+                    }
+                    Err(_) => None,
+                };
             log::info!("OCard 启动,版本 {}", env!("CARGO_PKG_VERSION"));
             // Linux WebKit 崩溃规避状态落日志(main.rs 里设置,这里只报告——
             // 打包后 stderr 不可见,远程排障只能靠这份日志)
@@ -253,6 +246,21 @@ pub fn run() {
                     core::preview::PreviewCache::with_default_budget(preview_dir),
                 ),
             });
+            // AppState 已托管:积压队列在了,启动期的通知从这里开始才到得了用户
+            if let Some((log_dir, failed)) = log_prune_failed {
+                // 句柄先绑成变量:通知 code 门禁只认调用点里第一个 `),` 之前的字面量
+                let handle = app.handle();
+                crate::commands::notify::warn(
+                    handle,
+                    "log-prune-failed",
+                    format!(
+                        "旧运行日志没能清理({} 项,例如 {}):日志会继续占用空间;请检查日志目录 {} 的权限或占用",
+                        failed.len(),
+                        failed[0],
+                        log_dir.display()
+                    ),
+                );
+            }
             // 卷插拔监视(快捷拷卡):2s 轮询本地挂载表(不碰 NAS/登记表),
             // 有插拔即发 volumes://changed;前端收到后再拉带卡匹配的完整列表。
             {
