@@ -520,9 +520,12 @@ describe("交付浮层：焦点圈定", () => {
     await user.click(screen.getByTestId("delivery-open"));
     const dialog = await screen.findByRole("alertdialog");
 
-    // 默认动作永远是不动手：焦点押在「取消」上
-    expect(document.activeElement).toBe(
-      screen.getByRole("button", { name: "取消" }),
+    // 默认动作永远是不动手：焦点押在「取消」上。焦点是在下一帧的 effect 里落的，
+    // CI 负载高时 findByRole 返回那一刻还没落下（Lint 门禁偶发红）——等它
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "取消" }),
+      ),
     );
 
     const items = focusables(dialog);
