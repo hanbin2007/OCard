@@ -1724,7 +1724,13 @@ pub fn run_copy(
                     Err(e) => {
                         if e.is_io() {
                             consecutive_io += 1;
-                            last_io_failure = Some(format!("{rel}: {e}"));
+                            // 带路径的报文(IoDetail)不再前缀 rel,免得一句话里路径出现两遍
+                            let text = e.to_string();
+                            last_io_failure = Some(if text.contains(rel.as_str()) {
+                                text
+                            } else {
+                                format!("{rel}: {text}")
+                            });
                         } else {
                             consecutive_io = 0;
                         }

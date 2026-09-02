@@ -10,12 +10,18 @@ const BUF_SIZE: usize = 1024 * 1024;
 
 /// 计算文件的 xxHash3-64,返回 16 位十六进制小写字符串。
 pub fn xxh3_file(path: &Path) -> Result<String> {
-    xxh3_reader(File::open(path)?)
+    // 打不开要带步骤与路径:裸的「IO 错误: 拒绝访问 (os error 5)」正是 0.4.3 事故的形状
+    let f =
+        File::open(path).map_err(|e| super::CoreError::io_detail("打开文件(哈希)", path, &e))?;
+    xxh3_reader(f)
 }
 
-/// 哈希**源**文件:按 [`fsx::open_source`](super::fsx::open_source) 打开(Windows 上排他于写者)。
+/// 哈希**源**文件:按 [`fsx::open_source_retried`](super::fsx::open_source_retried) 打开
+/// (Windows 上排他于写者、按占用重试),打不开的报文带步骤、路径、原因与重试轮数。
 pub fn xxh3_file_source(path: &Path) -> Result<String> {
-    xxh3_reader(super::fsx::open_source(path)?)
+    let f = super::fsx::open_source_retried(path)
+        .map_err(|f| super::CoreError::io_detail_retried("打开源文件(哈希)", path, &f))?;
+    xxh3_reader(f)
 }
 
 /// 校验专用:尽量绕页缓存读取后计算哈希(M2 技术债:回读命中页缓存会弱化校验)。

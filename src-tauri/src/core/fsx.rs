@@ -1283,15 +1283,22 @@ impl RetryFailure {
     /// 只有「重试后成功」才能证明是瞬时占用。
     pub fn note(&self) -> String {
         if self.retries == 0 {
-            String::new()
+            return String::new();
+        }
+        let waited = WRITE_RETRY_BACKOFF_MS[..self.retries as usize]
+            .iter()
+            .sum::<u64>() as f64
+            / 1000.0;
+        // 32/33 是明确的独占冲突,不是「分不出来」:那半句是为错误码 5 写的
+        if matches!(self.source.raw_os_error(), Some(32) | Some(33)) {
+            format!(
+                "(已自动重试 {} 轮、等了约 {waited:.1} 秒仍被占着:是明确的独占冲突,请确认没有别的程序 / 设备在用这个文件)",
+                self.retries
+            )
         } else {
             format!(
-                "(已自动重试 {} 轮、等了约 {:.1} 秒仍被拒:要么一直被别的程序占着,要么是权限/SMB 会话问题——仅凭这个错误码分不出来,两条都要查)",
-                self.retries,
-                WRITE_RETRY_BACKOFF_MS[..self.retries as usize]
-                    .iter()
-                    .sum::<u64>() as f64
-                    / 1000.0
+                "(已自动重试 {} 轮、等了约 {waited:.1} 秒仍被拒:要么一直被别的程序占着,要么是权限/SMB 会话问题——仅凭这个错误码分不出来,两条都要查)",
+                self.retries
             )
         }
     }
