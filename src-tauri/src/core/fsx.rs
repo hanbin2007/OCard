@@ -109,13 +109,17 @@ fn dir_supports_hard_links(dir: &Path) -> bool {
     }
 }
 
-/// 缓存键:(卷根 / 目录, 设备号)。unix 用 `st_dev`;Windows 没有稳定的设备号,退回卷根前缀。
+/// 缓存键:按**文件系统**——unix 用 `st_dev`(取得到就不再带目录路径,同一卷只探一次);
+/// 取不到设备号退回目录路径。Windows 没有稳定的设备号,退回卷根前缀(同一盘符先后映射到
+/// 不同后端时会陈旧,后果是响亮的逐文件失败而不是静默;补齐要读卷序列号,留待下一版)。
 fn fs_key(dir: &Path) -> (std::path::PathBuf, u64) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let dev = fs::metadata(dir).map(|m| m.dev()).unwrap_or(0);
-        (dir.to_path_buf(), dev)
+        match fs::metadata(dir).map(|m| m.dev()) {
+            Ok(dev) if dev != 0 => (std::path::PathBuf::new(), dev),
+            _ => (dir.to_path_buf(), 0),
+        }
     }
     #[cfg(not(unix))]
     {
@@ -145,24 +149,24 @@ fn dir_supports_hard_links_with(
     drop(f);
     let r = link(&a, &b);
     for p in [&b, &a] {
-        if let Err(e) = fs::remove_file(p) {
-            if e.kind() != io::ErrorKind::NotFound {
-                // 交付目录里多一个隐藏的探针文件没人清(part 清扫只认 .ocardpart):至少要说
-                log::warn!("硬链接探针文件没删掉 {}: {e}", p.display());
-            }
+        // 删也走占用重试(杀软刚打开探针文件);交付目录里的探针残留没有清扫认得
+        // (.ocardtmp 清扫只扫清单目录),删不掉至少要说
+        if let Err(f) = retry_contended(|| match fs::remove_file(p) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        }) {
+            log::warn!("硬链接探针文件没删掉 {}: {}", p.display(), f.source);
         }
     }
     match r {
         Ok(()) => Some(true),
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::Interrupted
-            ) =>
-        {
-            None
+        // 「不支持」(errno 名单)与「拒绝访问」(Samba 把后端的 EPERM 映成 ACCESS_DENIED)
+        // 才算不支持;EIO / ETIMEDOUT / ENOTCONN 这类抖动**不下结论、不缓存**——否则一次
+        // 抖动就把一个本来支持硬链接的目标钉成永久降级(fable 第五轮)
+        Err(e) if link_unsupported(&e) || e.kind() == io::ErrorKind::PermissionDenied => {
+            Some(false)
         }
-        Err(_) => Some(false),
+        Err(_) => None,
     }
 }
 
@@ -463,6 +467,13 @@ mod tests {
             Err(io::Error::from(io::ErrorKind::NotFound))
         });
         assert_eq!(vanished, None, "探针文件刚建好就不见了:不下结论");
+        let flaky = dir_supports_hard_links_with(t.path(), |_, _| {
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        });
+        assert_eq!(flaky, None, "NAS 抖动(超时)不下结论,更不许缓存成「不支持」");
+        let nowhere =
+            dir_supports_hard_links_with(&t.path().join("nope"), |a, b| fs::hard_link(a, b));
+        assert_eq!(nowhere, None, "探针文件都建不成:不下结论");
         assert_eq!(
             std::fs::read_dir(t.path()).unwrap().count(),
             0,

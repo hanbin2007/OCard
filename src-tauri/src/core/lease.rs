@@ -729,7 +729,9 @@ impl TakeoverLock {
                             let mine_recently = entries.is_empty() && {
                                 let mut dirs = lock_or_recover(my_orphaned_dirs());
                                 match dirs.get(&dir) {
-                                    Some(at) if at.elapsed() < ORPHAN_DIR_TTL => true,
+                                    Some(expires_at) if std::time::Instant::now() < *expires_at => {
+                                        true
+                                    }
                                     Some(_) => {
                                         dirs.remove(&dir); // 过期的记录不再算数
                                         false
@@ -856,8 +858,10 @@ impl Drop for TakeoverLock {
                             self.dir.display(),
                             ORPHAN_DIR_TTL.as_secs()
                         );
+                        // 存「到期时刻」(加法):测试与判定都不从 Instant 减——Windows 的 Instant
+                        // 自开机起算,开机不足 TTL 时减法会 panic(fable 抓到)
                         lock_or_recover(my_orphaned_dirs())
-                            .insert(self.dir.clone(), std::time::Instant::now());
+                            .insert(self.dir.clone(), std::time::Instant::now() + ORPHAN_DIR_TTL);
                     } else {
                         log::warn!("租约接管锁目录删不掉 {}: {e}", self.dir.display());
                     }
@@ -2566,7 +2570,8 @@ mod tests {
         let lease = t.path().join("z.lease");
         let dir = TakeoverLock::path_for(&lease);
         std::fs::create_dir(&dir).unwrap(); // 新鲜、空
-        lock_or_recover(my_orphaned_dirs()).insert(dir.clone(), std::time::Instant::now());
+        lock_or_recover(my_orphaned_dirs())
+            .insert(dir.clone(), std::time::Instant::now() + ORPHAN_DIR_TTL);
         match TakeoverLock::try_take(&lease).unwrap() {
             Take::Got(g) => {
                 assert!(g.still_mine());
@@ -2577,10 +2582,8 @@ mod tests {
         // 过期的记录不算数:10 分钟前记的、现在撞上同路径的新鲜空目录,那是别人刚 mkdir 的
         let dir3 = TakeoverLock::path_for(&t.path().join("v.lease"));
         std::fs::create_dir(&dir3).unwrap();
-        lock_or_recover(my_orphaned_dirs()).insert(
-            dir3.clone(),
-            std::time::Instant::now() - ORPHAN_DIR_TTL - std::time::Duration::from_secs(1),
-        );
+        // 「到期时刻 = 现在」即已过期;不从 Instant 减(Windows 开机不足 TTL 会 panic)
+        lock_or_recover(my_orphaned_dirs()).insert(dir3.clone(), std::time::Instant::now());
         assert!(matches!(
             TakeoverLock::try_take(&t.path().join("v.lease")).unwrap(),
             Take::Held(_)
