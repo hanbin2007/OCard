@@ -20,7 +20,9 @@ type StoreHandle = ReturnType<typeof useStore>;
  *  这类状态只能在挂载后 dispatch。 */
 function StoreProbe({ onStore }: { onStore: (s: StoreHandle) => void }) {
   const store = useStore();
-  useEffect(() => onStore(store), [store, onStore]);
+  useEffect(() => {
+    onStore(store);
+  }, [store, onStore]);
   return null;
 }
 

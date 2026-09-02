@@ -255,7 +255,7 @@ pub fn save(project_root: &Path, m: &CopyManifest) -> Result<(super::fsx::WriteR
 
 /// 守门人说不时的报文(`CoreError::Busy`,调用方按「栅栏被回收」中止,不当 IO 错)。
 pub const SAVE_FENCE_LOST: &str =
-    "落盘前的最后一刻发现租约接管锁已被外部回收(存储的时钟不准,或锁目录被人动过),这份清单没有发布";
+    "落盘前的最后一刻读不到本任务的租约锁标记(可能是存储抖了一下,也可能是锁被外部回收;这里分不出来),这份清单没有发布;已停下,可续传";
 
 /// 守门版 [`save`]:临时文件写完、改名之前再问一句 `before_publish`(写栅栏还是不是
 /// 自己的)。答否 → [`SAVE_FENCE_LOST`] 的 `Busy`,盘上那份不会被碰。
@@ -272,9 +272,12 @@ pub fn save_guarded(
     let bytes = serde_json::to_vec_pretty(m)?;
     match super::fsx::write_atomic_guarded(&path, &bytes, before_publish) {
         Ok(r) => Ok((r, path)),
-        Err(super::fsx::GuardedWrite::Refused) => {
+        Err(super::fsx::GuardedWrite::Refused { retries: 0 }) => {
             Err(super::CoreError::Busy(SAVE_FENCE_LOST.into()))
         }
+        Err(super::fsx::GuardedWrite::Refused { retries }) => Err(super::CoreError::Busy(format!(
+            "{SAVE_FENCE_LOST}(改名前已为目标被占用重试了 {retries} 轮)"
+        ))),
         // 报文带上「已重试 N 轮」:那是系统替用户排除掉「没有写权限」那一支的硬证据
         Err(super::fsx::GuardedWrite::Failed(f)) => Err(super::CoreError::io_detail_retried(
             "写入拷卡清单",

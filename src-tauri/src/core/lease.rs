@@ -403,12 +403,6 @@ impl TakeoverLock {
         Self::is_reclaimable_by(target, &disk_now)
     }
 
-    /// 同上,但**强制写新探针**(不用 5 秒缓存)。破坏性的回收判定用这个:缓存建立后
-    /// NAS 时钟若跳了两分钟以上,按缓存算刚建的锁会立刻「可回收」(codex r7)。
-    fn is_reclaimable_fresh(target: &Path) -> bool {
-        Self::is_reclaimable_by(target, &disk_now_fresh)
-    }
-
     fn is_reclaimable_by(
         target: &Path,
         now_of: &dyn Fn(&Path) -> Option<std::time::SystemTime>,
@@ -535,12 +529,17 @@ impl TakeoverLock {
             log::warn!("租约接管锁目录里有不认识的条目,不回收: {}", dir.display());
             return Err(LOCK_DIR_HAS_FOREIGN_ENTRIES);
         }
+        // 破坏性判定**强制写一个新探针**(不吃 5 秒缓存:缓存建立后 NAS 时钟若跳了两分钟
+        // 以上,按缓存算刚建的锁会立刻「可回收」),但一次 reclaim 只写这一个——锁目录
+        // 与它里面的 nonce 的探针都落在同一个 manifests 目录,答案是同一个
+        let fresh = std::cell::OnceCell::new();
+        let now_of = |d: &Path| *fresh.get_or_init(|| disk_now_fresh(d));
         let nonces = entries;
         if nonces.is_empty() {
             // 没有 nonce 的空目录有两种:mkdir 后写 nonce 前崩了的残留(老),
             // 或别人**此刻**刚 mkdir、还没来得及写 nonce(新)。调用方判断
             // 「可回收」看的可能是被换掉之前的那个目录,这里必须按目录本身再看一次
-            if !Self::is_reclaimable_fresh(dir) {
+            if !Self::is_reclaimable_by(dir, &now_of) {
                 return Ok(false);
             }
             return Ok(std::fs::remove_dir(dir).is_ok());
@@ -548,7 +547,7 @@ impl TakeoverLock {
         // 判据下沉到 nonce **自己**的年龄:调用方看到的「老目录」可能在它判断之后
         // 已经被别人回收重建——那个新目录里的 nonce 一定是新鲜的。真实的崩溃残留
         // nonce 一定是老的(它在取锁那一刻创建)。看到任何一个新鲜 nonce 就让路
-        if nonces.iter().any(|n| !Self::is_reclaimable_fresh(n)) {
+        if nonces.iter().any(|n| !Self::is_reclaimable_by(n, &now_of)) {
             return Ok(false);
         }
         let mut removed_any = false;
@@ -1106,7 +1105,7 @@ impl Held {
             }
             Take::Refused(why) => {
                 return Err(super::CoreError::Busy(format!(
-                    "落盘前发现租约接管锁目录{why},已拒绝回收,本次不写;这种情况不会自己好,请人工检查该目录:{}",
+                    "{LOCK_DIR_BROKEN_PREFIX}:落盘前发现租约接管锁目录{why},已拒绝回收,本次不写;这种情况不会自己好,请人工检查该目录:{}",
                     TakeoverLock::path_for(&self.path).display()
                 )));
             }
@@ -1193,7 +1192,7 @@ impl Held {
             }
             Ok(Take::Refused(why)) => {
                 return Released::NoLock(format!(
-                    "接管锁目录{why},已拒绝回收;请人工检查该目录:{}",
+                    "{LOCK_DIR_BROKEN_PREFIX}:接管锁目录{why},已拒绝回收;请人工检查该目录:{}",
                     TakeoverLock::path_for(&self.path).display()
                 ))
             }
@@ -1268,7 +1267,8 @@ fn heartbeat_loop(path: &Path, me: &Lease, timing: Timing, shared: &Arc<Shared>)
 
         // 与栅栏(清单落盘)在进程内排队,别自己和自己抢目录锁;等不到就下一拍再来
         // (回到循环顶先看 stop)
-        let Some(_turn) = shared.take_turn(timing.heartbeat_every * 3) else {
+        let patience = (timing.heartbeat_every * 3).max(std::time::Duration::from_secs(2));
+        let Some(_turn) = shared.take_turn(patience) else {
             fail("等本进程的清单落盘让出租约锁超时,本拍跳过".into());
             continue;
         };
@@ -1283,7 +1283,7 @@ fn heartbeat_loop(path: &Path, me: &Lease, timing: Timing, shared: &Arc<Shared>)
             Ok(Take::Refused(why)) => {
                 // 不会自己好:每拍都失败,at_risk_after 之后上层会停下并把这句话说出来
                 fail(format!(
-                    "接管锁目录{why},已拒绝回收,本拍跳过;需要人工清理该目录:{}",
+                    "{LOCK_DIR_BROKEN_PREFIX}:接管锁目录{why},已拒绝回收,本拍跳过;需要人工清理该目录:{}",
                     TakeoverLock::path_for(path).display()
                 ));
                 continue;

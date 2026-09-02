@@ -170,6 +170,31 @@ pub fn read_file_uncached(path: &Path) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 守门人说不:临时文件写了但不发布——目标不许出现,临时文件也不许留下。
+    #[test]
+    fn a_guarded_write_refused_before_publish_leaves_nothing_behind() {
+        let t = tempfile::tempdir().unwrap();
+        let target = t.path().join("m.json");
+        let r = write_atomic_guarded(&target, b"{}", &|| false);
+        assert!(
+            matches!(r, Err(GuardedWrite::Refused { retries: 0 })),
+            "{r:?}"
+        );
+        assert!(!target.exists(), "守门人说不之后仍发布了");
+        let leftovers = std::fs::read_dir(t.path()).unwrap().count();
+        assert_eq!(leftovers, 0, "临时文件没清掉");
+    }
+
+    /// 守门人放行:与普通 write_atomic 一样落盘。
+    #[test]
+    fn a_guarded_write_allowed_publishes_like_write_atomic() {
+        let t = tempfile::tempdir().unwrap();
+        let target = t.path().join("m.json");
+        let r = write_atomic_guarded(&target, b"{\"a\":1}", &|| true).unwrap();
+        assert_eq!(r.retries, 0);
+        assert_eq!(std::fs::read(&target).unwrap(), b"{\"a\":1}");
+    }
     use tempfile::tempdir;
 
     #[test]
@@ -483,13 +508,18 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<WriteReport, RetryFailu
 /// 守门版 [`write_atomic`]:临时文件写完、**改名之前**再问一句 `before_publish`,答否
 /// 就不发布(临时文件照常清掉)。给写栅栏用:写一份几 MB 的清单是落盘里最长的一段,
 /// 栅栏在这一段里被回收的话,改名前还能拦住——事后 `still_mine` 只能发现,拦不住。
+///
+/// `before_publish` **会被调用多次**:改名撞上占用时每重试一轮都再问一次。它必须
+/// 幂等、只看事实(锁标记还在不在),不能按调用次数计。
 pub fn write_atomic_guarded(
     path: &Path,
     bytes: &[u8],
     before_publish: &dyn Fn() -> bool,
 ) -> Result<WriteReport, GuardedWrite> {
     let refused = std::cell::Cell::new(false);
+    let attempts = std::cell::Cell::new(0u32);
     let r = write_atomic_with(path, bytes, |from, to| {
+        attempts.set(attempts.get() + 1);
         if !before_publish() {
             refused.set(true);
             return Err(io::Error::other("write fence refused"));
@@ -498,15 +528,18 @@ pub fn write_atomic_guarded(
     });
     match r {
         Ok(w) => Ok(w),
-        Err(_) if refused.get() => Err(GuardedWrite::Refused),
+        Err(_) if refused.get() => Err(GuardedWrite::Refused {
+            retries: attempts.get().saturating_sub(1),
+        }),
         Err(f) => Err(GuardedWrite::Failed(f)),
     }
 }
 
-/// [`write_atomic_guarded`] 的两种失败:守门人说不,或真正的写失败。
+/// [`write_atomic_guarded`] 的两种失败:守门人说不(带上说不之前已经为占用重试过的
+/// 轮数——那是可见的降级,不能丢),或真正的写失败。
 #[derive(Debug)]
 pub enum GuardedWrite {
-    Refused,
+    Refused { retries: u32 },
     Failed(RetryFailure),
 }
 

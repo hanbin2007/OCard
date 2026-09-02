@@ -2499,10 +2499,17 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
         }
     }
     if let Err(e) = saved {
-        let msg = format!(
-            "续传前刷新的文件清单**未能**写回拷卡清单,已拒绝续传(继续跑会让审计范围与实际拷贝范围对不上:\
-             worker 用的是刷新后的新清单,磁盘上却还是旧的那份)。请排查目的地/NAS 是否可写后重试: {e}"
-        );
+        // 栅栏那一支(Busy)不是写权限问题,别把人支去查权限——本模块反复强调的那条
+        let msg = if matches!(e, crate::core::CoreError::Busy(_)) {
+            format!(
+                "续传前刷新的文件清单**未能**写回拷卡清单,已拒绝续传:{e}。请确认没有别的 OCard 在跑这个任务(或检查清单目录里的租约锁目录)后再试"
+            )
+        } else {
+            format!(
+                "续传前刷新的文件清单**未能**写回拷卡清单,已拒绝续传(继续跑会让审计范围与实际拷贝范围对不上:\
+                 worker 用的是刷新后的新清单,磁盘上却还是旧的那份)。请排查目的地/NAS 是否可写后重试: {e}"
+            )
+        };
         notify::warn(app, "copy-resume-manifest-not-persisted", msg.clone());
         return Err(msg);
     }

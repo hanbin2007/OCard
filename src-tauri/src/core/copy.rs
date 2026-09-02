@@ -1225,25 +1225,24 @@ fn save_within_fence(
     fence: Option<SaveFenceHook<'_>>,
     project_root: &Path,
     m: &CopyManifest,
-) -> Result<std::result::Result<(super::fsx::WriteReport, PathBuf), String>> {
+) -> std::result::Result<(super::fsx::WriteReport, PathBuf), String> {
     let guard = match fence.map(|f| f()) {
         None => None,
         Some(Ok(g)) => Some(g),
-        Some(Err(e)) => return Ok(Err(e.to_string())),
+        Some(Err(e)) => return Err(e.to_string()),
     };
     let still_mine = || guard.as_ref().is_none_or(|g| g.still_mine());
-    let saved = match manifest::save_guarded(project_root, m, &still_mine) {
-        Ok(v) => v,
-        Err(super::CoreError::Busy(why)) => return Ok(Err(why)),
-        Err(e) => return Err(e),
-    };
+    // 真正的写失败(IO)也用 Err(原因) 承载而不是 `?`:否则 reports 跟着丢,已拷完 /
+    // 已失败文件一条审计都不写。任务落到暂停,清单还是上一次落盘的那份,可续传
+    let saved = manifest::save_guarded(project_root, m, &still_mine).map_err(|e| e.to_string())?;
     if !still_mine() {
-        // 改名之后才被回收:这份已经发布了,可能盖掉了接管者刚写的——停下并说明
-        return Ok(Err(
-            "落盘期间租约接管锁被外部回收(存储的时钟不准,或锁目录被人动过),这次落盘不可信,已停下;请核对是否有别的进程在跑这个任务,再决定在哪边续传".into(),
-        ));
+        // 改名之后才读不到锁标记:这份已经发布了,可能盖掉了接管者刚写的——停下并说明。
+        // 原因分不出来(存储抖动 / 被外部回收),就不点名
+        return Err(
+            "落盘之后读不到本任务的租约锁标记(可能是存储抖了一下,也可能是锁被外部回收;这里分不出来),这次落盘不可信,已停下;请核对是否有别的进程在跑这个任务,再决定在哪边续传".into(),
+        );
     }
-    Ok(Ok(saved))
+    Ok(saved)
 }
 
 pub fn run_copy(
@@ -1437,7 +1436,7 @@ pub fn run_copy(
         // 清单没变(续传时按哈希确认的文件不改清单)就不落盘、也不取栅栏:一次栅栏
         // 是 5 次 NAS 元数据往返,5000 个文件的续传白白多花两分钟
         if dirty {
-            match save_within_fence(fence, project_root, m)? {
+            match save_within_fence(fence, project_root, m) {
                 // 栅栏不给(被接管 / 没拿到锁 / 锁目录不可用 / 改名前或落盘后发现被回收):
                 // 一律按中止处理,收尾照跑——reports / 审计 / 总账都保住,原因原样带给用户
                 Err(why) => {
@@ -1511,7 +1510,7 @@ pub fn run_copy(
             material_retries,
         });
     }
-    match save_within_fence(fence, project_root, m)? {
+    match save_within_fence(fence, project_root, m) {
         Err(why) => {
             return Ok(CopyOutcome {
                 files: reports,
@@ -1683,8 +1682,10 @@ fn copy_one(
     if !on_chunk(0) {
         return Err(lease_abort());
     }
-    // 失败清理只清**自己建过的** part:建之前出错(建目录失败、租约检查点……)时,
-    // 同名的 part 可能是接管者的
+    // 失败清理只清**自己建过的那些路径**:建之前出错(建目录失败……)时同名的 part
+    // 可能是接管者的。按路径记而不是按 inode:休眠恢复的旧持有者与接管者若在同一个
+    // 路径上先后建过 part,这里仍会删掉对方的——模块头(core::lease)把这类互删声明
+    // 为已知边界(一方可见失败、续传按哈希修复)
     let created = std::cell::Cell::new(0usize);
     let result = (|| -> Result<String> {
         let mut writers = Vec::with_capacity(parts.len());
@@ -1974,16 +1975,16 @@ mod tests {
         }
     }
 
-    /// 前 `alive_for` 次问「还是我的吗」答是,之后答否:用来把「改名前那一问」和
-    /// 「写完之后的复核」分开考——前者会拦住发布,后者只能发现。
-    struct FlippingFence {
-        alive_for: std::cell::Cell<usize>,
+    /// 「发布之前还是我的、发布之后就不是了」:看**事实**(目标文件出现了没有),不按
+    /// 调用次数计——改名前那一问在改名撞上占用重试时会被问多次(Windows 上常态),
+    /// 按次数计的假栅栏会在 CI 上随机翻。用来把「改名前那一问」和「写完之后的复核」
+    /// 分开考:前者会拦住发布,后者只能发现。
+    struct LostAfterPublish {
+        published: PathBuf,
     }
-    impl SaveFenceGuard for FlippingFence {
+    impl SaveFenceGuard for LostAfterPublish {
         fn still_mine(&self) -> bool {
-            let left = self.alive_for.get();
-            self.alive_for.set(left.saturating_sub(1));
-            left > 0
+            !self.published.exists()
         }
     }
 
@@ -1995,9 +1996,9 @@ mod tests {
         let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
         let manifest_file = manifest::manifest_dir(&project).join(format!("{}.json", m.id));
         let fence = || -> super::super::Result<Box<dyn SaveFenceGuard>> {
-            // 改名前问一次(答是),写完复核问一次(答否)
-            Ok(Box::new(FlippingFence {
-                alive_for: std::cell::Cell::new(1),
+            // 改名前问(文件还没出现 → 是),写完复核问(出现了 → 否)
+            Ok(Box::new(LostAfterPublish {
+                published: manifest_file.clone(),
             }))
         };
         let out = run_copy(&req, &plan, &mut m, &project, Some(&fence), |_| {
@@ -2119,6 +2120,11 @@ mod tests {
             .files
             .iter()
             .all(|f| matches!(f.status, FileStatus::SkippedResume)));
+        assert_eq!(
+            out.files.len(),
+            plan.len(),
+            "必须是跑完全部文件之后才在收尾那一次失锁(逐文件那条路凑不出这个)"
+        );
         assert!(out.aborted && !out.all_verified, "收尾失锁不许报全部通过");
         assert!(
             out.abort_reason.as_deref().unwrap_or("").contains("回收"),
