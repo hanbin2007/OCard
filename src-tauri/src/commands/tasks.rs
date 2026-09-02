@@ -169,7 +169,19 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
     // 用户此刻点「继续」应让旧 worker 撤销暂停继续跑(评审 L19/P1-9)。
     handle.pause_requested.store(false, Ordering::SeqCst);
     if handle.running.swap(true, Ordering::SeqCst) {
-        return; // 已有工作线程在跑(暂停请求已被上面撤销)
+        // 已有工作线程在跑(暂停请求已被上面撤销)。这也覆盖「上一次运行正在收尾」
+        // 的窗口:用户点「继续」→ 界面闪一下 → 又回到暂停,若一声不吭就是静默 no-op
+        let (id, pid) = {
+            let s = handle.snapshot.lock().unwrap();
+            (s.id.clone(), s.project_id.clone())
+        };
+        super::notify::info_for_task(
+            &app,
+            "copy-resume-already-running",
+            (&id, &pid),
+            "这个任务的上一次运行还没退出(正在收尾或仍在拷贝),本次「继续」没有另起新的运行;若它正在收尾,稍候再点一次".into(),
+        );
+        return;
     }
     std::thread::spawn(move || {
         let outcome = run_worker(&app, &handle);
@@ -440,19 +452,24 @@ fn run_worker<R: tauri::Runtime>(
     // 把意图写明,并顺手自查一次——删不掉时别人要白等 TTL,用户有权知道
     let outcome = run_worker_locked(app, handle, &mut m, &lease);
     let lease_file = lease.path().to_path_buf();
-    lease.release();
-    if lease_file.is_file() {
-        // 还在 = 要么删不掉,要么已经被别人接管(那份不是我们的,不该删)。
-        // 后者在轮询阶段已经报过 lost,这里不重复判定,只说文件还在
-        super::notify::warn(
-            app,
-            "task-lease-left-behind",
-            format!(
-                "任务结束后租约文件仍在盘上(删不掉,或已被别的进程接管):{}。若是删不掉,别的机器续这个任务要等 {} 分钟",
-                lease_file.display(),
-                crate::core::lease::LEASE_TTL.num_minutes()
-            ),
-        );
+    match lease.release() {
+        crate::core::lease::Released::Removed => {}
+        // 被接管:轮询阶段已经报过 task-lease-lost,这里不重复
+        crate::core::lease::Released::TakenOver => {}
+        crate::core::lease::Released::RemoveFailed(why) => {
+            // 删不掉的是**我们自己的**租约:本机(pid 还活着,不算残留)与别的机器
+            // 都要等 TTL 才能再续这个任务。得说清楚,否则用户点「继续」会撞上
+            // 「本进程内的另一次续传」然后一头雾水
+            super::notify::warn(
+                app,
+                "task-lease-left-behind",
+                format!(
+                    "任务结束后没能删掉自己的租约文件({why}):{}。在此后 {} 分钟内,本机与别的机器续这个任务都会被它挡住;可手动删除该文件解锁",
+                    lease_file.display(),
+                    crate::core::lease::LEASE_TTL.num_minutes()
+                ),
+            );
+        }
     }
     outcome
 }
@@ -532,7 +549,10 @@ fn run_worker_locked<R: tauri::Runtime>(
         {
             let mut snap = handle.snapshot.lock().unwrap();
             match &p {
-                copy::Progress::Scanned { .. } | copy::Progress::FileStarted { .. } => {}
+                copy::Progress::Scanned { .. }
+                | copy::Progress::FileStarted { .. }
+                // 落盘前的租约询问:结论由回调末尾统一的 lease.poll() 给出
+                | copy::Progress::AboutToSave { .. } => {}
                 copy::Progress::Contention {
                     kind,
                     path,
@@ -592,11 +612,11 @@ fn run_worker_locked<R: tauri::Runtime>(
                 ),
             );
         }
-        // 租约状态轮询(心跳由独立线程推进,这里只看结论)。两种情况都要停在
-        // 文件边界:Lost = 别人已合法接管,再写就是双写;AtRisk = 心跳很久没成功,
-        // 再拷下去很快就会变成 Lost,而我们还在写
-        match lease.poll() {
-            crate::core::lease::LeaseStatus::Ok => {}
+        // 租约状态轮询(心跳由独立线程推进,这里只看结论)。两种情况都要**立刻**停,
+        // 而且不再写清单(CopyControl::Abort):Lost = 别人已合法接管,再写就是把人家
+        // 记下的进度整份顶掉;AtRisk = 心跳很久没成功,再拷下去很快就会变成 Lost
+        let lease_verdict = match lease.poll() {
+            crate::core::lease::LeaseStatus::Ok => None,
             crate::core::lease::LeaseStatus::Lost(who) => {
                 if !lease_stop_reported {
                     lease_stop_reported = true;
@@ -605,11 +625,11 @@ fn run_worker_locked<R: tauri::Runtime>(
                         "task-lease-lost",
                         (&task_for_notices.0, &task_for_notices.1),
                         format!(
-                            "这个任务的租约已被 {who} 接管(本机心跳停过一阵),为避免两边同时写清单,已在当前文件后停下转为暂停。请确认那边的进度,再决定在哪边续传"
+                            "本进程不再持有这个任务的租约,现在是 {who} 持有(可能是本机心跳中断过,也可能是租约文件被外部删除或替换)。为避免两边同时写清单,已在文件边界停下并放弃写回,转为暂停。请确认那边的进度,再决定在哪边续传"
                         ),
                     );
                 }
-                handle.pause_requested.store(true, Ordering::SeqCst);
+                Some(copy::CopyControl::Abort)
             }
             crate::core::lease::LeaseStatus::AtRisk(why) => {
                 if !lease_stop_reported {
@@ -619,12 +639,16 @@ fn run_worker_locked<R: tauri::Runtime>(
                         "task-lease-at-risk",
                         (&task_for_notices.0, &task_for_notices.1),
                         format!(
-                            "任务租约的心跳持续写不进去:{why}。为避免被别的进程接管后两边同时写清单,已在当前文件后停下转为暂停;排查清单目录是否可写后点「继续」"
+                            "任务租约的心跳出了问题:{why}。为避免被别的进程接管后两边同时写清单,已在文件边界停下并放弃写回,转为暂停;排查后点「继续」"
                         ),
                     );
                 }
-                handle.pause_requested.store(true, Ordering::SeqCst);
+                Some(copy::CopyControl::Abort)
             }
+        };
+        if let Some(abort) = lease_verdict {
+            handle.pause_requested.store(true, Ordering::SeqCst);
+            return abort;
         }
         if handle.pause_requested.load(Ordering::SeqCst) {
             copy::CopyControl::Pause

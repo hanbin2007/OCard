@@ -83,20 +83,64 @@ export async function createProjectViaWizard(name, scenario) {
   // 缓存下来的句柄下一拍就 stale(CI 实测 stale element reference)。
   // 点击也要容错:步骤面板有进场动画,动画期间点击可能被判为
   // intercepted/not interactable——失败就等下一轮重试,而不是炸掉。
-  await browser.waitUntil(
-    async () => {
-      if (await $('[data-testid="np-submit"]').isExisting()) return true;
-      if (await $('[data-testid="npw-next"]').isExisting()) {
-        try {
-          await $('[data-testid="npw-next"]').click();
-        } catch {
-          return false; // 动画/重挂撞上了,下一轮再来
+  let lastClickError = null;
+  try {
+    await browser.waitUntil(
+      async () => {
+        if (await $('[data-testid="np-submit"]').isExisting()) return true;
+        if (await $('[data-testid="npw-next"]').isExisting()) {
+          try {
+            await $('[data-testid="npw-next"]').click();
+          } catch (err) {
+            lastClickError = err; // 动画/重挂撞上了,下一轮再来
+            return false;
+          }
         }
+        return false;
+      },
+      { timeout: 30000, interval: 300, timeoutMsg: "引导没有走到「确认创建」步" },
+    );
+  } catch (err) {
+    // 超时时把「到底是什么压在按钮上」带出来。CI 上这条自 v0.4.2 起就红,
+    // 日志里只有几十行 element click intercepted,却没有一行说是被谁拦的;
+    // 不把现场拍下来就只能猜。
+    const scene = await browser.execute(() => {
+      const describe = (el) => {
+        const chain = [];
+        for (let n = el; n && n !== document.body && chain.length < 6; n = n.parentElement) {
+          const id = n.getAttribute?.("data-testid");
+          const code = n.getAttribute?.("data-code");
+          chain.push(
+            `${n.tagName.toLowerCase()}${n.className ? "." + String(n.className).replace(/\s+/g, ".") : ""}` +
+              (id ? `[testid=${id}]` : "") +
+              (code ? `[code=${code}]` : ""),
+          );
+        }
+        return chain.join(" < ");
+      };
+      const next = document.querySelector('[data-testid="npw-next"]');
+      const submit = document.querySelector('[data-testid="np-submit"]');
+      let atPoint = "(没有 npw-next)";
+      let rect = null;
+      if (next) {
+        const r = next.getBoundingClientRect();
+        rect = { x: r.x, y: r.y, w: r.width, h: r.height, disabled: next.disabled };
+        const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+        atPoint = hit ? describe(hit) : "(点上什么都没有:按钮在视口外?)";
       }
-      return false;
-    },
-    { timeout: 30000, interval: 300, timeoutMsg: "引导没有走到「确认创建」步" },
-  );
+      const toasts = [...document.querySelectorAll('[data-testid^="notice-toast-"]')].map(
+        (t) => `${t.getAttribute("data-code")}: ${(t.textContent || "").slice(0, 80)}`,
+      );
+      const overlays = [...document.querySelectorAll(".overlay, .dialog, [role=dialog], [role=alertdialog]")].map(
+        describe,
+      );
+      const step = document.querySelector('[data-testid^="npw-step"]')?.getAttribute("data-testid") ?? "?";
+      return { step, hasSubmit: Boolean(submit), rect, atPoint, toasts, overlays, vw: innerWidth, vh: innerHeight };
+    });
+    const detail = JSON.stringify(scene);
+    const last = lastClickError ? ` 最后一次点击错误: ${lastClickError.message}` : "";
+    throw new Error(`${err.message}${last}\n现场: ${detail}`);
+  }
   await retryOn('[data-testid="np-submit"]', (el) => el.click());
   // 创建成功 → 主窗口显示并选中新项目;主窗口侧栏有「项目管理」入口
   await switchToWindowWith('[data-testid="nav-manager"]', 30000);

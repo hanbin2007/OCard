@@ -957,16 +957,12 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
             if let Some(mid) = &intent_manifest {
                 // 评审 P0-4:空清单/读错/取消都不许标完成——attempts 上限负责最终放弃
                 if !cancelled && result.failures.is_empty() && total > 0 {
-                    if let Ok(mut m) = crate::core::manifest::load(&root, mid) {
-                        m.proxy_completed = true;
-                        if let Err(e) = crate::core::manifest::save(&root, &m) {
-                            notify::warn(
-                                &body_app,
-                                "auto-proxy-intent-degraded",
-                                format!("自动转代理完成,但意图标记写入失败({e});下次启动会重投一次(已转文件会安全跳过)"),
-                            );
-                        }
-                    }
+                    // 与放弃标记/重试计数同一条路:重读 + 看活租约 + 写回,写失败可见。
+                    // 此前这里 `if let Ok(..)` 读不出清单就一声不吭——任务显示完成、
+                    // 意图却没落盘,下次启动会重投一次,用户不知道为什么
+                    save_proxy_state(&body_app, &root, &machine_id, mid, "完成标记", |fresh| {
+                        fresh.proxy_completed = true
+                    });
                 }
             }
             serde_json::to_value(&result).map_err(|e| e.to_string())

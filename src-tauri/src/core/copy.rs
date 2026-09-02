@@ -97,6 +97,9 @@ pub enum Progress<'a> {
         path: &'a Path,
         retries: u32,
     },
+    /// 马上要写清单了。回调在这里回 [`CopyControl::Abort`] 就**不写**——租约状态
+    /// 在这一刻问,比在上一个块级回调问更准:丢租约与落盘之间不再有窗口。
+    AboutToSave { rel_path: &'a str },
 }
 
 /// 哪一步被占用了。两种的分量不同(清单重写得起,素材落不了位才要命),
@@ -120,6 +123,10 @@ pub struct ContentionTally {
 pub enum CopyControl {
     Continue,
     Pause,
+    /// 立刻停,而且**不再写清单**:租约已被别的进程接管(或马上会被接管),
+    /// 再写一次就是把人家记下的进度整份顶掉——租约存在的唯一理由就是防这个。
+    /// 跳过最后那次落盘不丢进度:接管方会按哈希重新核对已落位的文件。
+    Abort,
 }
 
 thread_local! {
@@ -1238,6 +1245,8 @@ pub fn run_copy(
     let mut write_retries = 0u32;
     // 素材文件落位改名被占用后重试的总轮数(同上,但这条是素材,更要紧)
     let mut material_retries = 0u32;
+    // 租约丢了(或马上要丢):从此一个字节都不许再写进清单
+    let mut abort_writes = false;
     let total = plan.len();
 
     for (index, item) in plan.iter().enumerate() {
@@ -1279,11 +1288,15 @@ pub fn run_copy(
                     &req.destinations,
                     &req.task_tag,
                     &mut |delta| {
-                        // 块级进度只上报,不在文件中途暂停
-                        let _ = progress(Progress::BytesCopied {
+                        // 块级进度只上报,不在文件中途暂停;但「不许再写清单」这一条
+                        // 在文件中途就得记下来,否则拷完这个文件就会落一次盘
+                        if progress(Progress::BytesCopied {
                             rel_path: rel,
                             delta,
-                        });
+                        }) == CopyControl::Abort
+                        {
+                            abort_writes = true;
+                        }
                     },
                     &mut file_tally,
                 ) {
@@ -1326,6 +1339,12 @@ pub fn run_copy(
                 retries: file_tally.retries,
             });
         }
+        if abort_writes
+            || control == CopyControl::Abort
+            || progress(Progress::AboutToSave { rel_path: rel }) == CopyControl::Abort
+        {
+            return Err(lease_abort());
+        }
         // 逐文件落盘,任意时刻中断都可续传
         let (wr, mpath) = manifest::save(project_root, m)?;
         if wr.retries > 0 {
@@ -1341,6 +1360,9 @@ pub fn run_copy(
             rel_path: rel,
             status: &status,
         });
+        if control == CopyControl::Abort {
+            return Err(lease_abort());
+        }
         reports.push(FileReport {
             rel_path: rel.clone(),
             source_rel: src_rel.clone(),
@@ -1360,6 +1382,9 @@ pub fn run_copy(
             .iter()
             .all(|r| !matches!(r.status, FileStatus::Failed(_)));
     m.completed = all_verified;
+    if abort_writes || progress(Progress::AboutToSave { rel_path: "" }) == CopyControl::Abort {
+        return Err(lease_abort());
+    }
     let (wr, mpath) = manifest::save(project_root, m)?;
     if wr.retries > 0 {
         write_retries += wr.retries;
@@ -1378,6 +1403,13 @@ pub fn run_copy(
         write_retries,
         material_retries,
     })
+}
+
+/// 因租约原因停机时返回的错误:`Busy` → 任务落「暂停」,可续传。
+fn lease_abort() -> super::CoreError {
+    super::CoreError::Busy(
+        "本任务的租约已不再由本进程持有(或心跳久未成功、随时会被接管),已在文件边界停下并放弃写回清单——继续写会把接管方记下的进度整份顶掉。请确认另一处的进度后再决定在哪边续传".into(),
+    )
 }
 
 /// 拷贝单个文件到全部目的地。核心安全语义(评审 F1/P0-2):
@@ -1760,6 +1792,87 @@ mod tests {
             "",
         );
         (tmp, req, m, project)
+    }
+
+    /// 租约丢了之后**一个字节都不许再写进清单**——租约存在的唯一理由就是防这个。
+    /// 此前 Lost 只置 pause_requested,当前文件拷完照样 save 一次、收尾再 save 一次,
+    /// 把接管方记下的进度整份顶掉;而 task-lease-lost 的报文还向用户承诺「已停下」。
+    #[test]
+    fn abort_stops_at_the_file_boundary_without_touching_the_manifest() {
+        let (_t, req, mut m, project) = setup();
+        let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        assert!(plan.len() >= 2, "前置:至少两个文件才谈得上「第一个之后停」");
+        let manifest_file = manifest::manifest_dir(&project).join(format!("{}.json", m.id));
+
+        let mut saves_asked = 0usize;
+        let err = run_copy(&req, &plan, &mut m, &project, |p| match p {
+            // 第一次要写清单的那一刻说「租约没了」
+            Progress::AboutToSave { .. } => {
+                saves_asked += 1;
+                CopyControl::Abort
+            }
+            _ => CopyControl::Continue,
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(err, super::super::CoreError::Busy(_)),
+            "租约原因停机要落「暂停」口径(Busy),不是失败: {err}"
+        );
+        assert_eq!(saves_asked, 1, "必须停在第一次落盘之前");
+        assert!(
+            !manifest_file.exists(),
+            "Abort 之后仍然写了清单——这正是租约要防的整份覆盖"
+        );
+        // 已经拷好的那个文件不能因此丢:接管方会按哈希重新核对它
+        let landed = req.destinations[0].join(&plan[0].target_rel);
+        assert!(landed.is_file(), "第一个文件应已落位: {}", landed.display());
+
+        // 对照:没有 Abort 时清单是会写的(否则上面的断言是恒真)
+        let (_t2, req2, mut m2, project2) = setup();
+        let plan2 = plan_whole_volume(&scan_source(&req2.source_root).unwrap());
+        run_copy(&req2, &plan2, &mut m2, &project2, |_| CopyControl::Continue).unwrap();
+        assert!(manifest::manifest_dir(&project2)
+            .join(format!("{}.json", m2.id))
+            .exists());
+    }
+
+    /// 在 FileFinished 上才说 Abort:那一次落盘已经发生(它在回调之前),
+    /// 但下一个文件的落盘必须停——窗口最多一次,且那一次在 Abort 之前。
+    #[test]
+    fn abort_at_file_finished_stops_before_the_next_save() {
+        let (_t, req, mut m, project) = setup();
+        let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        let mut saves = 0usize;
+        let err = run_copy(&req, &plan, &mut m, &project, |p| match p {
+            Progress::AboutToSave { .. } => {
+                saves += 1;
+                CopyControl::Continue
+            }
+            Progress::FileFinished { .. } => CopyControl::Abort,
+            _ => CopyControl::Continue,
+        })
+        .unwrap_err();
+        assert!(matches!(err, super::super::CoreError::Busy(_)), "{err}");
+        assert_eq!(saves, 1, "FileFinished 上的 Abort 只允许它之前那一次落盘");
+    }
+
+    /// 文件**中途**(块级回调)收到 Abort 也要算数:拷完这个文件后不许落盘。
+    #[test]
+    fn abort_signalled_mid_file_is_honoured_before_the_next_manifest_write() {
+        let (_t, req, mut m, project) = setup();
+        let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        let manifest_file = manifest::manifest_dir(&project).join(format!("{}.json", m.id));
+        let err = run_copy(&req, &plan, &mut m, &project, |p| match p {
+            Progress::BytesCopied { .. } => CopyControl::Abort,
+            _ => CopyControl::Continue,
+        })
+        .unwrap_err();
+        assert!(matches!(err, super::super::CoreError::Busy(_)), "{err}");
+        assert!(
+            !manifest_file.exists(),
+            "文件中途收到 Abort,拷完后仍写了清单"
+        );
     }
 
     #[test]

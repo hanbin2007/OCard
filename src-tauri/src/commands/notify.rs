@@ -141,6 +141,22 @@ pub fn error_for_task<R: tauri::Runtime>(
     );
 }
 
+pub fn info_for_task<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    code: &str,
+    task: (&str, &str),
+    message: String,
+) {
+    emit_notice_for(
+        app,
+        "info",
+        code,
+        message,
+        Some(task.0.to_string()),
+        Some(task.1.to_string()),
+    );
+}
+
 pub fn warn_for_task<R: tauri::Runtime>(
     app: &AppHandle<R>,
     code: &str,

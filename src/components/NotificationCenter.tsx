@@ -98,6 +98,7 @@ const NOTICE_TITLES: Record<string, string> = {
   "task-lease-lost": "任务已被别的进程接管，已暂停",
   "task-lease-left-behind": "任务租约没能清掉",
   "copy-resume-lease-held": "任务正被别的进程执行，拒绝续传",
+  "copy-resume-already-running": "上一次运行还没退出，本次「继续」未生效",
   "single-instance-refused": "OCard 已在运行",
 };
 
