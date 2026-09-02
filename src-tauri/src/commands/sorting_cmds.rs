@@ -98,11 +98,13 @@ pub(crate) fn notify_if_unsafe_fallback_for<R: tauri::Runtime>(
     task: Option<(&str, &str)>,
 ) {
     for (id, d) in crate::core::lease::take_late_heartbeat_degradations() {
-        super::tasks::report_heartbeat_degradations(app, Some((&id, "")), "迟到的租约心跳线程", &d);
+        // scope 先绑成变量:通知 code 门禁只认调用点里第一个 `),` 之前的字面量
+        let scope = Some((id.as_str(), ""));
+        super::tasks::report_heartbeat_degradations(app, scope, "迟到的租约心跳线程", &d);
         if d.heartbeat_stuck {
             notify::warn_scoped(
                 app,
-                Some((&id, "")),
+                scope,
                 "task-lease-heartbeat-stuck",
                 "租约心跳线程在释放之后才从 NAS 读写里醒来并退出;它攒下的降级已在上面补报".into(),
             );

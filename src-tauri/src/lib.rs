@@ -203,8 +203,10 @@ pub fn run() {
             if let Ok(log_dir) = app.path().app_log_dir() {
                 let failed = prune_rotated_logs(&log_dir, 10);
                 if !failed.is_empty() {
+                    // 句柄先绑成变量:通知 code 门禁只认调用点里第一个 `),` 之前的字面量
+                    let handle = app.handle();
                     crate::commands::notify::warn(
-                        app.handle(),
+                        handle,
                         "log-prune-failed",
                         format!(
                             "旧运行日志没能清理({} 项,例如 {}):日志会继续占用空间;请检查日志目录 {} 的权限或占用",
