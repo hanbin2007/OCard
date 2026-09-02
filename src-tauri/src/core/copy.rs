@@ -1624,6 +1624,15 @@ pub fn run_copy(
             material_retries,
         });
     }
+    // 全部按哈希确认了:清单此刻就是事实,不可信标记(若有)在**这次落盘之前**清掉。
+    // 放在落盘之后清会有一个窗口:旧持有者的迟到写入恰好落在「我们的落盘」与「我们的清标记」
+    // 之间,它写下的标记被我们删掉、盘上却是它的旧清单——标记就这样静默失效(codex 终审 P0)。
+    // 先清再写:迟到写入落在清之后,它自己写的标记留着;落在写之后,标记也留着
+    if all_verified {
+        if let Err(e) = manifest::clear_suspect(project_root, &m.id) {
+            log::warn!("清单不可信标记删不掉(收尾会再查一次并通知): {e}");
+        }
+    }
     match save_within_fence(fence, project_root, m) {
         Err(why) => {
             return Ok(CopyOutcome {
@@ -2267,6 +2276,24 @@ mod tests {
             out.abort_reason.as_deref().unwrap_or("").contains("回收"),
             "{:?}",
             out.abort_reason
+        );
+    }
+
+    /// 跑完(全部按哈希确认)之后清单就是事实,「不可信」标记要在**收尾落盘之前**清掉。
+    #[test]
+    fn a_suspect_marker_is_cleared_when_the_run_completes() {
+        let (_t, req, mut m, project) = setup();
+        let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        std::fs::create_dir_all(manifest::manifest_dir(&project)).unwrap();
+        manifest::mark_suspect(&project, &m.id, "上一次运行写完发现栅栏已丢").unwrap();
+        let out = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
+        assert!(out.all_verified, "前置:要跑完");
+        assert!(
+            manifest::suspect(&project, &m.id).unwrap().is_none(),
+            "跑完之后不可信标记必须清掉"
         );
     }
 

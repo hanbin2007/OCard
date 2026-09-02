@@ -45,7 +45,8 @@
 //! 只按心跳判,续传会被**自己**锁死 30 分钟,报文还指着一个不存在的进程。所以:
 //! ① `Held` 实现 `Drop`,panic 与所有早退都会释放;② 同机 + pid 已不存在 =
 //! 一定是自己上次的残留(single-instance 保证同机没有第二个 OCard),直接接管;
-//! ③ 心跳时间戳在**未来**也当过期(对方机器时钟快,否则那份租约永不过期)。
+//! ③ 心跳时间戳在**未来**超过 5 分钟([`FUTURE_SKEW_TOLERANCE`])也当过期(对方机器
+//!   时钟快,否则那份租约永不过期;快几分钟以内当偏差,由观察期保护活着的持有者)。
 //!
 //! # 契约:进程名
 //!
@@ -116,6 +117,9 @@ use std::sync::{Arc, Mutex};
 /// 只用于**别的机器**留下的租约(本机残留看 pid,不等)。取 30 分钟:宁可让
 /// 一次真的崩溃多等半小时,也不要把一个正在好好干活的任务判成死的。
 pub const LEASE_TTL: chrono::Duration = chrono::Duration::minutes(30);
+/// 心跳时间戳在**未来**多久以内还算「时钟偏差」而不是过期:对方机器时钟快几分钟是常态,
+/// 快过这个数的时间戳当过期处理(观察期会保护真正活着的持有者)。
+pub const FUTURE_SKEW_TOLERANCE: chrono::Duration = chrono::Duration::minutes(5);
 
 /// 读不懂的租约在多「年轻」以内当作「正在初始化/刚被接管」而不是「陈旧」。
 /// 取得与接管都是原子的,正常情况下不存在半截文件;这是给不支持原子原语的
@@ -191,7 +195,10 @@ impl Lease {
         match chrono::DateTime::parse_from_rfc3339(&self.heartbeat_at) {
             Ok(t) => {
                 let age = now - t.to_utc();
-                age > ttl || age < -ttl
+                // 未来超过 FUTURE_SKEW_TOLERANCE 就当过期(而不是超过一个 TTL):一份写在
+                // 「现在 + 20 分钟」的死租约按 -ttl 判要 50 分钟才能接管,报文却承诺 30 分钟;
+                // 活着的持有者时钟快几分钟无妨——它的心跳还在推进,观察期会放过它
+                age > ttl || age < -FUTURE_SKEW_TOLERANCE.min(ttl)
             }
             Err(_) => true,
         }
@@ -900,7 +907,28 @@ pub fn acquire_with(
         ));
     }
     if publish(&path, &me, note.is_some())? {
-        Held::start(path, me, timing, note)
+        // 接管路径也要写后复核(快路径早就有):publish 里的删 + 建可能卡在 NAS 上超过两分钟,
+        // 期间锁被回收、别人接管并发布了——我们迟到的删 + 建会把它的顶掉,然后两边都
+        // 以为自己赢了(codex 终审 P0)。锁不是自己的了就撤回并让路;回读不是自己的也让路
+        if !guard.still_mine() {
+            if matches!(read_lease(&path), Some(l) if l.token == me.token) {
+                let _ = std::fs::remove_file(&path);
+            }
+            return Err(super::CoreError::Busy(
+                "接管期间接管锁被别的进程回收(本机这一步卡了超过两分钟),本次让路;请稍后再试".into(),
+            ));
+        }
+        match read_lease(&path) {
+            Some(l) if l.token == me.token => Held::start(path, me, timing, note),
+            Some(l) => Err(super::CoreError::Busy(format!(
+                "接管刚完成就被 {} 顶掉,本次让路;请在那边操作,或稍后再试",
+                l.who(machine_id)
+            ))),
+            None => Err(super::CoreError::Busy(format!(
+                "刚写入的任务租约读不回来(存储可能正在抖动):{}。稍后再试",
+                path.display()
+            ))),
+        }
     } else {
         Err(super::CoreError::Busy(
             "另一个进程刚刚抢先取得了这个拷卡任务的租约,本次不再重复接管;请在那边操作,或稍后再试"
@@ -1806,6 +1834,24 @@ mod tests {
         assert!(msg.contains("王五") || msg.contains("MACHINE-C"), "{msg}");
         assert!(!msg.contains("校准"), "换了主人不是时钟问题: {msg}");
         assert_eq!(on_disk(&root, &id).token, theirs.token, "王五的租约被动了");
+    }
+
+    /// 未来的时间戳超过几分钟就当过期,不是超过一个 TTL:一份写在「现在 + 20 分钟」的死租约
+    /// 按 -TTL 判要 50 分钟才能接管,报文却承诺 30 分钟。
+    #[test]
+    fn a_lease_stamped_twenty_minutes_ahead_is_stale_not_fifty_minutes_away() {
+        let mut l = live("MACHINE-B", 4242, "李四");
+        let now = chrono::Utc::now();
+        l.heartbeat_at = (now + chrono::Duration::minutes(20)).to_rfc3339();
+        assert!(
+            l.is_stale_by(now, LEASE_TTL),
+            "未来 20 分钟 > 5 分钟容差,必须算过期"
+        );
+        l.heartbeat_at = (now + chrono::Duration::minutes(2)).to_rfc3339();
+        assert!(
+            !l.is_stale_by(now, LEASE_TTL),
+            "未来 2 分钟是时钟偏差,不算过期"
+        );
     }
 
     /// 对方机器时钟快:心跳在未来。只用 `now - t > TTL` 判的话它永不过期,

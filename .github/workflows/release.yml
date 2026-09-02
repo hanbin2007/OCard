@@ -41,6 +41,21 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # tag 与包内版本必须一致:否则打了 v0.4.4 的 tag,装出来的包自己却报 0.4.3
+      # (codex 终审)。三个版本源一处都不能漏:package.json / Cargo.toml / tauri.conf.json
+      - name: Tag 与包内版本一致性
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          cargo_v=$(grep -m1 '^version *= *"' src-tauri/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          echo "tag=$tag package.json=$pkg Cargo.toml=$cargo_v tauri.conf.json=$conf"
+          if [ "$tag" != "$pkg" ] || [ "$tag" != "$cargo_v" ] || [ "$tag" != "$conf" ]; then
+            echo "::error::版本不一致:tag v$tag 与包内版本(package.json=$pkg, Cargo.toml=$cargo_v, tauri.conf.json=$conf)必须相同"
+            exit 1
+          fi
+
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: pnpm test

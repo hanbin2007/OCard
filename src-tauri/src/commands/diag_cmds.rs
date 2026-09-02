@@ -179,7 +179,12 @@ impl ReportInputs {
             config_dir: state.config_dir.clone(),
             // 必须用 detailed_snapshots:`snapshots()` 走 summary_of,会把 files 清空
             tasks: state.tasks.detailed_snapshots(),
-            notices: state.notices.lock().unwrap().clone(),
+            // 中毒也照读:诊断导出是故障之后的最后出口,不能因为别处 panic 过就跟着炸
+            notices: state
+                .notices
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
         }
     }
 }

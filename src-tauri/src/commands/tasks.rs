@@ -178,18 +178,10 @@ pub fn file_status_str(status: &copy::FileStatus) -> &'static str {
 ///
 /// ## 已知未修:`Paused → Preparing → Running` 缺一个状态机 CAS(R12/R13 连续两轮被点名)
 ///
-/// `running` 只是一个布尔。`resume_copy_task` 的流程是「读 `running` → 重解析源卷
-/// → 复扫刷新清单 → 写回 `handle.plan`/快照 → `spawn_worker`」,这一整段**不是原子的**:
-/// 两个 `resume` 并发进来时,两边都可能读到 `running == false`,于是**两遍**复扫、
-/// 两遍写 `handle.plan`,最后靠这里的 `swap(true)` 只让一个 worker 真的起来。
-/// 后果是准备阶段的副作用(清单写回、告警)可能重复,而不是两个 worker 同时拷同一份
-/// 计划(那一层由 `swap` 挡住了)。
-///
-/// 为什么这一轮**没有**修:不是本轮引入的缺陷,正确的修法是把任务状态从布尔升级成
-/// 一个 `Paused/Preparing/Running/Done` 状态机,并让整个准备阶段跑在一次 CAS 之内
-/// ——改动面横跨 `TaskHandle`、`resume_copy_task`、`rebuild_tasks` 与全部快照读写,
-/// 与本轮的白名单/令牌修复混在一起会让评审无法归因。留档在此与契约文档「已知未修」
-/// 一节,下一轮单独做。
+/// `running` 只是一个布尔,但准备阶段的并发已经由**租约**挡住:`resume_copy_task` 第一件
+/// 事就是 `lease::acquire`,同进程第二次并发 resume 会在那里撞 Busy(pid 活着、token 不同),
+/// 走不到复扫与写回。这里的 `swap(true)` 只剩最后一道保险:守着「上一次运行还在收尾」
+/// 这段时间里的重复「继续」。
 pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle>) {
     // 先清暂停标志再判 running:若旧 worker 还在跑且刚收到暂停请求,
     // 用户此刻点「继续」应让旧 worker 撤销暂停继续跑(评审 L19/P1-9)。
@@ -207,7 +199,22 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
         } else {
             "这个任务的上一次运行还在收尾,本次「继续」没有另起新的运行;稍候再点一次"
         };
-        super::notify::info_for_task(&app, "copy-resume-already-running", (&id, &pid), msg.into());
+        // 两种情况 code 也分开:抬头「继续未生效」对「已撤销暂停请求、接着跑」是反的
+        if revoked_pause {
+            super::notify::info_for_task(
+                &app,
+                "copy-resume-revoked-pause",
+                (&id, &pid),
+                msg.into(),
+            );
+        } else {
+            super::notify::info_for_task(
+                &app,
+                "copy-resume-already-running",
+                (&id, &pid),
+                msg.into(),
+            );
+        }
         // 防御:这条路现有顺序到不了「槽里还有一份带心跳的租约」(第二次续传会先被
         // acquire 的 Busy 挡住),但槽里一份 Held 一旦漏了就是本进程生命周期内的永久自锁
         if let Some(lease) = handle.lease_slot().take() {
@@ -259,6 +266,10 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
         // 拷贝路径也消费 fsx 回退标记(终审:告警不能只挂在分类命令上)
         super::sorting_cmds::notify_if_unsafe_fallback(&app);
         // 拷完自动转代理(M3 T1.5):任务 done 且 manifest 带意图 → 派发作业
+        let done_task = {
+            let s = handle.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+            (s.id.clone(), s.project_id.clone())
+        };
         if outcome.is_ok()
             && handle
                 .snapshot
@@ -270,9 +281,10 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
             // 读不出清单就派不了自动转代理。此前是 `if let Ok(..)` 一声不吭:
             // 任务显示完成、代理却始终不出现,用户没有任何解释可循
             match manifest::load(&handle.project_root, &handle.manifest_id) {
-                Err(e) => super::notify::warn(
+                Err(e) => super::notify::warn_for_task(
                     &app,
                     "auto-proxy-deferred",
+                    (&done_task.0, &done_task.1),
                     format!(
                         "拷卡已完成,但读不出清单,自动转代理这一步没能派发(素材不受影响,下次启动会补投):{e}"
                     ),
@@ -1103,14 +1115,22 @@ fn run_worker_locked<R: tauri::Runtime>(
             snap.finished_at = Some(Utc::now().to_rfc3339());
         }
         if snap.state == "done" {
-            // 全部按哈希确认并落盘了:这份清单此刻就是事实,不可信标记(若有)可以清掉
-            if let Err(e) = manifest::clear_suspect(&handle.project_root, &handle.manifest_id) {
-                super::notify::warn_for_task(
+            // 标记在收尾落盘**之前**已由引擎清掉(见 run_copy);这里只查不删——此刻还在的
+            // 标记要么是删不掉,要么是收尾落盘之后又有迟到的写入留下的,两种都要说、都不能删
+            match manifest::suspect(&handle.project_root, &handle.manifest_id) {
+                Ok(None) => {}
+                Ok(Some(why)) => super::notify::warn_for_task(
                     app,
                     "manifest-suspect-not-cleared",
                     (&task_for_notices.0, &task_for_notices.1),
-                    format!("任务已完成,但清单旁的「不可信」标记没能删掉({e});下次启动它仍会被当作未完成展示,可手动删除该标记文件"),
-                );
+                    format!("任务已完成,但清单旁仍有「不可信」标记(完成落盘之后可能又有迟到的写入,或标记删不掉):{}。下次启动它会被当作未完成展示、续传按哈希重新确认;不要手动删标记", why.trim()),
+                ),
+                Err(e) => super::notify::warn_for_task(
+                    app,
+                    "manifest-suspect-not-cleared",
+                    (&task_for_notices.0, &task_for_notices.1),
+                    format!("任务已完成,但清单旁的「不可信」标记读不出({e});下次启动会按不可信处理(未完成展示)"),
+                ),
             }
         }
         let dest_state = match snap.state {

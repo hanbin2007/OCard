@@ -307,9 +307,19 @@ pub fn mark_suspect(project_root: &Path, id: &str, why: &str) -> Result<()> {
 }
 
 /// 这份清单是否带着不可信标记;有则返回标记正文。
-pub fn suspect(project_root: &Path, id: &str) -> Option<String> {
-    let path = suspect_path(project_root, id).ok()?;
-    std::fs::read_to_string(&path).ok()
+///
+/// **读不出 ≠ 没有**:权限、SMB 瞬断、内容不是 UTF-8 都返回 `Err`,调用方必须按
+/// 「不可信」处理(fail-closed)——把读错误压成 `None`,写着 completed=true 的任务就会被
+/// 静默当成已完成(codex 终审 P0)。
+pub fn suspect(project_root: &Path, id: &str) -> Result<Option<String>> {
+    let path = suspect_path(project_root, id)?;
+    match std::fs::read(&path) {
+        Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| {
+            super::CoreError::Invalid(format!("清单不可信标记内容不是 UTF-8:{}", path.display()))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(super::CoreError::io_detail("读取清单不可信标记", &path, &e)),
+    }
 }
 
 /// 清掉不可信标记(不存在也算成功)。
@@ -435,16 +445,35 @@ mod tests {
         std::fs::create_dir_all(manifest_dir(&root)).unwrap();
         let m = CopyManifest::new("1. 待分类/x", "CARD", "A_B_C", "张三", "");
         save(&root, &m).unwrap();
-        assert!(suspect(&root, &m.id).is_none());
+        assert!(suspect(&root, &m.id).unwrap().is_none());
         mark_suspect(&root, &m.id, "写完后发现租约锁已丢").unwrap();
-        let why = suspect(&root, &m.id).expect("标记要读得回");
+        let why = suspect(&root, &m.id).unwrap().expect("标记要读得回");
         assert!(why.contains("租约锁已丢"), "{why}");
         let listed = list(&root).unwrap();
         assert_eq!(listed.manifests.len(), 1);
         assert_eq!(listed.skipped, 0, "标记文件不是清单,不许算成读不懂的清单");
         clear_suspect(&root, &m.id).unwrap();
-        assert!(suspect(&root, &m.id).is_none());
+        assert!(suspect(&root, &m.id).unwrap().is_none());
         clear_suspect(&root, &m.id).expect("不存在也算清掉");
+    }
+
+    /// 标记**读不出**(权限)必须是 Err,不能当「没有标记」:调用方按不可信处理。
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_suspect_marker_is_an_error_not_a_missing_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(unsafe { libc::geteuid() }, 0, "前置:不能以 root 跑这条测试");
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("proj");
+        std::fs::create_dir_all(manifest_dir(&root)).unwrap();
+        let m = CopyManifest::new("1. 待分类/x", "CARD", "A_B_C", "张三", "");
+        save(&root, &m).unwrap();
+        mark_suspect(&root, &m.id, "x").unwrap();
+        let p = suspect_path(&root, &m.id).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = suspect(&root, &m.id);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(r.is_err(), "读不出必须是 Err,不能当没有: {r:?}");
     }
 
     /// 0.4.3 现场:Windows 上这里失败,用户看到的全部信息是

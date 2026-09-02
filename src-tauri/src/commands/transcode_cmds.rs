@@ -1101,19 +1101,21 @@ fn save_proxy_state<R: tauri::Runtime>(
         // 写完再复核:此时改名**已经发生**,栅栏没了只能说「发布了但不能确认」,不能说
         // 「没有写回」——放弃标记若已落盘,下次启动就不会再重投,却没人告诉用户已放弃
         let unverified = !fence.still_mine();
-        if unverified {
-            // NAS 上留持久化的不可信标记;写不成在下面的通知里说
-            let _ = crate::core::manifest::mark_suspect(
+        // NAS 上留持久化的不可信标记;写不成在下面的通知里如实说,不能谎称已留下
+        let marker = if unverified {
+            Some(crate::core::manifest::mark_suspect(
                 project_root,
                 id,
                 "自动转代理状态写回后发现租约锁已丢,这份清单可能盖掉了接管方的进度",
-            );
-        }
+            ))
+        } else {
+            None
+        };
         drop(fence);
-        Ok((wr, path, unverified))
+        Ok((wr, path, unverified, marker))
     });
     let outcome = match result {
-        Ok((wr, path, unverified)) => {
+        Ok((wr, path, unverified, marker)) => {
             // 被占用后重试成功的轮数在拷卡那条路上是可见的(fs-write-contention),口径一致
             if wr.retries > 0 {
                 notify::warn_for_task(
@@ -1133,7 +1135,12 @@ fn save_proxy_state<R: tauri::Runtime>(
                 "auto-proxy-state-unverified",
                 (id, &project_id),
                     format!(
-                        "清单 {which}… 的自动转代理{what}已写回,但写完后读不到本任务的租约锁标记(可能是存储抖动,也可能是锁被外部回收),不能确认这份清单没有被别处顶掉;本次按已写回处理,并已在清单旁留下「不可信」标记。请确认没有别的 OCard 在跑这个任务"
+                        "清单 {which}… 的自动转代理{what}已写回,但写完后读不到本任务的租约锁标记(可能是存储抖动,也可能是锁被外部回收),不能确认这份清单没有被别处顶掉;本次按已写回处理{}。请确认没有别的 OCard 在跑这个任务",
+                        match &marker {
+                            Some(Ok(())) => ",并已在清单旁留下「不可信」标记".to_string(),
+                            Some(Err(e)) => format!(",而且没能在清单旁写下「不可信」标记({e}):下次启动会采信盘上这份,请人工核对"),
+                            None => String::new(),
+                        }
                     ),
                 );
                 Persist::PublishedUnverified
@@ -1204,12 +1211,22 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
     if !m.auto_proxy || m.proxy_completed || !m.completed {
         return;
     }
-    // 带「不可信」标记的清单:completed 可能是迟到的写入顶回来的,不按它派发
-    if let Some(why) = crate::core::manifest::suspect(project_root, &m.id) {
+    let project_id: String = project_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // 带「不可信」标记的清单:completed 可能是迟到的写入顶回来的,不按它派发。
+    // 标记读不出也不派发(fail-closed)
+    let suspect = match crate::core::manifest::suspect(project_root, &m.id) {
+        Ok(None) => None,
+        Ok(Some(why)) => Some(why),
+        Err(e) => Some(format!("(标记读不出:{e};按不可信处理)")),
+    };
+    if let Some(why) = suspect {
         notify::warn_for_task(
             app,
             "auto-proxy-skipped-suspect",
-            (&m.id, ""),
+            (&m.id, &project_id),
             format!(
                 "「{}」的清单旁有「不可信」标记({}),它写着已完成但可能是被迟到的写入顶回来的:本次不派发自动转代理;续传跑完、标记清掉后会再派发",
                 m.target_rel,
@@ -1280,9 +1297,10 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
         Ok(m) => m,
         Err(e) => {
             // R2 P2:元数据读不出时意图会静默蒸发——如实告知
-            notify::warn(
+            notify::warn_for_task(
                 app,
                 "auto-proxy-deferred",
+                (&m.id, &project_id),
                 format!("自动转代理未启动(项目元数据读取失败: {e});下次启动会重试"),
             );
             return;
@@ -1298,7 +1316,7 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
         .to_string_lossy()
         .to_string();
     let input = ProxyInput {
-        project_id,
+        project_id: project_id.clone(),
         camera_folders: Some(vec![folder.to_string()]),
         force_all: Some(false),
         retranscode: Some(false),
@@ -1317,9 +1335,10 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
         Some(m.id.clone()),
     ) {
         intent_release_mid(&m.id);
-        notify::warn(
+        notify::warn_for_task(
             app,
             "auto-proxy-deferred",
+            (&m.id, &project_id),
             format!("自动转代理暂未启动({e});下次启动应用会自动补投"),
         );
     }

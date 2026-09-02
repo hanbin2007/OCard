@@ -2524,7 +2524,12 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
             notify::error_for_task(app, "copy-resume-lease-lock-broken", task, e.to_string());
         }
         // 栅栏那一支(Busy)不是写权限问题,别把人支去查权限——本模块反复强调的那条
-        let msg = if matches!(e, crate::core::CoreError::Busy(_)) {
+        let msg = if e.to_string().contains("不可信") {
+            // 改名已经发生、写后复核才失败:盘上多半就是这份,不能说「未能写回」
+            format!(
+                "续传前刷新的文件清单写回了但不能确认(写后复核发现租约锁标记不在了),已拒绝续传:{e}。请确认没有别的 OCard 在跑这个任务(或检查清单目录里的租约锁目录)后再试"
+            )
+        } else if matches!(e, crate::core::CoreError::Busy(_)) {
             format!(
                 "续传前刷新的文件清单**未能**写回拷卡清单,已拒绝续传:{e}。请确认没有别的 OCard 在跑这个任务(或检查清单目录里的租约锁目录)后再试"
             )
@@ -2703,12 +2708,16 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
         }
         // 带「不可信」标记的清单(被迟到的写入顶掉过)即使写着 completed 也按未完成展示:
         // 续传会按哈希重新确认,跑完才清标记。系统替用户改了判断,要说
-        let suspects: Vec<(String, String)> = list
-            .manifests
-            .iter()
-            .filter(|m| m.completed)
-            .filter_map(|m| manifest::suspect(&p.root, &m.id).map(|why| (m.id.clone(), why)))
-            .collect();
+        // 读不出标记(权限 / SMB 瞬断)也按不可信处理:把读错误当「没有标记」,写着
+        // completed 的任务就会被静默当成已完成(codex 终审 P0)
+        let mut suspects: Vec<(String, String)> = Vec::new();
+        for m in list.manifests.iter().filter(|m| m.completed) {
+            match manifest::suspect(&p.root, &m.id) {
+                Ok(None) => {}
+                Ok(Some(why)) => suspects.push((m.id.clone(), why)),
+                Err(e) => suspects.push((m.id.clone(), format!("(标记读不出:{e};按不可信处理)"))),
+            }
+        }
         for (mid, why) in &suspects {
             notify::warn_for_task(
                 app,
