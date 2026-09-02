@@ -1276,13 +1276,17 @@ pub fn sweep_stale_parts(
             let name = e.file_name();
             let name = name.to_string_lossy();
             // 最后一级回退留下的发布锁残留(`.<计划文件名>.publish.ocardtmp`,崩溃在建锁与删锁
-            // 之间):启动清扫只扫清单目录,交付目录里的由这里收——按存放它的盘的时钟量年龄,
-            // 超过两分钟才算残留;探针写不进就不下结论
-            if let Some(locked_name) = name
+            // 之间)和时钟探针残留(`.clock.<nonce>.ocardtmp`,删不掉的那种):启动清扫只扫清单
+            // 目录,交付目录里的由这里收——按存放它的盘的时钟量年龄,超过 30 分钟才算残留;
+            // 探针写不进就不下结论
+            let lock_residue = name
                 .strip_prefix('.')
                 .and_then(|n| n.strip_suffix(lock_suffix.as_str()))
-            {
-                if names.contains(locked_name) {
+                .is_some_and(|n| names.contains(n));
+            let probe_residue =
+                name.starts_with(".clock.") && name.ends_with(super::fsx::TMP_SUFFIX);
+            if lock_residue || probe_residue {
+                {
                     let path = e.path();
                     let age_ok = match (
                         e.metadata().and_then(|m| m.modified()),
@@ -2031,10 +2035,11 @@ fn finalize_no_replace(part: &Path, fin: &Path, retried: &mut ContentionTally) -
             Ok(())
         }
         // 撞上别的发布者的发布锁、占用重试完还在:不是权限 / 杀软,也不计入 IO 连败——
-        // 是「另一个任务正在往同一路径发布」(或两分钟内的崩溃残留锁),要人去核对,不是查权限
+        // 是「另一个任务正在往同一路径发布」(或崩溃残留的锁:发布锁不在热路径回收,开拷前
+        // 清扫按 30 分钟收),要人去核对,不是查权限
         Err(f) if f.source.to_string().contains(super::fsx::PUBLISH_LOCK_HELD) => {
             Err(super::CoreError::Invalid(format!(
-                "目标路径正被另一个任务发布(或该路径上有两分钟内的崩溃残留发布锁),已重试 {} 轮仍被占着,拒绝落位: {}。请确认没有别的 OCard 在往这个目录拷同名文件;确认后可删除同目录下的 .{}.publish{} 再续传",
+                "目标路径正被另一个任务发布(或该路径上有崩溃残留的发布锁;发布锁不自动回收,开拷前的清扫只收超过 30 分钟的),已重试 {} 轮仍被占着,拒绝落位: {}。请确认没有别的 OCard 在往这个目录拷同名文件;确认后可删除同目录下的 .{}.publish{} 再续传",
                 f.retries,
                 fin.display(),
                 fin.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -2201,6 +2206,71 @@ mod tests {
 
     /// 清扫只动**本任务、别的 run 标签**的普通文件 part:本轮的留着、别的任务的不碰、
     /// 名字像 part 的目录 / 链接不碰;升级前的旧格式(不带 run 标签)残留也要认领;
+    /// 交付目录里的发布锁残留 / 时钟探针残留:超过 30 分钟(按存放它的盘的时钟)且租约还在
+    /// 才收;新鲜的锁是别人正在发布,不碰;不在计划里的锁不是本任务的,不碰。
+    #[test]
+    fn sweeping_collects_stale_publish_locks_and_clock_probes_but_not_fresh_ones() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(dest.join("sub")).unwrap();
+        let planned = |n: &str| PlannedFile {
+            source_rel: format!("sub/{n}"),
+            target_rel: format!("sub/{n}"),
+            size: 1,
+            source_mtime_ns: 0,
+        };
+        let plan = vec![planned("a.mp4"), planned("c.mp4")];
+        let stale_lock = dest.join("sub/.a.mp4.publish.ocardtmp");
+        let fresh_lock = dest.join("sub/.c.mp4.publish.ocardtmp");
+        let stale_probe = dest.join("sub/.clock.deadbeefdeadbeef.ocardtmp");
+        let fresh_probe = dest.join("sub/.clock.0123456789abcdef.ocardtmp");
+        let unplanned_lock = dest.join("sub/.z.mp4.publish.ocardtmp");
+        for f in [
+            &stale_lock,
+            &fresh_lock,
+            &stale_probe,
+            &fresh_probe,
+            &unplanned_lock,
+        ] {
+            std::fs::write(f, b"").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 60);
+        for f in [&stale_lock, &stale_probe, &unplanned_lock] {
+            std::fs::File::options()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(long_ago))
+                .unwrap();
+        }
+        // 租约丢了:一个都不许删
+        let refused = sweep_stale_parts(
+            std::slice::from_ref(&dest),
+            &plan,
+            "abcd1234",
+            "22222222",
+            &|| false,
+        );
+        assert!(refused.removed.is_empty(), "{refused:?}");
+        assert!(stale_lock.exists() && stale_probe.exists());
+        let swept = sweep_stale_parts(
+            std::slice::from_ref(&dest),
+            &plan,
+            "abcd1234",
+            "22222222",
+            &|| true,
+        );
+        let mut removed = swept.removed.clone();
+        removed.sort();
+        let mut expected = vec![stale_lock.clone(), stale_probe.clone()];
+        expected.sort();
+        assert_eq!(removed, expected, "只收超过 30 分钟的锁 / 探针残留");
+        assert!(swept.failed.is_empty(), "{:?}", swept.failed);
+        assert!(fresh_lock.exists(), "新鲜的发布锁是别人正在发布,不许碰");
+        assert!(fresh_probe.exists(), "新鲜的探针不许碰");
+        assert!(unplanned_lock.exists(), "不在计划里的锁不是本任务的,不许碰");
+    }
+
     /// 清了什么、没清成什么都要回报。
     #[test]
     fn sweeping_stale_parts_only_touches_other_runs_of_this_task() {

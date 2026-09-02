@@ -363,7 +363,10 @@ fn disk_now_fresh(dir: &Path) -> Option<std::time::SystemTime> {
     ));
     std::fs::write(&probe, b"").ok()?;
     let t = std::fs::metadata(&probe).and_then(|m| m.modified()).ok();
-    let _ = std::fs::remove_file(&probe);
+    if let Err(e) = std::fs::remove_file(&probe) {
+        // 落在交付 / 清单目录里的探针残留:开拷前的清扫按 30 分钟收走;删不掉至少要说
+        log::warn!("时钟探针没删掉 {}: {e}", probe.display());
+    }
     if let Some(t) = t {
         lock_or_recover(disk_now_cache()).insert(dir.to_path_buf(), (std::time::Instant::now(), t));
     }

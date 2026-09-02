@@ -256,14 +256,15 @@ pub fn start_analysis<R: tauri::Runtime>(
                 failed: failures.into_inner().unwrap_or_default(),
                 cache_skipped_lines: skipped,
             };
+            // 无条件:分析全部成功也要说(此前放在「有失败」分支里,全绿时标记就无声丢了)
+            if fallback_seen.load(std::sync::atomic::Ordering::Relaxed) {
+                notify::warn(
+                    &body_app,
+                    "fsx-fallback-window",
+                    "分析写缩略图时文件系统不支持原子防覆盖改名与硬链接,已降级为「发布锁 + 复查后改名」;建议确认 NAS 协议(SMB3/NFSv4)".into(),
+                );
+            }
             if !result.failed.is_empty() {
-                if fallback_seen.load(std::sync::atomic::Ordering::Relaxed) {
-                    notify::warn(
-                        &body_app,
-                        "fsx-fallback-window",
-                        "分析写缩略图时文件系统不支持原子防覆盖改名与硬链接,已降级为「发布锁 + 复查后改名」;建议确认 NAS 协议(SMB3/NFSv4)".into(),
-                    );
-                }
                 notify::warn(
                     &body_app,
                     "analysis-partial",
