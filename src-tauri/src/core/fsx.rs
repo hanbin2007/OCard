@@ -198,13 +198,10 @@ fn rename_no_replace_with(
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
         Err(e) if !native_unsupported(&e) => Err(e),
-        // 目标目录根本不支持硬链接(探针说的,不是猜的):直接走复查+rename 并置可见标记
+        // 目标目录根本不支持硬链接(探针说的,不是猜的):直接走发布锁 + 复查 + rename 并置可见标记
         Err(_) if !dir_has_hard_links(dst.parent().unwrap_or(Path::new("."))) => {
             UNSAFE_FALLBACK_USED.store(true, Ordering::Relaxed);
-            if dst.exists() {
-                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
-            }
-            fs::rename(src, dst)
+            checked_rename_under_publish_lock(src, dst)
         }
         // 平台原语不可用(旧内核/异构文件系统):hard_link 仍是原子防覆盖
         Err(_) => match link(src, dst) {
@@ -227,16 +224,78 @@ fn rename_no_replace_with(
             }
             Err(le) if !link_unsupported(&le) => Err(le),
             Err(_) => {
-                // 最后回退:复查+rename。窗口在本地盘是微秒级,在不支持
-                // 原语/硬链接的网络盘上可达网络往返量级——置标记让上层告警
+                // 最后回退:发布锁 + 复查 + rename——置标记让上层告警
                 UNSAFE_FALLBACK_USED.store(true, Ordering::Relaxed);
-                if dst.exists() {
-                    return Err(io::Error::from(io::ErrorKind::AlreadyExists));
-                }
-                fs::rename(src, dst)
+                checked_rename_under_publish_lock(src, dst)
             }
         },
     }
+}
+
+/// 最后一级回退的「复查 + rename」本身有 TOCTOU:两个任务(同日期同机位的两张卡,目标夹
+/// 与文件名都相同)都看到目标不在、后一个普通 rename 会替换前一个,而两边的 part 都已各自
+/// 校验通过——两份清单都报成功,盘上却只剩一份(codex 终审 P0)。所以在目标路径上先用
+/// `create_new` 建一个**发布锁**(O_EXCL 在 FAT / SMB2+ 上都是原子的),锁内再复查 + rename;
+/// 别的发布者撞上锁 = 按占用重试,重试完还在 = 报 AlreadyExists 让上层核对内容。
+/// 崩溃残留的锁按年龄(两分钟)回收。
+fn checked_rename_under_publish_lock(src: &Path, dst: &Path) -> io::Result<()> {
+    let lock = publish_lock_path(dst);
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+    {
+        Ok(f) => drop(f),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let stale = fs::metadata(&lock)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(120));
+            if stale {
+                let _ = fs::remove_file(&lock);
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&lock)
+                {
+                    Ok(f) => drop(f),
+                    Err(e) => return Err(publish_lock_busy(e)),
+                }
+            } else {
+                return Err(publish_lock_busy(e));
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    let r = if dst.exists() {
+        Err(io::Error::from(io::ErrorKind::AlreadyExists))
+    } else {
+        fs::rename(src, dst)
+    };
+    let _ = retry_contended(|| match fs::remove_file(&lock) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        r => r,
+    });
+    r
+}
+
+/// 发布锁的落点:与目标同目录,`.<目标名>.publish<TMP_SUFFIX>`。
+fn publish_lock_path(dst: &Path) -> std::path::PathBuf {
+    let name = dst
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dst.with_file_name(format!(".{name}.publish{TMP_SUFFIX}"))
+}
+
+/// 别的发布者正持着这个目标路径的发布锁:按「占用」上抛(PermissionDenied 在 is_contention
+/// 名单里),调用方的占用重试会再来几轮;重试完还在就是 AlreadyExists 级别的冲突。
+fn publish_lock_busy(e: io::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("目标路径正被另一个发布者持有发布锁:{e}"),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -446,6 +505,52 @@ mod tests {
             b"x",
             "已存在的目标一个字节都不许动"
         );
+    }
+
+    /// 最后一级回退在目标路径上先拿发布锁:别的发布者持着锁时不许复查+rename(那正是
+    /// 两个任务互相覆盖的窗口),按占用上抛;锁陈旧(崩溃残留)则回收后继续。
+    #[test]
+    fn the_checked_rename_fallback_respects_a_publish_lock_on_the_final_path() {
+        let _serial = flag_lock();
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("e.tmp");
+        let dst = t.path().join("e");
+        std::fs::write(&src, b"x").unwrap();
+        let unsupported = || io::Error::from(io::ErrorKind::Unsupported);
+        let lock = publish_lock_path(&dst);
+        std::fs::write(&lock, b"").unwrap(); // 别的发布者刚拿到锁(新鲜)
+        let r = rename_no_replace_with(
+            &src,
+            &dst,
+            |_, _| Err(unsupported()),
+            |_, _| Err(unsupported()),
+            |_| false,
+        );
+        assert!(
+            matches!(&r, Err(e) if e.kind() == io::ErrorKind::PermissionDenied),
+            "锁被占着要按占用上抛,不许绕过去改名: {r:?}"
+        );
+        assert!(!dst.exists() && src.exists(), "锁被占时什么都不许动");
+        assert!(lock.exists(), "别人的锁不许删");
+        // 陈旧的锁(崩溃残留):回收后继续,发布完锁要清掉
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(200);
+        std::fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        rename_no_replace_with(
+            &src,
+            &dst,
+            |_, _| Err(unsupported()),
+            |_, _| Err(unsupported()),
+            |_| false,
+        )
+        .unwrap();
+        assert!(dst.exists() && !src.exists());
+        assert!(!lock.exists(), "发布完发布锁要清掉");
+        let _ = take_unsafe_fallback_flag();
     }
 
     /// 探针的分类是整件事的关键:自己刚建的文件、同目录硬链接还拿到 EACCES,就是「不支持」;

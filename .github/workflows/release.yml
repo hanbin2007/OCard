@@ -148,6 +148,12 @@ jobs:
         shell: bash
         run: bash scripts/fetch-ffmpeg.sh
 
+      # 平台条件编译的测试(Windows junction / unix 权限 / delete-pending)只在该平台上跑得到:
+      # 门禁只在 Ubuntu 跑测试不够,三平台各跑一遍再打包(codex 终审)
+      - name: cargo test(本平台)
+        run: cargo test
+        working-directory: src-tauri
+
       - name: Build and attach to GitHub Release
         uses: tauri-apps/tauri-action@action-v1.0.0
         env:
@@ -200,6 +206,12 @@ jobs:
       - name: Fetch ffmpeg sidecar (SHA-256 校验)
         shell: bash
         run: bash scripts/fetch-ffmpeg.sh
+
+      # 平台条件编译的测试(Windows junction / unix 权限 / delete-pending)只在该平台上跑得到:
+      # 门禁只在 Ubuntu 跑测试不够,三平台各跑一遍再打包(codex 终审)
+      - name: cargo test(本平台)
+        run: cargo test
+        working-directory: src-tauri
 
       - name: Build and attach to GitHub Release
         uses: tauri-apps/tauri-action@action-v1.0.0
@@ -263,6 +275,12 @@ jobs:
       - name: Fetch ffmpeg sidecar (SHA-256 校验)
         shell: bash
         run: bash scripts/fetch-ffmpeg.sh
+
+      # 平台条件编译的测试(Windows junction / unix 权限 / delete-pending)只在该平台上跑得到:
+      # 门禁只在 Ubuntu 跑测试不够,三平台各跑一遍再打包(codex 终审)
+      - name: cargo test(本平台)
+        run: cargo test
+        working-directory: src-tauri
 
       - name: Build, sign, notarize and attach to GitHub Release
         uses: tauri-apps/tauri-action@action-v1.0.0

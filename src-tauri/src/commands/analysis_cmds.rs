@@ -207,6 +207,9 @@ pub fn start_analysis<R: tauri::Runtime>(
                     if le.elapsed().as_millis() >= 500 {
                         *le = std::time::Instant::now();
                         let _ = body_app.emit(JOB_EVENT, &h.snapshot());
+                        // 分析写缩略图 / 缓存也走 rename_no_replace:降级标记要在这条路上
+                        // 消费,否则会被并发的拷卡收尾取走、归错任务(codex 终审)
+                        super::sorting_cmds::notify_if_unsafe_fallback(&body_app);
                     }
                 });
             });

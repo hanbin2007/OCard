@@ -2482,7 +2482,11 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
     m.completed = false;
     // 计划换代:自动转代理的完成标记与重试预算都是上一代的,一并失效——否则按旧计划
     // 跑完的代理作业晚一步回来,会把这一代标成「代理已完成」,新增文件永远不再自动转代理
-    m.plan_generation += 1;
+    // 持久化清单是不可信输入:u64::MAX 在 release 构建会绕回第 0 代,fail-closed
+    m.plan_generation = m
+        .plan_generation
+        .checked_add(1)
+        .ok_or_else(|| "清单的计划代次已达上限,拒绝续传;请重新发起拷贝".to_string())?;
     m.proxy_completed = false;
     m.proxy_attempts = 0;
     // 调用方(resume_copy_task)已经持有这个任务的租约,这次写在保护内;而且写在

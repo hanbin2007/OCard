@@ -1880,6 +1880,7 @@ fn copy_one(
 
         let mut hasher = xxhash_rust::xxh3::Xxh3::new();
         let mut buf = vec![0u8; BUF_SIZE];
+        let mut total_read: u64 = 0;
         loop {
             let n = src.read(&mut buf)?;
             if n == 0 {
@@ -1889,6 +1890,7 @@ fn copy_one(
             for w in &mut writers {
                 w.write_all(&buf[..n])?;
             }
+            total_read += n as u64;
             if !on_chunk(n as u64) {
                 return Err(lease_abort());
             }
@@ -1896,6 +1898,23 @@ fn copy_one(
         for mut w in writers {
             w.flush()?;
             w.sync_all()?;
+        }
+        // 源在拷贝期间变了(相机 / 别的程序还在写这张卡):流式哈希只证明「目标 = 本次读到的
+        // 字节」,不证明源读取期间稳定——一半旧一半新的目标也能通过回读校验并标成 verified
+        // (codex 终审)。读到的字节数与开拷前的大小、以及开拷前后的大小 / mtime 都要对得上
+        if let Some(before) = &src_meta {
+            if total_read != before.len() {
+                return Err(super::CoreError::Invalid(format!(
+                    "源文件在拷贝期间大小变了({} → 读到 {total_read} 字节),这份拷贝不可信,不落位: {source_rel}。请确认卡上没有程序还在写,再重试",
+                    before.len()
+                )));
+            }
+            let after = fs::metadata(&src_path)?;
+            if after.len() != before.len() || after.modified().ok() != before.modified().ok() {
+                return Err(super::CoreError::Invalid(format!(
+                    "源文件在拷贝期间被修改(大小或修改时间变了),这份拷贝不可信,不落位: {source_rel}。请确认卡上没有程序还在写,再重试"
+                )));
+            }
         }
         let src_hash = format!("{:016x}", hasher.digest());
         if let Some(known) = &known_src_hash {
@@ -2452,6 +2471,57 @@ mod tests {
             .all(|f| matches!(f.status, FileStatus::SkippedResume)));
         assert!(out.all_verified);
         assert_eq!(fences.get(), 1, "清单没变的文件不该逐个落盘;只有收尾那一次");
+    }
+
+    /// 源在拷贝期间被改写(相机还在写这张卡):目标是一半旧一半新,回读校验照样过——
+    /// 必须按「源不稳定」判失败、不落位、不标 verified。
+    #[test]
+    fn a_source_rewritten_during_the_copy_fails_instead_of_landing_a_mixed_file() {
+        let t = tempfile::tempdir().unwrap();
+        let card = t.path().join("card");
+        std::fs::create_dir_all(card.join("DCIM")).unwrap();
+        let src = card.join("DCIM/BIG.MP4");
+        std::fs::write(&src, vec![b'A'; 3 * 1024 * 1024]).unwrap();
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let project = t.path().join("proj");
+        std::fs::create_dir_all(manifest::manifest_dir(&project)).unwrap();
+        let req = CopyRequest {
+            source_root: card.clone(),
+            destinations: vec![dest.clone()],
+            task_tag: "mix".into(),
+            selection: SourceSelection::WholeVolume,
+        };
+        let mut m = manifest::CopyManifest::new("1. 待分类/x", "CARD", "A_B_C", "张三", "");
+        let plan = plan_whole_volume(&scan_source(&card).unwrap());
+        assert_eq!(plan.len(), 1);
+        let rewritten = std::cell::Cell::new(false);
+        let out = run_copy(&req, &plan, &mut m, &project, None, |p| {
+            if let Progress::BytesCopied { delta, .. } = p {
+                if delta > 0 && !rewritten.get() {
+                    rewritten.set(true);
+                    // 等长、内容不同的原位改写(mtime 随之变化)
+                    std::fs::write(&src, vec![b'B'; 3 * 1024 * 1024]).unwrap();
+                }
+            }
+            CopyControl::Continue
+        })
+        .unwrap();
+        assert!(rewritten.get(), "前置:改写要真的发生在拷贝期间");
+        assert!(!out.all_verified, "源不稳定不许报全部通过");
+        let status = &out.files[0].status;
+        assert!(
+            matches!(status, FileStatus::Failed(why) if why.contains("被修改") || why.contains("大小变了")),
+            "要按源不稳定判失败: {status:?}"
+        );
+        assert!(
+            !dest.join(&plan[0].target_rel).exists(),
+            "混合内容的文件不许落位"
+        );
+        assert!(
+            !m.entries.iter().any(|e| e.verified),
+            "不许把它标成 verified"
+        );
     }
 
     /// 写 part 之前、回读校验之前、落位之前各有一个 delta 为 0 的租约检查点。只在
