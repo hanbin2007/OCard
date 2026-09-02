@@ -56,7 +56,7 @@ fn native_unsupported(e: &io::Error) -> bool {
 }
 
 /// 硬链接级的「不支持」:原语级那些,外加 EPERM——Linux VFS 对没有 link 操作的文件系统
-/// (FAT/exFAT)固定答 EPERM,macOS 本机 exFAT 亦然。
+/// (FAT/exFAT)固定答 EPERM(macOS 本机 exFAT 答的是 ENOTSUP,已在原语级名单里)。
 fn link_unsupported(e: &io::Error) -> bool {
     if native_unsupported(e) {
         return true;
@@ -71,48 +71,99 @@ fn link_unsupported(e: &io::Error) -> bool {
     }
 }
 
-/// 这个目录能不能建硬链接——按目录缓存的探针。别靠 errno 猜:Samba 导出的 FAT/exFAT
-/// 后端(NAS 上插的 USB 盘、路由器 USB 共享)对 link() 答 EPERM,Samba 再把它映成
-/// ACCESS_DENIED,macOS 客户端拿到的是 EACCES——按「占用 / 权限原样上抛」处理的话,
+/// 这个目录能不能建硬链接——按**文件系统**缓存的探针。别靠 errno 猜:Samba 导出的
+/// FAT/exFAT 后端(NAS 上插的 USB 盘、路由器 USB 共享)对 link() 答 EPERM,Samba 再把它
+/// 映成 ACCESS_DENIED,macOS 客户端拿到的是 EACCES——按「占用 / 权限原样上抛」处理的话,
 /// 每个文件的落位都会响亮地失败(fable 终审)。探针:建一个唯一临时文件、对它做一次
-/// 硬链接、删掉两者;答「不支持」才走复查+rename,答「支持」时 link 的 EACCES 就是瞬时的。
+/// 硬链接、删掉两者。分类(fable 第四轮抓到此前把 EACCES 也归成「支持」,探针成了空操作):
+/// - `Ok` → 支持;
+/// - 探针文件刚建好就不见了(NotFound / Interrupted:并发清扫 / 抖动)→ **不下结论、不缓存**;
+/// - 其余一律「不支持」:我们刚在这个目录 `create_new` 成功,对自己刚建的文件做同目录硬链接
+///   还拿到权限错误,不是瞬时的。误判「无」的代价是复查+rename + 可见 UNSAFE 告警(可见降级),
+///   误判「有」的代价是这个目标上任务不可用。
 fn dir_supports_hard_links(dir: &Path) -> bool {
-    type Cache = std::collections::HashMap<std::path::PathBuf, bool>;
+    type Cache = std::collections::HashMap<(std::path::PathBuf, u64), bool>;
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
+    // 能力是按文件系统的,不是按路径:同一挂载点先后插不同的盘(DIT 常给所有 shuttle 盘
+    // 起同名)时按路径缓存会答错——键带上设备号(Windows 上用卷根)
+    let key = fs_key(dir);
     if let Some(v) = cache
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .get(dir)
+        .get(&key)
         .copied()
     {
         return v;
     }
+    match dir_supports_hard_links_with(dir, |a, b| fs::hard_link(a, b)) {
+        Some(v) => {
+            cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(key, v);
+            v
+        }
+        // 不下结论:按「支持」走一次(真正的错误会在正常路径上响亮地报出来),下次再探
+        None => true,
+    }
+}
+
+/// 缓存键:(卷根 / 目录, 设备号)。unix 用 `st_dev`;Windows 没有稳定的设备号,退回卷根前缀。
+fn fs_key(dir: &Path) -> (std::path::PathBuf, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dev = fs::metadata(dir).map(|m| m.dev()).unwrap_or(0);
+        (dir.to_path_buf(), dev)
+    }
+    #[cfg(not(unix))]
+    {
+        let root = dir
+            .components()
+            .next()
+            .map(|c| std::path::PathBuf::from(c.as_os_str()))
+            .unwrap_or_else(|| dir.to_path_buf());
+        (root, 0)
+    }
+}
+
+/// [`dir_supports_hard_links`] 的本体,`link` 可注入:`Some(true)` 支持、`Some(false)` 不支持、
+/// `None` 不下结论(探针文件都没建成 / 刚建好就不见了)。
+fn dir_supports_hard_links_with(
+    dir: &Path,
+    link: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> Option<bool> {
     let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
     let a = dir.join(format!(".hlprobe.{tag}{TMP_SUFFIX}"));
     let b = dir.join(format!(".hlprobe.{tag}.l{TMP_SUFFIX}"));
-    let supported = match fs::OpenOptions::new().write(true).create_new(true).open(&a) {
-        Ok(f) => {
-            drop(f);
-            let r = fs::hard_link(&a, &b);
-            let _ = fs::remove_file(&b);
-            let _ = fs::remove_file(&a);
-            match r {
-                Ok(()) => true,
-                // 答「不支持」的才算不支持;瞬时错误按「支持」记——之后 link 真撞上瞬时
-                // 错误会原样上抛,由占用重试处理,不会推进回退梯子
-                Err(e) => !link_unsupported(&e),
+    let f = match fs::OpenOptions::new().write(true).create_new(true).open(&a) {
+        Ok(f) => f,
+        // 探针文件都建不了(目录没权限 / 不存在 / 盘满):不下结论
+        Err(_) => return None,
+    };
+    drop(f);
+    let r = link(&a, &b);
+    for p in [&b, &a] {
+        if let Err(e) = fs::remove_file(p) {
+            if e.kind() != io::ErrorKind::NotFound {
+                // 交付目录里多一个隐藏的探针文件没人清(part 清扫只认 .ocardpart):至少要说
+                log::warn!("硬链接探针文件没删掉 {}: {e}", p.display());
             }
         }
-        // 探针文件都建不了(目录没权限 / 不存在):不下结论,按「支持」——真正的错误
-        // 会在正常路径上响亮地报出来
-        Err(_) => true,
-    };
-    cache
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(dir.to_path_buf(), supported);
-    supported
+    }
+    match r {
+        Ok(()) => Some(true),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::Interrupted
+            ) =>
+        {
+            None
+        }
+        Err(_) => Some(false),
+    }
 }
 
 /// 原子防覆盖改名:目标已存在时失败(`AlreadyExists`),绝不替换。
@@ -390,6 +441,32 @@ mod tests {
             std::fs::read(&dst).unwrap(),
             b"x",
             "已存在的目标一个字节都不许动"
+        );
+    }
+
+    /// 探针的分类是整件事的关键:自己刚建的文件、同目录硬链接还拿到 EACCES,就是「不支持」;
+    /// 此前把 EACCES 归成「支持」,探针对它要解决的那个场景是空操作(fable 第四轮)。
+    #[test]
+    fn the_hard_link_probe_treats_access_denied_as_unsupported() {
+        let t = tempfile::tempdir().unwrap();
+        let denied = dir_supports_hard_links_with(t.path(), |_, _| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(
+            denied,
+            Some(false),
+            "探针文件自己刚建成,link 再拒绝访问 = 不支持"
+        );
+        let ok = dir_supports_hard_links_with(t.path(), |a, b| fs::hard_link(a, b));
+        assert_eq!(ok, Some(true), "本机盘要能建硬链接");
+        let vanished = dir_supports_hard_links_with(t.path(), |_, _| {
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        });
+        assert_eq!(vanished, None, "探针文件刚建好就不见了:不下结论");
+        assert_eq!(
+            std::fs::read_dir(t.path()).unwrap().count(),
+            0,
+            "探针不许留下文件"
         );
     }
 

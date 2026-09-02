@@ -2547,6 +2547,21 @@ mod tests {
             }
             _ => panic!("自己留下的空锁目录不该被当成「别人正在接管」"),
         }
+        // 过期的记录不算数:10 分钟前记的、现在撞上同路径的新鲜空目录,那是别人刚 mkdir 的
+        let dir3 = TakeoverLock::path_for(&t.path().join("v.lease"));
+        std::fs::create_dir(&dir3).unwrap();
+        lock_or_recover(my_orphaned_dirs()).insert(
+            dir3.clone(),
+            std::time::Instant::now() - ORPHAN_DIR_TTL - std::time::Duration::from_secs(1),
+        );
+        assert!(matches!(
+            TakeoverLock::try_take(&t.path().join("v.lease")).unwrap(),
+            Take::Held(_)
+        ));
+        assert!(
+            !lock_or_recover(my_orphaned_dirs()).contains_key(&dir3),
+            "过期记录要顺手清掉"
+        );
         // 对照:同样新鲜的空目录、不在案 → 别人刚 mkdir 还没写 nonce,老实等
         let dir2 = TakeoverLock::path_for(&t.path().join("w.lease"));
         std::fs::create_dir(&dir2).unwrap();
