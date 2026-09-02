@@ -37,8 +37,13 @@ describe("通知 code 与抬头的契约", () => {
       // report_lease_release 里的 lease code 对门禁不可见
       // 终止符也认 `)}`:match 分支的尾表达式位置的调用没有分号
       const re = /notify::(?:warn|error|info)(?:_for_task|_scoped)?\s*\(([\s\S]{0,700}?)\)\s*[;,}]/g;
+      // 700 字符窗口是个没有守卫的洞:超长的调用点会被 exec 整个跳过——既不采集也不进
+      // blind。锚点数与匹配数必须相等
+      const anchors = src.match(/notify::(?:warn|error|info)(?:_for_task|_scoped)?\s*\(/g)?.length ?? 0;
+      let matched = 0;
       let m: RegExpExecArray | null;
       while ((m = re.exec(src))) {
+        matched++;
         let found = 0;
         for (const lit of m[1].matchAll(/"([a-z][a-z0-9]*(?:-[a-z0-9]+)+)"/g)) {
           codes.add(lit[1]);
@@ -51,6 +56,7 @@ describe("通知 code 与抬头的契约", () => {
           blind.push(`${file.slice(file.indexOf("src-tauri"))}:${line}`);
         }
       }
+      expect(matched, `${file}: 有调用点超出了 700 字符窗口,扫描器整个跳过了它`).toBe(anchors);
     }
     expect(codes.size, "扫描应至少找到几十个 code").toBeGreaterThan(60);
     expect(

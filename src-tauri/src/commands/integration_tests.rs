@@ -1402,7 +1402,9 @@ fn refresh_with_lease<R: tauri::Runtime>(
     let _ = std::fs::create_dir_all(crate::core::manifest::manifest_dir(project_root));
     let lease = crate::core::lease::acquire(project_root, &m.id, "TEST-MACHINE", "t")
         .expect("测试用的任务租约必须能拿到");
-    let r = crate::commands::refresh_resume_plan(app, m, project_root, card, &lease);
+    let task_id = m.id.clone();
+    let r =
+        crate::commands::refresh_resume_plan(app, m, project_root, card, &lease, (&task_id, ""));
     lease.release();
     r
 }

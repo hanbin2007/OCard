@@ -88,7 +88,11 @@
 //! - `.ocardpart` 临时名带**本次持有的 run 标签**(`<清单 id 前 8 位>-<token 前 8 位>`):
 //!   一个休眠后恢复的旧持有者永远碰不到接管者的 part(名字不同),它删、改名、清理的
 //!   只会是自己那一轮的路径。代价是上一轮的崩溃残留没人认得——所以持有租约的一方在
-//!   开拷前按清单 id 前缀把别的 run 标签的残留清掉,并把清了什么说出来。引擎另在四处查
+//!   开拷前按清单 id 前缀把别的 run 标签(含升级前不带标签的旧格式)的残留清掉,并把
+//!   清了什么说出来。反方向如实声明:接管方的这次清扫**会**删掉一个仍在休眠中的旧持有者
+//!   正在写的 part(它的标签不同,正落在认领范围内)——旧持有者醒来后回读校验读不到
+//!   路径,那个文件可见地失败、续传按哈希修复;Windows 上删不掉(文件仍被占着)则进
+//!   「没清成」的告警。引擎另在四处查
 //!   租约:清理同名残留前、建 part 前(源哈希与逐目的地哈希那几分钟之后)、回读校验前、
 //!   落位前;建 part 前那次在失败清理之外。
 //! - 心跳线程与写栅栏在进程内排队,排队是**有界**的(三个心跳周期,不少于 2 秒):
@@ -2195,7 +2199,10 @@ mod tests {
         let real = dir.join("deadbeefdeadbeefdeadbeefdeadbeef");
         std::fs::write(&real, b"").unwrap();
         std::fs::create_dir(dir.join("cafebabecafebabecafebabecafebabe")).unwrap();
+        // 三者都做旧:子目录新鲜的话「只看名字」的旧实现会先因它新鲜而让路,
+        // 根本走不到「先删真 nonce、再对异物 remove_file 失败」那一步
         set_file_mtime(&real, long_ago());
+        set_dir_mtime(&dir.join("cafebabecafebabecafebabecafebabe"), long_ago());
         set_dir_mtime(&dir, long_ago());
         assert!(TakeoverLock::reclaim(&dir).is_err(), "异物目录,不回收,要说");
         assert!(real.exists(), "真正的 nonce 被删了——持有者的锁被无声抹掉");

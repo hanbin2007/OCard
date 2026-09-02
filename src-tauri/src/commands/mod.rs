@@ -2107,6 +2107,7 @@ pub fn resume_copy_task<R: tauri::Runtime>(
             lease,
             "续传准备中断、回滚",
             (task_id_for_lease.clone(), project_id_for_lease.clone()),
+            handle.clone(),
         );
         if let Some(note) = keeper.lease_mut().took_over_stale.take() {
             notify::warn_for_task(
@@ -2193,6 +2194,7 @@ pub fn resume_copy_task<R: tauri::Runtime>(
             &handle.project_root,
             &resolved,
             keeper.lease(),
+            (&task_id_for_lease, &project_id_for_lease),
         )?;
         let mut snap = handle.snap();
         let old: std::collections::HashMap<String, &'static str> = snap
@@ -2236,6 +2238,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
     project_root: &Path,
     source_root: &Path,
     lease: &crate::core::lease::Held,
+    task: (&str, &str),
 ) -> CmdResult<Vec<copy::PlannedFile>> {
     let selection = copy::SourceSelection::from_folders(m.source_selection.clone());
     if matches!(selection, copy::SourceSelection::WholeVolume) {
@@ -2273,7 +2276,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
             &plan,
             m.scan_policy_version,
         );
-        persist_refreshed_plan(app, m, project_root, &plan, lease)?;
+        persist_refreshed_plan(app, m, project_root, &plan, lease, task)?;
         return Ok(plan);
     }
 
@@ -2343,7 +2346,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
                     ),
                 );
             }
-            persist_refreshed_plan(app, m, project_root, &plan, lease)?;
+            persist_refreshed_plan(app, m, project_root, &plan, lease, task)?;
         }
         Err(e) => notify::warn(
             app,
@@ -2464,6 +2467,8 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
     project_root: &Path,
     plan: &[copy::PlannedFile],
     lease: &crate::core::lease::Held,
+    // 通知带任务 scope:两个任务同时点「继续」时,无 scope 的同 code 会后一条顶掉前一条
+    task: (&str, &str),
 ) -> CmdResult<()> {
     let refreshed: Vec<manifest::PlannedFile> =
         plan.iter().map(manifest::PlannedFile::from_plan).collect();
@@ -2509,7 +2514,7 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
         if e.to_string()
             .starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX)
         {
-            notify::error(app, "copy-resume-lease-lock-broken", e.to_string());
+            notify::error_for_task(app, "copy-resume-lease-lock-broken", task, e.to_string());
         }
         // 栅栏那一支(Busy)不是写权限问题,别把人支去查权限——本模块反复强调的那条
         let msg = if matches!(e, crate::core::CoreError::Busy(_)) {
@@ -2522,7 +2527,7 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
                  worker 用的是刷新后的新清单,磁盘上却还是旧的那份)。请排查目的地/NAS 是否可写后重试: {e}"
             )
         };
-        notify::warn(app, "copy-resume-manifest-not-persisted", msg.clone());
+        notify::warn_for_task(app, "copy-resume-manifest-not-persisted", task, msg.clone());
         return Err(msg);
     }
     Ok(())

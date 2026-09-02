@@ -842,6 +842,24 @@ describe("拷卡中断的提示", () => {
     expect(screen.getByTestId("notice-toast-goto-task")).toBeDefined();
   });
 
+  /** 后端只按 task id 分桶,project id 可以为空(启动补投递那一路只有清单 id);
+   *  那种通知跳过去会落到一个空的拷卡屏——按钮必须两个 id 都在才渲染。删掉这个判据,
+   *  上面那条用例照样绿,所以这里单独守。 */
+  it("只有 taskId、没有 projectId 的通知不渲染「查看任务」", async () => {
+    render(<App preloaded={preloaded} />);
+    await act(async () => {
+      send({
+        level: "error",
+        code: "task-lease-left-behind",
+        message: "任务租约没能清掉",
+        occurredAt: new Date().toISOString(),
+        taskId: "task-1",
+      });
+    });
+    await screen.findByTestId("notice-toast-error");
+    expect(screen.queryByTestId("notice-toast-goto-task")).toBeNull();
+  });
+
   it("出事的卡片上直接有「导出诊断报告」，不用去翻三级菜单", async () => {
     render(<App preloaded={preloaded} />);
     await act(async () => {

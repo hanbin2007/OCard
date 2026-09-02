@@ -531,7 +531,7 @@ const DIAG_HINT: &str = "把现场发给维护者:设置 → 关于与更新 →
 
 fn run_worker<R: tauri::Runtime>(
     app: &AppHandle<R>,
-    handle: &TaskHandle,
+    handle: &Arc<TaskHandle>,
 ) -> crate::core::Result<()> {
     // 独占租约:同一个任务同时只允许一个进程写它的清单。
     // 清单落盘是整份覆盖,两处同时写时后写的会把先写的**整份顶掉**,而且
@@ -574,6 +574,7 @@ fn run_worker<R: tauri::Runtime>(
         lease,
         "任务异常中断",
         (id.clone(), pid.clone()),
+        handle.clone(),
     );
     if let Some(note) = keeper.lease_mut().took_over_stale.take() {
         // 接管别人/自己残留的租约是「系统替用户做了决定」,零静默要求说出来;
@@ -604,7 +605,8 @@ fn run_worker<R: tauri::Runtime>(
     let lease_file = lease.path().to_path_buf();
     // 「已暂停」只在结果确实是可续传的中断时才成立;跑完 / 真失败之后才在释放时发现被接管,
     // 抬头不能说「已暂停」
-    let task_paused = outcome.as_ref().err().is_some_and(|e| e.is_resumable());
+    // 按快照事实而不是按结果推:用户主动暂停时结果是 Ok,但任务确实处在可续传的暂停里
+    let task_paused = handle.snap().state == "paused";
     report_lease_release(
         app,
         lease.release(),
@@ -624,6 +626,8 @@ pub(crate) struct LeaseKeeper<R: tauri::Runtime> {
     app: AppHandle<R>,
     what: &'static str,
     task: (String, String),
+    /// 报判定时查快照:任务此刻是不是真的处在可续传的暂停里(抬头据此选)
+    handle: Arc<TaskHandle>,
 }
 
 impl<R: tauri::Runtime> LeaseKeeper<R> {
@@ -632,12 +636,14 @@ impl<R: tauri::Runtime> LeaseKeeper<R> {
         lease: crate::core::lease::Held,
         what: &'static str,
         task: (String, String),
+        handle: Arc<TaskHandle>,
     ) -> Self {
         Self {
             lease: Some(lease),
             app,
             what,
             task,
+            handle,
         }
     }
     pub(crate) fn lease(&self) -> &crate::core::lease::Held {
@@ -655,12 +661,13 @@ impl<R: tauri::Runtime> Drop for LeaseKeeper<R> {
     fn drop(&mut self) {
         if let Some(lease) = self.lease.take() {
             let path = lease.path().to_path_buf();
+            let task_paused = self.handle.snap().state == "paused";
             report_lease_release(
                 &self.app,
                 lease.release(),
                 &path,
                 self.what,
-                false,
+                task_paused,
                 Some((&self.task.0, &self.task.1)),
             );
         }
@@ -850,6 +857,9 @@ fn run_worker_locked<R: tauri::Runtime>(
     // 此前借用 pause_requested,用户此刻点「继续」会被告知「已撤销暂停请求,接着跑」,
     // 而那次运行正在中止,根本不会接着跑
     let mut lease_aborted = false;
+    // 心跳侧发现的原因(锁目录异常……)要带回收尾:那一支在落盘之前就 break,
+    // abort_reason 为空,收尾若一律退回 lease_abort() 的通用报文,「需人工清理」就丢了
+    let mut lease_abort_why: Option<String> = None;
     // 当前文件已进快照的字节(块级 delta 累加);中途中止时要从快照里减回去
     let mut current_file_delta = 0u64;
     let task_for_notices = {
@@ -863,8 +873,8 @@ fn run_worker_locked<R: tauri::Runtime>(
             .fence()
             .map(|f| Box::new(f) as Box<dyn copy::SaveFenceGuard>)
     };
-    // 持有租约的一方清掉上一轮(别的 run 标签)留下的 .ocardpart。系统替用户删了东西,
-    // 要说;没删成的也要说——那些残留会让本轮的落位撞上「目标名被占」
+    // 持有租约的一方清掉上一轮(别的 run 标签,含旧格式)留下的 .ocardpart。系统替用户
+    // 删了东西,要说;没删成的也要说——它们不会与本轮撞名,只是占着空间
     let swept = copy::sweep_stale_parts(&handle.dest_targets, &plan, &task_prefix, &run_tag);
     if !swept.removed.is_empty() {
         super::notify::info_for_task(
@@ -998,6 +1008,7 @@ fn run_worker_locked<R: tauri::Runtime>(
             crate::core::lease::LeaseStatus::AtRisk(why) => {
                 if !lease_stop_reported {
                     lease_stop_reported = true;
+                    lease_abort_why = Some(why.clone());
                     if why.starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) {
                         super::notify::error_for_task(
                             app,
@@ -1156,7 +1167,13 @@ fn run_worker_locked<R: tauri::Runtime>(
         // (栅栏拒绝 / 没拿到锁 / 栅栏被回收)就用它:没拿到锁 ≠ 被接管,不能一律说成后者
         return Err(match outcome.abort_reason.clone() {
             Some(why) => crate::core::CoreError::Busy(why),
-            None => copy::lease_abort(),
+            // 心跳侧带前缀的原因(锁目录异常)原样上抛:上层据前缀换抬头、改「点继续」的提示
+            None => match lease_abort_why.take() {
+                Some(why) if why.starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) => {
+                    crate::core::CoreError::Busy(why)
+                }
+                _ => copy::lease_abort(),
+            },
         });
     }
     Ok(())

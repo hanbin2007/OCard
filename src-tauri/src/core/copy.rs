@@ -1203,14 +1203,6 @@ pub fn file_done(
     })
 }
 
-/// 执行拷卡。`plan` 为调用方预先规划好的清单(与 UI 快照/manifest 同源,
-/// 避免两次扫描产生分歧):每项自带**源**相对路径与**目标**相对路径,
-/// 整卷时两者相同,选文件夹扁平化时两者分离。
-/// `project_root` 用于逐文件持久化 manifest(断点续传依据)。
-/// 回调返回 [`CopyControl::Pause`] 时在当前文件完成后停下,manifest 保证可续传。
-/// 落盘前取一次写栅栏(见 `lease::Held::fence`)。`None` = 不设栅栏(测试 / 无租约场景)。
-/// 栅栏不给 / 落盘失败都由 `CopyOutcome.abort_reason` 承载(收尾照跑,reports 不丢),
-/// 不再以 `Err` 上抛。
 /// 持有租约的一方在开拷前清掉**别的 run 标签**留下的 `.ocardpart`。
 ///
 /// part 名是 `<文件名>.<清单 id 前 8 位>-<run 标签>.ocardpart`:本轮的 run 标签来自
@@ -1236,7 +1228,9 @@ pub fn sweep_stale_parts(
             }
         }
     }
-    let ours = format!(".{task_prefix}-");
+    // 不带横杠:升级前(≤0.4.3)的 part 名是 `<文件名>.<前缀>.ocardpart`,没有 run 标签,
+    // 那些几十 GB 的半个文件也要认领并清掉;别的任务的前缀不同,`contains` 隔得开
+    let ours = format!(".{task_prefix}");
     let keep = format!(".{task_prefix}-{keep_run_tag}{PART_SUFFIX}");
     for dir in dirs {
         let Ok(rd) = fs::read_dir(&dir) else {
@@ -1304,6 +1298,14 @@ fn save_within_fence(
     Ok(saved)
 }
 
+/// 执行拷卡。`plan` 为调用方预先规划好的清单(与 UI 快照/manifest 同源,
+/// 避免两次扫描产生分歧):每项自带**源**相对路径与**目标**相对路径,
+/// 整卷时两者相同,选文件夹扁平化时两者分离。
+/// `project_root` 用于逐文件持久化 manifest(断点续传依据)。
+/// 回调返回 [`CopyControl::Pause`] 时在当前文件完成后停下,manifest 保证可续传。
+/// 落盘前取一次写栅栏(见 `lease::Held::fence`)。`None` = 不设栅栏(测试 / 无租约场景)。
+/// 栅栏不给 / 落盘失败都由 `CopyOutcome.abort_reason` 承载(收尾照跑,reports 不丢),
+/// 不再以 `Err` 上抛。
 pub fn run_copy(
     req: &CopyRequest,
     plan: &[PlannedFile],
@@ -2023,9 +2025,9 @@ mod tests {
         (tmp, req, m, project)
     }
 
-    /// 租约丢了之后**一个字节都不许再写进清单**——租约存在的唯一理由就是防这个。
     /// 清扫只动**本任务、别的 run 标签**的普通文件 part:本轮的留着、别的任务的不碰、
-    /// 名字像 part 的目录不碰;清了什么、没清成什么都要回报。
+    /// 名字像 part 的目录 / 链接不碰;升级前的旧格式(不带 run 标签)残留也要认领;
+    /// 清了什么、没清成什么都要回报。
     #[test]
     fn sweeping_stale_parts_only_touches_other_runs_of_this_task() {
         let t = tempfile::tempdir().unwrap();
@@ -2038,26 +2040,45 @@ mod tests {
             source_mtime_ns: 0,
         }];
         let old = dest.join("sub/a.mp4.abcd1234-11111111.ocardpart");
+        let legacy = dest.join("sub/a.mp4.abcd1234.ocardpart"); // ≤0.4.3 的旧格式
         let mine = dest.join("sub/a.mp4.abcd1234-22222222.ocardpart");
         let other_task = dest.join("sub/a.mp4.zzzz9999-11111111.ocardpart");
         let dir_lookalike = dest.join("sub/b.mp4.abcd1234-33333333.ocardpart");
-        for f in [&old, &mine, &other_task] {
+        for f in [&old, &legacy, &mine, &other_task] {
             std::fs::write(f, b"x").unwrap();
         }
         std::fs::create_dir(&dir_lookalike).unwrap();
+        // 指向用户素材的链接:名字像 part 也不许碰(NAS 上对链接一贯 fail-closed)
+        #[cfg(unix)]
+        let link = {
+            let target = dest.join("sub/REAL.MP4");
+            std::fs::write(&target, b"real").unwrap();
+            let link = dest.join("sub/c.mp4.abcd1234-44444444.ocardpart");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            (link, target)
+        };
         let swept = sweep_stale_parts(std::slice::from_ref(&dest), &plan, "abcd1234", "22222222");
-        assert_eq!(
-            swept.removed,
-            vec![old.clone()],
-            "只清本任务别的 run 的残留"
-        );
+        let mut removed = swept.removed.clone();
+        removed.sort();
+        let mut expected = vec![old.clone(), legacy.clone()];
+        expected.sort();
+        assert_eq!(removed, expected, "只清本任务别的 run(含旧格式)的残留");
         assert!(swept.failed.is_empty(), "{:?}", swept.failed);
-        assert!(!old.exists());
+        assert!(!old.exists() && !legacy.exists());
         assert!(mine.exists(), "本轮的 part 被清了");
         assert!(other_task.exists(), "别的任务的 part 被清了");
         assert!(dir_lookalike.is_dir(), "名字像 part 的目录被动了");
+        #[cfg(unix)]
+        {
+            assert!(
+                std::fs::symlink_metadata(&link.0).is_ok(),
+                "名字像 part 的链接被删了"
+            );
+            assert!(link.1.exists(), "链接指向的素材被删了");
+        }
     }
 
+    /// 租约丢了之后**一个字节都不许再写进清单**——租约存在的唯一理由就是防这个。
     struct FakeFence {
         alive: bool,
     }
