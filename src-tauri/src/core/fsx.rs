@@ -428,12 +428,19 @@ fn note_uncached_fallback() {
 /// 只保证写句柄**关闭后**修改时间才正确,写入过程中按元数据看不出(codex 终审 r17)。
 /// 其它平台没有强制共享模式,靠大小 + 修改时间的前后核对。
 pub fn open_source(path: &Path) -> io::Result<fs::File> {
+    open_source_retried(path).map_err(|f| f.source)
+}
+
+/// [`open_source`] 的带重试记录版:错误**原样**返回(保留原始错误码,`explain_io` 才认得
+/// 32/33 是「被占用」),重试轮数一起带回,调用点用 `CoreError::io_detail_retried` 拼出
+/// 「哪一步、哪个文件、什么毛病、重试了几轮、下一步查什么」的报文。
+pub fn open_source_retried(path: &Path) -> Result<fs::File, RetryFailure> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
         let mut got: Option<fs::File> = None;
-        match retry_contended(|| {
+        retry_contended(|| {
             got = Some(
                 fs::OpenOptions::new()
                     .read(true)
@@ -441,25 +448,15 @@ pub fn open_source(path: &Path) -> io::Result<fs::File> {
                     .open(path)?,
             );
             Ok(())
-        }) {
-            Ok(_) => Ok(got.expect("重试成功必有句柄")),
-            Err(f) => Err(if matches!(f.source.raw_os_error(), Some(32) | Some(33)) {
-                // 报文带原因与下一步(可见 ≠ 可用):裸的 os error 32 没人看得懂
-                io::Error::new(
-                    f.source.kind(),
-                    format!(
-                        "源文件正被别的程序打开写入(共享冲突,已重试 {} 轮仍被占着): {}。请确认没有设备 / 程序在写这张卡,再点「重试全部失败文件」",
-                        f.retries, f.source
-                    ),
-                )
-            } else {
-                f.source
-            }),
-        }
+        })
+        .map(|_| got.expect("重试成功必有句柄"))
     }
     #[cfg(not(windows))]
     {
-        fs::File::open(path)
+        fs::File::open(path).map_err(|e| RetryFailure {
+            retries: 0,
+            source: e,
+        })
     }
 }
 

@@ -2039,8 +2039,10 @@ fn copy_one(
         })
         .collect();
 
-    // Windows 上排他于写者(见 fsx::open_source):有程序正在写就打不开,可见失败
-    let mut src = super::fsx::open_source(&src_path)?;
+    // Windows 上排他于写者(见 fsx::open_source):有程序正在写就打不开——按占用重试几轮,
+    // 仍被占着就带原因(explain_io 认 32/33 为「被占用」)、路径与重试轮数可见失败
+    let mut src = super::fsx::open_source_retried(&src_path)
+        .map_err(|f| super::CoreError::io_detail_retried("打开源文件", &src_path, &f))?;
     // 源哈希 + 逐目的地哈希可能是好几分钟,期间没有块回调:建 part(先删同名残留)
     // 之前再查一次租约,别把接管者正在写的那份删掉。检查点在失败清理**之外**:
     // 放进闭包里的话,Err 会走下面的清理把接管者正在写的同名 part 删掉,等于没查
@@ -2118,7 +2120,9 @@ fn copy_one(
                 )));
             }
             // 按句柄取(见 source_unchanged_since):路径查询可能被 SMB 客户端缓存应答
-            let after = super::fsx::open_source(&src_path)?.metadata()?;
+            let after = super::fsx::open_source_retried(&src_path)
+                .map_err(|f| super::CoreError::io_detail_retried("拷后复核源文件", &src_path, &f))?
+                .metadata()?;
             // mtime 两边都要**读得到**才算一致:None == None 不是「没变」,是「不知道」
             let (Ok(m0), Ok(m1)) = (before.modified(), after.modified()) else {
                 return Err(super::CoreError::Invalid(format!(
@@ -2930,8 +2934,10 @@ mod tests {
         for p in &mut plan {
             p.source_mtime_ns = 0; // 旧版本清单:没记修改时间
         }
+        // 只在**最终**落盘前(rel_path 为空)中止:逐文件的 AboutToSave 中止会让循环在第一个
+        // 文件后就停,计数只到 1
         let out = run_copy(&req, &plan, &mut m, &project, None, |p| match p {
-            Progress::AboutToSave { .. } => CopyControl::Abort,
+            Progress::AboutToSave { rel_path: "" } => CopyControl::Abort,
             _ => CopyControl::Continue,
         })
         .unwrap();
