@@ -309,6 +309,13 @@ pub fn read_file_uncached(path: &Path) -> io::Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// UNSAFE_FALLBACK_USED 是进程级的一个标记:考它的用例必须串行,否则并行跑时一个
+    /// 用例刚置位、另一个就把它取走(Windows CI 上真的撞过)
+    fn flag_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// 原语报的是**占用 / 权限**(不是「不支持」):不许回退到硬链接或复查+rename——
     /// 那条尾路是可覆盖的竞态,一次瞬时的 AccessDenied 不该把安全关键路径推进去。
     #[test]
@@ -317,6 +324,7 @@ mod tests {
         let src = t.path().join("a.tmp");
         let dst = t.path().join("a");
         std::fs::write(&src, b"x").unwrap();
+        let _serial = flag_lock();
         let _ = take_unsafe_fallback_flag();
         let linked = std::cell::Cell::new(false);
         let r = rename_no_replace_with(
@@ -346,6 +354,7 @@ mod tests {
         let src = t.path().join("b.tmp");
         let dst = t.path().join("b");
         std::fs::write(&src, b"x").unwrap();
+        let _serial = flag_lock();
         let _ = take_unsafe_fallback_flag();
         let unsupported = || io::Error::from(io::ErrorKind::Unsupported);
         rename_no_replace_with(
@@ -392,6 +401,7 @@ mod tests {
         let src = t.path().join("c.tmp");
         let dst = t.path().join("c");
         std::fs::write(&src, b"x").unwrap();
+        let _serial = flag_lock();
         let _ = take_unsafe_fallback_flag();
         let linked = std::cell::Cell::new(false);
         rename_no_replace_with(
@@ -420,6 +430,7 @@ mod tests {
         let src = t.path().join("d.tmp");
         let dst = t.path().join("d");
         std::fs::write(&src, b"x").unwrap();
+        let _serial = flag_lock();
         let _ = take_unsafe_fallback_flag();
         let r = rename_no_replace_with(
             &src,
