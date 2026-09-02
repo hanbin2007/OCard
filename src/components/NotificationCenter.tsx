@@ -21,7 +21,7 @@ import { useWindowRole } from "../state/windowBridge";
 const AUTO_HIDE_MS = 6000;
 
 /** 已知 code 的中文抬头；未知 code 一律回落到通用抬头 */
-const NOTICE_TITLES: Record<string, string> = {
+export const NOTICE_TITLES: Record<string, string> = {
   "audit-outbox": "审计日志暂存本机",
   "audit-lost": "审计链存在缺口",
   // 后端读审计 journal 时跳过了坏行/坏文件：抽屉里的列表可能不完整，必须说出来
@@ -98,7 +98,7 @@ const NOTICE_TITLES: Record<string, string> = {
   "task-lease-lost": "任务已被别的进程接管，已暂停",
   "task-lease-left-behind": "任务租约没能清掉",
   "task-lease-heartbeat-stuck": "租约心跳线程收尾迟到",
-  "task-lease-lost-outside-run": "写回期间租约被别的进程接管",
+  "task-lease-lost-outside-run": "租约在收尾时被别的进程接管",
   "copy-resume-lease-lock-broken": "租约锁目录异常，需人工清理",
   "copy-resume-lease-held": "任务正被别的进程执行，拒绝续传",
   "copy-resume-already-running": "上一次运行还没退出，本次「继续」未生效",
@@ -121,6 +121,8 @@ const DIAGNOSTIC_CODES = new Set([
   "task-lease-lost",
   "task-lease-at-risk",
   "task-lease-heartbeat-stuck",
+  "task-lease-lost-outside-run",
+  "task-lease-left-behind",
   "copy-resume-lease-held",
   "copy-resume-lease-lock-broken",
 ]);

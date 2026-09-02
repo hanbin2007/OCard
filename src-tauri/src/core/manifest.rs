@@ -250,16 +250,33 @@ pub fn manifest_dir(project_root: &Path) -> PathBuf {
 /// 无法归因。在那之前:**不要在两台机器上同时续同一个任务**。
 /// (`manifest.rs` 的 owner lease 已在契约文档「已知未修」一节留档。)
 pub fn save(project_root: &Path, m: &CopyManifest) -> Result<(super::fsx::WriteReport, PathBuf)> {
+    save_guarded(project_root, m, &|| true)
+}
+
+/// 守门人说不时的报文(`CoreError::Busy`,调用方按「栅栏被回收」中止,不当 IO 错)。
+pub const SAVE_FENCE_LOST: &str =
+    "落盘前的最后一刻发现租约接管锁已被外部回收(存储的时钟不准,或锁目录被人动过),这份清单没有发布";
+
+/// 守门版 [`save`]:临时文件写完、改名之前再问一句 `before_publish`(写栅栏还是不是
+/// 自己的)。答否 → [`SAVE_FENCE_LOST`] 的 `Busy`,盘上那份不会被碰。
+pub fn save_guarded(
+    project_root: &Path,
+    m: &CopyManifest,
+    before_publish: &dyn Fn() -> bool,
+) -> Result<(super::fsx::WriteReport, PathBuf)> {
     let dir = manifest_dir(project_root);
     // R2 P0:`.ocard`/`manifests` 中间段防符号链接偷渡,落地闸后再写
     // 分类版:NAS 抖动/杀软占用要判成**可续传**的 IO,不是死路(见 paths::GateError)
     super::paths::ensure_dir_within_core(project_root, &dir)?;
     let path = manifest_path(project_root, &m.id)?;
     let bytes = serde_json::to_vec_pretty(m)?;
-    match super::fsx::write_atomic(&path, &bytes) {
+    match super::fsx::write_atomic_guarded(&path, &bytes, before_publish) {
         Ok(r) => Ok((r, path)),
+        Err(super::fsx::GuardedWrite::Refused) => {
+            Err(super::CoreError::Busy(SAVE_FENCE_LOST.into()))
+        }
         // 报文带上「已重试 N 轮」:那是系统替用户排除掉「没有写权限」那一支的硬证据
-        Err(f) => Err(super::CoreError::io_detail_retried(
+        Err(super::fsx::GuardedWrite::Failed(f)) => Err(super::CoreError::io_detail_retried(
             "写入拷卡清单",
             &path,
             &f,

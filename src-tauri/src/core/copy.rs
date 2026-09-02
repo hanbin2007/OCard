@@ -1217,6 +1217,35 @@ pub trait SaveFenceGuard {
 
 pub type SaveFenceHook<'a> = &'a dyn Fn() -> Result<Box<dyn SaveFenceGuard>>;
 
+/// 在写栅栏内落盘一次——**唯一**的落盘入口,调用方漏不掉任何一道检查:
+/// 取栅栏 → 写临时文件 → 改名前问一句栅栏还在不在 → 写完再问一句。
+/// `Ok(Ok(..))` 写成了;`Ok(Err(reason))` = 栅栏不给 / 改名前被回收 / 写完发现被回收,
+/// 调用方按中止处理、原因原样带给用户;`Err` = 真正的写失败(IO)。
+fn save_within_fence(
+    fence: Option<SaveFenceHook<'_>>,
+    project_root: &Path,
+    m: &CopyManifest,
+) -> Result<std::result::Result<(super::fsx::WriteReport, PathBuf), String>> {
+    let guard = match fence.map(|f| f()) {
+        None => None,
+        Some(Ok(g)) => Some(g),
+        Some(Err(e)) => return Ok(Err(e.to_string())),
+    };
+    let still_mine = || guard.as_ref().is_none_or(|g| g.still_mine());
+    let saved = match manifest::save_guarded(project_root, m, &still_mine) {
+        Ok(v) => v,
+        Err(super::CoreError::Busy(why)) => return Ok(Err(why)),
+        Err(e) => return Err(e),
+    };
+    if !still_mine() {
+        // 改名之后才被回收:这份已经发布了,可能盖掉了接管者刚写的——停下并说明
+        return Ok(Err(
+            "落盘期间租约接管锁被外部回收(存储的时钟不准,或锁目录被人动过),这次落盘不可信,已停下;请核对是否有别的进程在跑这个任务,再决定在哪边续传".into(),
+        ));
+    }
+    Ok(Ok(saved))
+}
+
 pub fn run_copy(
     req: &CopyRequest,
     plan: &[PlannedFile],
@@ -1408,14 +1437,11 @@ pub fn run_copy(
         // 清单没变(续传时按哈希确认的文件不改清单)就不落盘、也不取栅栏:一次栅栏
         // 是 5 次 NAS 元数据往返,5000 个文件的续传白白多花两分钟
         if dirty {
-            let fence_guard = match fence.map(|f| f()) {
-                None => None,
-                Some(Ok(g)) => Some(g),
-                // 栅栏不给(被接管 / 没拿到锁 / 锁目录不可用 / 建锁目录出错):一律按
-                // 中止处理,收尾照跑——此前非 Busy 的错误走 return Err,整批 reports
-                // 跟着丢,已失败文件一条审计都不写
-                Some(Err(e)) => {
-                    abort_reason = Some(e.to_string());
+            match save_within_fence(fence, project_root, m)? {
+                // 栅栏不给(被接管 / 没拿到锁 / 锁目录不可用 / 改名前或落盘后发现被回收):
+                // 一律按中止处理,收尾照跑——reports / 审计 / 总账都保住,原因原样带给用户
+                Err(why) => {
+                    abort_reason = Some(why);
                     // 中止前把这个文件的终态发出去:界面得把它刷回 pending / 记下失败
                     let _ = progress(Progress::FileFinished {
                         rel_path: rel,
@@ -1430,38 +1456,18 @@ pub fn run_copy(
                     aborted = true;
                     break;
                 }
-            };
-            let (wr, mpath) = manifest::save(project_root, m)?;
-            // 落盘之后再问一句栅栏还是不是我的:被外部回收了 = 这次落盘期间可能有人
-            // 接管,这份清单不可信,停下并说明
-            let fence_reclaimed = fence_guard.as_ref().is_some_and(|g| !g.still_mine());
-            drop(fence_guard);
-            dirty = false;
-            if wr.retries > 0 {
-                write_retries += wr.retries;
-                // 零静默:第一次就报,不等任务结束(见 Progress::WriteContention)
-                let _ = progress(Progress::Contention {
-                    kind: ContentionKind::Manifest,
-                    path: &mpath,
-                    retries: wr.retries,
-                });
-            }
-            if fence_reclaimed {
-                abort_reason = Some(
-                    "落盘期间租约接管锁被外部回收(存储的时钟不准,或锁目录被人动过),这次落盘不可信,已停下;请核对是否有别的进程在跑这个任务,再决定在哪边续传".into(),
-                );
-                let _ = progress(Progress::FileFinished {
-                    rel_path: rel,
-                    status: &status,
-                });
-                reports.push(FileReport {
-                    rel_path: rel.clone(),
-                    source_rel: src_rel.clone(),
-                    size,
-                    status,
-                });
-                aborted = true;
-                break;
+                Ok((wr, mpath)) => {
+                    dirty = false;
+                    if wr.retries > 0 {
+                        write_retries += wr.retries;
+                        // 零静默:第一次就报,不等任务结束(见 Progress::WriteContention)
+                        let _ = progress(Progress::Contention {
+                            kind: ContentionKind::Manifest,
+                            path: &mpath,
+                            retries: wr.retries,
+                        });
+                    }
+                }
             }
         }
         control = progress(Progress::FileFinished {
@@ -1505,33 +1511,30 @@ pub fn run_copy(
             material_retries,
         });
     }
-    let _fence = match fence.map(|f| f()) {
-        None => None,
-        Some(Ok(g)) => Some(g),
-        Some(Err(e)) => {
+    match save_within_fence(fence, project_root, m)? {
+        Err(why) => {
             return Ok(CopyOutcome {
                 files: reports,
                 bytes_copied,
                 all_verified: false,
                 paused: true,
                 aborted: true,
-                abort_reason: Some(e.to_string()),
+                abort_reason: Some(why),
                 write_retries,
                 material_retries,
             });
         }
-    };
-    let (wr, mpath) = manifest::save(project_root, m)?;
-    drop(_fence);
-    if wr.retries > 0 {
-        write_retries += wr.retries;
-        let _ = progress(Progress::Contention {
-            kind: ContentionKind::Manifest,
-            path: &mpath,
-            retries: wr.retries,
-        });
+        Ok((wr, mpath)) => {
+            if wr.retries > 0 {
+                write_retries += wr.retries;
+                let _ = progress(Progress::Contention {
+                    kind: ContentionKind::Manifest,
+                    path: &mpath,
+                    retries: wr.retries,
+                });
+            }
+        }
     }
-
     Ok(CopyOutcome {
         files: reports,
         bytes_copied,
@@ -1674,12 +1677,16 @@ fn copy_one(
         .collect();
 
     let mut src = File::open(&src_path)?;
+    // 源哈希 + 逐目的地哈希可能是好几分钟,期间没有块回调:建 part(先删同名残留)
+    // 之前再查一次租约,别把接管者正在写的那份删掉。检查点在失败清理**之外**:
+    // 放进闭包里的话,Err 会走下面的清理把接管者正在写的同名 part 删掉,等于没查
+    if !on_chunk(0) {
+        return Err(lease_abort());
+    }
+    // 失败清理只清**自己建过的** part:建之前出错(建目录失败、租约检查点……)时,
+    // 同名的 part 可能是接管者的
+    let created = std::cell::Cell::new(0usize);
     let result = (|| -> Result<String> {
-        // 源哈希 + 逐目的地哈希可能是好几分钟,期间没有块回调:建 part(先删同名残留)
-        // 之前再查一次租约,别把接管者正在写的那份删掉
-        if !on_chunk(0) {
-            return Err(lease_abort());
-        }
         let mut writers = Vec::with_capacity(parts.len());
         for (part, &i) in parts.iter().zip(&missing) {
             if let Some(parent) = part.parent() {
@@ -1705,6 +1712,7 @@ fn copy_one(
                     .create_new(true)
                     .open(part)?,
             );
+            created.set(created.get() + 1);
         }
 
         let mut hasher = xxhash_rust::xxh3::Xxh3::new();
@@ -1768,7 +1776,7 @@ fn copy_one(
     })();
 
     if result.is_err() {
-        for part in &parts {
+        for part in parts.iter().take(created.get()) {
             let _ = fs::remove_file(part);
         }
     }
@@ -1966,6 +1974,45 @@ mod tests {
         }
     }
 
+    /// 前 `alive_for` 次问「还是我的吗」答是,之后答否:用来把「改名前那一问」和
+    /// 「写完之后的复核」分开考——前者会拦住发布,后者只能发现。
+    struct FlippingFence {
+        alive_for: std::cell::Cell<usize>,
+    }
+    impl SaveFenceGuard for FlippingFence {
+        fn still_mine(&self) -> bool {
+            let left = self.alive_for.get();
+            self.alive_for.set(left.saturating_sub(1));
+            left > 0
+        }
+    }
+
+    /// 改名那一刻还是我的、改名之后才被回收:这份清单已经发布了,不假装没写,但
+    /// 必须停下并说明——「写完再复核」这一问守的就是这个窗口,拿掉它任务会若无其事跑完。
+    #[test]
+    fn a_fence_lost_right_after_publish_aborts_and_says_so() {
+        let (_t, req, mut m, project) = setup();
+        let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        let manifest_file = manifest::manifest_dir(&project).join(format!("{}.json", m.id));
+        let fence = || -> super::super::Result<Box<dyn SaveFenceGuard>> {
+            // 改名前问一次(答是),写完复核问一次(答否)
+            Ok(Box::new(FlippingFence {
+                alive_for: std::cell::Cell::new(1),
+            }))
+        };
+        let out = run_copy(&req, &plan, &mut m, &project, Some(&fence), |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
+        assert!(out.aborted && out.paused, "写完发现栅栏没了必须停下");
+        assert!(manifest_file.exists(), "改名已经发生,不假装没写");
+        assert!(
+            out.abort_reason.as_deref().unwrap_or("").contains("不可信"),
+            "{:?}",
+            out.abort_reason
+        );
+    }
+
     /// 栅栏说「已被接管」:清单一个字节不许写、结果标 aborted+paused、那个文件的终态
     /// 要发出去(界面靠它刷状态)、原因要带在 outcome 上。此前这两条分支零覆盖:把
     /// 「拿不到栅栏照写」的变异放进去,448 条测试一条都不红。
@@ -2024,7 +2071,8 @@ mod tests {
         );
     }
 
-    /// 落盘期间栅栏被外部回收:这次落盘不可信,停下并说明(清单已经写了,不假装没写)。
+    /// 落盘期间栅栏被外部回收:改名之前那一问就该拦住——盘上**不许**出现这份清单,
+    /// 停下并说明。(此前只在写完后复核,只能发现、拦不住。)
     #[test]
     fn a_fence_reclaimed_during_the_save_aborts_the_run() {
         let (_t, req, mut m, project) = setup();
@@ -2039,7 +2087,39 @@ mod tests {
         .unwrap();
         assert!(out.aborted && out.paused, "栅栏被回收必须停下");
         assert_eq!(out.files.len(), 1);
-        assert!(manifest_file.exists(), "那一次落盘已经发生,不假装没写");
+        assert!(
+            !manifest_file.exists(),
+            "改名前守门人已经说不,这份清单不许发布"
+        );
+        assert!(
+            out.abort_reason.as_deref().unwrap_or("").contains("回收"),
+            "{:?}",
+            out.abort_reason
+        );
+    }
+
+    /// 收尾那一次落盘同样受栅栏保护:续传全部按哈希确认(逐文件不落盘)时,唯一一次
+    /// 落盘就是收尾;它失锁就不许报 all_verified——那一条喂的是「本卡可格式化」。
+    #[test]
+    fn a_lost_fence_on_the_final_save_never_reports_all_verified() {
+        let (_t, req, mut m, project) = setup();
+        let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
+        let fence = || -> super::super::Result<Box<dyn SaveFenceGuard>> {
+            Ok(Box::new(FakeFence { alive: false }))
+        };
+        let out = run_copy(&req, &plan, &mut m, &project, Some(&fence), |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
+        assert!(out
+            .files
+            .iter()
+            .all(|f| matches!(f.status, FileStatus::SkippedResume)));
+        assert!(out.aborted && !out.all_verified, "收尾失锁不许报全部通过");
         assert!(
             out.abort_reason.as_deref().unwrap_or("").contains("回收"),
             "{:?}",

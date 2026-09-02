@@ -3691,6 +3691,94 @@ fn resume_is_refused_before_touching_anything_while_another_process_holds_the_ta
     );
 }
 
+/// 锁目录里有别的程序落的文件:续传的拒绝必须顶「需人工清理」的抬头
+/// (`copy-resume-lease-lock-broken`),不能顶「任务正被别的进程执行」——后者会让人
+/// 去别的机器上白找,而这种目录等多久都不会自己好。守的是 `LOCK_DIR_BROKEN_PREFIX`
+/// 这条跨模块契约:报文开头改一个字,分流就静默退回旧抬头。
+#[test]
+fn resume_reports_a_broken_lock_dir_as_needing_manual_cleanup() {
+    use crate::commands::dto::CopyTaskDto;
+    use crate::core::lease::{lease_path, Lease};
+    let (window, _tmp, nas) = mock_app();
+    let app = window.app_handle();
+    let state = app.state::<AppState>();
+    let project_root = nas.join("proj-lock-broken");
+    std::fs::create_dir_all(crate::core::manifest::manifest_dir(&project_root)).unwrap();
+    let m = crate::core::manifest::CopyManifest::new("1. 待分类/x", "CARD", "A_B_C", "张三", "");
+    crate::core::manifest::save(&project_root, &m).unwrap();
+    // 一份过期的别机租约(走不了快路径),锁目录里躺着一个 desktop.ini
+    let stale = Lease {
+        machine_id: "OTHER-MACHINE".into(),
+        pid: 4242,
+        token: uuid::Uuid::new_v4().to_string(),
+        operator: "李四".into(),
+        host: "他们的机器".into(),
+        heartbeat_at: (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+    };
+    let lease_file = lease_path(&project_root, &m.id).unwrap();
+    std::fs::write(&lease_file, serde_json::to_vec(&stale).unwrap()).unwrap();
+    let lock_dir = lease_file.with_extension("lease.takeover");
+    std::fs::create_dir(&lock_dir).unwrap();
+    std::fs::write(lock_dir.join("desktop.ini"), b"[.ShellClassInfo]").unwrap();
+
+    let snap = CopyTaskDto {
+        id: "task-lock-broken".into(),
+        project_id: "proj-lock-broken".into(),
+        volume_id: "/definitely/not/mounted".into(),
+        volume_name: "CARD".into(),
+        camera_id: "cam-1".into(),
+        camera_code: "A_B_C".into(),
+        note: String::new(),
+        tags: Vec::new(),
+        target_folder: "1. 待分类/x".into(),
+        source_folders: Vec::new(),
+        scan_policy_version: 1,
+        destinations: Vec::new(),
+        files: Vec::new(),
+        file_count: None,
+        status_counts: None,
+        total_bytes: 0,
+        copied_bytes: 0,
+        speed_bytes_per_sec: 0,
+        state: "paused",
+        progress_revision: Some(1),
+        operator: "张三".into(),
+        started_at: "2026-08-31T03:32:00Z".into(),
+        finished_at: None,
+    };
+    state.tasks.insert(
+        snap.id.clone(),
+        std::sync::Arc::new(crate::commands::tasks::TaskHandle {
+            pause_requested: Default::default(),
+            running: Default::default(),
+            snapshot: std::sync::Mutex::new(snap.clone()),
+            project_root: project_root.clone(),
+            manifest_id: m.id.clone(),
+            source_root: std::sync::Mutex::new(std::path::PathBuf::from("/definitely/not/mounted")),
+            plan: Default::default(),
+            dest_targets: Vec::new(),
+            machine_id: "TEST-MACHINE".into(),
+            config_dir: std::path::PathBuf::from("/nowhere"),
+            lease: Default::default(),
+        }),
+    );
+
+    let err = invoke(&window, "resume_copy_task", json!({ "taskId": snap.id })).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("人工检查"), "{msg}");
+    let notices = state.notices.lock().unwrap();
+    let codes: Vec<&str> = notices.iter().map(|n| n.code.as_str()).collect();
+    assert!(
+        codes.contains(&"copy-resume-lease-lock-broken"),
+        "锁目录异常要顶「需人工清理」的抬头: {codes:?}"
+    );
+    assert!(
+        !codes.contains(&"copy-resume-lease-held"),
+        "不许再冒充「任务正被别的进程执行」: {codes:?}"
+    );
+    assert!(lock_dir.join("desktop.ini").exists(), "不认识的文件被删了");
+}
+
 /* ------------------------------------------------------------------ *
  * 启动期残留临时文件清扫
  * ------------------------------------------------------------------ */

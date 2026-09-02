@@ -480,6 +480,36 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<WriteReport, RetryFailu
     write_atomic_with(path, bytes, |from, to| fs::rename(from, to))
 }
 
+/// 守门版 [`write_atomic`]:临时文件写完、**改名之前**再问一句 `before_publish`,答否
+/// 就不发布(临时文件照常清掉)。给写栅栏用:写一份几 MB 的清单是落盘里最长的一段,
+/// 栅栏在这一段里被回收的话,改名前还能拦住——事后 `still_mine` 只能发现,拦不住。
+pub fn write_atomic_guarded(
+    path: &Path,
+    bytes: &[u8],
+    before_publish: &dyn Fn() -> bool,
+) -> Result<WriteReport, GuardedWrite> {
+    let refused = std::cell::Cell::new(false);
+    let r = write_atomic_with(path, bytes, |from, to| {
+        if !before_publish() {
+            refused.set(true);
+            return Err(io::Error::other("write fence refused"));
+        }
+        fs::rename(from, to)
+    });
+    match r {
+        Ok(w) => Ok(w),
+        Err(_) if refused.get() => Err(GuardedWrite::Refused),
+        Err(f) => Err(GuardedWrite::Failed(f)),
+    }
+}
+
+/// [`write_atomic_guarded`] 的两种失败:守门人说不,或真正的写失败。
+#[derive(Debug)]
+pub enum GuardedWrite {
+    Refused,
+    Failed(RetryFailure),
+}
+
 /// [`write_atomic`] 的本体,`rename` 可注入。
 ///
 /// 存在只为一件事:让「write_atomic 到底有没有真的走重试」可以被直接断言。

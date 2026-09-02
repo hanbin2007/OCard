@@ -7,7 +7,7 @@
  *      然后经窗口桥接打开主窗口。
  */
 
-import { cleanup, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api";
@@ -18,6 +18,7 @@ import {
   mockWorkstation,
 } from "../api/mock";
 import type { Project } from "../api/types";
+import type { useStore } from "../state/store";
 import { renderWelcome } from "../testUtils";
 
 afterEach(() => {
@@ -126,6 +127,30 @@ describe("欢迎页(仿 Xcode)", () => {
 
     await user.click(screen.getByTestId("welcome-back"));
     expect(shell().hasAttribute("data-topbar")).toBe(false);
+  });
+
+  /** 真正被修的判据:view 是 manager 但正在加载 / 出错时渲染的是卡片,没有顶栏。
+   *  只走「首页 → manager → 返回」的用例里 hasTopBar 恒等于 view === "manager",
+   *  把判据改回去照样绿。 */
+  it("manager 视图里加载中 / 出错时没有顶栏,也就不打 data-topbar", async () => {
+    const user = userEvent.setup();
+    let dispatch: ReturnType<typeof useStore>["dispatch"] | null = null;
+    renderWelcome(base, (s) => {
+      dispatch = s.dispatch;
+    });
+    const shell = () => screen.getByTestId("welcome-root");
+    await user.click(screen.getByTestId("welcome-browse-all"));
+    expect(shell().hasAttribute("data-topbar"), "前置:manager 视图有顶栏").toBe(true);
+
+    // 管理视图里改 NAS 根 / 点刷新会触发 reload → loadStarted:渲染的是加载卡片,没有顶栏
+    act(() => dispatch!({ type: "loadStarted" }));
+    expect(screen.getByRole("status")).toBeDefined();
+    expect(shell().getAttribute("data-view"), "view 仍是 manager").toBe("manager");
+    expect(shell().hasAttribute("data-topbar"), "加载中没有顶栏").toBe(false);
+
+    act(() => dispatch!({ type: "loadFailed", error: "NAS 不可达" }));
+    expect(screen.getByRole("alert")).toBeDefined();
+    expect(shell().hasAttribute("data-topbar"), "出错时没有顶栏").toBe(false);
   });
 });
 

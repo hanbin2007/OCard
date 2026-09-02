@@ -2066,8 +2066,11 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         // 先读再拿会拿着它释放前的陈旧快照去覆盖它最后写的进度。准备阶段的
         // 刷新计划那次写因此也在保护内;租约随后交给 worker 接手。
         // 同进程并发两次 resume 也会在这里被第二次的 Busy 挡住(token 不同)。
-        let operator = handle.snap().operator.clone();
-        let mut lease = crate::core::lease::acquire(
+        let (operator, task_id_for_lease, project_id_for_lease) = {
+            let s = handle.snap();
+            (s.operator.clone(), s.id.clone(), s.project_id.clone())
+        };
+        let lease = crate::core::lease::acquire(
             &handle.project_root,
             &handle.manifest_id,
             &handle.machine_id,
@@ -2092,12 +2095,20 @@ pub fn resume_copy_task<R: tauri::Runtime>(
             }
             msg
         })?;
-        if let Some(note) = lease.took_over_stale.take() {
-            let (id, pid) = {
-                let s = handle.snap();
-                (s.id.clone(), s.project_id.clone())
-            };
-            notify::warn_for_task(&app, "task-lease-taken-over", (&id, &pid), note);
+        // 从这里到交给 worker 之间的任何早退(清单损坏、卷没插回……)都要有释放判定
+        let mut keeper = tasks::LeaseKeeper::new(
+            app.clone(),
+            lease,
+            "续传准备中断、回滚",
+            (task_id_for_lease.clone(), project_id_for_lease.clone()),
+        );
+        if let Some(note) = keeper.lease_mut().took_over_stale.take() {
+            notify::warn_for_task(
+                &app,
+                "task-lease-taken-over",
+                (&task_id_for_lease, &project_id_for_lease),
+                note,
+            );
         }
         // 续传身份核对(评审 M10/P0-1)+ 按卷名重解析挂载点(复核必修 A:
         // 卡后插/换挂载口场景,插回原卡即可续传,无需重启应用)
@@ -2170,7 +2181,13 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         // 并落盘——只改内存会留下 `planned.size = 旧值` / `entry.size = 新值` /
         // `completed = true` 的自相矛盾清单。
         let mut m = m;
-        let plan = refresh_resume_plan(&app, &mut m, &handle.project_root, &resolved, &lease)?;
+        let plan = refresh_resume_plan(
+            &app,
+            &mut m,
+            &handle.project_root,
+            &resolved,
+            keeper.lease(),
+        )?;
         let mut snap = handle.snap();
         let old: std::collections::HashMap<String, &'static str> = snap
             .files
@@ -2189,7 +2206,7 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         snap.file_count = Some(plan.len());
         *handle.plan_guard() = plan;
         // 准备完毕,租约交给 worker(它接手后一直持有到任务结束)
-        *handle.lease_slot() = Some(lease);
+        *handle.lease_slot() = Some(keeper.into_lease());
     }
 
     tasks::spawn_worker(app, handle);
@@ -2455,7 +2472,8 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
     // **栅栏**内:持有 Held 本身挡不住「进程休眠超过 TTL 后被接管」,栅栏在落盘前
     // 持锁核对 token,不是自己的就不写(codex r6)
     let saved = lease.fence().and_then(|fence| {
-        let r = manifest::save(project_root, m)?;
+        // 改名之前再问一句栅栏还在不在(守门版 save),写完再复核一次
+        let r = manifest::save_guarded(project_root, m, &|| fence.still_mine())?;
         // 落盘后复核栅栏:被外部回收 = 这次落盘期间可能有人接管,接管者的清单可能刚被
         // 这次整份重写顶掉——按写失败处理并说出来,不能一声不吭(第九轮评审)
         if !fence.still_mine() {
@@ -2466,6 +2484,20 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
         drop(fence);
         Ok(r)
     });
+    if let Ok((wr, path)) = &saved {
+        if wr.retries > 0 {
+            // 与拷卡那条路的 fs-write-contention 口径一致:被占用后重试成功也要可见
+            notify::warn(
+                app,
+                "fs-write-contention",
+                format!(
+                    "写入拷卡清单时被别的程序占着,重试 {} 轮后成功:{}。多半是杀毒软件或 NAS 索引正在扫这个目录;若反复出现,把该目录加入杀毒软件排除项",
+                    wr.retries,
+                    path.display()
+                ),
+            );
+        }
+    }
     if let Err(e) = saved {
         let msg = format!(
             "续传前刷新的文件清单**未能**写回拷卡清单,已拒绝续传(继续跑会让审计范围与实际拷贝范围对不上:\

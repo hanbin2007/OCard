@@ -5,19 +5,34 @@
  */
 
 import { render } from "@testing-library/react";
+import { useEffect } from "react";
 import { NoticeToasts } from "./components/NotificationCenter";
 import { ProjectsScreen } from "./screens/ProjectsScreen";
-import { StoreProvider, type AppState } from "./state/store";
+import { StoreProvider, useStore, type AppState } from "./state/store";
 import { ThemeProvider } from "./state/theme";
 import { WindowBridgeProvider } from "./state/windowBridge";
 
 import { WelcomeRoot } from "./welcome/WelcomeRoot";
 
+type StoreHandle = ReturnType<typeof useStore>;
+
+/** 把 store 句柄交给测试:preloaded 会把 loading 钉成 false,要考「加载中 / 出错」
+ *  这类状态只能在挂载后 dispatch。 */
+function StoreProbe({ onStore }: { onStore: (s: StoreHandle) => void }) {
+  const store = useStore();
+  useEffect(() => onStore(store), [store, onStore]);
+  return null;
+}
+
 /** 渲染欢迎/项目管理窗口根视图(含首跑/欢迎页/向导/所有项目) */
-export function renderWelcome(preloaded?: Partial<AppState>) {
+export function renderWelcome(
+  preloaded?: Partial<AppState>,
+  onStore?: (s: StoreHandle) => void,
+) {
   return render(
     <ThemeProvider>
       <StoreProvider preloaded={preloaded}>
+        {onStore ? <StoreProbe onStore={onStore} /> : null}
         <WindowBridgeProvider role="welcome">
           <WelcomeRoot />
         </WindowBridgeProvider>

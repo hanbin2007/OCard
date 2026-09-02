@@ -336,22 +336,10 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
     });
     if let Err(e) = spawned {
         // 线程都起不来(句柄耗尽等):running 已经被 swap 成 true,必须清回去,
-        // 否则任务永远「运行中」;并且要说
-        handle_for_spawn_error
-            .running
-            .store(false, Ordering::SeqCst);
+        // 否则任务永远「运行中」;并且要说。顺序:先释放租约、再清 running——
+        // 反过来的话释放的那几秒里点「继续」会撞上「本进程内的另一次续传」
         // 续传阶段预先拿到的租约还在槽里、心跳还在跳:不释放的话下一次「继续」会先
         // 重新 acquire,被自己这份挡住,而报文说的是「稍后点继续」(codex r6)
-        if let Some(lease) = handle_for_spawn_error.lease_slot().take() {
-            let lease_file = lease.path().to_path_buf();
-            report_lease_release(
-                &app_for_spawn_error,
-                lease.release(),
-                &lease_file,
-                "拷卡线程启动失败、回滚",
-                false,
-            );
-        }
         let (id, pid) = {
             let mut s = handle_for_spawn_error.snap();
             // 快照也要回到暂停:否则任务一直显示「运行中」,而根本没有线程在跑
@@ -362,6 +350,20 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
             }
             (s.id.clone(), s.project_id.clone())
         };
+        if let Some(lease) = handle_for_spawn_error.lease_slot().take() {
+            let lease_file = lease.path().to_path_buf();
+            report_lease_release(
+                &app_for_spawn_error,
+                lease.release(),
+                &lease_file,
+                "拷卡线程启动失败、回滚",
+                false,
+                Some((&id, &pid)),
+            );
+        }
+        handle_for_spawn_error
+            .running
+            .store(false, Ordering::SeqCst);
         super::notify::error_for_task(
             &app_for_spawn_error,
             "copy-worker-spawn-failed",
@@ -534,37 +536,118 @@ fn run_worker<R: tauri::Runtime>(
     // 陈旧的 entries 把人家最后写的进度整份顶掉。
     let operator = handle.snap().operator.clone();
     let taken = handle.lease_slot().take();
-    let mut lease = match taken {
+    let (id, pid) = {
+        let s = handle.snap();
+        (s.id.clone(), s.project_id.clone())
+    };
+    let lease = match taken {
         Some(h) => h, // 续传路径已在准备阶段取得(刷新计划那次写也在保护内)
         None => crate::core::lease::acquire(
             &handle.project_root,
             &handle.manifest_id,
             &handle.machine_id,
             &operator,
-        )?,
+        )
+        .inspect_err(|e| {
+            // 锁目录异常(链接 / 异物)不会自己好:除了「已中断、可续传」那条,还要一条
+            // 抬头就说「需人工清理」的,否则用户只会一遍遍点「继续」
+            if e.to_string()
+                .starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX)
+            {
+                super::notify::warn_for_task(
+                    app,
+                    "copy-resume-lease-lock-broken",
+                    (&id, &pid),
+                    e.to_string(),
+                );
+            }
+        })?,
     };
-    if let Some(note) = lease.took_over_stale.take() {
+    // 读清单失败等早退也要有释放判定(守卫的 Drop 会说)
+    let mut keeper = LeaseKeeper::new(
+        app.clone(),
+        lease,
+        "任务准备中断",
+        (id.clone(), pid.clone()),
+    );
+    if let Some(note) = keeper.lease_mut().took_over_stale.take() {
         // 接管别人/自己残留的租约是「系统替用户做了决定」,零静默要求说出来;
         // 带任务:并行拷卡时同 code 的通知会按任务分桶,不会互相顶掉正文
-        let (id, pid) = {
-            let s = handle.snap();
-            (s.id.clone(), s.project_id.clone())
-        };
         super::notify::warn_for_task(app, "task-lease-taken-over", (&id, &pid), note);
     }
     let mut m = manifest::load(&handle.project_root, &handle.manifest_id)?;
+    let lease = keeper.into_lease();
 
     // 租约实现了 Drop:下面任何路径(含 panic)都会释放。显式 release 只是
     // 把意图写明,并顺手自查一次——删不掉时别人要白等 TTL,用户有权知道
     let outcome = run_worker_locked(app, handle, &mut m, &lease);
     let lease_file = lease.path().to_path_buf();
-    report_lease_release(app, lease.release(), &lease_file, "任务结束", true);
+    report_lease_release(
+        app,
+        lease.release(),
+        &lease_file,
+        "任务结束",
+        true,
+        Some((&id, &pid)),
+    );
     outcome
 }
 
+/// 「拿到租约之后、交给 worker 之前」这段路上的任何早退(`?`)都会让 `Held` 只走
+/// Drop——释放了,但判定没人接:留下的自锁租约、被接管都成了无声。这个守卫在 Drop
+/// 里把判定说出来;交给 worker 时用 `into_lease` 取走,守卫就不再管。
+pub(crate) struct LeaseKeeper<R: tauri::Runtime> {
+    lease: Option<crate::core::lease::Held>,
+    app: AppHandle<R>,
+    what: &'static str,
+    task: (String, String),
+}
+
+impl<R: tauri::Runtime> LeaseKeeper<R> {
+    pub(crate) fn new(
+        app: AppHandle<R>,
+        lease: crate::core::lease::Held,
+        what: &'static str,
+        task: (String, String),
+    ) -> Self {
+        Self {
+            lease: Some(lease),
+            app,
+            what,
+            task,
+        }
+    }
+    pub(crate) fn lease(&self) -> &crate::core::lease::Held {
+        self.lease.as_ref().expect("租约已被取走")
+    }
+    pub(crate) fn lease_mut(&mut self) -> &mut crate::core::lease::Held {
+        self.lease.as_mut().expect("租约已被取走")
+    }
+    pub(crate) fn into_lease(mut self) -> crate::core::lease::Held {
+        self.lease.take().expect("租约已被取走")
+    }
+}
+
+impl<R: tauri::Runtime> Drop for LeaseKeeper<R> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            let path = lease.path().to_path_buf();
+            report_lease_release(
+                &self.app,
+                lease.release(),
+                &path,
+                self.what,
+                false,
+                Some((&self.task.0, &self.task.1)),
+            );
+        }
+    }
+}
+
 /// 释放判定的可见出口。`Held` 的 Drop 也会释放,但没人接结果——「没删掉 / 被接管
-/// / 心跳线程没退出」就成了无声。所有持有租约的路径(worker、续传准备、代理状态
-/// 保存、线程起不来时的回收)都走这里。
+/// / 心跳线程没退出」就成了无声。所有持有租约的路径都走这里:worker 收尾、代理状态
+/// 保存、线程起不来时的回收直接调;续传准备与 worker 准备阶段的早退经 [`LeaseKeeper`]
+/// 的 Drop 转到这里。
 pub(crate) fn report_lease_release<R: tauri::Runtime>(
     app: &AppHandle<R>,
     released: crate::core::lease::Released,
@@ -573,7 +656,14 @@ pub(crate) fn report_lease_release<R: tauri::Runtime>(
     // 三处复用同一段判定,但只有 worker 那一路真的有任务被暂停
     what: &str,
     task_paused: bool,
+    // 任务身份:同 code 的通知 30 秒内会合并、后一条正文覆盖前一条——两张卡同时
+    // 残留租约时没有 scope 就只剩一条。代理写回那一路没有 project id,给空串即可
+    task: Option<(&str, &str)>,
 ) {
+    let say = |code: &str, msg: String| match task {
+        Some(t) => super::notify::warn_for_task(app, code, t, msg),
+        None => super::notify::warn(app, code, msg),
+    };
     match released {
         crate::core::lease::Released::Removed => {}
         // 被接管:轮询阶段已经报过 task-lease-lost,这里不重复
@@ -582,9 +672,7 @@ pub(crate) fn report_lease_release<R: tauri::Runtime>(
             // 留下的是**我们自己的**租约:别的机器要等 TTL;本机在本次运行期间也续不了
             // (pid 还活着,不算残留;重启 OCard 后 pid 不在了就能立刻接管)。得说清楚,
             // 否则用户点「继续」会撞上「本进程内的另一次续传」然后一头雾水
-            super::notify::warn(
-                app,
-                "task-lease-left-behind",
+            say("task-lease-left-behind",
                 format!(
                     "{what}后没能删掉自己的租约文件({why}):{}。别的机器在 {} 分钟内、本机在本次运行期间续这个任务都会被它挡住;重启 OCard 或手动删除该文件可立刻解锁",
                     lease_file.display(),
@@ -594,18 +682,26 @@ pub(crate) fn report_lease_release<R: tauri::Runtime>(
         }
         crate::core::lease::Released::RemovedHeartbeatStuck => {
             // 删成了;只是心跳线程还卡在存储上。如实说,别混进「没敢删」那一桶
-            super::notify::warn(
-                app,
-                "task-lease-heartbeat-stuck",
+            say("task-lease-heartbeat-stuck",
                 "任务租约已正常删除,但本机的心跳线程 5 秒内没有退出(多半卡在存储的一次读写上)。它醒来后不会再写租约,只是本次收尾慢了些;若经常出现,说明这台机器到 NAS 的连接不稳".into(),
+            );
+        }
+        crate::core::lease::Released::NoLockHeartbeatStuck(why) => {
+            // 不混进「没敢删」那一桶:那一桶会拼出「可能已被别的进程接管——删除前先确认」,
+            // 与「是本机线程持着」自相矛盾。如实说两种可能,不承诺「不必处理」
+            say(
+                "task-lease-heartbeat-stuck",
+                format!(
+                    "{what}时{why}。它醒来时若正卡在写租约的那一拍上,会自己删掉租约;若卡在别处,这份租约会留到 {} 分钟后过期:{}。期间别的机器续这个任务会被挡住;确认本机 OCard 已退出后可手动删除该文件",
+                    crate::core::lease::LEASE_TTL.num_minutes(),
+                    lease_file.display()
+                ),
             );
         }
         crate::core::lease::Released::TakenOverUnnoticed => {
             // 释放时才第一次发现盘上是别人的:心跳线程没来得及报 Lost。要说,
             // 用户得知道从某一刻起这份进度可能有另一处在写
-            super::notify::warn(
-                app,
-                // 只有 worker 那一路真的「已暂停」;别的调用方用另一个 code,标题才不撒谎
+            say(// 只有 worker 那一路真的「已暂停」;别的调用方用另一个 code,标题才不撒谎
                 if task_paused {
                     "task-lease-lost"
                 } else {
@@ -618,9 +714,7 @@ pub(crate) fn report_lease_release<R: tauri::Runtime>(
         | crate::core::lease::Released::NoLock(why) => {
             // 没拿到接管锁就没敢删——盘上那份**可能已经是接管方的**。这里绝不能
             // 建议「手动删除」:照做就是删掉一个正在拷卡的进程的租约
-            super::notify::warn(
-                app,
-                "task-lease-left-behind",
+            say("task-lease-left-behind",
                 format!(
                     "{what}时没能确认租约文件的归属({why}),没有删除:{}。它可能仍是本进程的(别的机器要等 {} 分钟、本机重启 OCard 后可续),也可能已被别的进程接管——删除前请先确认没有别的 OCard 在跑这个任务",
                     lease_file.display(),

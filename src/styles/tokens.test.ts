@@ -272,7 +272,7 @@ describe("主题令牌", () => {
     expect(
       custom(".welcome-shell[data-topbar]", "--welcome-topbar-offset"),
       "只有真的渲染了顶栏的视图才让开顶栏",
-    ).toContain("--topbar-height");
+    ).toBe("var(--topbar-height)");
     expect(custom(".welcome-shell__drag", "height"), "拖动条高度与 toast 让开的量必须是同一个变量").toContain(
       "--welcome-drag-height",
     );

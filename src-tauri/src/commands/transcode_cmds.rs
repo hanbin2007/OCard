@@ -1065,9 +1065,18 @@ fn save_proxy_state<R: tauri::Runtime>(
             h
         }
         Err(e) => {
+            // 锁目录异常(链接 / 异物)不会自己好,抬头不能只说「没有写回」
+            let code = if e
+                .to_string()
+                .starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX)
+            {
+                "copy-resume-lease-lock-broken"
+            } else {
+                "auto-proxy-state-unsaved"
+            };
             notify::warn(
                 app,
-                "auto-proxy-state-unsaved",
+                code,
                 format!("清单 {which}… 的自动转代理{what}没有写回:{e}。{consequence}"),
             );
             return false;
@@ -1078,7 +1087,9 @@ fn save_proxy_state<R: tauri::Runtime>(
         // 写在栅栏内:持有 Held 本身挡不住「进程休眠超过 TTL 后被接管」,栅栏在落盘前
         // 持锁核对 token,不是自己的就不写(codex r6)
         let fence = lease.fence()?;
-        crate::core::manifest::save(project_root, &fresh)?;
+        // 改名之前再问一句栅栏还在不在(守门版 save),写完再复核一次
+        let (wr, path) =
+            crate::core::manifest::save_guarded(project_root, &fresh, &|| fence.still_mine())?;
         // 落盘后复核栅栏:被外部回收 = 这次写回不可信,按失败处理并说出来
         if !fence.still_mine() {
             return Err(crate::core::CoreError::Busy(
@@ -1087,10 +1098,24 @@ fn save_proxy_state<R: tauri::Runtime>(
             ));
         }
         drop(fence);
-        Ok(())
+        Ok((wr, path))
     });
+    // 被占用后重试成功的轮数在拷卡那条路上是可见的(fs-write-contention),这里口径一致
+    if let Ok((wr, path)) = &result {
+        if wr.retries > 0 {
+            notify::warn(
+                app,
+                "fs-write-contention",
+                format!(
+                    "写入拷卡清单时被别的程序占着,重试 {} 轮后成功:{}。多半是杀毒软件或 NAS 索引正在扫这个目录;若反复出现,把该目录加入杀毒软件排除项",
+                    wr.retries,
+                    path.display()
+                ),
+            );
+        }
+    }
     let ok = match result {
-        Ok(()) => true,
+        Ok(_) => true,
         Err(e) => {
             notify::warn(
                 app,
@@ -1108,6 +1133,7 @@ fn save_proxy_state<R: tauri::Runtime>(
         &lease_file,
         "自动转代理状态写回",
         false,
+        Some((id, "")),
     );
     ok
 }
