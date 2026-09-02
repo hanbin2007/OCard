@@ -1125,6 +1125,13 @@ fn save_proxy_state_inner<R: tauri::Runtime>(
         .unwrap_or_default();
     let lease = match crate::core::lease::acquire(project_root, id, machine_id, "") {
         Ok(mut h) => {
+            // 迟到的心跳降级的直达出口(同 LeaseKeeper)
+            {
+                let (app2, pid) = (app.clone(), project_id.clone());
+                h.set_late_reporter(move |mid, d| {
+                    super::tasks::report_late_heartbeat(&app2, mid, &pid, d);
+                });
+            }
             // 接管别人/自己残留的租约是「系统替用户做了决定」:这里也必须说
             if let Some(note) = h.took_over_stale.take() {
                 notify::warn_for_task(

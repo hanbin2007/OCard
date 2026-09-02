@@ -889,6 +889,8 @@ impl Drop for TakeoverLock {
                             self.dir.display(),
                             ORPHAN_DIR_TTL.as_secs()
                         );
+                        // 盘上此刻确实多了个目录:进程内残留表能自愈,但用户也要知道
+                        super::fsx::note_leftover_temp(&self.dir);
                         // 存「到期时刻」(加法):测试与判定都不从 Instant 减——Windows 的 Instant
                         // 自开机起算,开机不足 TTL 时减法会 panic(fable 抓到)
                         lock_or_recover(my_orphaned_dirs())
@@ -1184,6 +1186,26 @@ struct Shared {
     /// [`LATE_HEARTBEAT`],由下一个收尾钩子按租约文件名(= 清单 id)带 scope 报出来
     read_out: AtomicBool,
     lease_path: PathBuf,
+    /// 上层(有通知出口的一方)登记的「迟到的心跳降级」直达出口:有它就直接报,不进全局
+    /// 登记——登记要等下一个收尾钩子,应用退出前可能再也没有钩子(codex 终审 r17)
+    late_reporter: Mutex<LateReporterSlot>,
+}
+
+/// 「迟到的心跳线程」降级的直达出口:`(清单 id, 降级)`。
+pub type LateReporter = Box<dyn Fn(&str, HeartbeatDegradations) + Send + Sync>;
+
+/// 闭包装不进 `#[derive(Debug)]`,包一层。
+#[derive(Default)]
+struct LateReporterSlot(Option<LateReporter>);
+
+impl std::fmt::Debug for LateReporterSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "LateReporter(set)"
+        } else {
+            "LateReporter(none)"
+        })
+    }
 }
 
 /// 释放之后才退出的心跳线程留下的降级:`(清单 id, 降级)`。进程内的登记——心跳线程没有
@@ -1216,6 +1238,7 @@ fn new_shared(lease_path: PathBuf) -> Arc<Shared> {
         hb_stuck: AtomicBool::new(false),
         read_out: AtomicBool::new(false),
         lease_path,
+        late_reporter: Mutex::new(LateReporterSlot::default()),
     })
 }
 
@@ -1241,7 +1264,12 @@ fn hand_off_heartbeat_degradations(shared: &Shared) {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            lock_or_recover(&LATE_HEARTBEAT).push((id, d));
+            // 有直达出口就直接报(不等下一个钩子);没有(测试 / 未登记)才进全局登记
+            let reporter = lock_or_recover(&shared.late_reporter);
+            match reporter.0.as_ref() {
+                Some(report) => report(&id, d),
+                None => lock_or_recover(&LATE_HEARTBEAT).push((id, d)),
+            }
         }
     }
 }
@@ -1476,6 +1504,14 @@ impl Held {
     /// 之间,接管者完全可以完成一次接管——那一次 save 就把新持有者的进度整份顶掉。
     /// 接管、心跳、释放都在这把锁下动租约,save 也在锁下,窗口就没了。
     /// 拿不到锁 / 不是自己的 → `Err(Busy)`,调用方按丢租约处理(不写)。
+    /// 登记「迟到的心跳降级」的直达出口(上层有通知出口的一方在取得之后立刻登记)。
+    pub fn set_late_reporter(
+        &self,
+        report: impl Fn(&str, HeartbeatDegradations) + Send + Sync + 'static,
+    ) {
+        lock_or_recover(&self.shared.late_reporter).0 = Some(Box::new(report));
+    }
+
     pub fn fence(&self) -> Result<SaveFence> {
         // 先排**本进程内**的队:心跳线程与栅栏抢的是同一把目录锁。不排队就是自己和
         // 自己抢——慢 NAS 上心跳一拍(读→写→回读)就能耗尽栅栏的耐心,任务无故中止,
@@ -1914,6 +1950,31 @@ mod tests {
         assert_eq!(late[0].0, "abc-123");
         assert_eq!(late[0].1.leftovers.len(), 1);
         assert!(take_late_heartbeat_degradations().is_empty(), "取走即清空");
+    }
+
+    /// 登记了直达出口的租约:迟到的交接直接报出,不进全局登记(应用退出前可能再没有钩子)。
+    #[test]
+    fn a_late_heartbeat_reports_through_the_registered_outlet_instead_of_the_registry() {
+        let _ = take_late_heartbeat_degradations();
+        let shared = new_shared(PathBuf::from("/nas/proj/.ocard/copies/def-456.lease"));
+        let got: Arc<Mutex<Vec<(String, HeartbeatDegradations)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = got.clone();
+        lock_or_recover(&shared.late_reporter).0 =
+            Some(Box::new(move |id: &str, d: HeartbeatDegradations| {
+                lock_or_recover(&sink).push((id.to_string(), d));
+            }));
+        shared.read_out.store(true, Ordering::SeqCst);
+        crate::core::fsx::note_retried_writes(1);
+        hand_off_heartbeat_degradations(&shared);
+        let got = lock_or_recover(&got);
+        assert_eq!(got.len(), 1, "直达出口要被调用");
+        assert_eq!(got[0].0, "def-456");
+        assert_eq!(got[0].1.retried_writes, 1);
+        assert!(
+            take_late_heartbeat_degradations().is_empty(),
+            "有直达出口就不进登记"
+        );
     }
 
     use super::*;

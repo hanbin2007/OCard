@@ -227,6 +227,8 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
                 false,
                 Some((&id, &pid)),
             );
+            // 释放(接管锁取得 / 标记删不掉)留在这条命令线程上的降级也带 scope 取走
+            super::sorting_cmds::notify_if_unsafe_fallback_for(&app, Some((&id, &pid)));
         }
         return;
     }
@@ -403,6 +405,10 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
                 &lease_file,
                 "拷卡线程启动失败、回滚",
                 false,
+                Some((&id, &pid)),
+            );
+            super::sorting_cmds::notify_if_unsafe_fallback_for(
+                &app_for_spawn_error,
                 Some((&id, &pid)),
             );
         }
@@ -678,6 +684,15 @@ impl<R: tauri::Runtime> LeaseKeeper<R> {
         task: (String, String),
         handle: Arc<TaskHandle>,
     ) -> Self {
+        // 迟到的心跳降级的直达出口:释放只等心跳 5 秒,之后才退出的心跳线程直接经这里报,
+        // 不依赖「之后还有别的收尾钩子」
+        {
+            let (app2, tid, pid) = (app.clone(), task.0.clone(), task.1.clone());
+            lease.set_late_reporter(move |id, d| {
+                let pid = if id == tid { pid.as_str() } else { "" };
+                report_late_heartbeat(&app2, id, pid, d);
+            });
+        }
         Self {
             lease: Some(lease),
             app,
@@ -718,6 +733,27 @@ impl<R: tauri::Runtime> Drop for LeaseKeeper<R> {
                 Some((&self.task.0, &self.task.1)),
             );
         }
+    }
+}
+
+/// 「迟到的心跳线程」(释放之后才退出)攒下的降级的可见出口:三种降级 + 卡死那一句。
+pub(crate) fn report_late_heartbeat<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    task_id: &str,
+    project_id: &str,
+    d: crate::core::lease::HeartbeatDegradations,
+) {
+    // scope 先绑成变量:通知 code 门禁只认调用点里第一个 `),` 之前的字面量
+    let scope = Some((task_id, project_id));
+    let who = format!("迟到的租约心跳线程(清单 {task_id})");
+    report_heartbeat_degradations(app, scope, &who, &d);
+    if d.heartbeat_stuck {
+        super::notify::warn_scoped(
+            app,
+            scope,
+            "task-lease-heartbeat-stuck",
+            "租约心跳线程在释放之后才从 NAS 读写里醒来并退出;它攒下的降级已在上面补报".into(),
+        );
     }
 }
 
@@ -1254,6 +1290,17 @@ fn run_worker_locked<R: tauri::Runtime>(
     // 零静默中的最高危一条:部分拷贝完成时,`all_verified` 只代表**所选文件夹**
     // 全过了,卡上其余内容一个字节都没拷。UI 那句「本卡可格式化」在这种任务上
     // 是错的,会直接导致用户格式化掉没备份的素材——后端必须自己喊一嗓子。
+    if outcome.baseline_degraded > 0 {
+        super::notify::warn_for_task(
+            app,
+            "copy-baseline-degraded",
+            (&task_for_notices.0, &task_for_notices.1),
+            format!(
+                "{} 个文件的清单没有记录规划时的修改时间(旧版本清单,或扫描时读不到):它们「拷贝期间源没被改写」只按开拷快照的大小与修改时间判,同一时间戳槽内的等长改写挡不住。要完整保障请重新发起拷贝(新清单会记录基准)",
+                outcome.baseline_degraded
+            ),
+        );
+    }
     if !outcome.paused && outcome.all_verified && !m.source_selection.is_empty() {
         // 带任务 scope:两张部分拷卡在 30 秒内完成时,无 scope 的同 code 会让后一张顶掉前一张
         // 「其余内容没有备份、请勿格式化」的正文——这条直接关联素材丢失(codex 终审)

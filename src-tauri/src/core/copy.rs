@@ -8,7 +8,7 @@
 use super::hash;
 use super::manifest::{self, CopyManifest, ManifestEntry};
 use super::Result;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -62,6 +62,9 @@ pub struct CopyOutcome {
     /// 用 outcome 而不是 Err 承载:收尾(已失败文件的审计、占用总账)必须照跑,
     /// 否则那几条「哪个文件为什么失败」的记录就跟着 Err 一起消失了。
     pub aborted: bool,
+    /// 计划里没有修改时间基准(旧版本清单 / 扫描时读不到)的文件数:这些文件的「拷贝期间
+    /// 源没被改写」只按开拷快照判,同一时间戳槽内的等长改写挡不住——上层要说。
+    pub baseline_degraded: usize,
     /// 中止的具体原因(写栅栏拒绝 / 拿不到锁 / 落盘期间栅栏被回收)。`None` = 由
     /// 进度回调的 Abort 决定(上层自己知道为什么)。上层报给用户的必须是这一句,
     /// 而不是一律说「租约已被接管」——没拿到锁 ≠ 被接管。
@@ -1194,13 +1197,16 @@ fn baseline_settle_for(in_tests: bool) -> std::time::Duration {
 
 /// 源在「快照 → 现在」之间没变的证明:快照要有、两侧的修改时间都要读得到、大小与修改时间
 /// 都相等。「不知道」不算「没变」(fail-closed)。配合 [`baseline_settle`](基准比首次读源早
-/// 一个时间戳粒度以上),拷贝期间的写入必然落在更晚的时间槽里。残余的边界只剩等长原位改写
-/// **并把修改时间改回旧值**的对抗性场景——闭合它要把源再完整读一遍,拷卡时间翻倍,如实声明。
+/// 一个时间戳粒度以上),拷贝期间的写入必然落在更晚的时间槽里(写者的文件系统在写入时就
+/// 更新修改时间的前提下:macOS / Linux 本地与 Samba 都是;Windows 只保证写句柄关闭后才
+/// 正确——所以 Windows 上另有 [`fsx::open_source`](super::fsx::open_source) 的共享模式排他于
+/// 写者)。残余的边界:等长原位改写**并把修改时间改回旧值**的对抗性场景;非 Windows 客户端
+/// 读 Windows 共享上正被别的机器写的文件。闭合都要把源再完整读一遍,拷卡时间翻倍,如实声明。
 fn source_unchanged_since(pre: Option<&fs::Metadata>, src: &Path) -> bool {
     let Some(pre) = pre else { return false };
     // 按句柄取元数据:按路径的查询在 SMB 客户端上可能由元数据缓存应答(Windows 重定向器
     // 默认 10 秒),开一次句柄必到服务端
-    let Ok(now) = fs::File::open(src).and_then(|f| f.metadata()) else {
+    let Ok(now) = super::fsx::open_source(src).and_then(|f| f.metadata()) else {
         return false;
     };
     let (Ok(t0), Ok(t1)) = (pre.modified(), now.modified()) else {
@@ -1232,7 +1238,7 @@ pub fn file_done_stable(
     if super::paths::is_symlink(&src) || super::paths::assert_within(source_root, &src).is_err() {
         return false;
     }
-    let src_ok = hash::xxh3_file(&src)
+    let src_ok = hash::xxh3_file_source(&src)
         .map(|h| h == entry.xxh3)
         .unwrap_or(false);
     if !src_ok {
@@ -1590,6 +1596,8 @@ pub fn run_copy(
     if !settle.is_zero() {
         std::thread::sleep(settle);
     }
+    // 计划里没有修改时间基准的文件数(旧版本清单):上层要说「这些的稳定性只按开拷快照判」
+    let mut baseline_degraded: usize = 0;
     for (index, item) in plan.iter().enumerate() {
         let (src_rel, rel, size) = (&item.source_rel, &item.target_rel, item.size);
         if control == CopyControl::Abort {
@@ -1627,17 +1635,25 @@ pub fn run_copy(
         // 源自扫描后已变化,基准是新鲜的、挡不住同一时间槽内的等长改写——这个文件不拷,
         // 可见失败,请人重扫(codex 终审 r16)。0 = 老清单没有基准,只能靠开拷时的快照
         let baseline_issue = match &pre_meta {
-            Some(pre) if item.source_mtime_ns != 0 => {
+            Some(pre) => {
                 let now_ns = super::media::mtime_nanos(pre);
-                (pre.len() != item.size || now_ns != item.source_mtime_ns).then(|| {
-                    format!(
-                        "源文件自规划扫描后已变化(大小 {} → {},修改时间 {} → {}),无法确认拷贝期间的稳定性基准,这个文件不拷: {src_rel}。请确认没有设备在写这张卡,再点「继续」(会重新扫描)",
-                        item.size,
-                        pre.len(),
-                        item.source_mtime_ns,
-                        now_ns
-                    )
-                })
+                // 大小**无条件**核对(旧清单也记了大小);修改时间只在计划有记录时核对,
+                // 没记录(旧版本清单 / 扫描时读不到)= 基准退化为开拷快照,计数上报
+                let mtime_known = item.source_mtime_ns != 0;
+                if !mtime_known {
+                    baseline_degraded += 1;
+                }
+                (pre.len() != item.size || (mtime_known && now_ns != item.source_mtime_ns)).then(
+                    || {
+                        format!(
+                            "源文件自规划扫描后已变化(大小 {} → {},修改时间 {} → {}),无法确认拷贝期间的稳定性基准,这个文件不拷: {src_rel}。请确认没有设备在写这张卡,再点「重试全部失败文件」或「继续」(都会重新扫描)",
+                            item.size,
+                            pre.len(),
+                            item.source_mtime_ns,
+                            now_ns
+                        )
+                    },
+                )
             }
             _ => None,
         };
@@ -1816,6 +1832,7 @@ pub fn run_copy(
         || progress(Progress::AboutToSave { rel_path: "" }) == CopyControl::Abort
     {
         return Ok(CopyOutcome {
+            baseline_degraded: 0,
             files: reports,
             bytes_copied,
             all_verified: false,
@@ -1834,6 +1851,7 @@ pub fn run_copy(
     match save_within_fence(fence, project_root, m, all_verified) {
         Err(why) => {
             return Ok(CopyOutcome {
+                baseline_degraded: 0,
                 files: reports,
                 bytes_copied,
                 all_verified: false,
@@ -1856,6 +1874,7 @@ pub fn run_copy(
         }
     }
     Ok(CopyOutcome {
+        baseline_degraded,
         files: reports,
         bytes_copied,
         all_verified,
@@ -1956,7 +1975,7 @@ fn copy_one(
 
     let mut known_src_hash: Option<String> = None;
     if !pre_existing.is_empty() {
-        let src_hash = hash::xxh3_file(&src_path)?;
+        let src_hash = hash::xxh3_file_source(&src_path)?;
         for &i in &pre_existing {
             let existing_hash = hash::xxh3_file(&finals[i])?;
             if existing_hash != src_hash {
@@ -2006,7 +2025,8 @@ fn copy_one(
         })
         .collect();
 
-    let mut src = File::open(&src_path)?;
+    // Windows 上排他于写者(见 fsx::open_source):有程序正在写就打不开,可见失败
+    let mut src = super::fsx::open_source(&src_path)?;
     // 源哈希 + 逐目的地哈希可能是好几分钟,期间没有块回调:建 part(先删同名残留)
     // 之前再查一次租约,别把接管者正在写的那份删掉。检查点在失败清理**之外**:
     // 放进闭包里的话,Err 会走下面的清理把接管者正在写的同名 part 删掉,等于没查
@@ -2084,7 +2104,7 @@ fn copy_one(
                 )));
             }
             // 按句柄取(见 source_unchanged_since):路径查询可能被 SMB 客户端缓存应答
-            let after = fs::File::open(&src_path)?.metadata()?;
+            let after = super::fsx::open_source(&src_path)?.metadata()?;
             // mtime 两边都要**读得到**才算一致:None == None 不是「没变」,是「不知道」
             let (Ok(m0), Ok(m1)) = (before.modified(), after.modified()) else {
                 return Err(super::CoreError::Invalid(format!(

@@ -88,17 +88,31 @@ fn prune_rotated_logs(dir: &std::path::Path, keep: usize) -> Vec<String> {
             return failed;
         }
     };
-    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
-        .flatten()
-        .filter(|e| {
-            e.file_name().to_string_lossy().starts_with("ocard")
-                && e.file_type().map(|t| t.is_file()).unwrap_or(false)
-        })
-        .filter_map(|e| {
-            let m = e.metadata().ok()?.modified().ok()?;
-            Some((m, e.path()))
-        })
-        .collect();
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    for e in entries {
+        let e = match e {
+            Ok(e) => e,
+            Err(err) => {
+                failed.push(format!("日志目录条目读不了: {err}"));
+                continue;
+            }
+        };
+        if !e.file_name().to_string_lossy().starts_with("ocard") {
+            continue;
+        }
+        match e.file_type() {
+            Ok(t) if t.is_file() => {}
+            Ok(_) => continue,
+            Err(err) => {
+                failed.push(format!("{}: 类型读不了: {err}", e.path().display()));
+                continue;
+            }
+        }
+        match e.metadata().and_then(|m| m.modified()) {
+            Ok(m) => files.push((m, e.path())),
+            Err(err) => failed.push(format!("{}: 修改时间读不了: {err}", e.path().display())),
+        }
+    }
     if files.len() <= keep {
         return failed;
     }

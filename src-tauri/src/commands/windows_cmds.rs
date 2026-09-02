@@ -83,8 +83,14 @@ pub fn open_project_window<R: tauri::Runtime>(
             "projectId": project_id,
         }),
     ) {
-        // 事件发不出去还有暂存通道兜底;仍要记日志便于排障
+        // 事件发不出去还有暂存通道兜底(主窗口启动时消费一次);主窗口已在跑时兜底不会再
+        // 消费,用户会看到旧项目——要说,并告诉怎么办
         log::warn!("app://open-project 事件发送失败: {e}");
+        super::notify::warn(
+            &app,
+            "open-project-event-failed",
+            format!("切换项目的消息没能送到主窗口({e}):主窗口可能仍显示上一个项目,请在主窗口里手动切换到目标项目"),
+        );
     }
     main.show().map_err(|e| format!("显示主窗口失败: {e}"))?;
     let _ = main.unminimize();

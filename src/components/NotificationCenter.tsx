@@ -118,6 +118,8 @@ export const NOTICE_TITLES: Record<string, string> = {
   "fsx-write-retried": "写入被占用，重试后成功",
   "lease-heartbeat-leftover-temp": "租约心跳线程有临时文件没删掉",
   "log-prune-failed": "旧运行日志没能清理",
+  "copy-baseline-degraded": "部分文件缺少稳定性基准，按开拷快照判定",
+  "open-project-event-failed": "切换项目的消息没能送到主窗口",
   "copy-resume-lease-lock-broken": "租约锁目录异常，需人工清理",
   "copy-resume-lease-held": "任务正被别的进程执行，拒绝续传",
   "copy-resume-already-running": "上一次运行还没退出，本次「继续」未生效",

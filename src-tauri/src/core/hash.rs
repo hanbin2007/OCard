@@ -13,6 +13,11 @@ pub fn xxh3_file(path: &Path) -> Result<String> {
     xxh3_reader(File::open(path)?)
 }
 
+/// 哈希**源**文件:按 [`fsx::open_source`](super::fsx::open_source) 打开(Windows 上排他于写者)。
+pub fn xxh3_file_source(path: &Path) -> Result<String> {
+    xxh3_reader(super::fsx::open_source(path)?)
+}
+
 /// 校验专用:尽量绕页缓存读取后计算哈希(M2 技术债:回读命中页缓存会弱化校验)。
 pub fn xxh3_file_uncached(path: &Path) -> Result<String> {
     xxh3_reader(super::fsx::open_uncached(path)?)

@@ -421,6 +421,27 @@ fn note_uncached_fallback() {
     UNCACHED_FALLBACKS.with(|c| c.set(c.get() + 1));
 }
 
+/// 打开**源**文件供拷贝 / 哈希读取。Windows 上以「只允许别人读」的共享模式打开
+/// (`FILE_SHARE_READ`):正持着写句柄的程序会让这次打开直接报共享冲突(可见失败、按占用
+/// 重试),而我们持着句柄期间任何人都打不开写句柄——这是 Windows 上唯一可靠的「拷贝期间
+/// 没人在写」证明:Windows 只保证写句柄**关闭后**修改时间才正确,写入过程中按元数据看不出
+/// (codex 终审 r17)。其它平台没有强制共享模式,靠大小 + 修改时间的前后核对。
+pub fn open_source(path: &Path) -> io::Result<fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path)
+    }
+}
+
 /// 打开文件并尽量绕过页缓存(校验用:让回读尽量来自介质而非内存)。
 /// Windows 回退普通打开(如实标注的边界,见模块文档)。
 pub fn open_uncached(path: &Path) -> io::Result<fs::File> {
@@ -542,6 +563,32 @@ mod tests {
             b"x",
             "已存在的目标一个字节都不许动"
         );
+    }
+
+    /// Windows:别的程序持着写句柄时,源文件打不开(共享冲突 = 可见失败),持着我们的句柄
+    /// 时别人也拿不到写句柄——拷贝期间没人在写的证明。
+    #[cfg(windows)]
+    #[test]
+    fn a_source_held_open_for_writing_cannot_be_opened_for_copying_on_windows() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("A.MP4");
+        std::fs::write(&p, b"x").unwrap();
+        // 写者(默认共享模式:允许读写删)
+        let writer = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        let r = open_source(&p);
+        assert!(
+            matches!(&r, Err(e) if e.raw_os_error() == Some(32)),
+            "有写句柄时源必须打不开: {r:?}"
+        );
+        drop(writer);
+        let reader = open_source(&p).unwrap();
+        // 我们持着句柄期间,写句柄拿不到
+        let w2 = std::fs::OpenOptions::new().write(true).open(&p);
+        assert!(
+            matches!(&w2, Err(e) if e.raw_os_error() == Some(32)),
+            "我们读着时别人不许开写句柄: {w2:?}"
+        );
+        drop(reader);
     }
 
     /// 降级标记是线程局部的:别的线程(别的任务)的回退不会被本线程取走、归错任务。
