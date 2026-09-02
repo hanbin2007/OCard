@@ -1034,15 +1034,9 @@ fn run_worker_locked<R: tauri::Runtime>(
             crate::core::lease::LeaseStatus::AtRisk(why) => {
                 if !lease_stop_reported {
                     lease_stop_reported = true;
+                    // 锁目录异常的那条专用通知由收尾按前缀统一发(原因经 lease_abort_why
+                    // 带回),这里不再发——否则 30 秒内两条逐字相同的 error 叠成 ×2
                     lease_abort_why = Some(why.clone());
-                    if why.contains(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) {
-                        super::notify::error_for_task(
-                            app,
-                            "copy-resume-lease-lock-broken",
-                            (&task_for_notices.0, &task_for_notices.1),
-                            why.clone(),
-                        );
-                    }
                     super::notify::error_for_task(
                         app,
                         "task-lease-at-risk",

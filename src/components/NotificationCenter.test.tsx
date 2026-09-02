@@ -854,6 +854,8 @@ describe("拷卡中断的提示", () => {
         message: "任务租约没能清掉",
         occurredAt: new Date().toISOString(),
         taskId: "task-1",
+        // 后端 warn_for_task(app, code, (id, ""), …) 真发出来的形状是空串,不是缺字段
+        projectId: "",
       });
     });
     await screen.findByTestId("notice-toast-error");

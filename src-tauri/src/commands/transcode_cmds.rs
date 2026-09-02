@@ -1051,8 +1051,14 @@ fn save_proxy_state<R: tauri::Runtime>(
     // 短期持有真正的租约,而不是 live_holder 这种「检查后写」:worker 收尾那次
     // save 写的正是 completed=true,续传刷新又会把 completed 打回 false——写集合
     // 并不像此前注释说的那样不相交。Busy 就是可见出口;写完 Held 一 drop 就释放
-    // 报文里带清单身份:同 code 的通知 30 秒内会合并,两份清单同时出事时正文得分得清
+    // 报文里带清单身份:同 code 的通知 30 秒内会合并,两份清单同时出事时正文得分得清。
+    // project id 与任务重建同一口径(项目目录名):给空串的话这些通知永远不渲染
+    // 「查看任务」,而其中好几条明摆着要人去看任务
     let which: String = id.chars().take(8).collect();
+    let project_id: String = project_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let lease = match crate::core::lease::acquire(project_root, id, machine_id, "") {
         Ok(mut h) => {
             // 接管别人/自己残留的租约是「系统替用户做了决定」:这里也必须说
@@ -1060,7 +1066,7 @@ fn save_proxy_state<R: tauri::Runtime>(
                 notify::warn_for_task(
                     app,
                     "task-lease-taken-over",
-                    (id, ""),
+                    (id, &project_id),
                     format!("清单 {which}…:{note}"),
                 );
             }
@@ -1073,9 +1079,14 @@ fn save_proxy_state<R: tauri::Runtime>(
             if e.to_string()
                 .starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX)
             {
-                notify::error_for_task(app, "copy-resume-lease-lock-broken", (id, ""), msg);
+                notify::error_for_task(
+                    app,
+                    "copy-resume-lease-lock-broken",
+                    (id, &project_id),
+                    msg,
+                );
             } else {
-                notify::warn_for_task(app, "auto-proxy-state-unsaved", (id, ""), msg);
+                notify::warn_for_task(app, "auto-proxy-state-unsaved", (id, &project_id), msg);
             }
             return Persist::NotPublished;
         }
@@ -1108,7 +1119,7 @@ fn save_proxy_state<R: tauri::Runtime>(
                 notify::warn_for_task(
                 app,
                 "fs-write-contention",
-                (id, ""),
+                (id, &project_id),
                     format!(
                         "写入拷卡清单时被别的程序占着,重试 {} 轮后成功:{}。多半是杀毒软件或 NAS 索引正在扫这个目录;若反复出现,把该目录加入杀毒软件排除项",
                         wr.retries,
@@ -1120,9 +1131,9 @@ fn save_proxy_state<R: tauri::Runtime>(
                 notify::warn_for_task(
                 app,
                 "auto-proxy-state-unverified",
-                (id, ""),
+                (id, &project_id),
                     format!(
-                        "清单 {which}… 的自动转代理{what}已写回,但写完后读不到本任务的租约锁标记(可能是存储抖动,也可能是锁被外部回收),不能确认这份清单没有被别处顶掉;请确认没有别的 OCard 在跑这个任务"
+                        "清单 {which}… 的自动转代理{what}已写回,但写完后读不到本任务的租约锁标记(可能是存储抖动,也可能是锁被外部回收),不能确认这份清单没有被别处顶掉;本次按已写回处理,并已在清单旁留下「不可信」标记。请确认没有别的 OCard 在跑这个任务"
                     ),
                 );
                 Persist::PublishedUnverified
@@ -1138,21 +1149,21 @@ fn save_proxy_state<R: tauri::Runtime>(
                 notify::error_for_task(
                     app,
                     "copy-resume-lease-lock-broken",
-                    (id, ""),
+                    (id, &project_id),
                     format!("清单 {which}… 的自动转代理{what}没有写回:{e}。{consequence}"),
                 );
             } else if matches!(e, crate::core::CoreError::Busy(_)) {
                 notify::warn_for_task(
                     app,
                     "auto-proxy-state-unsaved",
-                    (id, ""),
+                    (id, &project_id),
                     format!("清单 {which}… 的自动转代理{what}没有写回:{e}。{consequence}"),
                 );
             } else {
                 notify::warn_for_task(
                     app,
                     "auto-proxy-state-unsaved",
-                    (id, ""),
+                    (id, &project_id),
                     format!("清单 {which}… 的自动转代理{what}写入失败({e})。{consequence}"),
                 );
             }
@@ -1247,11 +1258,13 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
     }
     // 计数写不进去=放弃上限失效,存在无限重投风险,必须可见(R2 P2)
     // 计数写不进去 = 放弃上限失效 = 无限重投的风险:那就**不派发**这一次。
-    // 通知已在 save_proxy_state 里发过,这里只中止(R2 P2 + 评审)
-    // fail-closed:「写回了但不能确认」也不派发这一次——计数写没写进去决定放弃上限
-    // 还灵不灵,不确定就不冒无限重投的险;下次启动会再试一次写回
-    if Persist::Confirmed
-        != save_proxy_state(
+    // 通知已在 save_proxy_state 里发过,这里只中止(R2 P2 + 评审)。
+    // 「写回了但不能确认」按 Persist 自己的口径**当已写回**照常派发:改名已经发生,
+    // 计数多半在盘上、放弃上限仍然有效;若当没写回,每一次 unverified 都会烧掉一次
+    // 重投额度却一个作业都不派,三次之后弹出「已连续 3 次未能整批完成」的假话
+    // (opus r14)
+    if Persist::NotPublished
+        == save_proxy_state(
             app,
             project_root,
             machine_id,

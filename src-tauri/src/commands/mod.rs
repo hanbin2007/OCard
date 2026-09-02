@@ -2253,7 +2253,12 @@ fn refresh_resume_plan<R: tauri::Runtime>(
         let old_plan: Vec<copy::PlannedFile> = m.planned.iter().map(|p| p.to_plan()).collect();
         if !old_plan.is_empty() {
             let fresh_plan = copy::plan_whole_volume(&files);
-            notice_resume_baseline_diff(app, &copy::diff_plans(&old_plan, &fresh_plan), "源卷上");
+            notice_resume_baseline_diff(
+                app,
+                &copy::diff_plans(&old_plan, &fresh_plan),
+                "源卷上",
+                task,
+            );
         }
         for p in &m.planned {
             if !files.iter().any(|f| f.rel == p.rel_path) {
@@ -2275,6 +2280,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
             m.planned.iter().map(|p| p.rel_path.as_str()),
             &plan,
             m.scan_policy_version,
+            task,
         );
         persist_refreshed_plan(app, m, project_root, &plan, lease, task)?;
         return Ok(plan);
@@ -2313,7 +2319,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
             }
             d.resized.sort();
             d.retimed.sort();
-            notice_resume_baseline_diff(app, &d, "所选文件夹里");
+            notice_resume_baseline_diff(app, &d, "所选文件夹里", task);
             let added: Vec<&str> = fresh
                 .iter()
                 .filter(|f| !plan.iter().any(|p| p.source_rel == f.source_rel))
@@ -2335,9 +2341,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
                 } else {
                     String::new()
                 };
-                notify::warn(
-                    app,
-                    "copy-resume-new-files",
+                notify::warn_for_task(app, "copy-resume-new-files", task,
                     format!(
                         "所选文件夹里新增了 {} 个文件({}{}),不在本任务开拷时锁定的清单内,本次续传不会拷它们{because};需要的话请对这些文件另发起一次拷卡",
                         added.len(),
@@ -2348,9 +2352,10 @@ fn refresh_resume_plan<R: tauri::Runtime>(
             }
             persist_refreshed_plan(app, m, project_root, &plan, lease, task)?;
         }
-        Err(e) => notify::warn(
+        Err(e) => notify::warn_for_task(
             app,
             "copy-resume-rescan-failed",
+            task,
             format!("续传前复查源卷失败,已按开拷时锁定的清单继续(卡上新增的文件不会被发现): {e}"),
         ),
     }
@@ -2398,6 +2403,7 @@ fn notice_policy_widened<'a, R: tauri::Runtime>(
     locked: impl Iterator<Item = &'a str>,
     plan: &[copy::PlannedFile],
     scan_policy_version: u32,
+    task: (&str, &str),
 ) {
     let locked: std::collections::HashSet<&str> = locked.collect();
     let newly: Vec<&str> = plan
@@ -2408,9 +2414,7 @@ fn notice_policy_widened<'a, R: tauri::Runtime>(
     if newly.is_empty() {
         return;
     }
-    notify::warn(
-        app,
-        "copy-resume-scope-widened",
+    notify::warn_for_task(app, "copy-resume-scope-widened", task,
         format!(
             "续传时新纳入了 {} 个「.」开头的条目({}{}),它们**会被拷贝**{}。任务进度会因此回退到未完成,拷完再看「可格式化」提示",
             newly.len(),
@@ -2430,11 +2434,10 @@ fn notice_resume_baseline_diff<R: tauri::Runtime>(
     app: &AppHandle<R>,
     d: &copy::PlanDiff,
     scope: &str,
+    task: (&str, &str),
 ) {
     if !d.resized.is_empty() {
-        notify::warn(
-            app,
-            "copy-resume-size-changed",
+        notify::warn_for_task(app, "copy-resume-size-changed", task,
             format!(
                 "{scope}有 {} 个文件在暂停期间大小变了({}),已按当前实际大小续传,开拷时记录的基线会被覆盖;若这不是预期,请核对是否换了卡或有人动过源文件",
                 d.resized.len(),
@@ -2443,9 +2446,7 @@ fn notice_resume_baseline_diff<R: tauri::Runtime>(
         );
     }
     if !d.retimed.is_empty() {
-        notify::warn(
-            app,
-            "copy-resume-content-replaced",
+        notify::warn_for_task(app, "copy-resume-content-replaced", task,
             format!(
                 "{scope}有 {} 个文件大小没变、修改时间却变了({})——内容很可能被替换过。续传会按内容哈希重新核对,已拷到目的地的旧版本不会被覆盖(会报冲突让你人工裁决);若这不是预期,请核对是否换了卡",
                 d.retimed.len(),

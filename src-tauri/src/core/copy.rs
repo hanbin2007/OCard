@@ -2137,7 +2137,6 @@ mod tests {
         }
     }
 
-    /// 租约丢了之后**一个字节都不许再写进清单**——租约存在的唯一理由就是防这个。
     struct FakeFence {
         alive: bool,
     }
@@ -2371,6 +2370,7 @@ mod tests {
         assert!(!part_left, "停下要清掉自己的 part");
     }
 
+    /// 租约丢了之后**一个字节都不许再写进清单**——租约存在的唯一理由就是防这个。
     /// 此前 Lost 只置 pause_requested,当前文件拷完照样 save 一次、收尾再 save 一次,
     /// 把接管方记下的进度整份顶掉;而 task-lease-lost 的报文还向用户承诺「已停下」。
     #[test]
