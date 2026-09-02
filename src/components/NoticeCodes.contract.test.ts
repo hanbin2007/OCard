@@ -104,7 +104,6 @@ const LEGACY_FALLBACK = new Set([
   "copy-resume-size-changed",
   "copy-symlinks-skipped",
   "copy-target-name-clash",
-  "copy-worker-spawn-failed",
   "curated-hints-degraded",
   "delivery-partial",
   "delivery-scan-degraded",

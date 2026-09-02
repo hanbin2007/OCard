@@ -2504,9 +2504,10 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
     if let Ok((wr, path)) = &saved {
         if wr.retries > 0 {
             // 与拷卡那条路的 fs-write-contention 口径一致:被占用后重试成功也要可见
-            notify::warn(
+            notify::warn_for_task(
                 app,
                 "fs-write-contention",
+                task,
                 format!(
                     "写入拷卡清单时被别的程序占着,重试 {} 轮后成功:{}。多半是杀毒软件或 NAS 索引正在扫这个目录;若反复出现,把该目录加入杀毒软件排除项",
                     wr.retries,
@@ -2574,7 +2575,10 @@ pub(crate) fn sweep_stale_temp_files(dir: &std::path::Path, tally: &mut SweepTal
             return;
         }
     };
-    let now = std::time::SystemTime::now();
+    // 年龄用 NAS 自己的时钟量(与租约模块同一把尺子):本机比 NAS 快一小时以上时,
+    // 别的工作站此刻正在「写临时文件 → 改名」窗口里的那份会被当孤儿删掉。探针写不成
+    // 就退回本机时钟(与此前行为相同)
+    let now = crate::core::lease::nas_now(dir).unwrap_or_else(std::time::SystemTime::now);
     let (mut removed, mut stuck) = (0usize, 0usize);
     for e in rd {
         // 逐项枚举失败(NAS 半死时常见)不能 flatten 掉:那一项到底是什么、

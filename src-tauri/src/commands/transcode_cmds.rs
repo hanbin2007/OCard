@@ -1178,7 +1178,7 @@ fn save_proxy_state<R: tauri::Runtime>(
         &lease_file,
         "自动转代理状态写回",
         false,
-        Some((id, "")),
+        Some((id, &project_id)),
     );
     outcome
 }

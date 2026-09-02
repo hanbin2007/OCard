@@ -59,21 +59,25 @@
 //! - 锁目录 / nonce / 租约文件的「年龄」用**存放它的那块盘自己的时钟**量(写探针
 //!   读 mtime,见 `disk_now`),不用本机 now——多数 NAS 由服务端盖章,本机与 NAS 的
 //!   时钟偏差就不影响回收判据。这是**尽力而为**:SMB 客户端持有写租约/oplock 时可能
-//!   在关闭时用本机时钟盖 LastWriteTime,那种情况下探针退化成本机 now,偏差又回来了
-//!   ——兜底仍是「拿不准算年轻」和两分钟的回收门槛。心跳时间戳(持有者用它自己的
-//!   墙钟写)本来就受偏差影响,那一条靠观察期兜。
+//!   在关闭时用本机时钟盖 LastWriteTime,那种情况下探针退化成本机 now,偏差又回来了。
+//!   租约文件那边的兜底是「拿不准算年轻」;锁目录的回收判据是**双向**过期(未来的
+//!   mtime 也算老,否则时钟快的机器留下的残留永远收不回),所以混合盖章 + 偏差超过
+//!   两分钟时,一次并发取锁会把一个**活着的**持有者的锁当残留回收——持有者在下一拍
+//!   心跳 / 下一次栅栏复核锁标记时发现不是自己的,**可见地**中止一次;回收方因观察到的
+//!   token 不一致拿不到租约,不会出双持有者。不是「拿不准算年轻」,是「可见地被打断一次」。
+//!   心跳时间戳(持有者用它自己的墙钟写)本来就受偏差影响,那一条靠观察期兜。
 //!
 //! - `rename_no_replace` 在不支持原子原语的文件系统上会退到「复查+rename」
 //!   (见 `fsx`,有可见告警),那种盘上的独占是尽力而为。
 //! - 接管锁靠 mtime 年龄回收(两分钟):没有存储端的原子 CAS,这是唯一能收回崩溃
 //!   残留的办法,代价是**整机休眠 / 卡在一次 NAS 读写里超过两分钟**的持有者会被当成
 //!   残留。后果有界且可见,但要分三种迟到的写入说清楚:
-//!   * **迟到的心跳改名**(卡在 rename 系统调用里超过 TTL 才完成):会把接管者的租约
-//!     整份盖回旧持有者的。旧持有者自己早已因 15 分钟没有成功心跳而停下(AtRisk),
-//!     不再写清单;接管者在下一拍心跳 / 下一次落盘的栅栏核对时读到旧 token → 报 Lost
-//!     并**可见地**转暂停;盖回去的那份租约心跳时间戳是 30 分钟前的,再点「继续」就能
-//!     立刻接管。代价是接管者白停一次,不丢数据。「下一拍看见新 token 就停」对这一种
-//!     迟到不成立,这里如实写明。
+//!   * **迟到的心跳改名**(卡在 rename 系统调用里、或整机休眠,超过 TTL 才完成):会把
+//!     接管者的租约整份盖回旧持有者的。让旧持有者停下的**不是** AtRisk(`poll` 用单调
+//!     时钟,macOS / Linux 休眠期间不走,醒来时「多久没心跳」依然很小),而是心跳线程写完
+//!     复核锁标记:锁已被回收 → 不可逆 Lost 并撤回自己那份;以及栅栏落盘前的 token 核对。
+//!     接管者若恰在撤回之前读到旧 token → 报 Lost 并**可见地**转暂停,再点「继续」就能
+//!     立刻接管(那份租约已被撤回或心跳陈旧)。代价是接管者白停一次,不丢数据。
 //!   * **迟到的清单改名**(改名之前那一问栅栏已经过了,卡在 rename 里):会盖掉接管者
 //!     刚写的清单。接管者还在跑就在它下一次落盘时修复;接管者已经跑完并释放了,盘上那份
 //!     就退回旧进度——审计日志是追加写的、不受影响。若退回的那份带 `completed=true`
@@ -315,6 +319,11 @@ fn read_lease(path: &Path) -> Option<Lease> {
 /// 有竞争的取锁(几十次重试)就要写-读-删几十个探针文件。
 const DISK_NOW_CACHE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// 给别的模块用的「这块盘现在几点」(启动期清扫按 NAS 时钟量临时文件的年龄)。
+pub fn nas_now(dir: &Path) -> Option<std::time::SystemTime> {
+    disk_now(dir)
+}
+
 /// 「这块盘现在几点」:写一个探针文件读它的 mtime。年龄判断一律用它,不用本机 now。
 /// 同一目录几秒内复用上次的答案(加上本机单调时钟走过的量)。
 fn disk_now(dir: &Path) -> Option<std::time::SystemTime> {
@@ -516,6 +525,34 @@ impl TakeoverLock {
         Ok(nonces)
     }
 
+    /// 目录里的条目若**全部**是本进程记在案的残留 nonce,就地删掉并 rmdir。返回是否
+    /// 轮到调用方重试 create_dir。
+    fn reclaim_my_orphans(entries: &[PathBuf], dir: &Path) -> bool {
+        let names: Vec<String> = entries
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        {
+            let orphans = lock_or_recover(my_orphaned_nonces());
+            if names.is_empty() || !names.iter().all(|n| orphans.contains(n)) {
+                return false;
+            }
+        }
+        let mut all_gone = true;
+        for (p, n) in entries.iter().zip(&names) {
+            match super::fsx::retry_contended(|| std::fs::remove_file(p)) {
+                Ok(_) => {
+                    lock_or_recover(my_orphaned_nonces()).remove(n);
+                }
+                Err(f) if f.source.kind() == std::io::ErrorKind::NotFound => {
+                    lock_or_recover(my_orphaned_nonces()).remove(n);
+                }
+                Err(_) => all_gone = false,
+            }
+        }
+        all_gone && super::fsx::retry_contended(|| std::fs::remove_dir(dir)).is_ok()
+    }
+
     /// mkdir 成功之后写 nonce。写不进去且目录已经不在 = 在 mkdir 与写 nonce 之间被
     /// 一个回收者当成「空的残留」删掉了(那是它的错,见 [`reclaim`](Self::reclaim)
     /// 的复查),按「没拿到」处理;目录还在却写不进去才是真错误。
@@ -593,20 +630,21 @@ impl TakeoverLock {
         }
         let mut removed_any = false;
         for n in &nonces {
-            match std::fs::remove_file(n) {
-                Ok(()) => removed_any = true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // 别人抢先删了
-                Err(e) => log::warn!("租约接管锁的残留标记删不掉 {}: {e}", n.display()),
+            // 删残留同样走占用重试(杀软扫描窗口)
+            match super::fsx::retry_contended(|| std::fs::remove_file(n)) {
+                Ok(_) => removed_any = true,
+                Err(f) if f.source.kind() == std::io::ErrorKind::NotFound => {} // 别人抢先删了
+                Err(f) => log::warn!("租约接管锁的残留标记删不掉 {}: {}", n.display(), f.source),
             }
         }
         if !removed_any {
             return Ok(false); // 我一个都没删成:回收权归别人
         }
-        match std::fs::remove_dir(dir) {
-            Ok(()) => Ok(true),
-            Err(e) => {
+        match super::fsx::retry_contended(|| std::fs::remove_dir(dir)) {
+            Ok(_) => Ok(true),
+            Err(f) => {
                 // 目录里又有了新 nonce(别人在我删完到 rmdir 之间建了新锁)= 让路
-                log::warn!("租约接管锁目录回收失败 {}: {e}", dir.display());
+                log::warn!("租约接管锁目录回收失败 {}: {}", dir.display(), f.source);
                 Ok(false)
             }
         }
@@ -634,7 +672,13 @@ impl TakeoverLock {
                     match Self::inspect_lock_shape(&dir) {
                         Err(ShapeIssue::Foreign(why)) => return Ok(Take::Refused(why)),
                         Err(ShapeIssue::Unreadable(e)) => return Ok(Take::Unreadable(e)),
-                        Ok(_) => {}
+                        Ok(entries) => {
+                            // 目录里**全是**本进程自己没删掉的 nonce(随机名,不可能是别人的):
+                            // 立刻回收,不必等两分钟的年龄门槛
+                            if !entries.is_empty() && Self::reclaim_my_orphans(&entries, &dir) {
+                                continue;
+                            }
+                        }
                     }
                     if !Self::is_reclaimable(&dir) {
                         return Ok(Take::Held);
@@ -678,17 +722,41 @@ impl TakeoverLock {
     }
 }
 
+/// 本进程写过、却没删掉的 nonce 文件名(Windows 上杀软/索引器在 close 之后仍短暂持有
+/// 句柄——0.4.3 事故的同一个根因搬到了锁目录上)。它们不可能是别人的(随机 32 位),
+/// 下一次取锁看到目录里**全是**这些,立刻回收,不必等两分钟。
+fn my_orphaned_nonces() -> &'static Mutex<std::collections::HashSet<String>> {
+    static ORPHANS: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    ORPHANS.get_or_init(Default::default)
+}
+
 impl Drop for TakeoverLock {
     fn drop(&mut self) {
-        // 只删自己的:nonce 已经不在 = 被人回收了,目录现在是别人的
-        match std::fs::remove_file(&self.nonce) {
-            Ok(()) => {
-                if let Err(e) = std::fs::remove_dir(&self.dir) {
-                    log::warn!("租约接管锁目录删不掉 {}: {e}", self.dir.display());
+        // 只删自己的:nonce 已经不在 = 被人回收了,目录现在是别人的。
+        // 删也走占用重试:一次共享冲突就把自己的新鲜 nonce 留在盘上,接下来两分钟内
+        // 每一次落盘都会「拿不到锁」而中止(fable 终审)
+        match super::fsx::retry_contended(|| match std::fs::remove_file(&self.nonce) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        }) {
+            Ok(_) => {
+                if let Err(f) = super::fsx::retry_contended(|| std::fs::remove_dir(&self.dir)) {
+                    // 目录里可能已有别人的新 nonce(正常),或残留了自己的 nonce 以外的东西
+                    log::warn!("租约接管锁目录删不掉 {}: {}", self.dir.display(), f.source);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => log::warn!("租约接管锁标记删不掉 {}: {e}", self.nonce.display()),
+            Err(f) => {
+                log::warn!(
+                    "租约接管锁标记删不掉 {}: {}(已记为本进程残留,下次取锁立即回收)",
+                    self.nonce.display(),
+                    f.source
+                );
+                if let Some(name) = self.nonce.file_name() {
+                    lock_or_recover(my_orphaned_nonces())
+                        .insert(name.to_string_lossy().into_owned());
+                }
+            }
         }
     }
 }
@@ -2247,6 +2315,38 @@ mod tests {
             "{msg}"
         );
         assert!(!msg.contains("另一个进程正在接管"), "{msg}");
+    }
+
+    /// 本进程自己没删掉的 nonce(Windows 共享冲突)不必等两分钟:下一次取锁看到目录里
+    /// 全是它们,立刻回收——否则接下来两分钟里每一次落盘都会「拿不到锁」而中止。
+    #[test]
+    fn my_own_orphaned_nonces_are_reclaimed_without_waiting_two_minutes() {
+        let t = tempdir().unwrap();
+        let lease = t.path().join("x.lease");
+        let dir = TakeoverLock::path_for(&lease);
+        std::fs::create_dir(&dir).unwrap();
+        let orphan = "0123456789abcdef0123456789abcdef";
+        std::fs::write(dir.join(orphan), b"").unwrap(); // 新鲜的
+        lock_or_recover(my_orphaned_nonces()).insert(orphan.into());
+        match TakeoverLock::try_take(&lease).unwrap() {
+            Take::Got(g) => {
+                assert!(g.still_mine());
+                assert!(!dir.join(orphan).exists(), "自己的残留要被清掉");
+                assert!(
+                    !lock_or_recover(my_orphaned_nonces()).contains(orphan),
+                    "清掉之后要从残留名单里删"
+                );
+            }
+            _ => panic!("自己的残留不该被当成「别人正在接管」"),
+        }
+        // 对照:同样新鲜、但**不是**本进程记在案的 nonce → 老老实实当别人的
+        let dir2 = TakeoverLock::path_for(&t.path().join("y.lease"));
+        std::fs::create_dir(&dir2).unwrap();
+        std::fs::write(dir2.join("fedcba9876543210fedcba9876543210"), b"").unwrap();
+        assert!(matches!(
+            TakeoverLock::try_take(&t.path().join("y.lease")).unwrap(),
+            Take::Held
+        ));
     }
 
     /// 读不出的锁目录(权限)要如实说「读不出」,不能说「另一个进程正在接管」——

@@ -208,6 +208,19 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
             "这个任务的上一次运行还在收尾,本次「继续」没有另起新的运行;稍候再点一次"
         };
         super::notify::info_for_task(&app, "copy-resume-already-running", (&id, &pid), msg.into());
+        // 防御:这条路现有顺序到不了「槽里还有一份带心跳的租约」(第二次续传会先被
+        // acquire 的 Busy 挡住),但槽里一份 Held 一旦漏了就是本进程生命周期内的永久自锁
+        if let Some(lease) = handle.lease_slot().take() {
+            let lease_file = lease.path().to_path_buf();
+            report_lease_release(
+                &app,
+                lease.release(),
+                &lease_file,
+                "重复的续传请求回滚",
+                true,
+                Some((&id, &pid)),
+            );
+        }
         return;
     }
     let app_for_spawn_error = app.clone();
@@ -321,6 +334,15 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
                     // 锁目录不清理的话点「继续」也没用——最响最持久的这条不能给错指令
                     format!(
                         "拷卡任务「{folder}」已中断并转入暂停,已拷部分不会丢。这次的原因不会自己好:请先人工清理清单目录里的租约锁目录,再点「继续」。\n原因:{e}\n{DIAG_HINT}"
+                    )
+                } else if paused
+                    && matches!(e, crate::core::CoreError::Busy(_))
+                    && e.to_string().contains("租约")
+                {
+                    // 租约原因的中止:上一条租约提示已经说了「先核对另一处」,这里不能反过来
+                    // 让人「点继续」——照做会立刻撞上「任务正被别的进程执行,拒绝续传」
+                    format!(
+                        "拷卡任务「{folder}」已中断并转入暂停,已拷部分不会丢。原因见上一条租约提示:不要在两台机器上同时续传,确认另一处已停下后再点「继续」。\n原因:{e}\n{DIAG_HINT}"
                     )
                 } else if paused {
                     format!(
@@ -1085,7 +1107,7 @@ fn run_worker_locked<R: tauri::Runtime>(
             if let Err(e) = manifest::clear_suspect(&handle.project_root, &handle.manifest_id) {
                 super::notify::warn_for_task(
                     app,
-                    "manifest-suspect",
+                    "manifest-suspect-not-cleared",
                     (&task_for_notices.0, &task_for_notices.1),
                     format!("任务已完成,但清单旁的「不可信」标记没能删掉({e});下次启动它仍会被当作未完成展示,可手动删除该标记文件"),
                 );
