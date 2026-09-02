@@ -2905,6 +2905,8 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
     }
     // 全部项目扫完再汇总成一条:逐项目发会被 30 秒合并窗口折掉计数和目录
     report_sweep(app, &sweep);
+    // 这条线程上 NAS 时钟探针删不掉之类的线程局部降级也在这里取走(无任务 scope:启动期)
+    sorting_cmds::notify_if_unsafe_fallback(app);
 }
 
 /// 单文件重试:失败文件在 manifest 中未验证,重跑任务即只补拷这些文件。

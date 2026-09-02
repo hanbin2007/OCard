@@ -1177,12 +1177,25 @@ pub fn file_done(
     )
 }
 
+/// 源稳定性基准与第一次读源之间的最小间隔:大于任何常见文件系统的时间戳粒度(FAT 2 秒、
+/// exFAT 10 ms、NTFS/APFS/ext4 亚微秒)。测试里为 0:测试自己造 mtime 差异。
+fn baseline_settle() -> std::time::Duration {
+    if cfg!(test) {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_millis(2500)
+    }
+}
+
 /// 源在「快照 → 现在」之间没变的证明:快照要有、两侧的修改时间都要读得到、大小与修改时间
-/// 都相等。「不知道」不算「没变」(fail-closed)。等长原位改写并把修改时间改回旧值的对抗性
-/// 场景不在保护范围内——闭合它要把源再完整读一遍,拷卡时间翻倍,如实声明的边界。
+/// 都相等。「不知道」不算「没变」(fail-closed)。配合 [`baseline_settle`](基准比首次读源早
+/// 一个时间戳粒度以上),拷贝期间的写入必然落在更晚的时间槽里。残余的边界只剩等长原位改写
+/// **并把修改时间改回旧值**的对抗性场景——闭合它要把源再完整读一遍,拷卡时间翻倍,如实声明。
 fn source_unchanged_since(pre: Option<&fs::Metadata>, src: &Path) -> bool {
     let Some(pre) = pre else { return false };
-    let Ok(now) = fs::metadata(src) else {
+    // 按句柄取元数据:按路径的查询在 SMB 客户端上可能由元数据缓存应答(Windows 重定向器
+    // 默认 10 秒),开一次句柄必到服务端
+    let Ok(now) = fs::File::open(src).and_then(|f| f.metadata()) else {
         return false;
     };
     let (Ok(t0), Ok(t1)) = (pre.modified(), now.modified()) else {
@@ -1511,6 +1524,7 @@ pub fn run_copy(
     mut progress: impl FnMut(Progress) -> CopyControl,
 ) -> Result<CopyOutcome> {
     assert!(!req.destinations.is_empty(), "至少需要一个目的地");
+    let run_started = std::time::Instant::now();
     // 全计划预检,闸先于任何副作用:清单可能来自被改写的 manifest。
     // ① 落点必须两两不同(按目的地文件系统的大小写口径):两项共用一个落点时,
     //    第二项会被续传判定当成「已完成」跳过,整批却仍报完成 = 静默漏拷;
@@ -1562,6 +1576,15 @@ pub fn run_copy(
     let mut dirty = false;
     let total = plan.len();
 
+    // 源稳定性基准要**先于**第一次读源至少一个时间戳粒度(FAT 是 2 秒):计划里的
+    // mtime 是规划扫描时观测的,扫描在 run_copy 之前;这里补足到 2.5 秒。于是拷贝期间
+    // 的任何一次写入(写者自己的时钟盖章)都落在比基准晚的时间槽里,拷后复核一定看得出;
+    // 否则同一个 2 秒槽内的等长原位改写会前后 mtime 相等而漏过(codex 终审 r16)。
+    // 每次运行只等一次,不是每个文件
+    let settle = baseline_settle().saturating_sub(run_started.elapsed());
+    if !settle.is_zero() {
+        std::thread::sleep(settle);
+    }
     for (index, item) in plan.iter().enumerate() {
         let (src_rel, rel, size) = (&item.source_rel, &item.target_rel, item.size);
         if control == CopyControl::Abort {
@@ -1592,14 +1615,34 @@ pub fn run_copy(
 
         // 清单来自持久化存储(NAS 上可被改写):源路径必须仍落在用户当初勾选的
         // 范围内,否则等于拿旧任务的授权去读别处的文件——拒绝并可见记为失败
+        // R5 三票 P1:时间戳快照在 file_done 的源哈希**之前**采集——
+        // 修复目标场景里,验证读同样会刷新源 atime
+        let pre_meta = fs::metadata(req.source_root.join(rel_to_native(src_rel))).ok();
+        // 快照必须与规划扫描时观测的一致,基准才有「至少 2.5 秒前」的年龄:不一致 =
+        // 源自扫描后已变化,基准是新鲜的、挡不住同一时间槽内的等长改写——这个文件不拷,
+        // 可见失败,请人重扫(codex 终审 r16)。0 = 老清单没有基准,只能靠开拷时的快照
+        let baseline_issue = match &pre_meta {
+            Some(pre) if item.source_mtime_ns != 0 => {
+                let now_ns = super::media::mtime_nanos(pre);
+                (pre.len() != item.size || now_ns != item.source_mtime_ns).then(|| {
+                    format!(
+                        "源文件自规划扫描后已变化(大小 {} → {},修改时间 {} → {}),无法确认拷贝期间的稳定性基准,这个文件不拷: {src_rel}。请确认没有设备在写这张卡,重新扫描后再拷",
+                        item.size,
+                        pre.len(),
+                        item.source_mtime_ns,
+                        now_ns
+                    )
+                })
+            }
+            _ => None,
+        };
         let status = if !req.selection.allows(src_rel, rel) {
             FileStatus::Failed(format!(
                 "清单项与本次源选择不符,拒绝执行: {src_rel} → {rel}(任务清单可能已损坏或被篡改,请重新发起拷贝)"
             ))
+        } else if let Some(msg) = baseline_issue {
+            FileStatus::Failed(msg)
         } else {
-            // R5 三票 P1:时间戳快照在 file_done 的源哈希**之前**采集——
-            // 修复目标场景里,验证读同样会刷新源 atime
-            let pre_meta = fs::metadata(req.source_root.join(rel_to_native(src_rel))).ok();
             if file_done_stable(
                 m,
                 &req.source_root,
@@ -2035,7 +2078,8 @@ fn copy_one(
                     before.len()
                 )));
             }
-            let after = fs::metadata(&src_path)?;
+            // 按句柄取(见 source_unchanged_since):路径查询可能被 SMB 客户端缓存应答
+            let after = fs::File::open(&src_path)?.metadata()?;
             // mtime 两边都要**读得到**才算一致:None == None 不是「没变」,是「不知道」
             let (Ok(m0), Ok(m1)) = (before.modified(), after.modified()) else {
                 return Err(super::CoreError::Invalid(format!(
@@ -3636,6 +3680,49 @@ mod review_regression_tests {
             9000,
             &req.destinations
         ));
+    }
+
+    /// codex 终审 r16:稳定性基准是规划扫描时观测的元数据;开拷时源与基准不一致 = 源自扫描
+    /// 后已变化,基准不够旧、挡不住同一时间槽内的等长改写——这个文件不拷、可见失败、请重扫。
+    #[test]
+    fn a_file_changed_since_the_plan_scan_is_refused_not_copied() {
+        let (_t, req, mut m, project) = setup();
+        let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        // 扫描之后、开拷之前源被「重写」:内容不变,修改时间前进一秒
+        let victim = req.source_root.join("CLIP0001.MP4");
+        let bumped =
+            fs::metadata(&victim).unwrap().modified().unwrap() + std::time::Duration::from_secs(1);
+        fs::File::options()
+            .write(true)
+            .open(&victim)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(bumped))
+            .unwrap();
+        let out = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
+        let r = out
+            .files
+            .iter()
+            .find(|f| f.rel_path == "CLIP0001.MP4")
+            .expect("有结果");
+        match &r.status {
+            FileStatus::Failed(msg) => assert!(msg.contains("自规划扫描后已变化"), "{msg}"),
+            other => panic!("要可见失败,得到 {other:?}"),
+        }
+        assert!(
+            !req.destinations[0].join("CLIP0001.MP4").exists(),
+            "基准不可靠的文件不许落位"
+        );
+        assert!(
+            out.files
+                .iter()
+                .filter(|f| f.rel_path != "CLIP0001.MP4")
+                .all(|f| matches!(f.status, FileStatus::Copied)),
+            "别的文件照常拷"
+        );
+        assert!(!out.all_verified, "有文件没拷成就不能说全部校验通过");
     }
 
     /// R4 终审 P0-1:目标被替换成**同大小不同内容**后,file_done 不许再判完成

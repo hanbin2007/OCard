@@ -710,7 +710,60 @@ impl<R: tauri::Runtime> Drop for LeaseKeeper<R> {
                 task_paused,
                 Some((&self.task.0, &self.task.1)),
             );
+            // RAII 收尾器:早退路径(`?`)上这条线程攒下的线程局部降级(取得时的回退、
+            // 不可信标记写入的重试、释放时接管锁回收探针的残留)在这里带 scope 取走,
+            // 不留给下一条落到同一线程的命令
+            super::sorting_cmds::notify_if_unsafe_fallback_for(
+                &self.app,
+                Some((&self.task.0, &self.task.1)),
+            );
         }
+    }
+}
+
+/// 心跳线程(或迟到的心跳线程)攒下的降级的可见出口:三种各一条,带任务 scope。
+/// `who` 是口径前缀(「租约心跳线程」/「迟到的租约心跳线程」)。
+pub(crate) fn report_heartbeat_degradations<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    task: Option<(&str, &str)>,
+    who: &str,
+    degraded: &crate::core::lease::HeartbeatDegradations,
+) {
+    if degraded.fallback_used {
+        super::notify::warn_scoped(
+            app,
+            task,
+            "fsx-fallback-window",
+            format!(
+                "{who}重建租约文件时:{}",
+                super::sorting_cmds::FALLBACK_WINDOW_BODY
+            ),
+        );
+    }
+    if !degraded.leftovers.is_empty() {
+        // 与拷卡 worker 的 fsx-leftover-temp 不同 code:同 code 30 秒内合并会让清单目录那条
+        // 的例子路径被拷卡目录那条顶掉(Fable)
+        super::notify::warn_scoped(
+            app,
+            task,
+            "lease-heartbeat-leftover-temp",
+            format!(
+                "{who}有 {} 个临时文件没删掉(例如 {});清单目录里的由启动清理收,其它请按路径手动删除",
+                degraded.leftovers.len(),
+                degraded.leftovers[0].display()
+            ),
+        );
+    }
+    if degraded.retried_writes > 0 {
+        super::notify::info_scoped(
+            app,
+            task,
+            "fsx-write-retried",
+            format!(
+                "{who}写入被占用(多半是杀毒软件 / 索引器),系统重试了 {} 轮后成功;内容无误",
+                degraded.retried_writes
+            ),
+        );
     }
 }
 
@@ -734,35 +787,21 @@ pub(crate) fn report_lease_release<R: tauri::Runtime>(
     task: Option<(&str, &str)>,
 ) {
     let (released, degraded) = released;
-    // 心跳线程上的降级:线程局部的标记随线程消亡,由释放路径带任务 scope 说出来
-    if degraded.fallback_used {
+    report_heartbeat_degradations(app, task, "租约心跳线程", &degraded);
+    // 心跳线程 5 秒没退出:只有两个释放变体自带这件事,其余变体在这里补一句
+    if degraded.heartbeat_stuck
+        && !matches!(
+            released,
+            crate::core::lease::Released::RemovedHeartbeatStuck
+                | crate::core::lease::Released::NoLockHeartbeatStuck(_)
+        )
+    {
         super::notify::warn_scoped(
             app,
             task,
-            "fsx-fallback-window",
-            "租约心跳线程重建租约文件时,文件系统不支持原子防覆盖改名与硬链接,已降级为「发布锁 + 复查后改名」;建议确认 NAS 协议(SMB3/NFSv4)".into(),
-        );
-    }
-    if !degraded.leftovers.is_empty() {
-        super::notify::warn_scoped(
-            app,
-            task,
-            "fsx-leftover-temp",
+            "task-lease-heartbeat-stuck",
             format!(
-                "租约心跳线程有 {} 个临时文件没删掉(例如 {});清单目录里的由启动清理收,其它请按路径手动删除",
-                degraded.leftovers.len(),
-                degraded.leftovers[0].display()
-            ),
-        );
-    }
-    if degraded.retried_writes > 0 {
-        super::notify::info_scoped(
-            app,
-            task,
-            "fsx-write-retried",
-            format!(
-                "租约心跳写入被占用(多半是杀毒软件 / 索引器),系统重试了 {} 轮后成功;内容无误",
-                degraded.retried_writes
+                "{what}:租约心跳线程 5 秒内没有退出(可能卡在 NAS 读写上),释放没有再等它。它醒来后会先查停止标记再动手,不会复活租约;但它在那之后攒下的降级会由下一次收尾补报"
             ),
         );
     }

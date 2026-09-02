@@ -2040,6 +2040,9 @@ export function CopyTaskScreen() {
                     ) : (
                     <div className="notice notice--ok" role="status">
                       <strong>校验 100% 通过，本卡可格式化。</strong>
+                      <span className="muted">
+                        前提：拷贝期间没有设备在写这张卡（引擎按大小与修改时间核对源没被改写；等长改写并改回修改时间的情况核对不出）。
+                      </span>
                       <span>
                         请在相机内格式化——OCard 不代为格式化，以防误操作。
                       </span>

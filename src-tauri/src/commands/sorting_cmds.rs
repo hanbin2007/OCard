@@ -87,17 +87,33 @@ pub(crate) fn notify_if_unsafe_fallback<R: tauri::Runtime>(app: &AppHandle<R>) {
     notify_if_unsafe_fallback_for(app, None);
 }
 
+/// 「文件系统降级」告警的**中央正文**:所有触发线程(拷卡 / 分类 / 分析池 / 心跳)都用它,
+/// 同一条边界不因触发线程不同而解释不同(codex 终审 r16)。
+pub(crate) const FALLBACK_WINDOW_BODY: &str = "当前文件系统不支持原子防覆盖改名与硬链接,零覆盖保障退化为「发布锁 + 复查后改名」:两个任务同时往同一路径写由发布锁串行;崩溃残留的锁不自动回收(开拷前清扫只收超过 30 分钟的),撞上会可见失败并点名锁文件。建议确认 NAS 协议(SMB3/NFSv4)";
+
 /// 同上,带任务 scope(拷卡 worker):标记是线程局部的,取走的一定是本线程(本任务)的。
+/// 顺带把「迟到的心跳线程」交到全局登记里的降级也报了(它们自带清单 id 作 scope)。
 pub(crate) fn notify_if_unsafe_fallback_for<R: tauri::Runtime>(
     app: &AppHandle<R>,
     task: Option<(&str, &str)>,
 ) {
+    for (id, d) in crate::core::lease::take_late_heartbeat_degradations() {
+        super::tasks::report_heartbeat_degradations(app, Some((&id, "")), "迟到的租约心跳线程", &d);
+        if d.heartbeat_stuck {
+            notify::warn_scoped(
+                app,
+                Some((&id, "")),
+                "task-lease-heartbeat-stuck",
+                "租约心跳线程在释放之后才从 NAS 读写里醒来并退出;它攒下的降级已在上面补报".into(),
+            );
+        }
+    }
     if crate::core::fsx::take_unsafe_fallback_flag() {
         notify::warn_scoped(
             app,
             task,
             "fsx-fallback-window",
-            "当前文件系统不支持原子防覆盖改名与硬链接,零覆盖保障退化为「发布锁 + 复查后改名」:两个任务同时往同一路径写由发布锁串行;崩溃残留的锁不自动回收(开拷前清扫只收超过 30 分钟的),撞上会可见失败并点名锁文件。建议确认 NAS 协议(SMB3/NFSv4)".into(),
+            FALLBACK_WINDOW_BODY.into(),
         );
     }
     let left = crate::core::fsx::take_leftover_sources();
@@ -1078,10 +1094,11 @@ pub fn start_delivery<R: tauri::Runtime>(
                     }
                 },
                 &|| h.cancel_requested(),
-            )
-            .map_err(|e| e.to_string())?;
-            invalidate_catalog(&root);
+            );
+            // 降级标记在 `?` **之前**取走:打包失败早退时不能把它留给下一条落到同一线程的命令
             notify_if_unsafe_fallback(&body_app);
+            let out = out.map_err(|e| e.to_string())?;
+            invalidate_catalog(&root);
             for w in &out.warnings {
                 notify::warn(&body_app, "delivery-scan-degraded", w.clone());
             }

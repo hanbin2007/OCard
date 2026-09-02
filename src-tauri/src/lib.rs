@@ -77,11 +77,16 @@ macro_rules! ocard_invoke_handler {
     };
 }
 
-/// 修剪轮转日志:按修改时间保留最新 keep 份 `ocard*` 文件(尽力而为,
-/// 失败只记日志不阻塞启动)。
-fn prune_rotated_logs(dir: &std::path::Path, keep: usize) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+/// 修剪轮转日志:按修改时间保留最新 keep 份 `ocard*` 文件。尽力而为、不阻塞启动,
+/// 但失败要**返回**给调用方说出来(零静默:日志目录读不了 / 旧日志删不掉都会让日志无界增长)。
+fn prune_rotated_logs(dir: &std::path::Path, keep: usize) -> Vec<String> {
+    let mut failed = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            failed.push(format!("日志目录读不了 {}: {e}", dir.display()));
+            return failed;
+        }
     };
     let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
         .flatten()
@@ -95,14 +100,16 @@ fn prune_rotated_logs(dir: &std::path::Path, keep: usize) {
         })
         .collect();
     if files.len() <= keep {
-        return;
+        return failed;
     }
     files.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
     for (_, p) in files.into_iter().skip(keep) {
         if let Err(e) = std::fs::remove_file(&p) {
             log::warn!("旧日志清理失败 {}: {e}", p.display());
+            failed.push(format!("{}: {e}", p.display()));
         }
     }
+    failed
 }
 
 /// 日志落点。
@@ -194,7 +201,19 @@ pub fn run() {
             let config_dir = app.path().app_config_dir()?;
             // 轮转日志修剪:按修改时间只留最新 10 份(KeepAll 不自清)
             if let Ok(log_dir) = app.path().app_log_dir() {
-                prune_rotated_logs(&log_dir, 10);
+                let failed = prune_rotated_logs(&log_dir, 10);
+                if !failed.is_empty() {
+                    crate::commands::notify::warn(
+                        app.handle(),
+                        "log-prune-failed",
+                        format!(
+                            "旧运行日志没能清理({} 项,例如 {}):日志会继续占用空间;请检查日志目录 {} 的权限或占用",
+                            failed.len(),
+                            failed[0],
+                            log_dir.display()
+                        ),
+                    );
+                }
             }
             log::info!("OCard 启动,版本 {}", env!("CARGO_PKG_VERSION"));
             // Linux WebKit 崩溃规避状态落日志(main.rs 里设置,这里只报告——

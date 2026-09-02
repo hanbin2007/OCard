@@ -332,7 +332,7 @@ function terminalNotice(before: CopyTask, after: CopyTask): NoticeDto | null {
       level: "info",
       code: "copy-task-done",
       message: !partial
-        ? `「${after.volumeName}」校验 100% 通过，本卡可格式化（请在相机内格式化）。`
+        ? `「${after.volumeName}」校验 100% 通过，本卡可格式化（请在相机内格式化）。前提：拷贝期间没有设备在写这张卡。`
         : count > 0
           ? `「${after.volumeName}」所选 ${count} 个文件夹（${scopeText}）校验 100% 通过。` +
             `本次是部分拷贝，卡上其余内容尚未备份——请勿格式化。`

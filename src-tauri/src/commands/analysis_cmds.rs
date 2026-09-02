@@ -269,7 +269,10 @@ pub fn start_analysis<R: tauri::Runtime>(
                 notify::warn(
                     &body_app,
                     "fsx-fallback-window",
-                    "分析写缩略图时文件系统不支持原子防覆盖改名与硬链接,已降级为「发布锁 + 复查后改名」;建议确认 NAS 协议(SMB3/NFSv4)".into(),
+                    format!(
+                        "分析写缩略图时:{}",
+                        super::sorting_cmds::FALLBACK_WINDOW_BODY
+                    ),
                 );
             }
             let left = std::mem::take(&mut *leftover_seen.lock().unwrap_or_else(|p| p.into_inner()));

@@ -3897,3 +3897,54 @@ fn the_sweep_removes_only_old_orphans_and_never_swallows_a_scan_failure() {
         }
     }
 }
+
+/// 线程局部的降级标记由收尾钩子带任务 scope 报出;「迟到的心跳线程」交到全局登记的降级
+/// 也由同一个钩子报出并带清单 id 作 scope(codex 终审 r16:要用 mock App 验 code 与 scope)。
+#[test]
+fn the_closing_hook_reports_thread_local_and_late_heartbeat_degradations_with_scope() {
+    let (window, _tmp, _nas) = mock_app();
+    let app = window.app_handle().clone();
+    // 清干净本线程与全局登记
+    let _ = crate::core::fsx::take_unsafe_fallback_flag();
+    let _ = crate::core::fsx::take_leftover_sources();
+    let _ = crate::core::fsx::take_retried_writes();
+    let _ = crate::core::lease::take_late_heartbeat_degradations();
+
+    crate::core::fsx::note_retried_writes(3);
+    crate::core::fsx::note_leftover_temp(std::path::Path::new("/nas/p/.ocard/x.ocardtmp"));
+    crate::core::lease::push_late_heartbeat_for_test(
+        "late-manifest-id",
+        crate::core::lease::HeartbeatDegradations {
+            fallback_used: true,
+            leftovers: vec![],
+            retried_writes: 0,
+            heartbeat_stuck: true,
+        },
+    );
+    crate::commands::sorting_cmds::notify_if_unsafe_fallback_for(&app, Some(("task-1", "proj-1")));
+
+    let notices = invoke(&window, "list_notices", json!({})).unwrap();
+    let list = notices.as_array().unwrap();
+    let find = |code: &str| list.iter().find(|n| n["code"] == code).cloned();
+    let retried =
+        find("fsx-write-retried").unwrap_or_else(|| panic!("要有重试成功的 info: {notices}"));
+    assert_eq!(retried["taskId"], "task-1", "{retried}");
+    assert_eq!(retried["projectId"], "proj-1", "{retried}");
+    let left = find("fsx-leftover-temp").unwrap_or_else(|| panic!("要有没删掉的告警: {notices}"));
+    assert_eq!(left["taskId"], "task-1", "{left}");
+    assert!(
+        left["message"].as_str().unwrap().contains("x.ocardtmp"),
+        "{left}"
+    );
+    let late = find("fsx-fallback-window")
+        .unwrap_or_else(|| panic!("迟到的心跳线程的回退要报: {notices}"));
+    assert_eq!(late["taskId"], "late-manifest-id", "{late}");
+    let stuck =
+        find("task-lease-heartbeat-stuck").unwrap_or_else(|| panic!("卡死也要报: {notices}"));
+    assert_eq!(stuck["taskId"], "late-manifest-id", "{stuck}");
+    // 取走即清空:再跑一次钩子不重报
+    let before = list.len();
+    crate::commands::sorting_cmds::notify_if_unsafe_fallback_for(&app, Some(("task-1", "proj-1")));
+    let again = invoke(&window, "list_notices", json!({})).unwrap();
+    assert_eq!(again.as_array().unwrap().len(), before, "不许重报");
+}

@@ -895,6 +895,8 @@ impl Drop for TakeoverLock {
                             .insert(self.dir.clone(), std::time::Instant::now() + ORPHAN_DIR_TTL);
                     } else {
                         log::warn!("租约接管锁目录删不掉 {}: {e}", self.dir.display());
+                        // 进程内的残留表能自愈(下次取锁回收),但用户也要知道盘上多了个目录
+                        super::fsx::note_leftover_temp(&self.dir);
                     }
                 }
             }
@@ -1172,6 +1174,73 @@ struct Shared {
     hb_fallback: AtomicBool,
     hb_leftovers: Mutex<Vec<PathBuf>>,
     hb_retries: std::sync::atomic::AtomicU64,
+    /// 释放路径等心跳线程 5 秒没等到、放手了(卡在 NAS 上):释放判定不一定带着这件事,
+    /// 这里记下来让上层统一说
+    hb_stuck: AtomicBool,
+    /// 释放路径已经读走了上面三项:之后才退出的心跳线程要把自己攒的交到全局登记
+    /// [`LATE_HEARTBEAT`],由下一个收尾钩子按租约文件名(= 清单 id)带 scope 报出来
+    read_out: AtomicBool,
+    lease_path: PathBuf,
+}
+
+/// 释放之后才退出的心跳线程留下的降级:`(清单 id, 降级)`。进程内的登记——心跳线程没有
+/// 通知出口,而它退出时 `Held` 已经没了;任何一个收尾钩子取走并报出。
+static LATE_HEARTBEAT: Mutex<Vec<(String, HeartbeatDegradations)>> = Mutex::new(Vec::new());
+
+/// 取走所有「迟到的心跳线程」攒下的降级(取走即清空)。
+pub fn take_late_heartbeat_degradations() -> Vec<(String, HeartbeatDegradations)> {
+    std::mem::take(&mut *lock_or_recover(&LATE_HEARTBEAT))
+}
+
+/// 测试用:模拟一条迟到的心跳交接。
+#[cfg(test)]
+pub(crate) fn push_late_heartbeat_for_test(id: &str, d: HeartbeatDegradations) {
+    lock_or_recover(&LATE_HEARTBEAT).push((id.to_string(), d));
+}
+
+fn new_shared(lease_path: PathBuf) -> Arc<Shared> {
+    Arc::new(Shared {
+        stop: AtomicBool::new(false),
+        epoch: std::time::Instant::now(),
+        last_ok_ms: std::sync::atomic::AtomicU64::new(0),
+        lost: Mutex::new(None),
+        last_err: Mutex::new(None),
+        io_busy: Mutex::new(false),
+        io_free: std::sync::Condvar::new(),
+        hb_fallback: AtomicBool::new(false),
+        hb_leftovers: Mutex::new(Vec::new()),
+        hb_retries: std::sync::atomic::AtomicU64::new(0),
+        hb_stuck: AtomicBool::new(false),
+        read_out: AtomicBool::new(false),
+        lease_path,
+    })
+}
+
+/// 读走(并清空)心跳线程攒下的降级。
+fn drain_degradations(shared: &Shared) -> HeartbeatDegradations {
+    HeartbeatDegradations {
+        fallback_used: shared.hb_fallback.swap(false, Ordering::SeqCst),
+        leftovers: std::mem::take(&mut *lock_or_recover(&shared.hb_leftovers)),
+        retried_writes: shared.hb_retries.swap(0, Ordering::SeqCst),
+        heartbeat_stuck: shared.hb_stuck.swap(false, Ordering::SeqCst),
+    }
+}
+
+/// 心跳线程退出前的交接:先把本线程的标记收进共享区;释放路径若**已经**读走了(它只等
+/// 5 秒),再读一次交到全局登记——两边都是「取走即清空」,谁读到谁报,不会丢也不会重。
+fn hand_off_heartbeat_degradations(shared: &Shared) {
+    absorb_thread_degradations(shared);
+    if shared.read_out.load(Ordering::SeqCst) {
+        let d = drain_degradations(shared);
+        if d.any() {
+            let id = shared
+                .lease_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            lock_or_recover(&LATE_HEARTBEAT).push((id, d));
+        }
+    }
 }
 
 /// 心跳线程上攒下的降级,随释放判定一起交给上层(见 [`Lease::release_reported`])。
@@ -1180,6 +1249,17 @@ pub struct HeartbeatDegradations {
     pub fallback_used: bool,
     pub leftovers: Vec<PathBuf>,
     pub retried_writes: u64,
+    /// 释放时心跳线程 5 秒没退出(卡在 NAS 上)。
+    pub heartbeat_stuck: bool,
+}
+
+impl HeartbeatDegradations {
+    pub fn any(&self) -> bool {
+        self.fallback_used
+            || !self.leftovers.is_empty()
+            || self.retried_writes > 0
+            || self.heartbeat_stuck
+    }
 }
 
 /// 把**本线程**的降级标记收进共享区(心跳线程退出前调用)。
@@ -1325,25 +1405,14 @@ impl Held {
         timing: Timing,
         took_over_stale: Option<String>,
     ) -> Result<Self> {
-        let shared = Arc::new(Shared {
-            stop: AtomicBool::new(false),
-            epoch: std::time::Instant::now(),
-            last_ok_ms: std::sync::atomic::AtomicU64::new(0),
-            io_busy: Mutex::new(false),
-            io_free: std::sync::Condvar::new(),
-            hb_fallback: AtomicBool::new(false),
-            hb_leftovers: Mutex::new(Vec::new()),
-            hb_retries: std::sync::atomic::AtomicU64::new(0),
-            lost: Mutex::new(None),
-            last_err: Mutex::new(None),
-        });
+        let shared = new_shared(path.to_path_buf());
         let thread = {
             let (path, me, shared) = (path.clone(), me.clone(), shared.clone());
             std::thread::Builder::new()
                 .name("ocard-lease-heartbeat".into())
                 .spawn(move || {
                     heartbeat_loop(&path, &me, timing, &shared);
-                    absorb_thread_degradations(&shared);
+                    hand_off_heartbeat_degradations(&shared);
                 })
         };
         match thread {
@@ -1502,11 +1571,10 @@ impl Held {
     pub fn release_reported(self) -> (Released, HeartbeatDegradations) {
         let shared = self.shared.clone();
         let released = self.release();
-        let degraded = HeartbeatDegradations {
-            fallback_used: shared.hb_fallback.swap(false, Ordering::Relaxed),
-            leftovers: std::mem::take(&mut *lock_or_recover(&shared.hb_leftovers)),
-            retried_writes: shared.hb_retries.swap(0, Ordering::Relaxed),
-        };
+        // 先声明「读走了」再读:之后才退出的心跳线程看到这个标记就把自己攒的交到全局登记;
+        // 反过来(先读再标)会让它在两步之间收进来的那份没人读
+        shared.read_out.store(true, Ordering::SeqCst);
+        let degraded = drain_degradations(&shared);
         (released, degraded)
     }
 
@@ -1536,6 +1604,7 @@ impl Held {
                 // 但这次释放就不能说得太干净
                 log::warn!("租约心跳线程 5 秒内没有退出(可能卡在 NAS 读写上),不再等待");
                 heartbeat_stuck = true;
+                self.shared.hb_stuck.store(true, Ordering::SeqCst);
             }
         }
         if lock_or_recover(&self.shared.lost).is_some() {
@@ -1815,6 +1884,35 @@ fn heartbeat_loop(path: &Path, me: &Lease, timing: Timing, shared: &Arc<Shared>)
 
 #[cfg(test)]
 mod tests {
+    /// 释放路径只等心跳线程 5 秒:之后才退出的心跳线程攒下的降级不能丢——释放已经读走
+    /// (`read_out`)时交到全局登记,由下一个收尾钩子报;释放还没读时留在共享区给释放读。
+    #[test]
+    fn a_late_heartbeat_hands_its_degradations_to_the_registry_only_after_release_read() {
+        let _ = take_late_heartbeat_degradations();
+        let shared = new_shared(PathBuf::from("/nas/proj/.ocard/copies/abc-123.lease"));
+        // 释放还没读:交接只是收进共享区
+        crate::core::fsx::note_retried_writes(2);
+        hand_off_heartbeat_degradations(&shared);
+        assert!(
+            take_late_heartbeat_degradations().is_empty(),
+            "释放还没读走,不该进登记"
+        );
+        assert_eq!(shared.hb_retries.load(Ordering::SeqCst), 2);
+        // 释放读走了(先标后读),之后心跳线程才退出:它攒的要进登记,带清单 id
+        shared.read_out.store(true, Ordering::SeqCst);
+        let first = drain_degradations(&shared);
+        assert_eq!(first.retried_writes, 2);
+        crate::core::fsx::note_leftover_temp(Path::new(
+            "/nas/proj/.ocard/copies/.clock.deadbeef.ocardtmp",
+        ));
+        hand_off_heartbeat_degradations(&shared);
+        let late = take_late_heartbeat_degradations();
+        assert_eq!(late.len(), 1, "{late:?}");
+        assert_eq!(late[0].0, "abc-123");
+        assert_eq!(late[0].1.leftovers.len(), 1);
+        assert!(take_late_heartbeat_degradations().is_empty(), "取走即清空");
+    }
+
     use super::*;
     use tempfile::tempdir;
 
