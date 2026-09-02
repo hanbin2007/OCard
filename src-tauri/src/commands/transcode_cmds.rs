@@ -1152,7 +1152,10 @@ fn save_proxy_state<R: tauri::Runtime>(
                     app,
                     "auto-proxy-skipped-stale",
                     (id, &project_id),
-                    format!("清单 {which}… 在租约下重读后已不满足{what}的条件(可能另一台机器正在续传、或别处已处理),本次不写回也不派发"),
+                    format!(
+                        "清单 {which}… 在租约下重读后已不满足{what}的条件(可能另一台机器正在续传、或别处已处理),本次不写回{}",
+                        if what == "完成标记" { "" } else { ",也不派发" }
+                    ),
                 );
                 Persist::Skipped
             }

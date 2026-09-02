@@ -1126,7 +1126,7 @@ fn run_worker_locked<R: tauri::Runtime>(
                     app,
                     "manifest-suspect-not-cleared",
                     (&task_for_notices.0, &task_for_notices.1),
-                    format!("任务已完成,但清单旁仍有「不可信」标记(完成落盘之后可能又有迟到的写入,或标记删不掉):{}。下次启动它会被当作未完成展示、续传按哈希重新确认;不要手动删标记", why.trim()),
+                    format!("任务已完成,但清单旁仍有「不可信」标记(完成落盘之后可能又有迟到的写入,或标记删不掉):{}。下次启动它会被当作未完成展示、续传按哈希重新确认。先确认没有别的 OCard 在跑这个任务;确认后若标记仍在(多半是删不掉:权限 / 别的账号写的),可手动删除该标记文件", why.trim()),
                 ),
                 Err(e) => super::notify::warn_for_task(
                     app,

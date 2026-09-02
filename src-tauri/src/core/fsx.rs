@@ -30,35 +30,89 @@ pub fn take_leftover_sources() -> usize {
     LEFTOVER_SOURCES.swap(0, Ordering::Relaxed)
 }
 
-/// 这个错误是不是「文件系统 / 内核不支持这个原语」——只有这种才允许回退到下一级。
+/// 原语级(renamex_np / renameat2 / MoveFileExW)的「不支持」:只有这种才允许退到硬链接。
 /// 占用(5/32/33)、权限、瞬断一律**不**回退:回退到「复查+rename」是可覆盖的竞态,
 /// 一次瞬时的 AccessDenied 就把安全关键路径推进去,而调用方的占用重试本来会处理它
-/// (codex 终审 P0)。
-fn is_unsupported(e: &io::Error) -> bool {
+/// (codex 终审 P0)。EPERM **不**在原语级名单里:粘滞位 / chattr +i 这类权限问题不该
+/// 被当成「不支持」而走进回退梯子(fable 终审)。
+fn native_unsupported(e: &io::Error) -> bool {
     if e.kind() == io::ErrorKind::Unsupported {
         return true;
     }
     #[cfg(unix)]
     {
         // 用值比较而不是模式:Linux 上 ENOTSUP == EOPNOTSUPP,写成模式会是「不可达分支」
-        // (CI 的 -D warnings 抓到的),macOS 上两者不同
         let code = e.raw_os_error();
-        [
-            libc::EINVAL,
-            libc::ENOSYS,
-            libc::ENOTSUP,
-            libc::EOPNOTSUPP,
-            libc::EPERM,
-        ]
-        .iter()
-        .any(|c| Some(*c) == code)
+        [libc::EINVAL, libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP]
+            .iter()
+            .any(|c| Some(*c) == code)
     }
     #[cfg(windows)]
     {
         // ERROR_INVALID_FUNCTION(1) / ERROR_NOT_SUPPORTED(50) / ERROR_INVALID_PARAMETER(87)
-        // / ERROR_CALL_NOT_IMPLEMENTED(120):SMB / exFAT 上硬链接与 no-replace 原语的典型回答
+        // / ERROR_CALL_NOT_IMPLEMENTED(120):SMB / exFAT 上 no-replace 原语的典型回答
         matches!(e.raw_os_error(), Some(1) | Some(50) | Some(87) | Some(120))
     }
+}
+
+/// 硬链接级的「不支持」:原语级那些,外加 EPERM——Linux VFS 对没有 link 操作的文件系统
+/// (FAT/exFAT)固定答 EPERM,macOS 本机 exFAT 亦然。
+fn link_unsupported(e: &io::Error) -> bool {
+    if native_unsupported(e) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// 这个目录能不能建硬链接——按目录缓存的探针。别靠 errno 猜:Samba 导出的 FAT/exFAT
+/// 后端(NAS 上插的 USB 盘、路由器 USB 共享)对 link() 答 EPERM,Samba 再把它映成
+/// ACCESS_DENIED,macOS 客户端拿到的是 EACCES——按「占用 / 权限原样上抛」处理的话,
+/// 每个文件的落位都会响亮地失败(fable 终审)。探针:建一个唯一临时文件、对它做一次
+/// 硬链接、删掉两者;答「不支持」才走复查+rename,答「支持」时 link 的 EACCES 就是瞬时的。
+fn dir_supports_hard_links(dir: &Path) -> bool {
+    type Cache = std::collections::HashMap<std::path::PathBuf, bool>;
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(v) = cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(dir)
+        .copied()
+    {
+        return v;
+    }
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let a = dir.join(format!(".hlprobe.{tag}{TMP_SUFFIX}"));
+    let b = dir.join(format!(".hlprobe.{tag}.l{TMP_SUFFIX}"));
+    let supported = match fs::OpenOptions::new().write(true).create_new(true).open(&a) {
+        Ok(f) => {
+            drop(f);
+            let r = fs::hard_link(&a, &b);
+            let _ = fs::remove_file(&b);
+            let _ = fs::remove_file(&a);
+            match r {
+                Ok(()) => true,
+                // 答「不支持」的才算不支持;瞬时错误按「支持」记——之后 link 真撞上瞬时
+                // 错误会原样上抛,由占用重试处理,不会推进回退梯子
+                Err(e) => !link_unsupported(&e),
+            }
+        }
+        // 探针文件都建不了(目录没权限 / 不存在):不下结论,按「支持」——真正的错误
+        // 会在正常路径上响亮地报出来
+        Err(_) => true,
+    };
+    cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(dir.to_path_buf(), supported);
+    supported
 }
 
 /// 原子防覆盖改名:目标已存在时失败(`AlreadyExists`),绝不替换。
@@ -68,9 +122,13 @@ fn is_unsupported(e: &io::Error) -> bool {
 /// (目标已经在了),只记一笔留给上层告警——否则调用方重试一次撞上 AlreadyExists,会把
 /// 自己刚发布的文件误报成「别的任务写的」。
 pub fn rename_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
-    rename_no_replace_with(src, dst, platform_rename_no_replace, |s, d| {
-        fs::hard_link(s, d)
-    })
+    rename_no_replace_with(
+        src,
+        dst,
+        platform_rename_no_replace,
+        |s, d| fs::hard_link(s, d),
+        dir_supports_hard_links,
+    )
 }
 
 /// [`rename_no_replace`] 的本体,两级原语可注入——好直接考「瞬时 AccessDenied 不许回退」。
@@ -79,11 +137,20 @@ fn rename_no_replace_with(
     dst: &Path,
     native: impl Fn(&Path, &Path) -> io::Result<()>,
     link: impl Fn(&Path, &Path) -> io::Result<()>,
+    dir_has_hard_links: impl Fn(&Path) -> bool,
 ) -> io::Result<()> {
     match native(src, dst) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
-        Err(e) if !is_unsupported(&e) => Err(e),
+        Err(e) if !native_unsupported(&e) => Err(e),
+        // 目标目录根本不支持硬链接(探针说的,不是猜的):直接走复查+rename 并置可见标记
+        Err(_) if !dir_has_hard_links(dst.parent().unwrap_or(Path::new("."))) => {
+            UNSAFE_FALLBACK_USED.store(true, Ordering::Relaxed);
+            if dst.exists() {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            }
+            fs::rename(src, dst)
+        }
         // 平台原语不可用(旧内核/异构文件系统):hard_link 仍是原子防覆盖
         Err(_) => match link(src, dst) {
             Ok(()) => {
@@ -103,7 +170,7 @@ fn rename_no_replace_with(
             Err(le) if le.kind() == io::ErrorKind::AlreadyExists => {
                 Err(io::Error::new(io::ErrorKind::AlreadyExists, le))
             }
-            Err(le) if !is_unsupported(&le) => Err(le),
+            Err(le) if !link_unsupported(&le) => Err(le),
             Err(_) => {
                 // 最后回退:复查+rename。窗口在本地盘是微秒级,在不支持
                 // 原语/硬链接的网络盘上可达网络往返量级——置标记让上层告警
@@ -260,6 +327,7 @@ mod tests {
                 linked.set(true);
                 Ok(())
             },
+            |_| true,
         );
         assert!(
             matches!(&r, Err(e) if e.kind() == io::ErrorKind::PermissionDenied),
@@ -285,6 +353,7 @@ mod tests {
             &dst,
             |_, _| Err(unsupported()),
             |_, _| Err(unsupported()),
+            |_| true,
         )
         .unwrap();
         assert!(
@@ -302,6 +371,7 @@ mod tests {
             &dst,
             |_, _| Err(unsupported()),
             |_, _| Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+            |_| true,
         );
         assert!(
             matches!(&r, Err(e) if e.kind() == io::ErrorKind::AlreadyExists),
@@ -312,6 +382,58 @@ mod tests {
             b"x",
             "已存在的目标一个字节都不许动"
         );
+    }
+
+    /// 目标目录探针说「没有硬链接」(Samba 导出的 FAT/exFAT):原语不支持之后**不去**
+    /// 试 link(那里会拿到 EACCES,被当成瞬时错误响亮地失败),直接复查+rename 并置标记。
+    #[test]
+    fn a_directory_without_hard_links_goes_straight_to_the_checked_rename() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("c.tmp");
+        let dst = t.path().join("c");
+        std::fs::write(&src, b"x").unwrap();
+        let _ = take_unsafe_fallback_flag();
+        let linked = std::cell::Cell::new(false);
+        rename_no_replace_with(
+            &src,
+            &dst,
+            |_, _| Err(io::Error::from(io::ErrorKind::Unsupported)),
+            |_, _| {
+                linked.set(true);
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            },
+            |_| false,
+        )
+        .expect("没有硬链接的目录要能落位");
+        assert!(!linked.get(), "探针已说没有硬链接,不该再去试 link");
+        assert!(dst.exists() && !src.exists());
+        assert!(
+            take_unsafe_fallback_flag(),
+            "走了复查+rename 必须置可见标记"
+        );
+    }
+
+    /// 探针说「有硬链接」时,link 的 EACCES 就是瞬时的:原样上抛,不许走复查+rename。
+    #[test]
+    fn a_link_access_denied_on_a_hard_link_capable_directory_is_propagated() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("d.tmp");
+        let dst = t.path().join("d");
+        std::fs::write(&src, b"x").unwrap();
+        let _ = take_unsafe_fallback_flag();
+        let r = rename_no_replace_with(
+            &src,
+            &dst,
+            |_, _| Err(io::Error::from(io::ErrorKind::Unsupported)),
+            |_, _| Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            |_| true,
+        );
+        assert!(
+            matches!(&r, Err(e) if e.kind() == io::ErrorKind::PermissionDenied),
+            "{r:?}"
+        );
+        assert!(!dst.exists() && src.exists());
+        assert!(!take_unsafe_fallback_flag());
     }
 
     /// 守门人说不:临时文件写了但不发布——目标不许出现,临时文件也不许留下。

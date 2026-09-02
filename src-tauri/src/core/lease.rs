@@ -644,6 +644,17 @@ impl TakeoverLock {
             return Ok(
                 match super::fsx::retry_contended(|| std::fs::remove_dir(dir)) {
                     Ok(_) => Reclaimed::Yes,
+                    // 「非空」= 别人在我判断之后刚 mkdir+写了 nonce(正常竞态);「不在」= 别人
+                    // 抢先收走了。两种都是让路,不是「删不掉」——否则 acquire 会报「请检查权限 /
+                    // 杀软」,而真相是另一个进程正在接管(fable 终审)
+                    Err(f)
+                        if matches!(
+                            f.source.kind(),
+                            std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                        ) || f.source.raw_os_error() == Some(145) =>
+                    {
+                        Reclaimed::No(None)
+                    }
                     Err(f) => Reclaimed::No(Some(format!(
                         "空的残留锁目录删不掉:{}",
                         super::error::explain_io(&f.source)
@@ -715,10 +726,18 @@ impl TakeoverLock {
                                 continue;
                             }
                             // 空目录且是本进程 rmdir 失败留下的:直接 rmdir
-                            if entries.is_empty()
-                                && lock_or_recover(my_orphaned_dirs()).contains(&dir)
-                                && remove_dir_patiently(&dir).is_ok()
-                            {
+                            let mine_recently = entries.is_empty() && {
+                                let mut dirs = lock_or_recover(my_orphaned_dirs());
+                                match dirs.get(&dir) {
+                                    Some(at) if at.elapsed() < ORPHAN_DIR_TTL => true,
+                                    Some(_) => {
+                                        dirs.remove(&dir); // 过期的记录不再算数
+                                        false
+                                    }
+                                    None => false,
+                                }
+                            };
+                            if mine_recently && remove_dir_patiently(&dir).is_ok() {
                                 lock_or_recover(my_orphaned_dirs()).remove(&dir);
                                 continue;
                             }
@@ -781,11 +800,17 @@ fn my_orphaned_nonces() -> &'static Mutex<std::collections::HashSet<String>> {
 /// 本进程 nonce 删成了、目录却 rmdir 失败留下的**空**锁目录。Windows 上杀软/索引器多以
 /// FILE_SHARE_DELETE 打开:DeleteFile 成功但名字 delete-pending,紧接着 rmdir 报
 /// ERROR_DIR_NOT_EMPTY——句柄一放目录就成了一个崭新的空锁目录,按年龄要等两分钟(fable 终审)。
-fn my_orphaned_dirs() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
-    static ORPHANS: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
-        std::sync::OnceLock::new();
+fn my_orphaned_dirs() -> &'static Mutex<std::collections::HashMap<PathBuf, std::time::Instant>> {
+    static ORPHANS: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<PathBuf, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
     ORPHANS.get_or_init(Default::default)
 }
+
+/// 「本进程留下的空锁目录」这条记录多久内有效:delete-pending 的窗口是几百毫秒到几秒,
+/// 记录永不过期的话,之后本进程任何一次取锁撞上同一路径上**别人**刚 mkdir 还没写 nonce 的
+/// 空目录,都会把它 rmdir 掉——对方得到一次假的「另一个进程正在接管」(fable 终审)。
+const ORPHAN_DIR_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// rmdir 的有界重试:delete-pending 的子项几百毫秒内就会消失。
 fn remove_dir_patiently(dir: &Path) -> std::io::Result<()> {
@@ -820,13 +845,22 @@ impl Drop for TakeoverLock {
         }) {
             Ok(_) => {
                 if let Err(e) = remove_dir_patiently(&self.dir) {
-                    // 目录里可能已有别人的新 nonce(正常);也可能是 delete-pending 的自己的 nonce
-                    // 还没消失——记成本进程残留的**空目录**,下次取锁看到它空着就直接 rmdir
-                    log::warn!(
-                        "租约接管锁目录删不掉 {}: {e}(已记为本进程残留,下次取锁若空着立即回收)",
-                        self.dir.display()
-                    );
-                    lock_or_recover(my_orphaned_dirs()).insert(self.dir.clone());
+                    // 「非空」有两种:别人已放了新 nonce(正常,不记),或 delete-pending 的
+                    // 自己的 nonce 还没消失(Windows)——只有后者值得记成本进程残留;分不出来
+                    // 时按「记,但带 TTL」:下次取锁看到它**空着**才直接 rmdir
+                    let not_empty = e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                        || e.raw_os_error() == Some(145);
+                    if not_empty {
+                        log::warn!(
+                            "租约接管锁目录删不掉 {}: {e}(已记为本进程残留,{} 秒内取锁若空着立即回收)",
+                            self.dir.display(),
+                            ORPHAN_DIR_TTL.as_secs()
+                        );
+                        lock_or_recover(my_orphaned_dirs())
+                            .insert(self.dir.clone(), std::time::Instant::now());
+                    } else {
+                        log::warn!("租约接管锁目录删不掉 {}: {e}", self.dir.display());
+                    }
                 }
             }
             Err(f) => {
@@ -2505,11 +2539,11 @@ mod tests {
         let lease = t.path().join("z.lease");
         let dir = TakeoverLock::path_for(&lease);
         std::fs::create_dir(&dir).unwrap(); // 新鲜、空
-        lock_or_recover(my_orphaned_dirs()).insert(dir.clone());
+        lock_or_recover(my_orphaned_dirs()).insert(dir.clone(), std::time::Instant::now());
         match TakeoverLock::try_take(&lease).unwrap() {
             Take::Got(g) => {
                 assert!(g.still_mine());
-                assert!(!lock_or_recover(my_orphaned_dirs()).contains(&dir));
+                assert!(!lock_or_recover(my_orphaned_dirs()).contains_key(&dir));
             }
             _ => panic!("自己留下的空锁目录不该被当成「别人正在接管」"),
         }
