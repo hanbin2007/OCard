@@ -1031,6 +1031,46 @@ pub(crate) fn intent_release_by_job(job_id: &str) {
 
 /// auto_proxy 意图派发(拷卡完成钩子与启动补投递共用)。
 /// 失败不炸调用方:派发失败给可见 warning(如已有作业在跑,下次启动仍会补投)。
+/// 自动转代理的状态写回(放弃标记 / 重试计数)。
+///
+/// 这两处此前拿调用方给的 `m` 直接整份写回。启动补投那一轮的 `m` 来自
+/// `manifest::list` 的快照——遍历 NAS 上全部项目之后可能已经旧了几十秒;
+/// 而且它们不在任务租约之内。整份写回一份陈旧快照,会把 worker 刚记下的进度
+/// 顶掉;反过来 worker 的下一次落盘又会把这里加的计数顶回去——「三次放弃」
+/// 上限就这么静默失效。所以:写之前**重读**,再看有没有活着的 worker 在写。
+///
+/// 边界:`live_holder` 检查与 `save` 之间仍是「检查后写」。但这里只对
+/// `completed == true` 的清单写(`dispatch_auto_proxy` 入口就挡了未完成的),
+/// 而 worker 只写未完成的清单——两边的写集合不相交,窗口里没有对手。
+fn save_proxy_state<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    project_root: &Path,
+    machine_id: &str,
+    id: &str,
+    what: &str,
+    mutate: impl FnOnce(&mut crate::core::manifest::CopyManifest),
+) {
+    if let Some(who) = crate::core::lease::live_holder(project_root, id, machine_id) {
+        notify::warn(
+            app,
+            "auto-proxy-state-unsaved",
+            format!("自动转代理{what}没有写回:这个任务正被 {who} 执行中,等它结束后下次启动会补"),
+        );
+        return;
+    }
+    let result = crate::core::manifest::load(project_root, id).and_then(|mut fresh| {
+        mutate(&mut fresh);
+        crate::core::manifest::save(project_root, &fresh).map(|_| ())
+    });
+    if let Err(e) = result {
+        notify::warn(
+            app,
+            "auto-proxy-state-unsaved",
+            format!("自动转代理{what}写入失败({e}),放弃上限可能失效,下次启动会重试"),
+        );
+    }
+}
+
 pub fn dispatch_auto_proxy<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     project_root: &Path,
@@ -1044,16 +1084,14 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
     }
     // 永久失败不许无限重投(评审 P1-8):三次仍未整批成功即放弃,可见告知
     if m.proxy_attempts >= 3 {
-        let mut done = m.clone();
-        done.proxy_completed = true;
-        if let Err(e) = crate::core::manifest::save(project_root, &done) {
-            // R2 P2:放弃标记写不进去=这条放弃告警每次启动都会重放,必须可见
-            notify::warn(
-                app,
-                "auto-proxy-state-unsaved",
-                format!("自动转代理放弃标记写入失败({e}),下次启动会重复本条提示"),
-            );
-        }
+        save_proxy_state(
+            app,
+            project_root,
+            machine_id,
+            &m.id,
+            "放弃标记",
+            |fresh| fresh.proxy_completed = true,
+        );
         notify::warn(
             app,
             "auto-proxy-abandoned",
@@ -1064,18 +1102,15 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
         );
         return;
     }
-    {
-        let mut bump = m.clone();
-        bump.proxy_attempts += 1;
-        if let Err(e) = crate::core::manifest::save(project_root, &bump) {
-            // R2 P2:计数写不进去=放弃上限失效,存在无限重投风险,必须可见
-            notify::warn(
-                app,
-                "auto-proxy-state-unsaved",
-                format!("自动转代理重试计数写入失败({e}),放弃上限可能失效"),
-            );
-        }
-    }
+    // 计数写不进去=放弃上限失效,存在无限重投风险,必须可见(R2 P2)
+    save_proxy_state(
+        app,
+        project_root,
+        machine_id,
+        &m.id,
+        "重试计数",
+        |fresh| fresh.proxy_attempts += 1,
+    );
     let meta = match project::load_meta(project_root) {
         Ok(m) => m,
         Err(e) => {

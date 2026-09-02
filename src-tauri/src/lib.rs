@@ -146,12 +146,27 @@ pub fn run() {
         // 是整份覆盖——后写的把先写的整份顶掉,且不报任何错(见 core::lease)。
         // 租约是第二道闸;这一道从源头上不让第二个进程起来。
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            // 第二次启动:把已经开着的窗口顶到前面来,别让用户以为没反应
-            let focused = app
-                .webview_windows()
-                .values()
-                .any(|w| w.set_focus().is_ok() && w.unminimize().is_ok());
+            // 第二次启动:把已经开着的窗口顶到前面来,别让用户以为没反应。
+            // 先 unminimize 再 set_focus——最常见的一幕正是「窗口缩在任务栏里,
+            // 用户以为没开,去双击图标」,顺序反了那一幕恰好不生效
+            let mut focused = false;
+            for w in app.webview_windows().values() {
+                let _ = w.unminimize();
+                if w.set_focus().is_ok() {
+                    focused = true;
+                    break;
+                }
+            }
             log::info!("已有实例在运行,拒绝第二个实例(前置已开窗口: {focused})");
+            if !focused {
+                // 这个回调跑在**已经在运行的那个实例**里,通知中心是通的:
+                // 用户双击图标什么都没发生时,至少要在这里留一条,不能无提示 no-op
+                commands::notify::warn(
+                    app,
+                    "single-instance-refused",
+                    "OCard 已经在运行,第二次启动被拒绝;但没能把已开的窗口顶到前面,请在任务栏/程序坞里找它".into(),
+                );
+            }
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())

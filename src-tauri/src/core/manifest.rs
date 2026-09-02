@@ -277,6 +277,13 @@ pub fn save(project_root: &Path, m: &CopyManifest) -> Result<(super::fsx::WriteR
 /// 三层闸:① id 必须是 UUID(引擎自己生成的形状);② 拼出来的必须仍是
 /// `manifests/` 的直接子项;③ 最终路径过 `assert_within`。
 fn manifest_path(project_root: &Path, id: &str) -> Result<PathBuf> {
+    manifest_child(project_root, id, "json")
+}
+
+/// 清单目录下按 id 命名的任一子文件(`<id>.json` / `<id>.lease`)。
+/// 所有按 id 拼路径的地方都走这一道闸,别裸拼——闸的价值在于哪天形状检查
+/// 被放宽了也还有人兜底,靠调用顺序保证的安全不算安全。
+pub(crate) fn manifest_child(project_root: &Path, id: &str, ext: &str) -> Result<PathBuf> {
     // 必须是**规范连字符形式**(36 位)。`Uuid::parse_str` 还接受 32 位无连字符、
     // `{...}` 花括号、以及 `urn:uuid:...`——后两种带着 `{}` 和 `:`,在 Windows 上
     // `:` 是备用数据流(ADS)的分隔符,落点会变成对另一个文件的流写入,
@@ -287,7 +294,7 @@ fn manifest_path(project_root: &Path, id: &str) -> Result<PathBuf> {
         )));
     }
     let dir = manifest_dir(project_root);
-    let path = dir.join(format!("{id}.json"));
+    let path = dir.join(format!("{id}.{ext}"));
     // UUID 里不可能有分隔符,这条按说到不了;留着是因为闸的价值在于
     // 「形状检查哪天被放宽了也还有人兜底」,而不是「现在正好够用」
     if path.parent() != Some(dir.as_path()) {
@@ -344,8 +351,13 @@ pub fn list(project_root: &Path) -> Result<ManifestList> {
         if path.extension().is_some_and(|e| e == "json") {
             match fs::read(&path) {
                 Ok(bytes) => match serde_json::from_slice::<CopyManifest>(&bytes) {
-                    Ok(m) => out.manifests.push(m),
-                    Err(_) => out.skipped += 1,
+                    // 与 `load` 同一道闸:文件名与内容里的 id 对不上,这份清单就是
+                    // 被搬过/改过的。放进列表会重建出一个「点继续必失败」的任务,
+                    // 而 skipped(「有 N 份清单损坏」告警的依据)还不计它
+                    Ok(m) if path.file_stem().is_some_and(|st| st == m.id.as_str()) => {
+                        out.manifests.push(m)
+                    }
+                    Ok(_) | Err(_) => out.skipped += 1,
                 },
                 Err(_) => out.skipped += 1,
             }
@@ -455,6 +467,26 @@ mod tests {
 
         let err = load(tmp.path(), &real_id).unwrap_err();
         assert!(err.to_string().contains("不一致"), "{err}");
+    }
+
+    /// `list` 与 `load` 同一道闸:文件名 id ≠ 内容 id 的清单要计入 skipped,
+    /// 不然启动重建会造出一个点继续必失败的任务,还不计「损坏」。
+    #[test]
+    fn list_counts_a_manifest_whose_inner_id_disagrees_with_its_file_name_as_damaged() {
+        let tmp = tempdir().unwrap();
+        let m = sample();
+        save(tmp.path(), &m).unwrap();
+        let mut moved = m.clone();
+        moved.id = uuid::Uuid::new_v4().to_string();
+        // 内容换了 id,文件名不动
+        std::fs::write(
+            manifest_dir(tmp.path()).join(format!("{}.json", m.id)),
+            serde_json::to_vec(&moved).unwrap(),
+        )
+        .unwrap();
+        let l = list(tmp.path()).unwrap();
+        assert_eq!(l.manifests.len(), 0, "对不上的清单进了列表");
+        assert_eq!(l.skipped, 1, "要按损坏计数,告警才有依据");
     }
 
     /// 项目根整个不见了(NAS 掉线)= **可续传**的 IO 问题,不是死路。

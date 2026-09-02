@@ -490,16 +490,46 @@ fn write_atomic_with(
     bytes: &[u8],
     mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
 ) -> Result<WriteReport, RetryFailure> {
-    let tmp = tmp_name_for(path);
-    if let Err(e) = fs::write(&tmp, bytes) {
+    // 临时名 8 位随机:撞车概率极低但不是零,而 `fs::write` 会把撞上的那份截断。
+    // 用 create_new 取名,撞了就换一个,最多三次
+    let mut tmp = tmp_name_for(path);
+    let mut file = None;
+    for _ in 0..3 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => {
+                file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => tmp = tmp_name_for(path),
+            Err(e) => {
+                // 临时文件是**新建的唯一名**,建不出来只有确定性原因(目录没权限、
+                // 盘满、路径超长),一轮都没重试过
+                return Err(RetryFailure {
+                    retries: 0,
+                    source: e,
+                });
+            }
+        }
+    }
+    let Some(mut f) = file else {
+        return Err(RetryFailure {
+            retries: 0,
+            source: io::Error::new(io::ErrorKind::AlreadyExists, "临时文件名连续三次撞车"),
+        });
+    };
+    if let Err(e) = std::io::Write::write_all(&mut f, bytes) {
+        drop(f);
         cleanup_tmp(&tmp);
-        // 临时文件是**新建的唯一名**,写它失败只有确定性原因(目录没权限、
-        // 盘满、路径超长),一轮都没重试过
         return Err(RetryFailure {
             retries: 0,
             source: e,
         });
     }
+    drop(f);
 
     match retry_contended(|| rename(&tmp, path)) {
         Ok(retries) => Ok(WriteReport { retries }),
@@ -530,13 +560,16 @@ pub struct RetryFailure {
 
 impl RetryFailure {
     /// 拼进报文的那半句(没重试过就是空串)。
+    ///
+    /// 措辞要诚实:重试满还失败**分不出**是「一直被占着」还是「权限/SMB 会话
+    /// 问题」——持久的 ACL 错误每一轮都会返回同一个错误码,重试排除不了它。
+    /// 只有「重试后成功」才能证明是瞬时占用。
     pub fn note(&self) -> String {
         if self.retries == 0 {
             String::new()
         } else {
             format!(
-                "(已自动重试 {} 轮、等了约 {:.1} 秒,占用一直没退——基本可以排除「没有写权限」,\
-                 那种情况第一次就会失败且不会自行好转)",
+                "(已自动重试 {} 轮、等了约 {:.1} 秒仍被拒:要么一直被别的程序占着,要么是权限/SMB 会话问题——仅凭这个错误码分不出来,两条都要查)",
                 self.retries,
                 WRITE_RETRY_BACKOFF_MS[..self.retries as usize]
                     .iter()

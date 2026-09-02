@@ -43,17 +43,22 @@ pub async fn export_diagnostics<R: tauri::Runtime>(
     let stamp = Local::now().format("%Y%m%d-%H%M%S");
     let name = format!("OCard-诊断报告-{stamp}.txt");
 
-    let (dir, fallback) = report_dir(&app);
-    if let Some(why) = fallback {
-        // 落点不是「下载」时必须说:换个位置本身是降级,用户按经验去下载夹找
-        // 会一无所获,然后以为导出没成功
+    // 候选落点按优先级**逐个真的写**:「下载」能解析出来但不可写(企业机的
+    // 同步目录、只读配置)时,此前直接报失败,后面的候选一个都不试。
+    // 落点不是「下载」时必须说:换个位置本身是降级,用户按经验去下载夹找
+    // 会一无所获,然后以为导出没成功
+    let (path, skipped) = write_to_first_writable(&report_dirs(&app), &name, &report)?;
+    if !skipped.is_empty() {
         notify::warn(
             &app,
             "diagnostics-dir-fallback",
-            format!("拿不到「下载」目录({why}),诊断报告改放到:{}", dir.display()),
+            format!(
+                "「下载」目录写不进去({}),诊断报告改放到:{}",
+                skipped.join(";"),
+                path.display()
+            ),
         );
     }
-    let path = write_report_to(&dir, &name, &report)?;
 
     // 打不开文件管理器不算失败:文件已经在那儿了,路径也回给了界面。
     // 但零静默——退化要说出来,否则用户会一直等一个不会弹出的窗口。
@@ -110,22 +115,41 @@ fn write_report_to(dir: &Path, name: &str, report: &str) -> Result<PathBuf, Stri
     Ok(path)
 }
 
-/// 报告落在哪:优先「下载」,退「桌面」,再退日志目录。
-/// 三个都拿不到时退到临时目录——宁可放在一个怪地方,也不能因为找不到
-/// 好位置就整条导出不可用。
-fn report_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> (PathBuf, Option<String>) {
-    let p = app.path();
-    match p.download_dir() {
-        Ok(d) => (d, None),
-        Err(e) => {
-            let why = e.to_string();
-            let d = p
-                .desktop_dir()
-                .or_else(|_| p.app_log_dir())
-                .unwrap_or_else(|_| std::env::temp_dir());
-            (d, Some(why))
+/// 按顺序逐个**真的写**,第一个写成功的算数;返回落点与前面写失败的原因
+/// (非空 = 发生了降级,调用方必须说出来)。全都写不进去才报错。
+fn write_to_first_writable(
+    dirs: &[PathBuf],
+    name: &str,
+    report: &str,
+) -> Result<(PathBuf, Vec<String>), String> {
+    let mut failures: Vec<String> = Vec::new();
+    for dir in dirs {
+        match write_report_to(dir, name, report) {
+            Ok(p) => return Ok((p, failures)),
+            Err(e) => failures.push(e),
         }
     }
+    Err(format!(
+        "诊断报告写不进任何一个候选目录:{}",
+        failures.join(";")
+    ))
+}
+
+/// 报告的候选落点,按优先级:「下载」→「桌面」→ 日志目录 → 临时目录。
+/// 全部列出来由调用方逐个真写——「能解析出路径」不等于「写得进去」。
+fn report_dirs<R: tauri::Runtime>(app: &AppHandle<R>) -> Vec<PathBuf> {
+    let p = app.path();
+    let mut out: Vec<PathBuf> = [
+        p.download_dir().ok(),
+        p.desktop_dir().ok(),
+        p.app_log_dir().ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    out.push(std::env::temp_dir());
+    out.dedup();
+    out
 }
 
 /// 从 `AppState` 里拷一份报告要用的数据。
@@ -180,7 +204,7 @@ pub(crate) fn build_report_from<R: tauri::Runtime>(
          · 操作人姓名、本机机器 ID\n\
          · 项目名、NAS 路径、配置与日志目录(路径里通常含本机登录用户名)\n\
          · 素材文件名与失败原因(**不含素材文件本身**)\n\
-         · 界面上出现过的全部提示原文\n\
+         · 界面上出现过的提示原文(最多最近 500 条,更早的已被积压上限丢弃)\n\
          · 最近 {} KB 运行日志(自由文本,内容以实际记录为准)\n\
          发之前可以先打开看一眼;确认没问题再整份发给维护者。",
         LOG_TAIL_BYTES / 1024
@@ -499,6 +523,36 @@ mod tests {
                 assert!(e.contains("权限") || e.contains("拒绝访问"), "{e}");
             }
         }
+    }
+
+    /// 「下载」能解析出来但写不进去(企业机的同步目录、只读配置)时必须退到
+    /// 下一个候选,而且要把「为什么没落在下载里」带回去给调用方说。此前只在
+    /// 「解析不到路径」时降级,写失败直接报错、后面的候选一个都不试。
+    #[test]
+    #[cfg(unix)]
+    fn report_falls_through_to_the_next_writable_dir_and_says_why() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            panic!("本测试要求非 root(root 无视权限位,造不出这个场景)");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let ro = tmp.path().join("ro");
+        let ok = tmp.path().join("ok");
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let r = write_to_first_writable(&[ro.clone(), ok.clone()], "r.txt", "x");
+        let (p, skipped) = r.expect("第二个候选可写,不该整体失败");
+        assert_eq!(p.parent(), Some(ok.as_path()));
+        assert_eq!(
+            skipped.len(),
+            1,
+            "要带回第一个候选的失败原因,调用方据此发降级通知"
+        );
+        assert!(skipped[0].contains("ro"), "{skipped:?}");
+
+        let e = write_to_first_writable(std::slice::from_ref(&ro), "r.txt", "x").unwrap_err();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(e.contains("任何一个候选"), "{e}");
     }
 
     #[test]

@@ -2033,6 +2033,7 @@ pub fn start_copy_task<R: tauri::Runtime>(
         dest_targets,
         machine_id: state.machine_id.clone(),
         config_dir: state.config_dir.clone(),
+        lease: Default::default(),
     });
     state.tasks.insert(dto.id.clone(), handle.clone());
     tasks::spawn_worker(app, handle);
@@ -2061,6 +2062,27 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         .ok_or_else(|| format!("任务不存在: {task_id}"))?;
 
     if !handle.running.load(Ordering::SeqCst) {
+        // **第一件事是拿租约**,在读清单之前:另一个进程可能正跑着这个任务,
+        // 先读再拿会拿着它释放前的陈旧快照去覆盖它最后写的进度。准备阶段的
+        // 刷新计划那次写因此也在保护内;租约随后交给 worker 接手。
+        // 同进程并发两次 resume 也会在这里被第二次的 Busy 挡住(token 不同)。
+        let operator = handle.snapshot.lock().unwrap().operator.clone();
+        let mut lease = crate::core::lease::acquire(
+            &handle.project_root,
+            &handle.manifest_id,
+            &handle.machine_id,
+            &operator,
+        )
+        .map_err(|e| {
+            let msg = e.to_string();
+            if matches!(e, crate::core::CoreError::Busy(_)) {
+                notify::warn(&app, "copy-resume-lease-held", msg.clone());
+            }
+            msg
+        })?;
+        if let Some(note) = lease.took_over_stale.take() {
+            notify::warn(&app, "task-lease-taken-over", note);
+        }
         // 续传身份核对(评审 M10/P0-1)+ 按卷名重解析挂载点(复核必修 A:
         // 卡后插/换挂载口场景,插回原卡即可续传,无需重启应用)
         let m = manifest::load(&handle.project_root, &handle.manifest_id).map_err(err)?;
@@ -2132,13 +2154,7 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         // 并落盘——只改内存会留下 `planned.size = 旧值` / `entry.size = 新值` /
         // `completed = true` 的自相矛盾清单。
         let mut m = m;
-        let plan = refresh_resume_plan(
-            &app,
-            &mut m,
-            &handle.project_root,
-            &resolved,
-            &handle.machine_id,
-        )?;
+        let plan = refresh_resume_plan(&app, &mut m, &handle.project_root, &resolved)?;
         let mut snap = handle.snapshot.lock().unwrap();
         let old: std::collections::HashMap<String, &'static str> = snap
             .files
@@ -2156,6 +2172,8 @@ pub fn resume_copy_task<R: tauri::Runtime>(
             .collect();
         snap.file_count = Some(plan.len());
         *handle.plan.lock().unwrap() = plan;
+        // 准备完毕,租约交给 worker(它接手后一直持有到任务结束)
+        *handle.lease.lock().unwrap() = Some(lease);
     }
 
     tasks::spawn_worker(app, handle);
@@ -2178,7 +2196,6 @@ fn refresh_resume_plan<R: tauri::Runtime>(
     m: &mut manifest::CopyManifest,
     project_root: &Path,
     source_root: &Path,
-    machine_id: &str,
 ) -> CmdResult<Vec<copy::PlannedFile>> {
     let selection = copy::SourceSelection::from_folders(m.source_selection.clone());
     if matches!(selection, copy::SourceSelection::WholeVolume) {
@@ -2216,7 +2233,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
             &plan,
             m.scan_policy_version,
         );
-        persist_refreshed_plan(app, m, project_root, &plan, machine_id)?;
+        persist_refreshed_plan(app, m, project_root, &plan)?;
         return Ok(plan);
     }
 
@@ -2286,7 +2303,7 @@ fn refresh_resume_plan<R: tauri::Runtime>(
                     ),
                 );
             }
-            persist_refreshed_plan(app, m, project_root, &plan, machine_id)?;
+            persist_refreshed_plan(app, m, project_root, &plan)?;
         }
         Err(e) => notify::warn(
             app,
@@ -2406,7 +2423,6 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
     m: &mut manifest::CopyManifest,
     project_root: &Path,
     plan: &[copy::PlannedFile],
-    machine_id: &str,
 ) -> CmdResult<()> {
     let refreshed: Vec<manifest::PlannedFile> =
         plan.iter().map(manifest::PlannedFile::from_plan).collect();
@@ -2417,15 +2433,9 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
     // 计划变了就还没跑完:`completed` 必须跟着回落,否则会留下
     // 「清单说完成了、里面却有未验证项」的自相矛盾状态
     m.completed = false;
-    // 这一步在 worker 起来**之前**,不在租约保护内——而另一个进程的 worker
-    // 可能正跑着这个任务。整份覆盖会把人家已经记下的 entries 顶掉,还不报错。
-    if let Some(who) = crate::core::lease::live_holder(project_root, &m.id, machine_id) {
-        let msg = format!(
-            "这个拷卡任务正被 {who} 执行中,拒绝在这里改写它的清单——两处同时写会让一方的记录被整份顶掉。请在那边继续,或等它结束后再试"
-        );
-        notify::warn(app, "copy-resume-lease-held", msg.clone());
-        return Err(msg);
-    }
+    // 调用方(resume_copy_task)已经持有这个任务的租约,这次写在保护内。
+    // 此前这里是「先看有没有活租约、再写」——检查与写之间仍有窗口;现在
+    // 租约在读清单之前就拿到了,窗口不存在
     if let Err(e) = manifest::save(project_root, m) {
         let msg = format!(
             "续传前刷新的文件清单**未能**写回拷卡清单,已拒绝续传(继续跑会让审计范围与实际拷贝范围对不上:\
@@ -2474,19 +2484,30 @@ pub(crate) fn sweep_stale_temp_files(dir: &std::path::Path, tally: &mut SweepTal
     };
     let now = std::time::SystemTime::now();
     let (mut removed, mut stuck) = (0usize, 0usize);
-    for e in rd.flatten() {
+    for e in rd {
+        // 逐项枚举失败(NAS 半死时常见)不能 flatten 掉:那一项到底是什么、
+        // 清没清,我们不知道——按「没扫成」计,让用户知道这个目录没扫干净
+        let Ok(e) = e else {
+            stuck += 1;
+            continue;
+        };
         let name = e.file_name().to_string_lossy().to_string();
         if !name.starts_with('.') || !name.ends_with(crate::core::fsx::TMP_SUFFIX) {
             continue;
         }
-        let old_enough = e
+        let age = e
             .metadata()
             .and_then(|m| m.modified())
             .ok()
-            .and_then(|t| now.duration_since(t).ok())
-            .is_some_and(|age| age > STALE_TEMP_AGE);
-        if !old_enough {
-            continue; // 可能是另一台机器**此刻**正在写的那一个
+            .and_then(|t| now.duration_since(t).ok());
+        match age {
+            // 读不到 mtime:不知道它多老,不敢删,也不能假装没看见
+            None => {
+                stuck += 1;
+                continue;
+            }
+            Some(a) if a <= STALE_TEMP_AGE => continue, // 可能是另一台机器**此刻**正在写的
+            Some(_) => {}
         }
         match std::fs::remove_file(e.path()) {
             Ok(()) => removed += 1,
@@ -2514,6 +2535,11 @@ fn report_sweep<R: tauri::Runtime>(app: &AppHandle<R>, tally: &SweepTally) {
         );
     }
     if tally.stuck > 0 {
+        // 通知正文只列前 5 个;其余的名字必须**有地方落地**——「把目录加进杀软
+        // 排除项」这条建议对第 6 个之后的目录才有得执行。诊断报告会带上日志
+        for d in &tally.trouble {
+            log::warn!("残留临时清单文件没能清掉(目录): {d}");
+        }
         let dirs = tally.trouble.iter().take(5).cloned().collect::<Vec<_>>();
         let more = tally.trouble.len().saturating_sub(dirs.len());
         notify::warn(
@@ -2524,7 +2550,7 @@ fn report_sweep<R: tauri::Runtime>(app: &AppHandle<R>, tally: &SweepTally) {
                 tally.stuck,
                 dirs.join("、"),
                 if more > 0 {
-                    format!(" 等 {} 处", tally.trouble.len())
+                    format!(",另有 {more} 处(全部目录见运行日志)")
                 } else {
                     String::new()
                 }
@@ -2714,6 +2740,7 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
                 dest_targets,
                 machine_id: state.machine_id.clone(),
                 config_dir: state.config_dir.clone(),
+                lease: Default::default(),
             });
             state.tasks.insert(m.id.clone(), handle);
         }

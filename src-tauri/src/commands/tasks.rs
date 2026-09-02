@@ -30,6 +30,9 @@ pub struct TaskHandle {
     pub machine_id: String,
     /// 应用配置目录(审计 outbox 兜底用)。
     pub config_dir: PathBuf,
+    /// 续传路径在 worker 起来**之前**就取得的租约(刷新计划那次写也在保护内),
+    /// worker 起来后接手。开拷路径为空,worker 自己取。
+    pub lease: Mutex<Option<crate::core::lease::Held>>,
 }
 
 #[derive(Default)]
@@ -394,7 +397,7 @@ pub fn append_audit<R: tauri::Runtime>(
 /// `matches!(e, CoreError::Io(_))` 会把带人话的 `IoDetail` 漏判成死路——
 /// 用户会被迫整卡重拷,而错的只是一次瞬时占用。
 fn state_after_error(e: &crate::core::CoreError) -> &'static str {
-    if e.is_io() {
+    if e.is_resumable() {
         "paused"
     } else {
         "failed"
@@ -410,25 +413,47 @@ fn run_worker<R: tauri::Runtime>(
     app: &AppHandle<R>,
     handle: &TaskHandle,
 ) -> crate::core::Result<()> {
-    let mut m = manifest::load(&handle.project_root, &handle.manifest_id)?;
-
     // 独占租约:同一个任务同时只允许一个进程写它的清单。
     // 清单落盘是整份覆盖,两处同时写时后写的会把先写的**整份顶掉**,而且
     // 自从临时名改成唯一的之后,这件事连个错都不报了(见 core::lease 模块头)。
+    //
+    // 顺序:**先租约,再读清单**。反过来会读到旧持有者释放前的快照,然后拿着
+    // 陈旧的 entries 把人家最后写的进度整份顶掉。
     let operator = handle.snapshot.lock().unwrap().operator.clone();
-    let mut lease = crate::core::lease::acquire(
-        &handle.project_root,
-        &handle.manifest_id,
-        &handle.machine_id,
-        &operator,
-    )?;
+    let taken = handle.lease.lock().unwrap().take();
+    let mut lease = match taken {
+        Some(h) => h, // 续传路径已在准备阶段取得(刷新计划那次写也在保护内)
+        None => crate::core::lease::acquire(
+            &handle.project_root,
+            &handle.manifest_id,
+            &handle.machine_id,
+            &operator,
+        )?,
+    };
     if let Some(note) = lease.took_over_stale.take() {
-        // 接管别人的租约是「系统替用户做了决定」,零静默要求说出来
+        // 接管别人/自己残留的租约是「系统替用户做了决定」,零静默要求说出来
         super::notify::warn(app, "task-lease-taken-over", note);
     }
-    // 从这里往下任何提前返回都必须先还租约,所以收尾统一走 finish()
-    let outcome = run_worker_locked(app, handle, &mut m, &mut lease);
+    let mut m = manifest::load(&handle.project_root, &handle.manifest_id)?;
+
+    // 租约实现了 Drop:下面任何路径(含 panic)都会释放。显式 release 只是
+    // 把意图写明,并顺手自查一次——删不掉时别人要白等 TTL,用户有权知道
+    let outcome = run_worker_locked(app, handle, &mut m, &lease);
+    let lease_file = lease.path().to_path_buf();
     lease.release();
+    if lease_file.is_file() {
+        // 还在 = 要么删不掉,要么已经被别人接管(那份不是我们的,不该删)。
+        // 后者在轮询阶段已经报过 lost,这里不重复判定,只说文件还在
+        super::notify::warn(
+            app,
+            "task-lease-left-behind",
+            format!(
+                "任务结束后租约文件仍在盘上(删不掉,或已被别的进程接管):{}。若是删不掉,别的机器续这个任务要等 {} 分钟",
+                lease_file.display(),
+                crate::core::lease::LEASE_TTL.num_minutes()
+            ),
+        );
+    }
     outcome
 }
 
@@ -436,7 +461,7 @@ fn run_worker_locked<R: tauri::Runtime>(
     app: &AppHandle<R>,
     handle: &TaskHandle,
     m: &mut manifest::CopyManifest,
-    lease: &mut crate::core::lease::Held,
+    lease: &crate::core::lease::Held,
 ) -> crate::core::Result<()> {
     let req = copy::CopyRequest {
         source_root: handle.source_root.lock().unwrap().clone(),
@@ -492,9 +517,10 @@ fn run_worker_locked<R: tauri::Runtime>(
     // 每类占用只发第一条(带路径,可执行);总数留给收尾那两条。
     // 收集在这里、出锁之后再发:notify 会写日志 + app.emit,不该在持有
     // snapshot 锁的时候做 IPC(同函数下面几行也是刻意先 drop 再 emit)
-    let mut contention_reported: std::collections::HashSet<&'static str> = Default::default();
-    let mut pending_contention: Vec<(&'static str, String, u32)> = Vec::new();
-    let mut lease_warned = false;
+    let mut contention_reported: std::collections::HashSet<copy::ContentionKind> =
+        Default::default();
+    let mut pending_contention: Vec<(copy::ContentionKind, String, u32)> = Vec::new();
+    let mut lease_stop_reported = false;
     let task_for_notices = {
         let s = handle.snapshot.lock().unwrap();
         (s.id.clone(), s.project_id.clone())
@@ -508,14 +534,14 @@ fn run_worker_locked<R: tauri::Runtime>(
             match &p {
                 copy::Progress::Scanned { .. } | copy::Progress::FileStarted { .. } => {}
                 copy::Progress::Contention {
-                    what,
+                    kind,
                     path,
                     retries,
                 } => {
                     // 每类只报第一次:零静默要的是「当场知道」,不是把两小时里的
-                    // 每一次重试都堆进通知积压(总数由收尾那两条给)
-                    if contention_reported.insert(*what) {
-                        pending_contention.push((*what, path.display().to_string(), *retries));
+                    // 每一次重试都堆进通知积压(总数由收尾那条给)
+                    if contention_reported.insert(*kind) {
+                        pending_contention.push((*kind, path.display().to_string(), *retries));
                     }
                 }
                 copy::Progress::BytesCopied { delta, .. } => {
@@ -548,34 +574,56 @@ fn run_worker_locked<R: tauri::Runtime>(
         }
         // 锁已出:占用告警在这里发。notify 会写日志 + app.emit(IPC),
         // 持着 snapshot 锁做这些事是全文件唯一的例外,不留
-        for (what, path, retries) in pending_contention.drain(..) {
+        for (kind, path, retries) in pending_contention.drain(..) {
+            // 两类各用各的 code:共用一个会在 30 秒合并窗口里互相顶掉正文,
+            // 更要紧的素材那条可能就此消失
+            let (code, what) = match kind {
+                copy::ContentionKind::Manifest => ("fs-write-contention", "写入拷卡清单"),
+                copy::ContentionKind::Material => {
+                    ("material-rename-contention", "素材文件落位改名")
+                }
+            };
             super::notify::warn_for_task(
                 app,
-                "fs-write-contention",
+                code,
                 (&task_for_notices.0, &task_for_notices.1),
                 format!(
-                    "{what}时被别的程序占着,重试 {retries} 轮后成功:{path}。多半是杀毒软件或 NAS 索引正在扫这个目录;若反复出现,把该目录加入杀毒软件排除项,否则下次可能直接中断任务"
+                    "{what}时被别的程序占着,重试 {retries} 轮后成功:{path}。多半是杀毒软件或 NAS 索引正在扫这个文件所在的目录;若反复出现,把该目录加入杀毒软件排除项,否则下次可能直接中断任务"
                 ),
             );
         }
-        // 心跳(自带 30 秒节流)。写不动只告警不打断:租约是防并发写的,
-        // 不是拷贝本身的前提;为它把一个正常任务打断,代价远大于收益。
-        // 但也不静默——心跳停了之后别人可能接管,用户有权知道。
-        match lease.heartbeat() {
-            Ok(_) => {}
-            Err(e) => {
-                if !lease_warned {
-                    lease_warned = true;
-                    super::notify::warn_for_task(
+        // 租约状态轮询(心跳由独立线程推进,这里只看结论)。两种情况都要停在
+        // 文件边界:Lost = 别人已合法接管,再写就是双写;AtRisk = 心跳很久没成功,
+        // 再拷下去很快就会变成 Lost,而我们还在写
+        match lease.poll() {
+            crate::core::lease::LeaseStatus::Ok => {}
+            crate::core::lease::LeaseStatus::Lost(who) => {
+                if !lease_stop_reported {
+                    lease_stop_reported = true;
+                    super::notify::error_for_task(
                         app,
-                        "task-lease-heartbeat-failed",
+                        "task-lease-lost",
                         (&task_for_notices.0, &task_for_notices.1),
                         format!(
-                            "任务租约的心跳更新失败,拷贝继续,但超过 {} 分钟后别的进程可能接管这个任务并同时写清单:{e}",
-                            crate::core::lease::LEASE_TTL.num_minutes()
+                            "这个任务的租约已被 {who} 接管(本机心跳停过一阵),为避免两边同时写清单,已在当前文件后停下转为暂停。请确认那边的进度,再决定在哪边续传"
                         ),
                     );
                 }
+                handle.pause_requested.store(true, Ordering::SeqCst);
+            }
+            crate::core::lease::LeaseStatus::AtRisk(why) => {
+                if !lease_stop_reported {
+                    lease_stop_reported = true;
+                    super::notify::error_for_task(
+                        app,
+                        "task-lease-at-risk",
+                        (&task_for_notices.0, &task_for_notices.1),
+                        format!(
+                            "任务租约的心跳持续写不进去:{why}。为避免被别的进程接管后两边同时写清单,已在当前文件后停下转为暂停;排查清单目录是否可写后点「继续」"
+                        ),
+                    );
+                }
+                handle.pause_requested.store(true, Ordering::SeqCst);
             }
         }
         if handle.pause_requested.load(Ordering::SeqCst) {
@@ -856,6 +904,12 @@ mod tests {
         assert_eq!(
             super::state_after_error(&CoreError::Invalid("任务清单为空".into())),
             "failed"
+        );
+        // 被别人暂时占着(租约):等那边结束就能续,判成 failed 会把用户引去看
+        // 一份不存在的红字明细
+        assert_eq!(
+            super::state_after_error(&CoreError::Busy("正被别人执行".into())),
+            "paused"
         );
     }
 

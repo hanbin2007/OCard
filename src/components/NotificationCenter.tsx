@@ -91,6 +91,14 @@ const NOTICE_TITLES: Record<string, string> = {
   /* 抬头必须自己表态:这是一条 warning,写成「诊断报告已生成」会被一扫而过,
      而它真正要说的是「文件夹没弹出来,得你自己去找」 */
   "diagnostics-reveal-failed": "诊断报告已生成，但没能打开文件夹",
+  /* 任务租约:这几条说的都是「别的进程可能/正在写你的清单」,顶着通用的
+     「降级提示」会被一扫而过 */
+  "task-lease-taken-over": "接管了上次留下的任务租约",
+  "task-lease-at-risk": "任务租约心跳持续失败，已暂停",
+  "task-lease-lost": "任务已被别的进程接管，已暂停",
+  "task-lease-left-behind": "任务租约没能清掉",
+  "copy-resume-lease-held": "任务正被别的进程执行，拒绝续传",
+  "single-instance-refused": "OCard 已在运行",
 };
 
 /**
@@ -106,6 +114,9 @@ const DIAGNOSTIC_CODES = new Set([
   "fs-write-contention",
   "material-rename-contention",
   "auto-proxy-deferred",
+  "task-lease-lost",
+  "task-lease-at-risk",
+  "copy-resume-lease-held",
 ]);
 
 /**

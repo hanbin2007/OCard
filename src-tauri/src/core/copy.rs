@@ -93,10 +93,26 @@ pub enum Progress<'a> {
     /// 走任务级管道而不是进程级 static:后者会被拷卡/分类/转码三条路径互相
     /// 抢走计数,并行两张卡时告警还会归因到错误的那张。
     Contention {
-        what: &'static str,
+        kind: ContentionKind,
         path: &'a Path,
         retries: u32,
     },
+}
+
+/// 哪一步被占用了。两种的分量不同(清单重写得起,素材落不了位才要命),
+/// 通知也要各用各的 code——共用一个会在 30 秒合并窗口里互相顶掉正文。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContentionKind {
+    Manifest,
+    Material,
+}
+
+/// 素材落位一步的占用记录:轮数 + 最近被占的那个**最终文件**。
+/// 报给用户的必须是被占的文件本身,不是目的地根——两个目的地时根会指错一个。
+#[derive(Debug, Default)]
+pub struct ContentionTally {
+    pub retries: u32,
+    pub last_path: Option<PathBuf>,
 }
 
 /// 进度回调的返回值:在文件边界处响应暂停请求。
@@ -1230,8 +1246,8 @@ pub fn run_copy(
             paused = true;
             break;
         }
-        // 本文件素材落位的占用重试轮数(累加进 material_retries 并逐次上报)
-        let mut file_retries = 0u32;
+        // 本文件素材落位的占用记录(累加进 material_retries 并逐次上报)
+        let mut file_tally = ContentionTally::default();
         control = progress(Progress::FileStarted {
             rel_path: rel,
             index,
@@ -1269,7 +1285,7 @@ pub fn run_copy(
                             delta,
                         });
                     },
-                    &mut file_retries,
+                    &mut file_tally,
                 ) {
                     Ok(xxh3) => {
                         consecutive_io = 0;
@@ -1299,13 +1315,15 @@ pub fn run_copy(
                 }
             }
         };
-        if file_retries > 0 {
-            material_retries += file_retries;
-            let dest0 = req.destinations.first().cloned().unwrap_or_default();
+        if file_tally.retries > 0 {
+            material_retries += file_tally.retries;
+            // 报被占的那个文件;拿不到(不该发生)就退回目的地根,总好过空串
+            let fallback = req.destinations.first().cloned().unwrap_or_default();
+            let path = file_tally.last_path.as_deref().unwrap_or(&fallback);
             let _ = progress(Progress::Contention {
-                what: "素材文件落位改名",
-                path: &dest0,
-                retries: file_retries,
+                kind: ContentionKind::Material,
+                path,
+                retries: file_tally.retries,
             });
         }
         // 逐文件落盘,任意时刻中断都可续传
@@ -1314,7 +1332,7 @@ pub fn run_copy(
             write_retries += wr.retries;
             // 零静默:第一次就报,不等任务结束(见 Progress::WriteContention)
             let _ = progress(Progress::Contention {
-                what: "写入拷卡清单",
+                kind: ContentionKind::Manifest,
                 path: &mpath,
                 retries: wr.retries,
             });
@@ -1346,7 +1364,7 @@ pub fn run_copy(
     if wr.retries > 0 {
         write_retries += wr.retries;
         let _ = progress(Progress::Contention {
-            what: "写入拷卡清单",
+            kind: ContentionKind::Manifest,
             path: &mpath,
             retries: wr.retries,
         });
@@ -1379,8 +1397,8 @@ fn copy_one(
     destinations: &[PathBuf],
     task_tag: &str,
     on_chunk: &mut dyn FnMut(u64),
-    // 素材落位时为躲开占用而重试的轮数,累加进来(零静默:上层要报给用户看)
-    retried: &mut u32,
+    // 素材落位时为躲开占用而重试的记录,累加进来(零静默:上层要报给用户看)
+    retried: &mut ContentionTally,
 ) -> Result<String> {
     // R2 P0:两条 rel 都可能来自持久化清单(resume),被篡改为 `../../…` 即任意
     // 读写——源侧越界=任意读,目标侧越界=任意写,两侧都必须过闸。
@@ -1567,7 +1585,7 @@ fn copy_one(
 /// 优先 `hard_link`:目标已存在时原子失败,不可能覆盖;成功后删除 part 名。
 /// 文件系统不支持硬链接(部分 SMB/exFAT)时回退「存在性复查 + rename」,
 /// 该回退窗口为微秒级且长窗口已被入口 pre_existing 检查夹住。
-fn finalize_no_replace(part: &Path, fin: &Path, retried: &mut u32) -> Result<()> {
+fn finalize_no_replace(part: &Path, fin: &Path, retried: &mut ContentionTally) -> Result<()> {
     // 平台原生 no-replace 原子改名(renamex_np/renameat2/MoveFileEx),
     // 逐级回退见 fsx 模块(M2 技术债:替代此前的 hard_link 方案)。
     //
@@ -1580,7 +1598,10 @@ fn finalize_no_replace(part: &Path, fin: &Path, retried: &mut u32) -> Result<()>
     // 同一堵墙,而这堵墙本身就是零覆盖保障。
     match super::fsx::retry_contended(|| super::fsx::rename_no_replace(part, fin)) {
         Ok(retries) => {
-            *retried += retries;
+            if retries > 0 {
+                retried.retries += retries;
+                retried.last_path = Some(fin.to_path_buf());
+            }
             Ok(())
         }
         Err(f) if f.source.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1592,7 +1613,10 @@ fn finalize_no_replace(part: &Path, fin: &Path, retried: &mut u32) -> Result<()>
         Err(f) => {
             // 天书报文的另一半:此前这里抛的是裸 Io,逐文件失败原因就是
             // 那句「IO 错误: 拒绝访问。 (os error 5)」
-            *retried += f.retries;
+            // 最终失败的轮数**不**进成功总账:那条总账的正文说的是「重试后成功、
+            // 结果不受影响」,把失败混进去等于把失败报成成功。失败自己带着轮数
+            // 走 FileStatus::Failed 的报文(io_detail_retried)
+            retried.last_path = Some(fin.to_path_buf());
             Err(super::CoreError::io_detail_retried(
                 "把临时文件改名为最终文件",
                 fin,

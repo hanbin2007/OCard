@@ -12,6 +12,11 @@ pub enum CoreError {
     /// 不知道是哪个文件、不知道下一步做什么。可见 ≠ 可用,零静默的下半句是人话。
     #[error("{0}")]
     IoDetail(String),
+    /// **暂时**冲突:别人正持有这个任务(见 `core::lease`)。不是 IO,也不是死路——
+    /// 等那边结束就能续,所以和 IO 一样落到「暂停」而不是「失败」。判成失败会把
+    /// 用户引去看一份不存在的红字明细。
+    #[error("{0}")]
+    Busy(String),
     #[error("JSON 错误: {0}")]
     Json(#[from] serde_json::Error),
     #[error("{0}")]
@@ -26,6 +31,11 @@ impl CoreError {
     /// 判定必须走这里:`matches!(e, Io(_))` 会把 [`Self::IoDetail`] 漏成死路。
     pub fn is_io(&self) -> bool {
         matches!(self, Self::Io(_) | Self::IoDetail(_))
+    }
+
+    /// 这次失败之后任务该不该停在**可续传的暂停**上(IO 抖动、别人暂时占着)。
+    pub fn is_resumable(&self) -> bool {
+        self.is_io() || matches!(self, Self::Busy(_))
     }
 
     /// 同 [`Self::io_detail`],外加「已经自动重试了几轮」。
@@ -128,6 +138,10 @@ mod tests {
         .is_io());
         assert!(!CoreError::Invalid("坏清单".into()).is_io());
         assert!(!CoreError::AlreadyExists("/x".into()).is_io());
+        // 被别人暂时占着:不是 IO,但和 IO 一样要能续传
+        assert!(!CoreError::Busy("占着".into()).is_io());
+        assert!(CoreError::Busy("占着".into()).is_resumable());
+        assert!(!CoreError::Invalid("坏清单".into()).is_resumable());
     }
 
     /// 事故原文是「IO 错误: 拒绝访问。 (os error 5)」:没有路径、没有下一步。
