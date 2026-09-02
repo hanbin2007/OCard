@@ -26,7 +26,10 @@ pub fn xxh3_file_source(path: &Path) -> Result<String> {
 
 /// 校验专用:尽量绕页缓存读取后计算哈希(M2 技术债:回读命中页缓存会弱化校验)。
 pub fn xxh3_file_uncached(path: &Path) -> Result<String> {
-    xxh3_reader(super::fsx::open_uncached(path)?)
+    // 刚写完的新文件正是杀软独占扫描最爱撞的:打不开要带步骤与路径,不能是裸的 os error 32
+    let f = super::fsx::open_uncached(path)
+        .map_err(|e| super::CoreError::io_detail("回读校验(哈希)", path, &e))?;
+    xxh3_reader(f)
 }
 
 fn xxh3_reader(mut file: File) -> Result<String> {
@@ -44,6 +47,20 @@ fn xxh3_reader(mut file: File) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// 打不开的报文要带步骤与路径(0.4.3 事故的形状是裸的「IO 错误: …(os error 5)」)。
+    #[test]
+    fn opening_failures_name_the_step_and_the_path() {
+        let missing = std::path::Path::new("/definitely/not/here/x.mp4");
+        for (r, step) in [
+            (super::xxh3_file(missing), "打开文件(哈希)"),
+            (super::xxh3_file_source(missing), "打开源文件(哈希)"),
+            (super::xxh3_file_uncached(missing), "回读校验(哈希)"),
+        ] {
+            let e = r.expect_err("不存在的路径必失败").to_string();
+            assert!(e.contains(step) && e.contains("x.mp4"), "{e}");
+        }
+    }
+
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;

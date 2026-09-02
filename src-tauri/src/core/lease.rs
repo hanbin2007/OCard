@@ -2584,7 +2584,7 @@ mod tests {
         // Windows CI 负载高时进程存活探测 + 接管锁 + 时钟探针本身就能超过两拍(3bdb05c 偶发红)
         assert!(
             started.elapsed() < FAST.heartbeat_every * 2 + std::time::Duration::from_secs(1),
-            "本机残留不该走观察期(观察期是两拍心跳 + 余量)"
+            "粗略上限:本机残留的接管不该耗时到秒级"
         );
         let note = held.took_over_stale.as_deref().unwrap();
         assert!(
