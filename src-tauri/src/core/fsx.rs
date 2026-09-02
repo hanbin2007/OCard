@@ -422,19 +422,40 @@ fn note_uncached_fallback() {
 }
 
 /// 打开**源**文件供拷贝 / 哈希读取。Windows 上以「只允许别人读」的共享模式打开
-/// (`FILE_SHARE_READ`):正持着写句柄的程序会让这次打开直接报共享冲突(可见失败、按占用
-/// 重试),而我们持着句柄期间任何人都打不开写句柄——这是 Windows 上唯一可靠的「拷贝期间
-/// 没人在写」证明:Windows 只保证写句柄**关闭后**修改时间才正确,写入过程中按元数据看不出
-/// (codex 终审 r17)。其它平台没有强制共享模式,靠大小 + 修改时间的前后核对。
+/// (`FILE_SHARE_READ`):正持着写句柄的程序会让这次打开报共享冲突——按占用重试几轮
+/// (杀软 / 索引器的短暂写句柄),仍被占着就可见失败并说明原因与下一步;而我们持着句柄
+/// 期间任何人都打不开写句柄——这是 Windows 上唯一可靠的「拷贝期间没人在写」证明:Windows
+/// 只保证写句柄**关闭后**修改时间才正确,写入过程中按元数据看不出(codex 终审 r17)。
+/// 其它平台没有强制共享模式,靠大小 + 修改时间的前后核对。
 pub fn open_source(path: &Path) -> io::Result<fs::File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
-        fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ)
-            .open(path)
+        let mut got: Option<fs::File> = None;
+        match retry_contended(|| {
+            got = Some(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ)
+                    .open(path)?,
+            );
+            Ok(())
+        }) {
+            Ok(_) => Ok(got.expect("重试成功必有句柄")),
+            Err(f) => Err(if matches!(f.source.raw_os_error(), Some(32) | Some(33)) {
+                // 报文带原因与下一步(可见 ≠ 可用):裸的 os error 32 没人看得懂
+                io::Error::new(
+                    f.source.kind(),
+                    format!(
+                        "源文件正被别的程序打开写入(共享冲突,已重试 {} 轮仍被占着): {}。请确认没有设备 / 程序在写这张卡,再点「重试全部失败文件」",
+                        f.retries, f.source
+                    ),
+                )
+            } else {
+                f.source
+            }),
+        }
     }
     #[cfg(not(windows))]
     {

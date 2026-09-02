@@ -1990,7 +1990,7 @@ fn copy_one(
         // 把既有目标当「已交付」——卡上的新内容没有备份(codex 终审 r15)
         if !source_unchanged_since(src_meta.as_ref(), &src_path) {
             return Err(super::CoreError::Invalid(format!(
-                "源文件在与既有目标比对期间被修改(大小或修改时间变了,或读不到修改时间),不能把既有目标当作这份源的备份: {source_rel}。请确认相机 / 录机已停止写这张卡后重试"
+                "源文件在与既有目标比对期间被修改(大小或修改时间变了,或读不到修改时间;Windows 上也可能是它正被别的程序占着打不开),不能把既有目标当作这份源的备份: {source_rel}。请确认相机 / 录机已停止写这张卡后重试"
             )));
         }
         if pre_existing.len() == finals.len() {
