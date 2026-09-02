@@ -167,6 +167,12 @@ pub struct CopyManifest {
     /// 自动转代理已尝试次数(≥3 放弃并可见告知,防永久失败无限重投)。
     #[serde(default)]
     pub proxy_attempts: u32,
+    /// 计划代次:`planned` 每被刷新一次(续传前复扫发现变化)加一。自动转代理作业按
+    /// 派发时的代次工作,完成标记只对**同一代**有效——否则旧作业晚完成会把新增文件从未
+    /// 进过它工作集的新计划标成「代理已完成」(codex 第三轮 P0)。计划一变,旧的
+    /// proxy_completed / proxy_attempts 一并失效。老清单没有这个字段 = 第 0 代
+    #[serde(default)]
+    pub plan_generation: u64,
     pub entries: Vec<ManifestEntry>,
 }
 
@@ -200,6 +206,7 @@ impl CopyManifest {
             auto_proxy: false,
             proxy_completed: false,
             proxy_attempts: 0,
+            plan_generation: 0,
             entries: Vec::new(),
         }
     }
@@ -430,6 +437,16 @@ pub fn list(project_root: &Path) -> Result<ManifestList> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 老清单(0.4.3 及之前)没有 plan_generation 字段:按第 0 代读入,不许读失败。
+    #[test]
+    fn an_old_manifest_without_plan_generation_loads_as_generation_zero() {
+        let m = CopyManifest::new("1. 待分类/x", "CARD", "A_B_C", "张三", "");
+        let mut v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        v.as_object_mut().unwrap().remove("plan_generation");
+        let back: CopyManifest = serde_json::from_value(v).expect("老清单必须能读");
+        assert_eq!(back.plan_generation, 0);
+    }
 
     /// 不可信标记:写得下、读得回、清得掉;而且它**不是**清单——`list` 不许把它算成
     /// 「读不懂的清单」而计入 skipped。

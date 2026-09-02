@@ -909,26 +909,10 @@ pub fn acquire_with(
     let token = uuid::Uuid::new_v4().to_string();
     let me = Lease::fresh(machine_id, operator, &token);
 
-    // 快路径:没人持有时一步原子取得。写后回读复核 token:`rename_no_replace` 在
-    // 不支持原子原语的文件系统上会退到「复查+改名」,两个快路径可能都以为自己赢了
-    if try_create(&path, &me)? {
-        match read_lease(&path) {
-            Some(l) if l.token == me.token => return Held::start(path, me, timing, None),
-            Some(l) => {
-                return Err(super::CoreError::Busy(format!(
-                    "这个拷卡任务的租约刚刚被 {} 同时取得,本次让路;请在那边操作,或稍后再试",
-                    l.who(machine_id)
-                )));
-            }
-            // 刚写完就读不回自己的:这块盘现在不可信,不能装作拿到了
-            None => {
-                return Err(super::CoreError::Busy(format!(
-                    "刚写入的任务租约读不回来(存储可能正在抖动):{}。稍后再试",
-                    path.display()
-                )));
-            }
-        }
-    }
+    // 没有「绕开接管锁的快路径」:租约文件不在时也要在接管锁下取得。否则一个仍持着写栅栏
+    // 的持有者(它的租约文件被别的进程的迟到写入盖掉又撤回,此刻是空缺)会与一个走快路径
+    // 的第三者同时成为「可信写者」——栅栏的目录锁正是要把这段窗口串行化(codex 第三轮 P0)。
+    // 锁内 classify_existing 对「文件不在」答 Fresh,publish(evict=false) 走不替换式创建
 
     // 「按时钟过期」不能单独定罪:对方机器时钟偏差超过 TTL 时,一份**活着**的租约
     // 在我们眼里也是过期的。所以先用本机的单调时间观察一个心跳周期:心跳还在
@@ -1216,13 +1200,19 @@ pub struct SaveFence {
     guard: TakeoverLock,
     /// 进程内的轮次:声明在 guard 之后 → 先还目录锁,再让心跳线程上
     _turn: IoTurn,
+    /// 租约文件与本次持有的 token:复核不能只看锁标记,还要看盘上的租约是不是自己的——
+    /// 锁标记还在、租约却已被迟到的写入换成别人的(或被撤回成空缺),照样不可信
+    path: PathBuf,
+    token: String,
 }
 
 impl SaveFence {
-    /// 落盘**之后**再问一句:栅栏还是不是我的。不是了(nonce 被外部回收)= 这次落盘
-    /// 期间可能有别人接管,调用方应停下并说明。
+    /// 落盘**之后**再问一句:栅栏还是不是我的。锁标记不在了(被外部回收)、或盘上的租约
+    /// 不再是自己的 token(被迟到的写入盖掉 / 撤回)= 这次落盘期间可能有别人接管,
+    /// 调用方应停下并说明。
     pub fn still_mine(&self) -> bool {
         self.guard.still_mine()
+            && matches!(read_lease(&self.path), Some(l) if l.token == self.token)
     }
 }
 
@@ -1399,7 +1389,12 @@ impl Held {
                         "接管锁在核对期间被回收(存储的时钟或锁目录被外部动过),本次不写".into(),
                     ));
                 }
-                Ok(SaveFence { guard, _turn: turn })
+                Ok(SaveFence {
+                    guard,
+                    _turn: turn,
+                    path: self.path.clone(),
+                    token: self.me.token.clone(),
+                })
             }
             Some(l) => {
                 *lock_or_recover(&self.shared.lost) = Some(l.who(&self.me.machine_id));
@@ -2405,6 +2400,38 @@ mod tests {
         assert!(TakeoverLock::reclaim(&dir).is_err(), "junction 不许回收");
         assert!(victim.exists(), "顺着 junction 把外面的文件删了");
         assert!(!TakeoverLock::is_reclaimable(&dir), "junction 不许判可回收");
+    }
+
+    /// 栅栏持有期间租约文件被撤回成空缺:第三者的取得**不能**绕开接管锁溜进来。
+    /// (此前有一条不拿锁的快路径,文件不在就直接建;codex 第三轮抓到它能与一个仍持栅栏的
+    /// 持有者同时成为「可信写者」。)
+    #[test]
+    fn a_fresh_acquire_cannot_slip_in_while_someone_holds_a_fence() {
+        let (_t, root, id) = setup();
+        let held = acquire_with(&root, &id, "MACHINE-A", "张三", FAST).unwrap();
+        let fence = held.fence().unwrap();
+        // 模拟迟到写入盖掉又撤回:租约文件消失
+        std::fs::remove_file(lease_path(&root, &id).unwrap()).unwrap();
+        let err = acquire_with(&root, &id, "MACHINE-C", "王五", FAST).unwrap_err();
+        assert!(matches!(err, super::super::CoreError::Busy(_)), "{err}");
+        assert!(
+            !lease_path(&root, &id).unwrap().exists(),
+            "第三者不许在别人持栅栏期间建出租约"
+        );
+        drop(fence);
+    }
+
+    /// 栅栏复核要看 token:锁标记还在、盘上租约却换成了别人的,不算「还是我的」。
+    #[test]
+    fn a_fence_is_not_mine_once_the_lease_on_disk_belongs_to_someone_else() {
+        let (_t, root, id) = setup();
+        let held = acquire_with(&root, &id, "MACHINE-A", "张三", FAST).unwrap();
+        let fence = held.fence().unwrap();
+        assert!(fence.still_mine());
+        write_lease(&root, &id, &live("MACHINE-B", 4242, "李四"));
+        assert!(!fence.still_mine(), "盘上已是李四的,栅栏不能说还是自己的");
+        std::fs::remove_file(lease_path(&root, &id).unwrap()).unwrap();
+        assert!(!fence.still_mine(), "租约被撤回成空缺,同样不算自己的");
     }
 
     /// Fresh 路径绝不删文件:文件在我们判断之后又出现了 = 有人走快路径刚干净取得,

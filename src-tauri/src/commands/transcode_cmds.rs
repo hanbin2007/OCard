@@ -502,7 +502,8 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
     config_dir: PathBuf,
     op: String,
     input: ProxyInput,
-    intent_manifest: Option<String>,
+    // (清单 id, 派发时的计划代次):完成标记只对同一代有效
+    intent_manifest: Option<(String, u64)>,
 ) -> std::result::Result<JobSnapshot, String> {
     let jobs = app.state::<Arc<JobManager>>().inner().clone();
     // auto_proxy 补投递允许排队(lane 串行天然消化多卡,评审 P1-7);
@@ -515,7 +516,7 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
     }
     let handle = jobs.create_op(JobKind::Transcode, Some("proxy"), &input.project_id);
     // intent 绑定到作业(R5:排队期被取消也能按 job 释放,不再卡到重启)
-    if let Some(mid) = &intent_manifest {
+    if let Some((mid, _)) = &intent_manifest {
         intent_bind(mid, &handle.snapshot().id);
     }
     let body_app = app.clone();
@@ -954,7 +955,8 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
             }
             // auto_proxy intent:整批成功才置位(计划 D2 at-least-once);
             // in-flight 登记的移除统一由 exit_guard 负责(含所有早退路径)
-            if let Some(mid) = &intent_manifest {
+            if let Some((mid, generation)) = &intent_manifest {
+                let generation = *generation;
                 // 评审 P0-4:空清单/读错/取消都不许标完成——attempts 上限负责最终放弃
                 if !cancelled && result.failures.is_empty() && total > 0 {
                     // 与放弃标记/重试计数同一条路:重读 + 看活租约 + 写回,写失败可见。
@@ -963,13 +965,10 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                     // 三种结局都已在里面各自通知;完成标记写不写得进不改变本次作业的结果
                     let _ = save_proxy_state(&body_app, &root, &machine_id, mid, "完成标记",
                         "下次启动会重投一次(已转文件会安全跳过)", |fresh| {
-                        // 盘上那份已经不是「已完成」(另一台机器续传把它打回了):不许标代理完成,
+                        // 盘上那份已经不是「已完成」(另一台机器续传把它打回了)、或计划已经
+                        // 换代(本作业按旧计划扫的文件集,新增的从未进过工作集):不许标代理完成,
                         // 否则以后补拷的新文件永远不会再自动转代理
-                        if !fresh.completed || !fresh.auto_proxy {
-                            return false;
-                        }
-                        fresh.proxy_completed = true;
-                        true
+                        proxy_completion_applies(fresh, generation)
                     });
                 }
             }
@@ -991,6 +990,42 @@ static INTENTS_IN_FLIGHT: Mutex<Option<std::collections::HashMap<String, Option<
 
 /// 原子占位:同一 manifest 已在途则拒(返回 false)。占位发生在创建作业前,
 /// 拿到 job id 后用 [`intent_bind`] 绑定,取消/出口按 job 释放。
+/// 完成标记能不能写到这份(租约下重读的)清单上:必须仍是已完成、仍有意图、且**同一代**
+/// 计划。返回 true 时已把 proxy_completed 置位。
+fn proxy_completion_applies(
+    fresh: &mut crate::core::manifest::CopyManifest,
+    generation: u64,
+) -> bool {
+    if !fresh.completed || !fresh.auto_proxy || fresh.plan_generation != generation {
+        return false;
+    }
+    fresh.proxy_completed = true;
+    true
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::proxy_completion_applies;
+    use crate::core::manifest::CopyManifest;
+
+    /// 完成标记只对派发时那一代计划有效:计划换代之后旧作业晚回来,不许把新一代标成
+    /// 「代理已完成」——新增文件从未进过它的工作集(codex 第三轮 P0)。
+    #[test]
+    fn a_proxy_job_from_an_older_plan_generation_never_marks_the_new_one_done() {
+        let mut m = CopyManifest::new("1. 待分类/x", "CARD", "A_B_C", "张三", "");
+        m.completed = true;
+        m.auto_proxy = true;
+        m.plan_generation = 2;
+        assert!(
+            !proxy_completion_applies(&mut m, 1),
+            "旧一代的作业不许标完成"
+        );
+        assert!(!m.proxy_completed, "拒绝时一个字段都不许动");
+        assert!(proxy_completion_applies(&mut m, 2), "同一代才算数");
+        assert!(m.proxy_completed);
+    }
+}
+
 fn intent_claim(mid: &str) -> bool {
     let mut g = INTENTS_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
     let map = g.get_or_insert_with(Default::default);
@@ -1282,6 +1317,8 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
         );
         return;
     }
+    // 派发时的计划代次:放弃 / 计数 / 完成标记都只对这一代有效
+    let generation = m.plan_generation;
     // 永久失败不许无限重投(评审 P1-8):三次仍未整批成功即放弃,可见告知
     if m.proxy_attempts >= 3 {
         let persisted = save_proxy_state(
@@ -1295,7 +1332,8 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
                 if !(fresh.auto_proxy
                     && fresh.completed
                     && !fresh.proxy_completed
-                    && fresh.proxy_attempts >= 3)
+                    && fresh.proxy_attempts >= 3
+                    && fresh.plan_generation == generation)
                 {
                     return false;
                 }
@@ -1337,28 +1375,6 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
     // 计数多半在盘上、放弃上限仍然有效;若当没写回,每一次 unverified 都会烧掉一次
     // 重投额度却一个作业都不派,三次之后弹出「已连续 3 次未能整批完成」的假话
     // (opus r14)
-    let reserved = save_proxy_state(
-        app,
-        project_root,
-        machine_id,
-        &m.id,
-        "重试计数",
-        "放弃上限会失效,本次不派发,下次启动再试",
-        |fresh| {
-            if !(fresh.auto_proxy
-                && fresh.completed
-                && !fresh.proxy_completed
-                && fresh.proxy_attempts < 3)
-            {
-                return false;
-            }
-            fresh.proxy_attempts += 1;
-            true
-        },
-    );
-    if matches!(reserved, Persist::NotPublished | Persist::Skipped) {
-        return;
-    }
     let meta = match project::load_meta(project_root) {
         Ok(m) => m,
         Err(e) => {
@@ -1390,6 +1406,30 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
     if !intent_claim(&m.id) {
         return; // 同一意图已在排队/执行(P1-7 去重),双投只会白跑一轮
     }
+    let reserved = save_proxy_state(
+        app,
+        project_root,
+        machine_id,
+        &m.id,
+        "重试计数",
+        "放弃上限会失效,本次不派发,下次启动再试",
+        |fresh| {
+            if !(fresh.auto_proxy
+                && fresh.completed
+                && !fresh.proxy_completed
+                && fresh.proxy_attempts < 3
+                && fresh.plan_generation == generation)
+            {
+                return false;
+            }
+            fresh.proxy_attempts += 1;
+            true
+        },
+    );
+    if matches!(reserved, Persist::NotPublished | Persist::Skipped) {
+        intent_release_mid(&m.id); // 预留失败:把刚占的意图放掉,不然到重启前都投不了
+        return;
+    }
     if let Err(e) = spawn_proxy_job(
         app,
         project_root.to_path_buf(),
@@ -1398,7 +1438,7 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
         config_dir.to_path_buf(),
         operator.to_string(),
         input,
-        Some(m.id.clone()),
+        Some((m.id.clone(), generation)),
     ) {
         intent_release_mid(&m.id);
         notify::warn_for_task(

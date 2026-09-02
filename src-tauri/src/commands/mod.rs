@@ -2480,6 +2480,11 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
     // 计划变了就还没跑完:`completed` 必须跟着回落,否则会留下
     // 「清单说完成了、里面却有未验证项」的自相矛盾状态
     m.completed = false;
+    // 计划换代:自动转代理的完成标记与重试预算都是上一代的,一并失效——否则按旧计划
+    // 跑完的代理作业晚一步回来,会把这一代标成「代理已完成」,新增文件永远不再自动转代理
+    m.plan_generation += 1;
+    m.proxy_completed = false;
+    m.proxy_attempts = 0;
     // 调用方(resume_copy_task)已经持有这个任务的租约,这次写在保护内;而且写在
     // **栅栏**内:持有 Held 本身挡不住「进程休眠超过 TTL 后被接管」,栅栏在落盘前
     // 持锁核对 token,不是自己的就不写(codex r6)
