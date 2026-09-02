@@ -375,6 +375,9 @@ const LOCK_DIR_HAS_FOREIGN_ENTRIES: &str = "里有不认识的条目(不是 OCar
 
 /// 锁目录形状检查的两种「不合法」:读不出(让路、下次再看)与异物(拒绝、要说)。
 enum ShapeIssue {
+    /// 锁目录在我们看它的这一瞬间**没了**(mkdir 说已存在,read_dir 却说不在):别人刚
+    /// 释放并 rmdir(Windows 上 delete-pending 更常见)——不是读不出,是该立刻重试 create_dir
+    Vanished,
     /// 枚举 / 读条目类型失败(带 IO 原因)。瞬时的让路;持续的要告诉用户是权限 / 存储问题,
     /// 而不是「别的进程正在接管」
     Unreadable(String),
@@ -520,14 +523,25 @@ impl TakeoverLock {
         }
     }
 
+    /// 锁目录在看的一瞬间没了要判成 Vanished(而不是「读不出」):acquire 据此立刻重试。
+    #[cfg(test)]
+    fn shape_vanished(dir: &Path) -> bool {
+        matches!(Self::inspect_lock_shape(dir), Err(ShapeIssue::Vanished))
+    }
+
     /// 锁目录的形状:**唯一**的判据,预判(`try_take`)与回收(`reclaim`)共用,两边不会
     /// 一个放行一个拒绝。合法条目 = 名字是 32 位十六进制、且是**普通文件**(不跟链接):
     /// 一个 32 位十六进制的子目录或链接,按名字放行、回收时 `remove_file` 失败,结果是
     /// 真正的 nonce 已被删掉、异物还在、报文却说「别人正在接管」(codex r8)。
     /// 枚举出错(NAS 抖一下)不算异物,按「读不出」让路,下一次再看。
     fn inspect_lock_shape(dir: &Path) -> std::result::Result<Vec<PathBuf>, ShapeIssue> {
-        let rd = std::fs::read_dir(dir)
-            .map_err(|e| ShapeIssue::Unreadable(super::error::explain_io(&e)))?;
+        let rd = std::fs::read_dir(dir).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ShapeIssue::Vanished
+            } else {
+                ShapeIssue::Unreadable(super::error::explain_io(&e))
+            }
+        })?;
         let mut nonces = Vec::new();
         for e in rd {
             let e = e.map_err(|e| ShapeIssue::Unreadable(super::error::explain_io(&e)))?;
@@ -626,7 +640,9 @@ impl TakeoverLock {
                 log::warn!("租约接管锁目录里有不认识的条目,不回收: {}", dir.display());
                 return Err(why);
             }
-            Err(ShapeIssue::Unreadable(_)) => return Ok(Reclaimed::No(None)),
+            Err(ShapeIssue::Unreadable(_)) | Err(ShapeIssue::Vanished) => {
+                return Ok(Reclaimed::No(None))
+            }
         };
         // 破坏性判定**强制写一个新探针**(不吃 5 秒缓存:缓存建立后 NAS 时钟若跳了两分钟
         // 以上,按缓存算刚建的锁会立刻「可回收」),但一次 reclaim 只写这一个——锁目录
@@ -719,6 +735,9 @@ impl TakeoverLock {
                     match Self::inspect_lock_shape(&dir) {
                         Err(ShapeIssue::Foreign(why)) => return Ok(Take::Refused(why)),
                         Err(ShapeIssue::Unreadable(e)) => return Ok(Take::Unreadable(e)),
+                        // 刚被别人 rmdir 了:立刻再 create_dir(Windows CI 上并发接管真的撞到过:
+                        // 输家把这一瞬报成「锁目录读不出」)
+                        Err(ShapeIssue::Vanished) => continue,
                         Ok(entries) => {
                             // 目录里**全是**本进程自己没删掉的 nonce(随机名,不可能是别人的):
                             // 立刻回收,不必等两分钟的年龄门槛
@@ -2626,6 +2645,15 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("读不出") && msg.contains("权限"), "{msg}");
         assert!(!msg.contains("另一个进程正在接管"), "{msg}");
+    }
+
+    /// 锁目录不在 = Vanished,不是「读不出」:并发接管时输家看到的就是这一瞬,要立刻重试而
+    /// 不是报「锁目录读不出,请检查权限」。
+    #[test]
+    fn a_vanished_lock_dir_is_a_retry_not_an_unreadable_error() {
+        let t = tempdir().unwrap();
+        let dir = t.path().join("gone.lease.takeover");
+        assert!(TakeoverLock::shape_vanished(&dir));
     }
 
     /// 名字像 nonce 的**子目录 / 链接**也是异物:预判与回收用的是同一套形状判据——
