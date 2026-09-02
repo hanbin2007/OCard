@@ -955,7 +955,14 @@ pub fn acquire_with(
 
     // 已存在:能不能接管,要在**接管锁**下重读再判——锁之前读到的那份可能
     // 在我们判断的这一瞬间已经被别的接管者换成了新鲜的
-    let guard = match TakeoverLock::try_take(&path)? {
+    // 取得也带一点耐心(约 2 秒;测试节奏 200ms):快路径去掉之后这里落在每一次取得的热路径上,
+    // Windows 杀软刚把上一把锁的 nonce 置成 delete-pending、或对方正处在几十毫秒的接管中,
+    // 立即放弃会把「几百毫秒后就能拿到」说成「另一个进程正在接管」(fable 第六轮)
+    let patience = (timing.heartbeat_every / 5).clamp(
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_secs(2),
+    );
+    let guard = match TakeoverLock::take_with_patience(&path, patience)? {
         Take::Got(g) => g,
         Take::Held(reason) => {
             return Err(super::CoreError::Busy(match reason {
@@ -1002,7 +1009,7 @@ pub fn acquire_with(
         Existing::TakeOver(note) => Some(note),
         Existing::Fresh => None,
     };
-    // 持锁期间接管者只有我们;快路径的 try_create 仍可能抢在 remove 与 create
+    // 持锁期间接管者只有我们;（历史上的不拿锁快路径已去掉,这里的复核仍保留:）它曾可能抢在 remove 与 create
     // 之间落一份新的——那就让它赢,我们退回 Busy(它是干净取得,不需要接管)
     // 删之前再确认锁还是我的:被回收了就等于没锁
     if !guard.still_mine() {
@@ -1011,7 +1018,7 @@ pub fn acquire_with(
         ));
     }
     if publish(&path, &me, note.is_some())? {
-        // 接管路径也要写后复核(快路径早就有):publish 里的删 + 建可能卡在 NAS 上超过两分钟,
+        // 写后复核:publish 里的删 + 建可能卡在 NAS 上超过两分钟,
         // 期间锁被回收、别人接管并发布了——我们迟到的删 + 建会把它的顶掉,然后两边都
         // 以为自己赢了(codex 终审 P0)。锁不是自己的了就撤回并让路;回读不是自己的也让路
         if !guard.still_mine() {
@@ -1043,7 +1050,7 @@ pub fn acquire_with(
 
 /// 在锁下把自己的租约放上去。`evict` = 先把盘上那份(已判定为可接管的)删掉。
 ///
-/// Fresh(文件已不在)时必须 `evict = false`:此刻可能有人正走快路径(不拿锁)
+/// Fresh(文件已不在)时必须 `evict = false`:取得现在一律在锁下,但心跳的「文件没了 → 重建」也在锁下用不替换式创建,不删就不会误伤;历史上曾有不拿锁的快路径
 /// 刚原子建好自己的租约,删了等于把一份合法的干净取得抹掉。直接去建,建不成
 /// 就是它赢——这条语义单独成函数,好被直接考。
 fn publish(path: &Path, me: &Lease, evict: bool) -> Result<bool> {
@@ -1685,7 +1692,7 @@ fn heartbeat_loop(path: &Path, me: &Lease, timing: Timing, shared: &Arc<Shared>)
             });
         match written {
             Ok(_) => {
-                // 写完回读复核:锁之外唯一能插进来的是快路径的干净取得,而那只在
+                // 写完回读复核:取得现在一律在锁下,锁之外理论上没人能插进来;但复核只花一次小读,值得。历史上快路径的干净取得只在
                 // 文件不存在时成功——理论上到不了,但复核只花一次小读,值得。
                 // 回读不到自己的**不算成功**(fail-closed)
                 match read_lease(path) {
@@ -2438,7 +2445,7 @@ mod tests {
         assert!(!fence.still_mine(), "租约被撤回成空缺,同样不算自己的");
     }
 
-    /// Fresh 路径绝不删文件:文件在我们判断之后又出现了 = 有人走快路径刚干净取得,
+    /// Fresh 路径绝不删文件:文件在我们判断之后又出现了 = 有人(心跳重建 / 历史上的快路径)刚干净取得,
     /// 那份必须留着,我们让路。
     #[test]
     fn publishing_without_evict_never_removes_a_lease_that_appeared_meanwhile() {
@@ -2669,7 +2676,7 @@ mod tests {
     }
 
     /// 等锁期间上一个持有者干净释放、文件已经不在:那不是接管,不许标成接管。
-    /// (快路径拿不到这一支——文件不在时快路径直接成功——所以直接考分类函数。)
+    /// (直接考分类函数:acquire 里这一支被 publish 的结果盖住,不好单独观察。)
     #[test]
     fn a_vanished_lease_classifies_as_fresh_not_takeover() {
         let t = tempdir().unwrap();

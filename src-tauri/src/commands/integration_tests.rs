@@ -3693,6 +3693,65 @@ fn resume_is_refused_before_touching_anything_while_another_process_holds_the_ta
     );
 }
 
+/// 计划换代:刷新后的计划与盘上不同 → plan_generation +1、上一代的代理完成标记与重试预算
+/// 归零;计划没变则一个都不动。删掉那三行,`proxy_completion_applies` 的单测照样绿,这里守着。
+#[test]
+fn refreshing_the_plan_bumps_the_generation_and_invalidates_proxy_state() {
+    use crate::core::manifest::{CopyManifest, PlannedFile};
+    let (window, tmp, _nas) = mock_app();
+    let app = window.app_handle();
+    let project_root = tmp.path().join("proj-gen");
+    std::fs::create_dir_all(crate::core::manifest::manifest_dir(&project_root)).unwrap();
+    let mut m = CopyManifest::new("1. 待分类/x", "CARD", "A_B_C", "张三", "");
+    m.planned = vec![PlannedFile {
+        rel_path: "a.jpg".into(),
+        size: 10,
+        source_rel: "D/a.jpg".into(),
+        source_mtime_ns: 0,
+    }];
+    m.completed = true;
+    m.proxy_completed = true;
+    m.proxy_attempts = 2;
+    crate::core::manifest::save(&project_root, &m).unwrap();
+    let lease = crate::core::lease::acquire(&project_root, &m.id, "TEST-MACHINE", "t").unwrap();
+    let changed = vec![crate::core::copy::PlannedFile {
+        source_rel: "D/a.jpg".into(),
+        target_rel: "a.jpg".into(),
+        size: 999,
+        source_mtime_ns: 0,
+    }];
+    let task_id = m.id.clone();
+    crate::commands::persist_refreshed_plan(
+        app,
+        &mut m,
+        &project_root,
+        &changed,
+        &lease,
+        (&task_id, ""),
+    )
+    .unwrap();
+    assert_eq!(m.plan_generation, 1, "计划变了要换代");
+    assert!(
+        !m.completed && !m.proxy_completed,
+        "上一代的完成 / 代理完成标记要失效"
+    );
+    assert_eq!(m.proxy_attempts, 0, "上一代的重试预算要归零");
+    let on_disk = crate::core::manifest::load(&project_root, &m.id).unwrap();
+    assert_eq!(on_disk.plan_generation, 1, "换代要落盘");
+    // 同一份计划再刷新一次:一个都不动
+    crate::commands::persist_refreshed_plan(
+        app,
+        &mut m,
+        &project_root,
+        &changed,
+        &lease,
+        (&task_id, ""),
+    )
+    .unwrap();
+    assert_eq!(m.plan_generation, 1, "计划没变不许换代");
+    lease.release();
+}
+
 /// 锁目录里有别的程序落的文件:续传的拒绝必须顶「需人工清理」的抬头
 /// (`copy-resume-lease-lock-broken`),不能顶「任务正被别的进程执行」——后者会让人
 /// 去别的机器上白找,而这种目录等多久都不会自己好。守的是 `LOCK_DIR_BROKEN_PREFIX`

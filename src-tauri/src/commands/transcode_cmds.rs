@@ -1188,7 +1188,7 @@ fn save_proxy_state<R: tauri::Runtime>(
                     "auto-proxy-skipped-stale",
                     (id, &project_id),
                     format!(
-                        "清单 {which}… 在租约下重读后已不满足{what}的条件(可能另一台机器正在续传、或别处已处理),本次不写回{}",
+                        "清单 {which}… 在租约下重读后已不满足{what}的条件(可能计划已刷新、另一台机器正在续传、或别处已处理),本次不写回{}",
                         if what == "完成标记" { "" } else { ",也不派发" }
                     ),
                 );
@@ -1404,7 +1404,19 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
         retranscode: Some(false),
     };
     if !intent_claim(&m.id) {
-        return; // 同一意图已在排队/执行(P1-7 去重),双投只会白跑一轮
+        // 同一意图已在排队/执行(P1-7 去重),双投只会白跑一轮。但要说:计划刷新后这一代
+        // 的派发被上一代还在跑的作业挡住,那个作业结束时会按代次拒绝标完成,本代要等下次
+        // 启动补投——不说的话新增文件的代理就是无声地推迟了(fable 第六轮)
+        notify::info_for_task(
+            app,
+            "auto-proxy-deferred",
+            (&m.id, &project_id),
+            format!(
+                "「{}」已有一个自动转代理作业在排队/执行,本次不再另起;若这期间计划刷新过(有新增文件),那份作业结束时不会把新计划标成已完成,新一代会在下次启动时补投",
+                m.target_rel
+            ),
+        );
+        return;
     }
     let reserved = save_proxy_state(
         app,

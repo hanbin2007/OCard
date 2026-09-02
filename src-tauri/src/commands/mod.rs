@@ -2495,7 +2495,7 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
         // 这次整份重写顶掉——按写失败处理并说出来,不能一声不吭(第九轮评审)
         if !fence.still_mine() {
             let mut why = String::from(
-                "落盘之后读不到本任务的租约锁标记(可能是存储抖了一下,也可能是锁被外部回收;这里分不出来),这次写回不可信;请确认没有别的 OCard 在跑这个任务",
+                "落盘之后发现本任务的租约栅栏已不成立(读不到锁标记,或盘上租约已不是本任务的;可能是存储抖了一下,也可能是锁被外部回收 / 被别的进程接管;这里分不出来),这次写回不可信;请确认没有别的 OCard 在跑这个任务",
             );
             // NAS 上留持久化的不可信标记(本机通知别的机器看不见)
             if let Err(e) = manifest::mark_suspect(project_root, &m.id, &why) {
