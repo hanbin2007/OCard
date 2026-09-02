@@ -114,6 +114,7 @@ export const NOTICE_TITLES: Record<string, string> = {
   "auto-proxy-skipped-suspect": "清单不可信，暂不派发自动转代理",
   "auto-proxy-skipped-stale": "清单已变，本次不派发自动转代理",
   "fsx-leftover-temp": "落位成功，但临时文件没删掉",
+  "fsx-fallback-window": "文件系统不支持原子防覆盖改名，已降级",
   "copy-resume-lease-lock-broken": "租约锁目录异常，需人工清理",
   "copy-resume-lease-held": "任务正被别的进程执行，拒绝续传",
   "copy-resume-already-running": "上一次运行还没退出，本次「继续」未生效",

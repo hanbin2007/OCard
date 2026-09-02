@@ -139,6 +139,9 @@ pub fn start_analysis<R: tauri::Runtime>(
             let failures = std::sync::Mutex::new(Vec::<AnalysisFailureDto>::new());
             let new_features = std::sync::Mutex::new(Vec::<analysis::FeatureRecord>::new());
             let last_emit = std::sync::Mutex::new(std::time::Instant::now());
+            // 降级标记是线程局部的:池线程上写缩略图走了回退,要在**池线程**上取走、汇总到
+            // 作业,作业结束时一次性告知(此前只在 500ms 节流分支里取,且取的是作业线程的)
+            let fallback_seen = std::sync::atomic::AtomicBool::new(false);
 
             // rayon 并行(物理核-1);每项 catch_unwind 隔离(计划 C2/W7)
             let workers = std::thread::available_parallelism()
@@ -166,6 +169,9 @@ pub fn start_analysis<R: tauri::Runtime>(
                             ffmpeg_bin.as_ref(),
                         )
                     }));
+                    if crate::core::fsx::take_unsafe_fallback_flag() {
+                        fallback_seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     match outcome {
                         Ok(AnalyzeOne::Cached) => {
                             cached.fetch_add(1, Ordering::Relaxed);
@@ -209,7 +215,6 @@ pub fn start_analysis<R: tauri::Runtime>(
                         let _ = body_app.emit(JOB_EVENT, &h.snapshot());
                         // 分析写缩略图 / 缓存也走 rename_no_replace:降级标记要在这条路上
                         // 消费,否则会被并发的拷卡收尾取走、归错任务(codex 终审)
-                        super::sorting_cmds::notify_if_unsafe_fallback(&body_app);
                     }
                 });
             });
@@ -252,7 +257,13 @@ pub fn start_analysis<R: tauri::Runtime>(
                 cache_skipped_lines: skipped,
             };
             if !result.failed.is_empty() {
-                super::sorting_cmds::notify_if_unsafe_fallback(&body_app);
+                if fallback_seen.load(std::sync::atomic::Ordering::Relaxed) {
+                    notify::warn(
+                        &body_app,
+                        "fsx-fallback-window",
+                        "分析写缩略图时文件系统不支持原子防覆盖改名与硬链接,已降级为「发布锁 + 复查后改名」;建议确认 NAS 协议(SMB3/NFSv4)".into(),
+                    );
+                }
                 notify::warn(
                     &body_app,
                     "analysis-partial",

@@ -1290,7 +1290,9 @@ pub fn sweep_stale_parts(
                     ) {
                         (Ok(t), Some(now)) => now
                             .duration_since(t)
-                            .is_ok_and(|age| age > std::time::Duration::from_secs(120)),
+                            // 30 分钟(不是接管锁的两分钟):发布锁**不**在热路径回收,残留只由
+                            // 这里收;一个 rename 卡住半小时才迟到完成不是现实场景,两分钟是
+                            .is_ok_and(|age| age > std::time::Duration::from_secs(30 * 60)),
                         _ => false,
                     };
                     if age_ok && still_mine() {
@@ -1930,7 +1932,13 @@ fn copy_one(
         // 源在拷贝期间变了(相机 / 别的程序还在写这张卡):流式哈希只证明「目标 = 本次读到的
         // 字节」,不证明源读取期间稳定——一半旧一半新的目标也能通过回读校验并标成 verified
         // (codex 终审)。读到的字节数与开拷前的大小、以及开拷前后的大小 / mtime 都要对得上
-        if let Some(before) = &src_meta {
+        // 开拷前的 metadata 取不到 → 无法证明源稳定 → fail-closed(此前跳过检查)
+        let Some(before) = &src_meta else {
+            return Err(super::CoreError::Invalid(format!(
+                "开拷前读不到源文件的元数据,无法确认它在拷贝期间没有被改写,这份拷贝不落位: {source_rel}。请重试;持续出现请检查卡的读取"
+            )));
+        };
+        {
             if total_read != before.len() {
                 return Err(super::CoreError::Invalid(format!(
                     "源文件在拷贝期间大小变了({} → 读到 {total_read} 字节),这份拷贝不可信,不落位: {source_rel}。请确认卡上没有程序还在写,再重试",
@@ -1938,7 +1946,13 @@ fn copy_one(
                 )));
             }
             let after = fs::metadata(&src_path)?;
-            if after.len() != before.len() || after.modified().ok() != before.modified().ok() {
+            // mtime 两边都要**读得到**才算一致:None == None 不是「没变」,是「不知道」
+            let (Ok(m0), Ok(m1)) = (before.modified(), after.modified()) else {
+                return Err(super::CoreError::Invalid(format!(
+                    "读不到源文件的修改时间,无法确认它在拷贝期间没有被改写,这份拷贝不落位: {source_rel}"
+                )));
+            };
+            if after.len() != before.len() || m0 != m1 {
                 return Err(super::CoreError::Invalid(format!(
                     "源文件在拷贝期间被修改(大小或修改时间变了),这份拷贝不可信,不落位: {source_rel}。请确认卡上没有程序还在写,再重试"
                 )));

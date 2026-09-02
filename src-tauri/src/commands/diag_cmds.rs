@@ -40,7 +40,8 @@ pub async fn export_diagnostics<R: tauri::Runtime>(
             .await
             .map_err(|e| format!("生成诊断报告的线程异常终止: {e}"))?
     };
-    let stamp = Local::now().format("%Y%m%d-%H%M%S");
+    // 毫秒 + create_new:toast 与面板各有一个导出按钮,同一秒内两次导出不许互相覆盖
+    let stamp = Local::now().format("%Y%m%d-%H%M%S-%3f");
     let name = format!("OCard-诊断报告-{stamp}.txt");
 
     // 候选落点按优先级**逐个真的写**:「下载」能解析出来但不可写(企业机的
@@ -111,13 +112,18 @@ fn write_report_to(dir: &Path, name: &str, report: &str) -> Result<PathBuf, Stri
         )
     })?;
     let path = dir.join(name);
-    std::fs::write(&path, report.as_bytes()).map_err(|e| {
-        format!(
-            "写入诊断报告失败: {} —— {}",
-            path.display(),
-            crate::core::error::explain_io(&e)
-        )
-    })?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, report.as_bytes()))
+        .map_err(|e| {
+            format!(
+                "写入诊断报告失败: {} —— {}",
+                path.display(),
+                crate::core::error::explain_io(&e)
+            )
+        })?;
     Ok(path)
 }
 

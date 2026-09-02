@@ -84,9 +84,18 @@ impl Drop for DeliveryGuard {
 /// fsx 最后回退(检查+改名)被使用过:发一次性告警(零静默,复验轮二 P1)。
 /// 同点位顺带消费时间戳保留失败计数(拷贝路径共用的收尾钩子)。
 pub(crate) fn notify_if_unsafe_fallback<R: tauri::Runtime>(app: &AppHandle<R>) {
+    notify_if_unsafe_fallback_for(app, None);
+}
+
+/// 同上,带任务 scope(拷卡 worker):标记是线程局部的,取走的一定是本线程(本任务)的。
+pub(crate) fn notify_if_unsafe_fallback_for<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    task: Option<(&str, &str)>,
+) {
     if crate::core::fsx::take_unsafe_fallback_flag() {
-        notify::warn(
+        notify::warn_scoped(
             app,
+            task,
             "fsx-fallback-window",
             "当前文件系统不支持原子防覆盖改名与硬链接,零覆盖保障退化为「发布锁 + 复查后改名」:两个任务同时往同一路径写由发布锁串行,残余边界是崩溃残留锁的两分钟回收;建议确认 NAS 协议(SMB3/NFSv4)".into(),
         );

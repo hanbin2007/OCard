@@ -110,7 +110,6 @@ const LEGACY_FALLBACK = new Set([
   "disk-space-insufficient",
   "face-detect-degraded",
   "ffmpeg-missing",
-  "fsx-fallback-window",
   "hwenc-fallback",
   "hwenc-probe-failed",
   "hwenc-runtime-fallback",

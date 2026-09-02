@@ -9,25 +9,30 @@
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-/// 「最后回退(复查+rename)被真实使用」标记。该回退只在文件系统既不支持
-/// 平台原子原语也不支持硬链接时触发,存在检查-改名窗口(NAS 上可达网络往返
-/// 量级)。零静默原则:上层取走标记后必须给用户一次可见警告。
-static UNSAFE_FALLBACK_USED: AtomicBool = AtomicBool::new(false);
-
-/// 取走「最后回退被使用」标记(swap 语义,取走即清零)。
-pub fn take_unsafe_fallback_flag() -> bool {
-    UNSAFE_FALLBACK_USED.swap(false, Ordering::Relaxed)
+thread_local! {
+    /// 「最后回退(发布锁 + 复查 + rename)被真实使用」标记。**线程局部**:拷卡 worker、
+    /// 分类 / 交付命令、转码作业各在自己的线程上做改名、也在同一线程的收尾取走标记——
+    /// 进程级的一个标记会被并发的别的任务先取走、归错任务(codex 终审)。
+    /// 用了线程池的调用方(分析)要在池线程上取,再汇总到作业。
+    static UNSAFE_FALLBACK_USED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 落位成功但源(临时名)没删掉的次数:目标已经发布,这不是失败,但留下的临时文件
+    /// 是可见的降级,上层要说(启动清扫 / 下一轮 part 清扫会收走)。
+    static LEFTOVER_SOURCES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// 落位成功但源(临时名)没删掉的次数:目标已经发布,这不是失败,但留下的临时文件
-/// 是可见的降级,上层要说(启动清扫 / 下一轮 part 清扫会收走)。
-static LEFTOVER_SOURCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// 取走**本线程**的「最后回退被使用」标记(取走即清零)。
+pub fn take_unsafe_fallback_flag() -> bool {
+    UNSAFE_FALLBACK_USED.with(|c| c.replace(false))
+}
 
-/// 取走并清零「落位后源没删掉」的计数(给上层告警用)。
+fn mark_unsafe_fallback() {
+    UNSAFE_FALLBACK_USED.with(|c| c.set(true));
+}
+
+/// 取走并清零**本线程**的「落位后源没删掉」计数(给上层告警用)。
 pub fn take_leftover_sources() -> usize {
-    LEFTOVER_SOURCES.swap(0, Ordering::Relaxed)
+    LEFTOVER_SOURCES.with(|c| c.replace(0))
 }
 
 /// 原语级(renamex_np / renameat2 / MoveFileExW)的「不支持」:只有这种才允许退到硬链接。
@@ -200,7 +205,7 @@ fn rename_no_replace_with(
         Err(e) if !native_unsupported(&e) => Err(e),
         // 目标目录根本不支持硬链接(探针说的,不是猜的):直接走发布锁 + 复查 + rename 并置可见标记
         Err(_) if !dir_has_hard_links(dst.parent().unwrap_or(Path::new("."))) => {
-            UNSAFE_FALLBACK_USED.store(true, Ordering::Relaxed);
+            mark_unsafe_fallback();
             checked_rename_under_publish_lock(src, dst)
         }
         // 平台原语不可用(旧内核/异构文件系统):hard_link 仍是原子防覆盖
@@ -214,7 +219,7 @@ fn rename_no_replace_with(
                             "落位成功但临时名没删掉 {}: {ce}(目标已发布;临时文件留给清扫)",
                             src.display()
                         );
-                        LEFTOVER_SOURCES.fetch_add(1, Ordering::Relaxed);
+                        LEFTOVER_SOURCES.with(|c| c.set(c.get() + 1));
                     }
                 }
                 Ok(())
@@ -225,7 +230,7 @@ fn rename_no_replace_with(
             Err(le) if !link_unsupported(&le) => Err(le),
             Err(_) => {
                 // 最后回退:发布锁 + 复查 + rename——置标记让上层告警
-                UNSAFE_FALLBACK_USED.store(true, Ordering::Relaxed);
+                mark_unsafe_fallback();
                 checked_rename_under_publish_lock(src, dst)
             }
         },
@@ -240,55 +245,18 @@ fn rename_no_replace_with(
 /// 崩溃残留的锁按年龄(两分钟)回收。
 fn checked_rename_under_publish_lock(src: &Path, dst: &Path) -> io::Result<()> {
     let lock = publish_lock_path(dst);
-    let dir = dst.parent().unwrap_or(Path::new("."));
-    let mut claimed_stale = false;
-    loop {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-        {
-            Ok(f) => {
-                drop(f);
-                break;
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && !claimed_stale => {
-                // 陈旧(崩溃残留)才回收。年龄用**存放它的那块盘**的时钟量(与 lease 模块同一把
-                // 尺子):本机比 NAS 快两分钟以上时,按本机时钟每一把刚建的锁都「陈旧」,锁会
-                // 无声失效;探针写不进就不下结论、不回收(fail-closed)
-                let stale = match (
-                    fs::metadata(&lock).and_then(|m| m.modified()),
-                    super::lease::nas_now(dir),
-                ) {
-                    (Ok(t), Some(now)) => now
-                        .duration_since(t)
-                        .is_ok_and(|age| age > std::time::Duration::from_secs(120)),
-                    _ => false,
-                };
-                if !stale {
-                    return Err(publish_lock_busy(e));
-                }
-                // 回收要先**认领**:两个回收者同时 remove + create_new 会都成功(第二个删掉的是
-                // 第一个刚建的锁)。rename 到带 nonce 的名字只会有一个赢家;输家 NotFound → 重来
-                let claim = lock.with_file_name(format!(
-                    ".{}.reclaim.{}{TMP_SUFFIX}",
-                    lock.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    &uuid::Uuid::new_v4().simple().to_string()[..8]
-                ));
-                match fs::rename(&lock, &claim) {
-                    Ok(()) => {
-                        let _ = fs::remove_file(&claim);
-                    }
-                    Err(re) if re.kind() == io::ErrorKind::NotFound => {}
-                    Err(re) => return Err(publish_lock_busy(re)),
-                }
-                claimed_stale = true; // 只回收一次;再撞上就是别人刚建的新鲜锁
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(publish_lock_busy(e)),
-            Err(e) => return Err(e),
-        }
+    // 锁在就是在:**不在热路径上回收**。按年龄回收有 ABA(两个回收者 / 时钟快的机器偷走
+    // 新鲜锁 / 原持有者的 rename 卡住两分钟后迟到完成),任何一种都能让两份清单都报成功而
+    // 盘上只剩一份(codex 终审)。撞锁按占用重试几轮,仍在就可见失败并点名锁文件;崩溃残留
+    // 由开拷前的清扫按 30 分钟(NAS 时钟)收走——卡住半小时的 rename 不是现实场景
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+    {
+        Ok(f) => drop(f),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(publish_lock_busy(e)),
+        Err(e) => return Err(e),
     }
     let r = if dst.exists() {
         Err(io::Error::from(io::ErrorKind::AlreadyExists))
@@ -536,6 +504,20 @@ mod tests {
         );
     }
 
+    /// 降级标记是线程局部的:别的线程(别的任务)的回退不会被本线程取走、归错任务。
+    #[test]
+    fn the_fallback_flag_is_per_thread() {
+        let _serial = flag_lock();
+        let _ = take_unsafe_fallback_flag();
+        std::thread::spawn(|| {
+            mark_unsafe_fallback();
+            assert!(take_unsafe_fallback_flag(), "自己线程上置的标记自己取得到");
+        })
+        .join()
+        .unwrap();
+        assert!(!take_unsafe_fallback_flag(), "别的线程的标记不许漏到本线程");
+    }
+
     /// 最后一级回退在目标路径上先拿发布锁:别的发布者持着锁时不许复查+rename(那正是
     /// 两个任务互相覆盖的窗口),按占用上抛;锁陈旧(崩溃残留)则回收后继续。
     #[test]
@@ -561,14 +543,28 @@ mod tests {
         );
         assert!(!dst.exists() && src.exists(), "锁被占时什么都不许动");
         assert!(lock.exists(), "别人的锁不许删");
-        // 陈旧的锁(崩溃残留):回收后继续,发布完锁要清掉
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(200);
+        // 陈旧的锁(崩溃残留)也**不在这里回收**(年龄回收有 ABA):照样按占用上抛
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
         std::fs::File::options()
             .write(true)
             .open(&lock)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(old))
             .unwrap();
+        let r = rename_no_replace_with(
+            &src,
+            &dst,
+            |_, _| Err(unsupported()),
+            |_, _| Err(unsupported()),
+            |_| false,
+        );
+        assert!(
+            matches!(&r, Err(e) if e.kind() == io::ErrorKind::PermissionDenied),
+            "陈旧锁也不在热路径回收: {r:?}"
+        );
+        assert!(lock.exists() && !dst.exists());
+        // 锁没了才发布,发布完自己的锁要清掉
+        std::fs::remove_file(&lock).unwrap();
         rename_no_replace_with(
             &src,
             &dst,

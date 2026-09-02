@@ -264,7 +264,13 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
             crate::core::catalog::invalidate_cache(nas);
         }
         // 拷贝路径也消费 fsx 回退标记(终审:告警不能只挂在分类命令上)
-        super::sorting_cmds::notify_if_unsafe_fallback(&app);
+        // 降级标记是线程局部的:拷卡 worker 在这条线程上落位,也在这里取走,并带任务 scope
+        {
+            let s = handle.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+            let (tid, pid) = (s.id.clone(), s.project_id.clone());
+            drop(s);
+            super::sorting_cmds::notify_if_unsafe_fallback_for(&app, Some((&tid, &pid)));
+        }
         // 拷完自动转代理(M3 T1.5):任务 done 且 manifest 带意图 → 派发作业
         let done_task = {
             let s = handle.snapshot.lock().unwrap_or_else(|p| p.into_inner());
@@ -1174,9 +1180,12 @@ fn run_worker_locked<R: tauri::Runtime>(
     // 全过了,卡上其余内容一个字节都没拷。UI 那句「本卡可格式化」在这种任务上
     // 是错的,会直接导致用户格式化掉没备份的素材——后端必须自己喊一嗓子。
     if !outcome.paused && outcome.all_verified && !m.source_selection.is_empty() {
-        super::notify::warn(
+        // 带任务 scope:两张部分拷卡在 30 秒内完成时,无 scope 的同 code 会让后一张顶掉前一张
+        // 「其余内容没有备份、请勿格式化」的正文——这条直接关联素材丢失(codex 终审)
+        super::notify::warn_for_task(
             app,
             "copy-partial-scope-done",
+            (&task_for_notices.0, &task_for_notices.1),
             format!(
                 "任务「{target_folder}」只拷贝了所选的 {} 个文件夹({}),卡上其余内容**没有**备份——请勿据此格式化这张卡",
                 m.source_selection.len(),
