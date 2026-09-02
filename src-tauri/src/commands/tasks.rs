@@ -317,7 +317,12 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
                     "copy-task-aborted"
                 },
                 (&task_id, &proj_id),
-                if paused {
+                if paused && e.to_string().starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) {
+                    // 锁目录不清理的话点「继续」也没用——最响最持久的这条不能给错指令
+                    format!(
+                        "拷卡任务「{folder}」已中断并转入暂停,已拷部分不会丢。这次的原因不会自己好:请先人工清理清单目录里的租约锁目录,再点「继续」。\n原因:{e}\n{DIAG_HINT}"
+                    )
+                } else if paused {
                     format!(
                         "拷卡任务「{folder}」已中断并转入暂停,已拷部分不会丢,排除原因后点「继续」即可从断点接着拷。\n原因:{e}\n{DIAG_HINT}"
                     )
@@ -554,7 +559,7 @@ fn run_worker<R: tauri::Runtime>(
             if e.to_string()
                 .starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX)
             {
-                super::notify::warn_for_task(
+                super::notify::error_for_task(
                     app,
                     "copy-resume-lease-lock-broken",
                     (&id, &pid),
@@ -567,7 +572,7 @@ fn run_worker<R: tauri::Runtime>(
     let mut keeper = LeaseKeeper::new(
         app.clone(),
         lease,
-        "任务准备中断",
+        "任务异常中断",
         (id.clone(), pid.clone()),
     );
     if let Some(note) = keeper.lease_mut().took_over_stale.take() {
@@ -576,18 +581,19 @@ fn run_worker<R: tauri::Runtime>(
         super::notify::warn_for_task(app, "task-lease-taken-over", (&id, &pid), note);
     }
     let mut m = manifest::load(&handle.project_root, &handle.manifest_id)?;
-    let lease = keeper.into_lease();
 
-    // 租约实现了 Drop:下面任何路径(含 panic)都会释放。显式 release 只是
-    // 把意图写明,并顺手自查一次——删不掉时别人要白等 TTL,用户有权知道
-    let outcome = run_worker_locked(app, handle, &mut m, &lease);
+    // 守卫一直跟到 worker 结束:panic 展开、precheck 拒绝这类路径的释放判定由 Drop
+    // 说出来(此前只覆盖起跑阶段,worker 里的 panic 走裸 Held::drop,「没删掉 / 被接管」
+    // 只进日志)。正常结束走下面的显式 release,口径与「是否真的暂停」按结果定
+    let outcome = run_worker_locked(app, handle, &mut m, keeper.lease());
+    let lease = keeper.into_lease();
     if let Err(e) = &outcome {
         // 运行中(落盘时)才发现锁目录异常:除了「已中断、可续传」那条,还要一条抬头就说
         // 「需人工清理」的,否则用户会白点一次「继续」才拿到这句话
         if e.to_string()
             .starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX)
         {
-            super::notify::warn_for_task(
+            super::notify::error_for_task(
                 app,
                 "copy-resume-lease-lock-broken",
                 (&id, &pid),
@@ -596,12 +602,15 @@ fn run_worker<R: tauri::Runtime>(
         }
     }
     let lease_file = lease.path().to_path_buf();
+    // 「已暂停」只在结果确实是可续传的中断时才成立;跑完 / 真失败之后才在释放时发现被接管,
+    // 抬头不能说「已暂停」
+    let task_paused = outcome.as_ref().err().is_some_and(|e| e.is_resumable());
     report_lease_release(
         app,
         lease.release(),
         &lease_file,
         "任务结束",
-        true,
+        task_paused,
         Some((&id, &pid)),
     );
     outcome
@@ -736,12 +745,18 @@ pub(crate) fn report_lease_release<R: tauri::Runtime>(
         crate::core::lease::Released::NoLock(why)
             if why.starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) =>
         {
-            // 锁目录异常不会自己好:抬头要说「需人工清理」
-            super::notify::warn_scoped(
+            // 锁目录异常不会自己好:抬头要说「需人工清理」,而且是 error 级(不自动收起);
+            // 后果那半句不能丢:租约留下了,别的机器要等 TTL、本机本次运行期间续不了,
+            // 而锁目录不清理的话谁的接管都会被挡
+            super::notify::error_scoped(
                 app,
                 task,
                 "copy-resume-lease-lock-broken",
-                format!("{what}时{why};租约文件没有删除:{}", lease_file.display()),
+                format!(
+                    "{what}时{why};租约文件没有删除:{}。别的机器在 {} 分钟内、本机在本次运行期间续这个任务都会被它挡住;而且锁目录不清理的话,谁来接管都会被挡——请先人工清理锁目录,再重启 OCard(或确认没有别的 OCard 在跑后删除该租约文件)",
+                    lease_file.display(),
+                    crate::core::lease::LEASE_TTL.num_minutes()
+                ),
             );
         }
         crate::core::lease::Released::Unverified(why)
@@ -768,10 +783,14 @@ fn run_worker_locked<R: tauri::Runtime>(
     m: &mut manifest::CopyManifest,
     lease: &crate::core::lease::Held,
 ) -> crate::core::Result<()> {
+    let task_prefix: String = handle.manifest_id.chars().take(8).collect();
+    let run_tag = lease.run_tag();
     let req = copy::CopyRequest {
         source_root: handle.source_root_guard().clone(),
         destinations: handle.dest_targets.clone(),
-        task_tag: handle.manifest_id.chars().take(8).collect(),
+        // 带本次持有的 run 标签:休眠后恢复的旧持有者永远碰不到本轮的 part(见
+        // core::lease 模块头);上一轮的残留由下面的清扫按清单 id 前缀认领
+        task_tag: format!("{task_prefix}-{run_tag}"),
         // 口径取自 manifest(持久化的开拷选择):重启重建的任务也用同一把尺子
         selection: copy::SourceSelection::from_folders(m.source_selection.clone()),
     };
@@ -844,6 +863,34 @@ fn run_worker_locked<R: tauri::Runtime>(
             .fence()
             .map(|f| Box::new(f) as Box<dyn copy::SaveFenceGuard>)
     };
+    // 持有租约的一方清掉上一轮(别的 run 标签)留下的 .ocardpart。系统替用户删了东西,
+    // 要说;没删成的也要说——那些残留会让本轮的落位撞上「目标名被占」
+    let swept = copy::sweep_stale_parts(&handle.dest_targets, &plan, &task_prefix, &run_tag);
+    if !swept.removed.is_empty() {
+        super::notify::info_for_task(
+            app,
+            "copy-stale-parts-swept",
+            (&task_for_notices.0, &task_for_notices.1),
+            format!(
+                "清理了上次运行留下的 {} 个临时文件(.ocardpart),例如 {}。这些是上次中断时没写完的半个文件,本次会重新拷",
+                swept.removed.len(),
+                swept.removed[0].display()
+            ),
+        );
+    }
+    if !swept.failed.is_empty() {
+        super::notify::warn_for_task(
+            app,
+            "copy-stale-parts-sweep-failed",
+            (&task_for_notices.0, &task_for_notices.1),
+            format!(
+                "上次运行留下的 {} 个临时文件(.ocardpart)没能清掉,例如 {}({})。它们不影响本次拷贝,但会一直占着空间;可手动删除",
+                swept.failed.len(),
+                swept.failed[0].0.display(),
+                swept.failed[0].1
+            ),
+        );
+    }
     let outcome = copy::run_copy(&req, &plan, m, &handle.project_root, Some(&fence), |p| {
         let mut changed: Vec<CopyFileItemDto> = Vec::new();
         let mut force_emit = false;
@@ -907,20 +954,24 @@ fn run_worker_locked<R: tauri::Runtime>(
         for (kind, path, retries) in pending_contention.drain(..) {
             // 两类各用各的 code:共用一个会在 30 秒合并窗口里互相顶掉正文,
             // 更要紧的素材那条可能就此消失
-            let (code, what) = match kind {
-                copy::ContentionKind::Manifest => ("fs-write-contention", "写入拷卡清单"),
-                copy::ContentionKind::Material => {
-                    ("material-rename-contention", "素材文件落位改名")
-                }
+            let what = match kind {
+                copy::ContentionKind::Manifest => "写入拷卡清单",
+                copy::ContentionKind::Material => "素材文件落位改名",
             };
-            super::notify::warn_for_task(
-                app,
-                code,
-                (&task_for_notices.0, &task_for_notices.1),
-                format!(
-                    "{what}时被别的程序占着,重试 {retries} 轮后成功:{path}。多半是杀毒软件或 NAS 索引正在扫这个文件所在的目录;若反复出现,把该目录加入杀毒软件排除项,否则下次可能直接中断任务"
-                ),
+            let msg = format!(
+                "{what}时被别的程序占着,重试 {retries} 轮后成功:{path}。多半是杀毒软件或 NAS 索引正在扫这个文件所在的目录;若反复出现,把该目录加入杀毒软件排除项,否则下次可能直接中断任务"
             );
+            // code 直接写字面量,不经变量:通知 code 门禁(NoticeCodes.contract)只认
+            // 调用点里的字面量
+            let task = (task_for_notices.0.as_str(), task_for_notices.1.as_str());
+            match kind {
+                copy::ContentionKind::Manifest => {
+                    super::notify::warn_for_task(app, "fs-write-contention", task, msg)
+                }
+                copy::ContentionKind::Material => {
+                    super::notify::warn_for_task(app, "material-rename-contention", task, msg)
+                }
+            }
         }
         // 租约状态轮询(心跳由独立线程推进,这里只看结论)。两种情况都要**立刻**停,
         // 而且不再写清单(CopyControl::Abort):Lost = 别人已合法接管,再写就是把人家
@@ -948,7 +999,7 @@ fn run_worker_locked<R: tauri::Runtime>(
                 if !lease_stop_reported {
                     lease_stop_reported = true;
                     if why.starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) {
-                        super::notify::warn_for_task(
+                        super::notify::error_for_task(
                             app,
                             "copy-resume-lease-lock-broken",
                             (&task_for_notices.0, &task_for_notices.1),

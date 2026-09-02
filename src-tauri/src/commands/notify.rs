@@ -162,9 +162,10 @@ pub fn info_for_task<R: tauri::Runtime>(
     );
 }
 
-/// 有任务身份就按任务分桶(同 code 30 秒内合并会互相覆盖正文),没有——或 project id
-/// 为空(启动补投递那一路只有清单 id)——就退回不带 scope 的 warn:空的 project id 会让
-/// 前端渲染出一个点下去落到空拷卡屏的「查看任务」按钮。
+/// 有任务身份就按任务分桶(同 code 30 秒内合并会互相覆盖正文),没有就不带 scope。
+/// **只看 task id**:project id 为空(启动补投递那一路只有清单 id)也照样分桶——退回
+/// 无 scope 会让多份清单的租约告警折成一条、只剩最后一份的路径(opus r12)。空的
+/// project id 会不会渲染出死的「查看任务」按钮,由前端按两个 id 都在才显示来挡。
 pub fn warn_scoped<R: tauri::Runtime>(
     app: &AppHandle<R>,
     task: Option<(&str, &str)>,
@@ -172,10 +173,25 @@ pub fn warn_scoped<R: tauri::Runtime>(
     message: String,
 ) {
     match task {
-        Some((task_id, project_id)) if !task_id.is_empty() && !project_id.is_empty() => {
+        Some((task_id, project_id)) if !task_id.is_empty() => {
             warn_for_task(app, code, (task_id, project_id), message)
         }
         _ => warn(app, code, message),
+    }
+}
+
+/// [`warn_scoped`] 的 error 级:锁目录异常这类「不会自己好、必须逐条确认」的事用它。
+pub fn error_scoped<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    task: Option<(&str, &str)>,
+    code: &str,
+    message: String,
+) {
+    match task {
+        Some((task_id, project_id)) if !task_id.is_empty() => {
+            error_for_task(app, code, (task_id, project_id), message)
+        }
+        _ => error(app, code, message),
     }
 }
 

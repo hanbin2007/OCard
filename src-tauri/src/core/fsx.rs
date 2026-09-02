@@ -186,6 +186,46 @@ mod tests {
         assert_eq!(leftovers, 0, "临时文件没清掉");
     }
 
+    /// 契约:每一次**实际改名尝试**之前都要再问守门人。第一次改名撞上占用进入重试、
+    /// 第二次问时锁已经没了 → 不许发布,并且把已经为占用重试过的那一轮报出来。
+    /// 把实现退化成「入口问一次、之后不再问」,这条必红。
+    #[test]
+    fn a_guard_that_says_no_on_the_retry_still_blocks_publish_and_keeps_the_retry_count() {
+        let t = tempfile::tempdir().unwrap();
+        let target = t.path().join("m.json");
+        // 守门人看事实:第一次问时锁还在,之后没了
+        let lock = t.path().join("lock");
+        std::fs::write(&lock, b"").unwrap();
+        let asked = std::cell::Cell::new(0u32);
+        let guard = || {
+            asked.set(asked.get() + 1);
+            let ok = lock.exists();
+            let _ = std::fs::remove_file(&lock); // 第一次问完锁就没了
+            ok
+        };
+        let mut renames = 0u32;
+        let r = write_atomic_guarded_with(&target, b"{}", &guard, |from, to| {
+            renames += 1;
+            if renames == 1 {
+                // 第一次:目标被占(杀软扫描),走占用重试
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            fs::rename(from, to)
+        });
+        assert!(
+            matches!(r, Err(GuardedWrite::Refused { retries: 1 })),
+            "第二次问守门人已说不,且要报出此前那一轮占用重试: {r:?}"
+        );
+        assert_eq!(asked.get(), 2, "每次实际改名之前都要问一次");
+        assert_eq!(renames, 1, "守门人说不之后不许再试改名");
+        assert!(!target.exists(), "说不之后仍发布了");
+        assert_eq!(
+            std::fs::read_dir(t.path()).unwrap().count(),
+            0,
+            "临时文件没清掉"
+        );
+    }
+
     /// 守门人放行:与普通 write_atomic 一样落盘。
     #[test]
     fn a_guarded_write_allowed_publishes_like_write_atomic() {
@@ -516,6 +556,17 @@ pub fn write_atomic_guarded(
     bytes: &[u8],
     before_publish: &dyn Fn() -> bool,
 ) -> Result<WriteReport, GuardedWrite> {
+    write_atomic_guarded_with(path, bytes, before_publish, |from, to| fs::rename(from, to))
+}
+
+/// [`write_atomic_guarded`] 的本体,`rename` 可注入——好直接考「第一次改名撞上占用
+/// 重试、第二次问守门人时它已经说不」这条契约。
+fn write_atomic_guarded_with(
+    path: &Path,
+    bytes: &[u8],
+    before_publish: &dyn Fn() -> bool,
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<WriteReport, GuardedWrite> {
     let refused = std::cell::Cell::new(false);
     let attempts = std::cell::Cell::new(0u32);
     let r = write_atomic_with(path, bytes, |from, to| {
@@ -524,7 +575,7 @@ pub fn write_atomic_guarded(
             refused.set(true);
             return Err(io::Error::other("write fence refused"));
         }
-        fs::rename(from, to)
+        rename(from, to)
     });
     match r {
         Ok(w) => Ok(w),

@@ -832,6 +832,9 @@ describe("拷卡中断的提示", () => {
         message: "拷卡任务「0831上午」已中断并转入暂停\n原因:写入拷卡清单失败",
         occurredAt: new Date().toISOString(),
         taskId: "task-1",
+        // 两个 id 都要在才有「查看任务」:后端按任务分桶时 project id 可能为空(启动
+        // 补投递那一路),那种通知跳过去会落到一个空的拷卡屏
+        projectId: "proj-1",
       });
     });
     const toast = await screen.findByTestId("notice-toast-error");

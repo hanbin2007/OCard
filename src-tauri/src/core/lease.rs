@@ -67,21 +67,30 @@
 //!   (见 `fsx`,有可见告警),那种盘上的独占是尽力而为。
 //! - 接管锁靠 mtime 年龄回收(两分钟):没有存储端的原子 CAS,这是唯一能收回崩溃
 //!   残留的办法,代价是**整机休眠 / 卡在一次 NAS 读写里超过两分钟**的持有者会被当成
-//!   残留。后果有界且可见:它的心跳在下一拍读到别人的 token 就报 Lost 并停下;它在
-//!   栅栏内的那一次落盘若恰好在休眠后完成,会盖掉接管者刚写的清单(改名之前还会再问
-//!   一次栅栏,写临时文件那段长窗口能拦住,卡在改名系统调用里的拦不住)。后果:接管者
-//!   还在跑就在它下一次落盘时修复;接管者已经跑完并释放了,盘上那份就退回旧进度——
-//!   审计日志是追加写的、不受影响,下一次续传按哈希重新确认即恢复,期间「本卡可格式化」
-//!   不会显示。不丢数据,但要重算一遍哈希。释放路径放手后才写完的一拍心跳会自己撤回
-//!   (见 `heartbeat_loop`;撤回删文件与接管者刚写入之间有微秒级窗口,删掉的话接管者
-//!   的心跳下一拍按「文件没了」重建)。真正的 fencing token 需要清单写入端做 CAS,
-//!   SMB/NFS 上没有这种原语,这里如实声明。
-//! - `.ocardpart` 临时名按任务(清单 id)共享,不按持有者区分——否则上一次运行的崩溃
-//!   残留没人认得、没人清。接管方与一个休眠后恢复的旧持有者若碰到同一个 part,结果是
-//!   一方那个文件**可见地**失败、续传按哈希修复;目标已存在且内容不同会被拒绝,不会
-//!   静默产出坏文件。引擎在四处查租约:清理同名残留前、建 part 前(源哈希与逐目的地
-//!   哈希那几分钟之后)、回读校验前、落位前;建 part 前那次在失败清理之外,中止时不会
-//!   去删可能属于接管者的同名 part。窗口压到真正卡在系统调用里的那一小段。
+//!   残留。后果有界且可见,但要分三种迟到的写入说清楚:
+//!   * **迟到的心跳改名**(卡在 rename 系统调用里超过 TTL 才完成):会把接管者的租约
+//!     整份盖回旧持有者的。旧持有者自己早已因 15 分钟没有成功心跳而停下(AtRisk),
+//!     不再写清单;接管者在下一拍心跳 / 下一次落盘的栅栏核对时读到旧 token → 报 Lost
+//!     并**可见地**转暂停;盖回去的那份租约心跳时间戳是 30 分钟前的,再点「继续」就能
+//!     立刻接管。代价是接管者白停一次,不丢数据。「下一拍看见新 token 就停」对这一种
+//!     迟到不成立,这里如实写明。
+//!   * **迟到的清单改名**(改名之前那一问栅栏已经过了,卡在 rename 里):会盖掉接管者
+//!     刚写的清单。接管者还在跑就在它下一次落盘时修复;接管者已经跑完并释放了,盘上那份
+//!     就退回旧进度——审计日志是追加写的、不受影响。若退回的那份带 `completed=true`
+//!     而接管者本已把新增文件加进计划并写成 `completed=false`,后果不止「重算一遍哈希」:
+//!     启动时任务重建会把它当已完成而不展示,启动补投的自动转代理也会按这份旧清单派发
+//!     ——**未完成的工作可能被藏起来、后续阶段可能被提前触发**。旧持有者在写完复核时
+//!     会发现栅栏已丢并发出「这次落盘不可信,请核对另一处」的通知,这是唯一的线索。
+//!   * **释放路径放手后才写完的一拍心跳**会自己撤回(见 `heartbeat_loop`;撤回删文件
+//!     与接管者刚写入之间有微秒级窗口,删掉的话接管者的心跳下一拍按「文件没了」重建)。
+//!
+//!   真正的 fencing token 需要清单写入端做 CAS,SMB/NFS 上没有这种原语,这里如实声明。
+//! - `.ocardpart` 临时名带**本次持有的 run 标签**(`<清单 id 前 8 位>-<token 前 8 位>`):
+//!   一个休眠后恢复的旧持有者永远碰不到接管者的 part(名字不同),它删、改名、清理的
+//!   只会是自己那一轮的路径。代价是上一轮的崩溃残留没人认得——所以持有租约的一方在
+//!   开拷前按清单 id 前缀把别的 run 标签的残留清掉,并把清了什么说出来。引擎另在四处查
+//!   租约:清理同名残留前、建 part 前(源哈希与逐目的地哈希那几分钟之后)、回读校验前、
+//!   落位前;建 part 前那次在失败清理之外。
 //! - 心跳线程与写栅栏在进程内排队,排队是**有界**的(三个心跳周期,不少于 2 秒):
 //!   心跳等不到就跳过这一拍,栅栏等不到就按「没拿到锁」停下任务(可续传)——慢 NAS 上
 //!   一拍心跳超过 30 秒会让任务转暂停,而不是无声挂起。
@@ -344,6 +353,12 @@ const LOCK_DIR_NOT_A_DIR: &str = "不是普通目录(是符号链接 / junction 
 /// 锁目录里有不是 OCard 写的条目:同上。
 const LOCK_DIR_HAS_FOREIGN_ENTRIES: &str = "里有不认识的条目(不是 OCard 写的标记)";
 
+/// 锁目录形状检查的两种「不合法」:读不出(让路、下次再看)与异物(拒绝、要说)。
+enum ShapeIssue {
+    Unreadable,
+    Foreign(&'static str),
+}
+
 /// 取接管锁的三种结果。`Held` 可以等;`Refused` 等多久都没用,必须说出来。
 enum Take {
     Got(TakeoverLock),
@@ -457,16 +472,36 @@ impl TakeoverLock {
         n == 1 && mine
     }
 
-    /// 锁目录里有没有不是 OCard 写的条目(名字不是 32 位十六进制)。只读、不看年龄:
-    /// 一个刚落下的 `desktop.ini` 也该立刻被说出来,而不是先当「别人正在接管」等两分钟。
+    /// 锁目录里有没有不是 OCard 写的条目。只读、不看年龄:一个刚落下的 `desktop.ini`
+    /// 也该立刻被说出来,而不是先当「别人正在接管」等两分钟。
     fn foreign_shape(dir: &Path) -> Option<&'static str> {
-        let rd = std::fs::read_dir(dir).ok()?;
-        let foreign = rd.flatten().any(|e| {
-            let n = e.file_name();
-            let n = n.to_string_lossy();
-            !(n.len() == 32 && n.bytes().all(|b| b.is_ascii_hexdigit()))
-        });
-        foreign.then_some(LOCK_DIR_HAS_FOREIGN_ENTRIES)
+        match Self::inspect_lock_shape(dir) {
+            Err(ShapeIssue::Foreign(why)) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// 锁目录的形状:**唯一**的判据,预判(`try_take`)与回收(`reclaim`)共用,两边不会
+    /// 一个放行一个拒绝。合法条目 = 名字是 32 位十六进制、且是**普通文件**(不跟链接):
+    /// 一个 32 位十六进制的子目录或链接,按名字放行、回收时 `remove_file` 失败,结果是
+    /// 真正的 nonce 已被删掉、异物还在、报文却说「别人正在接管」(codex r8)。
+    /// 枚举出错(NAS 抖一下)不算异物,按「读不出」让路,下一次再看。
+    fn inspect_lock_shape(dir: &Path) -> std::result::Result<Vec<PathBuf>, ShapeIssue> {
+        let rd = std::fs::read_dir(dir).map_err(|_| ShapeIssue::Unreadable)?;
+        let mut nonces = Vec::new();
+        for e in rd {
+            let e = e.map_err(|_| ShapeIssue::Unreadable)?;
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            let shaped = name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit());
+            // DirEntry::file_type 不跟链接:链接就是链接,不是文件
+            let kind = e.file_type().map_err(|_| ShapeIssue::Unreadable)?;
+            if !shaped || !kind.is_file() {
+                return Err(ShapeIssue::Foreign(LOCK_DIR_HAS_FOREIGN_ENTRIES));
+            }
+            nonces.push(e.path());
+        }
+        Ok(nonces)
     }
 
     /// mkdir 成功之后写 nonce。写不进去且目录已经不在 = 在 mkdir 与写 nonce 之间被
@@ -513,22 +548,16 @@ impl TakeoverLock {
             Ok(_) => return Err(LOCK_DIR_NOT_A_DIR),
             Err(_) => return Ok(false), // 已经不在了(别人回收完了)或读不到:让路
         }
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return Ok(false);
+        // 只认形状像我们自己写的 nonce(32 位十六进制的普通文件)的条目;别的一律不碰、
+        // 不回收。判据与 try_take 的预判是同一个函数
+        let entries = match Self::inspect_lock_shape(dir) {
+            Ok(entries) => entries,
+            Err(ShapeIssue::Foreign(why)) => {
+                log::warn!("租约接管锁目录里有不认识的条目,不回收: {}", dir.display());
+                return Err(why);
+            }
+            Err(ShapeIssue::Unreadable) => return Ok(false),
         };
-        // 只认形状像我们自己写的 nonce(32 位十六进制)的条目;别的一律不碰、不回收
-        let entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
-        if entries.iter().any(|e| {
-            !e.file_name()
-                .map(|n| {
-                    let n = n.to_string_lossy();
-                    n.len() == 32 && n.bytes().all(|b| b.is_ascii_hexdigit())
-                })
-                .unwrap_or(false)
-        }) {
-            log::warn!("租约接管锁目录里有不认识的条目,不回收: {}", dir.display());
-            return Err(LOCK_DIR_HAS_FOREIGN_ENTRIES);
-        }
         // 破坏性判定**强制写一个新探针**(不吃 5 秒缓存:缓存建立后 NAS 时钟若跳了两分钟
         // 以上,按缓存算刚建的锁会立刻「可回收」),但一次 reclaim 只写这一个——锁目录
         // 与它里面的 nonce 的探针都落在同一个 manifests 目录,答案是同一个
@@ -2153,6 +2182,28 @@ mod tests {
             "{msg}"
         );
         assert!(!msg.contains("另一个进程正在接管"), "{msg}");
+    }
+
+    /// 名字像 nonce 的**子目录 / 链接**也是异物:预判与回收用的是同一套形状判据——
+    /// 此前预判只看名字,回收先删掉真正的 nonce 再对异物 `remove_file` 失败,持有者的
+    /// 锁就这样被无声抹掉。
+    #[test]
+    fn a_hex_named_subdir_inside_the_lock_dir_is_an_alien_not_a_nonce() {
+        let t = tempdir().unwrap();
+        let dir = t.path().join("x.lease.takeover");
+        std::fs::create_dir(&dir).unwrap();
+        let real = dir.join("deadbeefdeadbeefdeadbeefdeadbeef");
+        std::fs::write(&real, b"").unwrap();
+        std::fs::create_dir(dir.join("cafebabecafebabecafebabecafebabe")).unwrap();
+        set_file_mtime(&real, long_ago());
+        set_dir_mtime(&dir, long_ago());
+        assert!(TakeoverLock::reclaim(&dir).is_err(), "异物目录,不回收,要说");
+        assert!(real.exists(), "真正的 nonce 被删了——持有者的锁被无声抹掉");
+        assert_eq!(
+            TakeoverLock::foreign_shape(&dir),
+            Some(LOCK_DIR_HAS_FOREIGN_ENTRIES),
+            "预判与回收要一致"
+        );
     }
 
     /// 老目录里躺着一个**新鲜**的 nonce = 别人刚回收重建、正在持有:不许再回收。

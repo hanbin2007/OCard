@@ -8,6 +8,9 @@ import { NOTICE_TITLES } from "./NotificationCenter";
  * 忘了配的话用户看到的抬头是「降级提示」这种通用回落——CI 照样全绿,直到现场有人问
  * 「这是什么」。这里直接扫 Rust 源码里 notify::warn / error / info(_for_task) 调用
  * 里的 code 字面量。
+ *
+ * code 先赋给变量再传进去的写法扫不到,所以下面同时断言「每个调用点都产出至少
+ * 一个字面量」——这种写法会直接让测试红。
  */
 function rustFiles(dir: string): string[] {
   const out: string[] = [];
@@ -24,6 +27,7 @@ describe("通知 code 与抬头的契约", () => {
     // 整棵 src-tauri/src:lib.rs 里也有 8 处 notify 调用(协议 / 关窗)
     const root = join(__dirname, "..", "..", "src-tauri", "src");
     const codes = new Set<string>();
+    const blind: string[] = [];
     for (const file of rustFiles(root)) {
       const src = readFileSync(file, "utf8");
       // 终止符认 `);` 也认 `),`(match 分支表达式位置的调用以逗号收尾,只认分号会漏掉
@@ -31,19 +35,36 @@ describe("通知 code 与抬头的契约", () => {
       // 之前。不用「调用点后 N 字符」的宽口径——那会把线程名、审计 kind 这类 kebab
       // 字面量也收进来。`warn_scoped` 是带 Option 任务身份的间接层,也要认,否则
       // report_lease_release 里的 lease code 对门禁不可见
-      const re = /notify::(?:warn|error|info)(?:_for_task|_scoped)?\s*\(([\s\S]{0,700}?)\)\s*[;,]/g;
+      // 终止符也认 `)}`:match 分支的尾表达式位置的调用没有分号
+      const re = /notify::(?:warn|error|info)(?:_for_task|_scoped)?\s*\(([\s\S]{0,700}?)\)\s*[;,}]/g;
       let m: RegExpExecArray | null;
       while ((m = re.exec(src))) {
-        for (const lit of m[1].matchAll(/"([a-z][a-z0-9]*(?:-[a-z0-9]+)+)"/g)) codes.add(lit[1]);
+        let found = 0;
+        for (const lit of m[1].matchAll(/"([a-z][a-z0-9]*(?:-[a-z0-9]+)+)"/g)) {
+          codes.add(lit[1]);
+          found++;
+        }
+        // 第四个洞:code 先赋给变量再传进来(`let code = if … { "…" } else { "…" }`),
+        // 字面量在调用点之前,扫不到。每个调用点都必须自己产出至少一个 code 字面量
+        if (found === 0) {
+          const line = src.slice(0, m.index).split("\n").length;
+          blind.push(`${file.slice(file.indexOf("src-tauri"))}:${line}`);
+        }
       }
     }
     expect(codes.size, "扫描应至少找到几十个 code").toBeGreaterThan(60);
+    expect(
+      blind,
+      "这些调用点没有 code 字面量(code 经变量传入),门禁扫不到——请把字面量直接写在调用里",
+    ).toEqual([]);
     // 门禁自身的守卫:这几个此前被漏掉的 code 必须被扫到(扫描根 / 终止符 / 间接层三个洞)
     for (const must of [
       "close-blocked-active-jobs",
       "copy-resume-rescan-failed",
       "task-lease-left-behind",
       "task-lease-lost-outside-run",
+      "copy-resume-lease-held",
+      "material-rename-contention",
     ]) {
       expect(codes.has(must), `扫描器漏掉了 ${must}`).toBe(true);
     }

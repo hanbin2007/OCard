@@ -104,6 +104,9 @@ export const NOTICE_TITLES: Record<string, string> = {
   "preview-protocol-failed": "全尺寸预览读取失败",
   "thumb-protocol-degraded": "缩略图服务读取失败",
   "copy-resume-rescan-failed": "续传前复查源卷失败",
+  "copy-stale-parts-swept": "清理了上次运行留下的临时文件",
+  "copy-stale-parts-sweep-failed": "上次运行的临时文件没清干净",
+  "auto-proxy-state-unverified": "自动转代理状态写回后无法确认",
   "copy-resume-lease-lock-broken": "租约锁目录异常，需人工清理",
   "copy-resume-lease-held": "任务正被别的进程执行，拒绝续传",
   "copy-resume-already-running": "上一次运行还没退出，本次「继续」未生效",
@@ -129,6 +132,7 @@ const DIAGNOSTIC_CODES = new Set([
   "task-lease-left-behind-heartbeat-stuck",
   "task-lease-lost-outside-run",
   "task-lease-left-behind",
+  "copy-stale-parts-sweep-failed",
   "copy-resume-lease-held",
   "copy-resume-lease-lock-broken",
 ]);
@@ -212,8 +216,11 @@ function useCanGoToTask() {
   // 不抛的版本：通知中心是零静默的最后一道出口，不能因为某处渲染它时
   // 没包 Provider 就整个炸掉。拿不到角色 → 不渲染按钮（fail-closed）。
   const role = useWindowRole();
+  // 两个 id 都要在:后端按任务分桶时 project id 可能为空(启动补投递那一路只有清单
+  // id),那种通知跳过去会落到一个空的拷卡屏——scope 归后端,按钮归这里
   return useCallback(
-    (entry: NoticeEntry) => role === "main" && Boolean(entry.taskId),
+    (entry: NoticeEntry) =>
+      role === "main" && Boolean(entry.taskId) && Boolean(entry.projectId),
     [role],
   );
 }

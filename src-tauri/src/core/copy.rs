@@ -1209,7 +1209,65 @@ pub fn file_done(
 /// `project_root` 用于逐文件持久化 manifest(断点续传依据)。
 /// 回调返回 [`CopyControl::Pause`] 时在当前文件完成后停下,manifest 保证可续传。
 /// 落盘前取一次写栅栏(见 `lease::Held::fence`)。`None` = 不设栅栏(测试 / 无租约场景)。
-/// 返回 `Err(Busy)` = 租约已不是自己的,这次**不写**,按 Abort 处理。
+/// 栅栏不给 / 落盘失败都由 `CopyOutcome.abort_reason` 承载(收尾照跑,reports 不丢),
+/// 不再以 `Err` 上抛。
+/// 持有租约的一方在开拷前清掉**别的 run 标签**留下的 `.ocardpart`。
+///
+/// part 名是 `<文件名>.<清单 id 前 8 位>-<run 标签>.ocardpart`:本轮的 run 标签来自
+/// 本次租约的 token,休眠后恢复的旧持有者永远碰不到这一轮的 part。代价就是上一轮的
+/// 崩溃残留没人认得,由此刻唯一合法的写入者按清单 id 前缀认领并清掉。只动普通文件,
+/// 只动计划里那些目录。清了什么、没清成什么,都回给调用方——系统替用户删了东西,要说。
+pub fn sweep_stale_parts(
+    destinations: &[PathBuf],
+    plan: &[PlannedFile],
+    task_prefix: &str,
+    keep_run_tag: &str,
+) -> SweptParts {
+    let mut swept = SweptParts::default();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dest in destinations {
+        for p in plan {
+            let parent = Path::new(&rel_to_native(&p.target_rel))
+                .parent()
+                .map(|d| dest.join(d))
+                .unwrap_or_else(|| dest.clone());
+            if !dirs.contains(&parent) {
+                dirs.push(parent);
+            }
+        }
+    }
+    let ours = format!(".{task_prefix}-");
+    let keep = format!(".{task_prefix}-{keep_run_tag}{PART_SUFFIX}");
+    for dir in dirs {
+        let Ok(rd) = fs::read_dir(&dir) else {
+            continue; // 目录还不存在(首次拷)或读不出:没有残留可清
+        };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if !name.ends_with(PART_SUFFIX) || !name.contains(&ours) || name.ends_with(&keep) {
+                continue;
+            }
+            let path = e.path();
+            if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue; // 链接 / 目录不碰
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => swept.removed.push(path),
+                Err(err) => swept.failed.push((path, super::error::explain_io(&err))),
+            }
+        }
+    }
+    swept
+}
+
+/// [`sweep_stale_parts`] 的结果。
+#[derive(Debug, Default)]
+pub struct SweptParts {
+    pub removed: Vec<PathBuf>,
+    pub failed: Vec<(PathBuf, String)>,
+}
+
 /// 写栅栏的凭证:落盘之后还能问一句「栅栏还是不是我的」。
 pub trait SaveFenceGuard {
     fn still_mine(&self) -> bool;
@@ -1219,8 +1277,9 @@ pub type SaveFenceHook<'a> = &'a dyn Fn() -> Result<Box<dyn SaveFenceGuard>>;
 
 /// 在写栅栏内落盘一次——**唯一**的落盘入口,调用方漏不掉任何一道检查:
 /// 取栅栏 → 写临时文件 → 改名前问一句栅栏还在不在 → 写完再问一句。
-/// `Ok(Ok(..))` 写成了;`Ok(Err(reason))` = 栅栏不给 / 改名前被回收 / 写完发现被回收,
-/// 调用方按中止处理、原因原样带给用户;`Err` = 真正的写失败(IO)。
+/// `Ok(..)` 写成了;`Err(reason)` = 栅栏不给 / 改名前锁标记没了 / 写完发现没了 / 真正的
+/// 写失败(IO)——一律由调用方按中止处理、原因原样带给用户、收尾照跑。IO 失败不再
+/// `?` 上抛:那会让 reports 跟着丢,已拷完 / 已失败文件一条审计都不写。
 fn save_within_fence(
     fence: Option<SaveFenceHook<'_>>,
     project_root: &Path,
@@ -1682,10 +1741,9 @@ fn copy_one(
     if !on_chunk(0) {
         return Err(lease_abort());
     }
-    // 失败清理只清**自己建过的那些路径**:建之前出错(建目录失败……)时同名的 part
-    // 可能是接管者的。按路径记而不是按 inode:休眠恢复的旧持有者与接管者若在同一个
-    // 路径上先后建过 part,这里仍会删掉对方的——模块头(core::lease)把这类互删声明
-    // 为已知边界(一方可见失败、续传按哈希修复)
+    // 失败清理只清**自己建过的那些路径**:建之前出错(建目录失败……)时不动任何 part。
+    // part 名带本轮的 run 标签,同一路径上不可能有接管者的 part(它的标签不同),
+    // 所以按路径记就够了
     let created = std::cell::Cell::new(0usize);
     let result = (|| -> Result<String> {
         let mut writers = Vec::with_capacity(parts.len());
@@ -1966,6 +2024,40 @@ mod tests {
     }
 
     /// 租约丢了之后**一个字节都不许再写进清单**——租约存在的唯一理由就是防这个。
+    /// 清扫只动**本任务、别的 run 标签**的普通文件 part:本轮的留着、别的任务的不碰、
+    /// 名字像 part 的目录不碰;清了什么、没清成什么都要回报。
+    #[test]
+    fn sweeping_stale_parts_only_touches_other_runs_of_this_task() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(dest.join("sub")).unwrap();
+        let plan = vec![PlannedFile {
+            source_rel: "sub/a.mp4".into(),
+            target_rel: "sub/a.mp4".into(),
+            size: 1,
+            source_mtime_ns: 0,
+        }];
+        let old = dest.join("sub/a.mp4.abcd1234-11111111.ocardpart");
+        let mine = dest.join("sub/a.mp4.abcd1234-22222222.ocardpart");
+        let other_task = dest.join("sub/a.mp4.zzzz9999-11111111.ocardpart");
+        let dir_lookalike = dest.join("sub/b.mp4.abcd1234-33333333.ocardpart");
+        for f in [&old, &mine, &other_task] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        std::fs::create_dir(&dir_lookalike).unwrap();
+        let swept = sweep_stale_parts(std::slice::from_ref(&dest), &plan, "abcd1234", "22222222");
+        assert_eq!(
+            swept.removed,
+            vec![old.clone()],
+            "只清本任务别的 run 的残留"
+        );
+        assert!(swept.failed.is_empty(), "{:?}", swept.failed);
+        assert!(!old.exists());
+        assert!(mine.exists(), "本轮的 part 被清了");
+        assert!(other_task.exists(), "别的任务的 part 被清了");
+        assert!(dir_lookalike.is_dir(), "名字像 part 的目录被动了");
+    }
+
     struct FakeFence {
         alive: bool,
     }

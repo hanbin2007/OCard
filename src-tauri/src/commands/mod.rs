@@ -2086,12 +2086,18 @@ pub fn resume_copy_task<R: tauri::Runtime>(
                 };
                 // 锁目录异常(链接 / 异物)不是「别的进程在跑」:标题也要换,否则用户
                 // 先去别的机器上白找一圈
-                let code = if msg.starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) {
-                    "copy-resume-lease-lock-broken"
+                // code 直接写字面量(通知 code 门禁只认调用点里的字面量);锁目录异常
+                // 用 error 级——它不会自己好,不该 6 秒后自动收起
+                if msg.starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) {
+                    notify::error_for_task(
+                        &app,
+                        "copy-resume-lease-lock-broken",
+                        (&id, &pid),
+                        msg.clone(),
+                    );
                 } else {
-                    "copy-resume-lease-held"
-                };
-                notify::warn_for_task(&app, code, (&id, &pid), msg.clone());
+                    notify::warn_for_task(&app, "copy-resume-lease-held", (&id, &pid), msg.clone());
+                }
             }
             msg
         })?;
@@ -2478,7 +2484,7 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
         // 这次整份重写顶掉——按写失败处理并说出来,不能一声不吭(第九轮评审)
         if !fence.still_mine() {
             return Err(crate::core::CoreError::Busy(
-                "落盘期间租约接管锁被外部回收(存储的时钟不准,或锁目录被人动过),这次写回不可信;请确认没有别的 OCard 在跑这个任务".into(),
+                "落盘之后读不到本任务的租约锁标记(可能是存储抖了一下,也可能是锁被外部回收;这里分不出来),这次写回不可信;请确认没有别的 OCard 在跑这个任务".into(),
             ));
         }
         drop(fence);
@@ -2499,6 +2505,12 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
         }
     }
     if let Err(e) = saved {
+        // 锁目录异常(链接 / 异物)不会自己好:单独一条 error 级、抬头就说「需人工清理」
+        if e.to_string()
+            .starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX)
+        {
+            notify::error(app, "copy-resume-lease-lock-broken", e.to_string());
+        }
         // 栅栏那一支(Busy)不是写权限问题,别把人支去查权限——本模块反复强调的那条
         let msg = if matches!(e, crate::core::CoreError::Busy(_)) {
             format!(
