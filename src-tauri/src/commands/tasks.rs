@@ -35,6 +35,23 @@ pub struct TaskHandle {
     pub lease: Mutex<Option<crate::core::lease::Held>>,
 }
 
+impl TaskHandle {
+    /// 中毒也照读:worker 持锁时 panic 会让这把锁中毒,之后界面每次刷新都撞
+    /// `unwrap()` 再 panic——任务列表整个不动了,而通知中心一条没有。
+    pub fn snap(&self) -> std::sync::MutexGuard<'_, CopyTaskDto> {
+        self.snapshot.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    pub fn plan_guard(&self) -> std::sync::MutexGuard<'_, Vec<copy::PlannedFile>> {
+        self.plan.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    pub fn source_root_guard(&self) -> std::sync::MutexGuard<'_, PathBuf> {
+        self.source_root.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    pub fn lease_slot(&self) -> std::sync::MutexGuard<'_, Option<crate::core::lease::Held>> {
+        self.lease.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
 #[derive(Default)]
 pub struct TaskManager {
     inner: Mutex<HashMap<String, Arc<TaskHandle>>>,
@@ -42,11 +59,15 @@ pub struct TaskManager {
 
 impl TaskManager {
     pub fn get(&self, task_id: &str) -> Option<Arc<TaskHandle>> {
-        self.inner.lock().unwrap().get(task_id).cloned()
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(task_id)
+            .cloned()
     }
 
     pub fn insert(&self, task_id: String, handle: Arc<TaskHandle>) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         map.insert(task_id, handle);
         // 句柄回收(L20):终态任务超过 40 个时按完成时间淘汰最旧,防止全天拷卡后
         // 内存里堆满文件级快照
@@ -55,10 +76,10 @@ impl TaskManager {
             let mut finished: Vec<(String, String)> = map
                 .iter()
                 .filter(|(_, h)| {
-                    let s = h.snapshot.lock().unwrap();
+                    let s = h.snap();
                     matches!(s.state, "done" | "failed")
                 })
-                .map(|(k, h)| (k.clone(), h.snapshot.lock().unwrap().started_at.clone()))
+                .map(|(k, h)| (k.clone(), h.snap().started_at.clone()))
                 .collect();
             finished.sort_by(|a, b| a.1.cmp(&b.1));
             let excess = map.len().saturating_sub(KEEP);
@@ -72,7 +93,12 @@ impl TaskManager {
     /// 作业与 ffmpeg,拷卡线程被硬杀在半写 .part 上;暂停走引擎安全点,
     /// part 残留由同任务重启清理,manifest 支持续传)。
     pub fn pause_all(&self) {
-        for h in self.inner.lock().unwrap().values() {
+        for h in self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+        {
             if h.running.load(Ordering::SeqCst) {
                 h.pause_requested.store(true, Ordering::SeqCst);
             }
@@ -95,20 +121,17 @@ impl TaskManager {
     /// 一个拷了 400 个文件、失败了 12 个的任务在报告里干干净净,
     /// 那不是信息缺失,是主动误导。
     pub fn detailed_snapshots(&self) -> Vec<CopyTaskDto> {
-        let map = self.inner.lock().unwrap();
-        let mut out: Vec<CopyTaskDto> = map
-            .values()
-            .map(|h| h.snapshot.lock().unwrap().clone())
-            .collect();
+        let map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out: Vec<CopyTaskDto> = map.values().map(|h| h.snap().clone()).collect();
         out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         out
     }
 
     pub fn snapshots(&self, project_id: Option<&str>) -> Vec<CopyTaskDto> {
-        let map = self.inner.lock().unwrap();
+        let map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut out: Vec<CopyTaskDto> = map
             .values()
-            .map(|h| summary_of(&h.snapshot.lock().unwrap()))
+            .map(|h| summary_of(&h.snap()))
             .filter(|t| project_id.is_none_or(|p| t.project_id == p))
             .collect();
         out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
@@ -169,23 +192,26 @@ pub fn file_status_str(status: &copy::FileStatus) -> &'static str {
 pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle>) {
     // 先清暂停标志再判 running:若旧 worker 还在跑且刚收到暂停请求,
     // 用户此刻点「继续」应让旧 worker 撤销暂停继续跑(评审 L19/P1-9)。
-    handle.pause_requested.store(false, Ordering::SeqCst);
+    let revoked_pause = handle.pause_requested.swap(false, Ordering::SeqCst);
     if handle.running.swap(true, Ordering::SeqCst) {
-        // 已有工作线程在跑(暂停请求已被上面撤销)。这也覆盖「上一次运行正在收尾」
-        // 的窗口:用户点「继续」→ 界面闪一下 → 又回到暂停,若一声不吭就是静默 no-op
+        // 已有工作线程在跑。两种情况要分开说:它正在等暂停 → 用户的「继续」其实
+        // 已经生效(暂停请求被撤销,旧运行接着跑);它正在收尾 → 本次没起新运行,
+        // 稍候再点。混成一句「没生效」是误导
         let (id, pid) = {
-            let s = handle.snapshot.lock().unwrap();
+            let s = handle.snap();
             (s.id.clone(), s.project_id.clone())
         };
-        super::notify::info_for_task(
-            &app,
-            "copy-resume-already-running",
-            (&id, &pid),
-            "这个任务的上一次运行还没退出(正在收尾或仍在拷贝),本次「继续」没有另起新的运行;若它正在收尾,稍候再点一次".into(),
-        );
+        let msg = if revoked_pause {
+            "已撤销暂停请求,上一次运行接着跑(没有另起新的运行)"
+        } else {
+            "这个任务的上一次运行还在收尾,本次「继续」没有另起新的运行;稍候再点一次"
+        };
+        super::notify::info_for_task(&app, "copy-resume-already-running", (&id, &pid), msg.into());
         return;
     }
-    std::thread::spawn(move || {
+    let app_for_spawn_error = app.clone();
+    let handle_for_spawn_error = handle.clone();
+    let spawned = std::thread::Builder::new().name("ocard-copy-worker".into()).spawn(move || {
         // running 的复位放进 guard:下面任何路径(含二次 panic)都会清,否则任务
         // 永远卡在「运行中」
         struct RunningGuard<'a>(&'a AtomicBool);
@@ -251,7 +277,7 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
             }
         }
         if let Err(e) = &outcome {
-            let mut snap = handle.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+            let mut snap = handle.snap();
             snap.state = state_after_error(e);
             if snap.state == "failed" {
                 snap.finished_at = Some(Utc::now().to_rfc3339());
@@ -302,11 +328,31 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
         // 终态事件在 running=false 之后发(复核 P1-9):此刻点「继续」已能启动新 worker;
         // 事件读的是实时快照,若新 worker 已接手则发出的就是其当前状态,不会回退 UI
         drop(_running); // running=false 之后再发终态事件(此刻点「继续」已能起新 worker)
-        let mut snap = handle.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        let mut snap = handle.snap();
         let ev = final_event(&mut snap, Vec::new());
         drop(snap);
         let _ = app.emit(PROGRESS_EVENT, &ev);
     });
+    if let Err(e) = spawned {
+        // 线程都起不来(句柄耗尽等):running 已经被 swap 成 true,必须清回去,
+        // 否则任务永远「运行中」;并且要说
+        handle_for_spawn_error
+            .running
+            .store(false, Ordering::SeqCst);
+        let (id, pid) = {
+            let s = handle_for_spawn_error
+                .snapshot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            (s.id.clone(), s.project_id.clone())
+        };
+        super::notify::error_for_task(
+            &app_for_spawn_error,
+            "copy-worker-spawn-failed",
+            (&id, &pid),
+            format!("拷卡线程没能启动(系统资源不足:{e}),任务仍是暂停状态,可稍后点「继续」"),
+        );
+    }
 }
 
 /// 续传源卷解析(纯函数,可测)。
@@ -465,8 +511,8 @@ fn run_worker<R: tauri::Runtime>(
     //
     // 顺序:**先租约,再读清单**。反过来会读到旧持有者释放前的快照,然后拿着
     // 陈旧的 entries 把人家最后写的进度整份顶掉。
-    let operator = handle.snapshot.lock().unwrap().operator.clone();
-    let taken = handle.lease.lock().unwrap().take();
+    let operator = handle.snap().operator.clone();
+    let taken = handle.lease_slot().take();
     let mut lease = match taken {
         Some(h) => h, // 续传路径已在准备阶段取得(刷新计划那次写也在保护内)
         None => crate::core::lease::acquire(
@@ -480,7 +526,7 @@ fn run_worker<R: tauri::Runtime>(
         // 接管别人/自己残留的租约是「系统替用户做了决定」,零静默要求说出来;
         // 带任务:并行拷卡时同 code 的通知会按任务分桶,不会互相顶掉正文
         let (id, pid) = {
-            let s = handle.snapshot.lock().unwrap();
+            let s = handle.snap();
             (s.id.clone(), s.project_id.clone())
         };
         super::notify::warn_for_task(app, "task-lease-taken-over", (&id, &pid), note);
@@ -509,7 +555,17 @@ fn run_worker<R: tauri::Runtime>(
                 ),
             );
         }
-        crate::core::lease::Released::NoLock(why) => {
+        crate::core::lease::Released::TakenOverUnnoticed => {
+            // 释放时才第一次发现盘上是别人的:心跳线程没来得及报 Lost。要说,
+            // 用户得知道从某一刻起这份进度可能有另一处在写
+            super::notify::warn(
+                app,
+                "task-lease-lost",
+                "任务结束时发现租约已被别的进程接管(本机心跳没有及时发现)。请核对另一处的进度,再决定在哪边续传".into(),
+            );
+        }
+        crate::core::lease::Released::Unverified(why)
+        | crate::core::lease::Released::NoLock(why) => {
             // 没拿到接管锁就没敢删——盘上那份**可能已经是接管方的**。这里绝不能
             // 建议「手动删除」:照做就是删掉一个正在拷卡的进程的租约
             super::notify::warn(
@@ -533,7 +589,7 @@ fn run_worker_locked<R: tauri::Runtime>(
     lease: &crate::core::lease::Held,
 ) -> crate::core::Result<()> {
     let req = copy::CopyRequest {
-        source_root: handle.source_root.lock().unwrap().clone(),
+        source_root: handle.source_root_guard().clone(),
         destinations: handle.dest_targets.clone(),
         task_tag: handle.manifest_id.chars().take(8).collect(),
         // 口径取自 manifest(持久化的开拷选择):重启重建的任务也用同一把尺子
@@ -542,7 +598,7 @@ fn run_worker_locked<R: tauri::Runtime>(
 
     // 单一清单:引擎、manifest、UI 快照消费同一份文件列表(评审 M11/P1-11)。
     // 从 manifest+目标实存恢复初始进度(续传场景)。
-    let plan: Vec<copy::PlannedFile> = handle.plan.lock().unwrap().clone();
+    let plan: Vec<copy::PlannedFile> = handle.plan_guard().clone();
     if plan.is_empty() {
         // 零静默:清单为空说明接线出了问题,绝不能「跑完 0 个文件」再报成功
         return Err(crate::core::CoreError::Invalid(
@@ -550,7 +606,7 @@ fn run_worker_locked<R: tauri::Runtime>(
         ));
     }
     {
-        let mut snap = handle.snapshot.lock().unwrap();
+        let mut snap = handle.snap();
         // 引擎清单与 UI 快照必须按目标 rel 一一对应:对不上就会出现「文件在拷、
         // 界面不动」的静默失配,宁可当场拒绝也不让它悄悄跑
         let ids: std::collections::HashSet<&str> =
@@ -590,19 +646,25 @@ fn run_worker_locked<R: tauri::Runtime>(
         Default::default();
     let mut pending_contention: Vec<(copy::ContentionKind, String, u32)> = Vec::new();
     let mut lease_stop_reported = false;
+    // 当前文件已进快照的字节(块级 delta 累加);中途中止时要从快照里减回去
+    let mut current_file_delta = 0u64;
     let task_for_notices = {
-        let s = handle.snapshot.lock().unwrap();
+        let s = handle.snap();
         (s.id.clone(), s.project_id.clone())
     };
 
-    let outcome = copy::run_copy(&req, &plan, m, &handle.project_root, |p| {
+    // 写栅栏:每次落盘都在租约锁下核对 token(见 lease::Held::fence)
+    let fence = || -> crate::core::Result<Box<dyn std::any::Any>> {
+        lease.fence().map(|f| Box::new(f) as Box<dyn std::any::Any>)
+    };
+    let outcome = copy::run_copy(&req, &plan, m, &handle.project_root, Some(&fence), |p| {
         let mut changed: Vec<CopyFileItemDto> = Vec::new();
         let mut force_emit = false;
         {
-            let mut snap = handle.snapshot.lock().unwrap();
+            let mut snap = handle.snap();
             match &p {
+                copy::Progress::FileStarted { .. } => current_file_delta = 0,
                 copy::Progress::Scanned { .. }
-                | copy::Progress::FileStarted { .. }
                 // 落盘前的租约询问:结论由回调末尾统一的 lease.poll() 给出
                 | copy::Progress::AboutToSave { .. } => {}
                 copy::Progress::Contention {
@@ -619,9 +681,13 @@ fn run_worker_locked<R: tauri::Runtime>(
                 copy::Progress::BytesCopied { delta, .. } => {
                     snap.copied_bytes += delta;
                     window_bytes += delta;
+                    current_file_delta += delta;
                 }
                 copy::Progress::FileFinished { rel_path, status } => {
                     force_emit = true;
+                    if !matches!(status, copy::FileStatus::AbortedMidFile) {
+                        current_file_delta = 0; // 正常结束的文件,字节留在快照里
+                    }
                     if let Some(f) = snap.files.iter_mut().find(|f| f.id == *rel_path) {
                         f.status = file_status_str(status);
                         if let copy::FileStatus::Failed(e) = status {
@@ -714,7 +780,7 @@ fn run_worker_locked<R: tauri::Runtime>(
     let operator;
     let target_folder;
     {
-        let mut snap = handle.snapshot.lock().unwrap();
+        let mut snap = handle.snap();
         operator = snap.operator.clone();
         task_id = snap.id.clone();
         target_folder = snap.target_folder.clone();
@@ -735,9 +801,10 @@ fn run_worker_locked<R: tauri::Runtime>(
             _ => "error",
         };
         // 主动中止时,快照的 copied_bytes 吃进了当前文件的部分 delta,而那个 part
-        // 已被清掉;按引擎的 bytes_copied(只算落位的)回填,别让界面虚高
+        // 已被清掉——只把**这一个文件**的 delta 减回去。不能用引擎的 bytes_copied
+        // 回填:那只算本次落位的,续传场景下会把 410GB 打回 10GB
         if outcome.aborted {
-            snap.copied_bytes = outcome.bytes_copied;
+            snap.copied_bytes = snap.copied_bytes.saturating_sub(current_file_delta);
         }
         let written = snap.copied_bytes;
         for d in snap.destinations.iter_mut() {

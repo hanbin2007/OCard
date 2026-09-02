@@ -249,7 +249,10 @@ describe("主题令牌", () => {
     expect(rule ? where(rule) : null, "缺 .welcome-shell .toasts 规则").not.toBeNull();
     const decl = (prop: string) => rule!.decls.find((d) => d.prop === prop)?.value.trim();
     expect(decl("bottom"), "必须把默认的 bottom 让开").toBe("auto");
-    expect(decl("top"), "必须给一个 top").toBeTruthy();
+    // 只让开拖动条还不够:项目管理视图的顶栏(新建 / 铃铛 / 设置)就在拖动条下面,
+    // toast 压上去会把铃铛盖住——而 error toast 不自动消失
+    expect(decl("top"), "top 必须让开拖动条和顶栏").toContain("--topbar-height");
+    expect(decl("top")).toContain("--welcome-drag-height");
   });
 
   it("字体栈全部是系统字体，不引 webfont", () => {

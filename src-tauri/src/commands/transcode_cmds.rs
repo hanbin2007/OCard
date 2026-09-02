@@ -1051,7 +1051,13 @@ fn save_proxy_state<R: tauri::Runtime>(
     // save 写的正是 completed=true,续传刷新又会把 completed 打回 false——写集合
     // 并不像此前注释说的那样不相交。Busy 就是可见出口;写完 Held 一 drop 就释放
     let _lease = match crate::core::lease::acquire(project_root, id, machine_id, "") {
-        Ok(h) => h,
+        Ok(mut h) => {
+            // 接管别人/自己残留的租约是「系统替用户做了决定」:这里也必须说
+            if let Some(note) = h.took_over_stale.take() {
+                notify::warn(app, "task-lease-taken-over", note);
+            }
+            h
+        }
         Err(e) => {
             notify::warn(
                 app,
@@ -1091,23 +1097,26 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
     }
     // 永久失败不许无限重投(评审 P1-8):三次仍未整批成功即放弃,可见告知
     if m.proxy_attempts >= 3 {
-        save_proxy_state(
+        let persisted = save_proxy_state(
             app,
             project_root,
             machine_id,
             &m.id,
             "放弃标记",
-            "下次启动会重复本条放弃提示",
+            "本次不派发;放弃状态没有持久化,下次启动会再试一次写回",
             |fresh| fresh.proxy_completed = true,
         );
-        notify::warn(
-            app,
-            "auto-proxy-abandoned",
-            format!(
-                "「{}」的自动转代理已连续 {} 次未能整批完成,停止自动重试;可在转码页手动执行(已转文件会安全跳过)",
-                m.target_rel, m.proxy_attempts
-            ),
-        );
+        // 放弃标记写成了才能说「停止自动重试」;没写成就不是停止,是「这次没派发」
+        if persisted {
+            notify::warn(
+                app,
+                "auto-proxy-abandoned",
+                format!(
+                    "「{}」的自动转代理已连续 {} 次未能整批完成,停止自动重试;可在转码页手动执行(已转文件会安全跳过)",
+                    m.target_rel, m.proxy_attempts
+                ),
+            );
+        }
         return;
     }
     // 计数写不进去=放弃上限失效,存在无限重投风险,必须可见(R2 P2)

@@ -1481,7 +1481,7 @@ pub fn get_copy_task(state: State<AppState>, task_id: String) -> Option<CopyTask
     state
         .tasks
         .get(&task_id)
-        .map(|h| tasks::summary_of(&h.snapshot.lock().unwrap()))
+        .map(|h| tasks::summary_of(&h.snap()))
 }
 
 #[tauri::command(async)]
@@ -1495,7 +1495,7 @@ pub fn list_copy_files(
         .tasks
         .get(&task_id)
         .ok_or_else(|| format!("任务不存在: {task_id}"))?;
-    let snap = handle.snapshot.lock().unwrap();
+    let snap = handle.snap();
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(200);
     Ok(CopyFilePage {
@@ -2066,7 +2066,7 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         // 先读再拿会拿着它释放前的陈旧快照去覆盖它最后写的进度。准备阶段的
         // 刷新计划那次写因此也在保护内;租约随后交给 worker 接手。
         // 同进程并发两次 resume 也会在这里被第二次的 Busy 挡住(token 不同)。
-        let operator = handle.snapshot.lock().unwrap().operator.clone();
+        let operator = handle.snap().operator.clone();
         let mut lease = crate::core::lease::acquire(
             &handle.project_root,
             &handle.manifest_id,
@@ -2078,7 +2078,7 @@ pub fn resume_copy_task<R: tauri::Runtime>(
             if matches!(e, crate::core::CoreError::Busy(_)) {
                 // 先 clone 再放锁:notify 会写日志 + IPC,不该持着 snapshot 锁做
                 let (id, pid) = {
-                    let s = handle.snapshot.lock().unwrap();
+                    let s = handle.snap();
                     (s.id.clone(), s.project_id.clone())
                 };
                 notify::warn_for_task(&app, "copy-resume-lease-held", (&id, &pid), msg.clone());
@@ -2087,7 +2087,7 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         })?;
         if let Some(note) = lease.took_over_stale.take() {
             let (id, pid) = {
-                let s = handle.snapshot.lock().unwrap();
+                let s = handle.snap();
                 (s.id.clone(), s.project_id.clone())
             };
             notify::warn_for_task(&app, "task-lease-taken-over", (&id, &pid), note);
@@ -2138,7 +2138,7 @@ pub fn resume_copy_task<R: tauri::Runtime>(
             .into_iter()
             .map(|v| (v.mount_point, v.name))
             .collect();
-        let recorded = handle.source_root.lock().unwrap().clone();
+        let recorded = handle.source_root_guard().clone();
         // 重解析 + 布局复核一体(codex 终验 P0:重插的卡可能挂到某目的地的
         // 祖先路径,不复核会把素材写回源卡);同时覆盖旧 manifest 的病态目的地。
         let resolved = tasks::prepare_resume(
@@ -2150,11 +2150,11 @@ pub fn resume_copy_task<R: tauri::Runtime>(
             &|p| volumes::read_volume_uid(p),
         )?;
         {
-            let mut src = handle.source_root.lock().unwrap();
+            let mut src = handle.source_root_guard();
             *src = resolved.clone();
         }
         {
-            let mut snap = handle.snapshot.lock().unwrap();
+            let mut snap = handle.snap();
             snap.volume_id = resolved.display().to_string();
         }
         // 刷新清单:源卡内容可能在暂停期间变化,快照与引擎必须消费同一份新清单。
@@ -2164,7 +2164,7 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         // `completed = true` 的自相矛盾清单。
         let mut m = m;
         let plan = refresh_resume_plan(&app, &mut m, &handle.project_root, &resolved)?;
-        let mut snap = handle.snapshot.lock().unwrap();
+        let mut snap = handle.snap();
         let old: std::collections::HashMap<String, &'static str> = snap
             .files
             .iter()
@@ -2180,9 +2180,9 @@ pub fn resume_copy_task<R: tauri::Runtime>(
             })
             .collect();
         snap.file_count = Some(plan.len());
-        *handle.plan.lock().unwrap() = plan;
+        *handle.plan_guard() = plan;
         // 准备完毕,租约交给 worker(它接手后一直持有到任务结束)
-        *handle.lease.lock().unwrap() = Some(lease);
+        *handle.lease_slot() = Some(lease);
     }
 
     tasks::spawn_worker(app, handle);

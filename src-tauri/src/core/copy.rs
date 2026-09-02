@@ -1204,11 +1204,16 @@ pub fn file_done(
 /// 整卷时两者相同,选文件夹扁平化时两者分离。
 /// `project_root` 用于逐文件持久化 manifest(断点续传依据)。
 /// 回调返回 [`CopyControl::Pause`] 时在当前文件完成后停下,manifest 保证可续传。
+/// 落盘前取一次写栅栏(见 `lease::Held::fence`)。`None` = 不设栅栏(测试 / 无租约场景)。
+/// 返回 `Err(Busy)` = 租约已不是自己的,这次**不写**,按 Abort 处理。
+pub type SaveFenceHook<'a> = &'a dyn Fn() -> Result<Box<dyn std::any::Any>>;
+
 pub fn run_copy(
     req: &CopyRequest,
     plan: &[PlannedFile],
     m: &mut CopyManifest,
     project_root: &Path,
+    fence: Option<SaveFenceHook<'_>>,
     mut progress: impl FnMut(Progress) -> CopyControl,
 ) -> Result<CopyOutcome> {
     assert!(!req.destinations.is_empty(), "至少需要一个目的地");
@@ -1274,6 +1279,12 @@ pub fn run_copy(
             index,
             total,
         });
+        if control == CopyControl::Abort {
+            // 在动任何东西之前退出:copy_one 开头会清同任务的 .ocardpart——那可能
+            // 正是接管者在写的那一个
+            aborted = true;
+            break;
+        }
         if control == CopyControl::Pause {
             paused = true;
             break;
@@ -1363,7 +1374,12 @@ pub fn run_copy(
             || control == CopyControl::Abort
             || progress(Progress::AboutToSave { rel_path: rel }) == CopyControl::Abort
         {
-            // 这个文件的结果仍要进 reports(它已经拷完/失败了,审计要记),只是不落盘
+            // 这个文件的结果仍要进 reports(它已经拷完/失败了,审计要记),只是不落盘;
+            // 终态也要发出去,界面才会把中途中止的那个刷回 pending
+            let _ = progress(Progress::FileFinished {
+                rel_path: rel,
+                status: &status,
+            });
             reports.push(FileReport {
                 rel_path: rel.clone(),
                 source_rel: src_rel.clone(),
@@ -1373,8 +1389,30 @@ pub fn run_copy(
             aborted = true;
             break;
         }
-        // 逐文件落盘,任意时刻中断都可续传
+        // 逐文件落盘,任意时刻中断都可续传。落盘在写栅栏内:AboutToSave 只是看
+        // 缓存,从它说「还是我的」到真正写完之间接管者可以完成一次接管
+        let _fence = match fence.map(|f| f()) {
+            None => None,
+            Some(Ok(g)) => Some(g),
+            Some(Err(super::CoreError::Busy(_))) => {
+                // 中止前把这个文件的终态发出去:界面得把它刷回 pending / 记下失败
+                let _ = progress(Progress::FileFinished {
+                    rel_path: rel,
+                    status: &status,
+                });
+                reports.push(FileReport {
+                    rel_path: rel.clone(),
+                    source_rel: src_rel.clone(),
+                    size,
+                    status,
+                });
+                aborted = true;
+                break;
+            }
+            Some(Err(e)) => return Err(e),
+        };
         let (wr, mpath) = manifest::save(project_root, m)?;
+        drop(_fence);
         if wr.retries > 0 {
             write_retries += wr.retries;
             // 零静默:第一次就报,不等任务结束(见 Progress::WriteContention)
@@ -1404,9 +1442,11 @@ pub fn run_copy(
         && !aborted
         && reports.len() == total
         && !reports.is_empty()
-        && reports
-            .iter()
-            .all(|r| !matches!(r.status, FileStatus::Failed(_)));
+        // 白名单:只有「拷了并校验过」和「续传时按哈希确认过」算。以后新加任何状态,
+        // 忘了改这里就是保守判 false,而不是静默放行——这条喂的是「本卡可格式化」
+        && reports.iter().all(|r| {
+            matches!(r.status, FileStatus::Copied | FileStatus::SkippedResume)
+        });
     m.completed = all_verified;
     if aborted
         || abort_writes
@@ -1422,7 +1462,24 @@ pub fn run_copy(
             material_retries,
         });
     }
+    let _fence = match fence.map(|f| f()) {
+        None => None,
+        Some(Ok(g)) => Some(g),
+        Some(Err(super::CoreError::Busy(_))) => {
+            return Ok(CopyOutcome {
+                files: reports,
+                bytes_copied,
+                all_verified: false,
+                paused: true,
+                aborted: true,
+                write_retries,
+                material_retries,
+            });
+        }
+        Some(Err(e)) => return Err(e),
+    };
     let (wr, mpath) = manifest::save(project_root, m)?;
+    drop(_fence);
     if wr.retries > 0 {
         write_retries += wr.retries;
         let _ = progress(Progress::Contention {
@@ -1848,7 +1905,7 @@ mod tests {
         let manifest_file = manifest::manifest_dir(&project).join(format!("{}.json", m.id));
 
         let mut saves_asked = 0usize;
-        let out = run_copy(&req, &plan, &mut m, &project, |p| match p {
+        let out = run_copy(&req, &plan, &mut m, &project, None, |p| match p {
             // 第一次要写清单的那一刻说「租约没了」
             Progress::AboutToSave { .. } => {
                 saves_asked += 1;
@@ -1876,7 +1933,10 @@ mod tests {
         // 对照:没有 Abort 时清单是会写的(否则上面的断言是恒真)
         let (_t2, req2, mut m2, project2) = setup();
         let plan2 = plan_whole_volume(&scan_source(&req2.source_root).unwrap());
-        run_copy(&req2, &plan2, &mut m2, &project2, |_| CopyControl::Continue).unwrap();
+        run_copy(&req2, &plan2, &mut m2, &project2, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(manifest::manifest_dir(&project2)
             .join(format!("{}.json", m2.id))
             .exists());
@@ -1889,7 +1949,7 @@ mod tests {
         let (_t, req, mut m, project) = setup();
         let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
         let mut saves = 0usize;
-        let out = run_copy(&req, &plan, &mut m, &project, |p| match p {
+        let out = run_copy(&req, &plan, &mut m, &project, None, |p| match p {
             Progress::AboutToSave { .. } => {
                 saves += 1;
                 CopyControl::Continue
@@ -1908,7 +1968,7 @@ mod tests {
         let (_t, req, mut m, project) = setup();
         let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
         let manifest_file = manifest::manifest_dir(&project).join(format!("{}.json", m.id));
-        let out = run_copy(&req, &plan, &mut m, &project, |p| match p {
+        let out = run_copy(&req, &plan, &mut m, &project, None, |p| match p {
             Progress::BytesCopied { .. } => CopyControl::Abort,
             _ => CopyControl::Continue,
         })
@@ -1987,6 +2047,7 @@ mod tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| {
                 events += 1;
                 CopyControl::Continue
@@ -2032,6 +2093,7 @@ mod tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2042,6 +2104,7 @@ mod tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2062,6 +2125,7 @@ mod tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2081,6 +2145,7 @@ mod tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m2,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2111,6 +2176,7 @@ mod tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2127,6 +2193,7 @@ mod tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m2,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2143,6 +2210,7 @@ mod tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2153,6 +2221,7 @@ mod tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2177,6 +2246,7 @@ mod tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2213,6 +2283,7 @@ mod tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |p| {
                 if let Progress::BytesCopied { delta, .. } = p {
                     bytes += delta;
@@ -2234,6 +2305,7 @@ mod tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |p| {
                 if matches!(p, Progress::FileFinished { .. }) {
                     finished += 1;
@@ -2257,6 +2329,7 @@ mod tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2320,9 +2393,14 @@ mod review_regression_tests {
         fs::write(req.destinations[0].join(&part_name), b"stale junk").unwrap();
 
         let files = scan_source(&req.source_root).unwrap();
-        let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
-            CopyControl::Continue
-        })
+        let out = run_copy(
+            &req,
+            &plan_whole_volume(&files),
+            &mut m,
+            &project,
+            None,
+            |_| CopyControl::Continue,
+        )
         .unwrap();
         assert!(out.all_verified);
         assert!(!req.destinations[0].join(&part_name).exists());
@@ -2344,9 +2422,14 @@ mod review_regression_tests {
         });
         files.sort();
 
-        let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
-            CopyControl::Continue
-        })
+        let out = run_copy(
+            &req,
+            &plan_whole_volume(&files),
+            &mut m,
+            &project,
+            None,
+            |_| CopyControl::Continue,
+        )
         .unwrap();
         let gone = out.files.iter().find(|f| f.rel_path == "GONE.MP4").unwrap();
         assert!(matches!(gone.status, FileStatus::Failed(_)));
@@ -2362,9 +2445,14 @@ mod review_regression_tests {
         req.destinations = vec![blocked.join("sub")];
 
         let files = scan_source(&req.source_root).unwrap();
-        let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
-            CopyControl::Continue
-        })
+        let out = run_copy(
+            &req,
+            &plan_whole_volume(&files),
+            &mut m,
+            &project,
+            None,
+            |_| CopyControl::Continue,
+        )
         .unwrap();
         assert!(out.paused, "连续 IO 失败应转入可续传的暂停,而非终态 failed");
         assert!(!out.all_verified);
@@ -2386,6 +2474,7 @@ mod review_regression_tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2435,9 +2524,14 @@ mod review_regression_tests {
             size: 4,
             mtime_ns: 0,
         });
-        let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
-            CopyControl::Continue
-        })
+        let out = run_copy(
+            &req,
+            &plan_whole_volume(&files),
+            &mut m,
+            &project,
+            None,
+            |_| CopyControl::Continue,
+        )
         .unwrap();
         assert!(!out.all_verified);
         assert!(
@@ -2469,6 +2563,7 @@ mod review_regression_tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2496,9 +2591,14 @@ mod review_regression_tests {
             size: 9000,
             mtime_ns: 0,
         });
-        let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
-            CopyControl::Continue
-        })
+        let out = run_copy(
+            &req,
+            &plan_whole_volume(&files),
+            &mut m,
+            &project,
+            None,
+            |_| CopyControl::Continue,
+        )
         .unwrap();
         assert!(out
             .files
@@ -2517,6 +2617,7 @@ mod review_regression_tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2556,6 +2657,7 @@ mod review_regression_tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2594,6 +2696,7 @@ mod review_regression_tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2632,9 +2735,14 @@ mod review_regression_tests {
             size: 64,
             mtime_ns: 0,
         });
-        let out = run_copy(&req, &plan_whole_volume(&files), &mut m, &project, |_| {
-            CopyControl::Continue
-        })
+        let out = run_copy(
+            &req,
+            &plan_whole_volume(&files),
+            &mut m,
+            &project,
+            None,
+            |_| CopyControl::Continue,
+        )
         .unwrap();
         assert!(out
             .files
@@ -2667,6 +2775,7 @@ mod review_regression_tests {
             &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
             &mut m,
             &project,
+            None,
             |_| CopyControl::Continue,
         )
         .unwrap();
@@ -2749,7 +2858,10 @@ mod folder_selection_tests {
         assert!(renamed.is_empty(), "只勾一个夹子不会撞名");
         m.planned = plan.iter().map(manifest::PlannedFile::from_plan).collect();
 
-        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(out.all_verified);
         for d in &req.destinations {
             // 落盘扁平:不带 DCIM/100MSDCF 这层
@@ -2781,7 +2893,10 @@ mod folder_selection_tests {
         m.source_selection = req.selection.to_folders();
         m.renamed_files = renamed.clone();
 
-        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(out.all_verified);
         for d in &req.destinations {
             assert!(d.join("100MSDCF_DSC1.JPG").is_file());
@@ -2793,7 +2908,10 @@ mod folder_selection_tests {
         let saved = manifest::load(&project, &m.id).unwrap();
         let resumed: Vec<PlannedFile> = saved.planned.iter().map(|p| p.to_plan()).collect();
         assert_eq!(resumed, plan, "持久化的计划必须能原样还原");
-        let out2 = run_copy(&req, &resumed, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out2 = run_copy(&req, &resumed, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(
             out2.files
                 .iter()
@@ -2816,7 +2934,10 @@ mod folder_selection_tests {
             size: 3000,
             source_mtime_ns: 0,
         });
-        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(
             out.files
                 .iter()
@@ -2838,7 +2959,10 @@ mod folder_selection_tests {
             size: 4000,
             source_mtime_ns: 0,
         }];
-        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(matches!(out.files[0].status, FileStatus::Failed(_)));
         assert!(!req.destinations[0].join("改过的名字.MP4").exists());
     }
@@ -2855,7 +2979,10 @@ mod folder_selection_tests {
             size: 4000,
             source_mtime_ns: 0,
         }];
-        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(matches!(out.files[0].status, FileStatus::Failed(_)));
         assert!(
             !tmp.path().join("nas/逃逸.MP4").exists() && !tmp.path().join("bak/逃逸.MP4").exists(),
@@ -2983,7 +3110,10 @@ mod folder_selection_tests {
                 source_mtime_ns: 0,
             },
         ];
-        let e = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap_err();
+        let e = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap_err();
         assert!(e.to_string().contains("同一个落点"), "{e}");
         assert!(!req.destinations[0].exists(), "拒绝要发生在任何写入之前");
     }
@@ -2999,7 +3129,10 @@ mod folder_selection_tests {
             size: 4000,
             source_mtime_ns: 0,
         }];
-        let e = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap_err();
+        let e = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap_err();
         assert!(e.to_string().contains(PART_SUFFIX), "{e}");
     }
 
@@ -3018,7 +3151,10 @@ mod folder_selection_tests {
             req.selection.allows("ROOT.MP4", r"..\逃逸.MP4"),
             "前置断言:这条要能过选择闸,才谈得上测目标侧路径闸"
         );
-        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(
             matches!(&out.files[0].status, FileStatus::Failed(e) if e.contains("清单相对路径非法")),
             "必须被目标侧路径闸拒: {:?}",
@@ -3253,7 +3389,10 @@ mod folder_selection_tests {
                 source_mtime_ns: 0,
             },
         ];
-        let e = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap_err();
+        let e = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap_err();
         assert!(e.to_string().contains("同一个落点"), "{e}");
         assert!(!req.destinations[0].exists(), "拒绝要发生在任何写入之前");
     }
@@ -3311,7 +3450,10 @@ mod folder_selection_tests {
                 source_mtime_ns: 0,
             },
         ];
-        let e = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap_err();
+        let e = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap_err();
         assert!(e.to_string().contains("同一个落点"), "{e}");
         assert!(!req.destinations[0].exists(), "拒绝要发生在任何写入之前");
     }
@@ -3342,7 +3484,10 @@ mod folder_selection_tests {
         let mut m = CopyManifest::new("target", "card", "A7M4_A_ZS", "ZS", "");
         let (plan, _renamed, _) = scan_selection(&req.source_root, &req.selection).unwrap();
         assert_eq!(plan.len(), source_entries, "计划项数必须等于源目录项数");
-        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(out.all_verified, "{:?}", out.files);
         assert_eq!(
             fs::read_dir(&req.destinations[0]).unwrap().count(),
@@ -3486,7 +3631,10 @@ mod folder_selection_tests {
             .unwrap();
         drop(f);
 
-        let out = run_copy(&req, &plan, &mut m, &project, |_| CopyControl::Continue).unwrap();
+        let out = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
         assert!(
             matches!(&out.files[0].status, FileStatus::Failed(e) if e.contains("同名")),
             "同名不同内容必须报冲突,不许静默覆盖也不许静默当成功: {:?}",

@@ -16,9 +16,14 @@
 }
 
 /* 无边框窗口的可拖动条(macOS 红绿灯悬浮其上) */
+.welcome-shell {
+  /* 顶部拖动条的高度;toast 的落点也要让开它——同一个数只写一处 */
+  --welcome-drag-height: 36px;
+}
+
 .welcome-shell__drag {
   flex: 0 0 auto;
-  height: 36px;
+  height: var(--welcome-drag-height);
 }
 
 /* 欢迎窗口里的 toast 靠**上**贴,不靠下。
@@ -27,7 +32,10 @@
    右下,就把向导的主按钮整个盖住了,点不动也看不见为什么。CI 的 E2E 自 v0.4.2
    起一直红,取证抓到的就是这一幕。 */
 .welcome-shell .toasts {
-  top: calc(36px + var(--space-3)); /* 让开顶部拖动条 */
+  /* 让开拖动条**和**项目管理视图的顶栏(新建 / 铃铛 / 设置在顶栏右侧):
+     只让开拖动条时,toast 正压在铃铛上——而 error toast 不自动消失,
+     铃铛是那个视图里唯一能翻回历史通知的入口 */
+  top: calc(var(--welcome-drag-height) + var(--topbar-height) + var(--space-3));
   bottom: auto;
 }
 
