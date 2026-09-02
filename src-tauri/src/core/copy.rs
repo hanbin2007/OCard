@@ -1165,6 +1165,44 @@ pub fn file_done(
     size: u64,
     destinations: &[PathBuf],
 ) -> bool {
+    let pre = fs::metadata(source_root.join(rel_to_native(source_rel))).ok();
+    file_done_stable(
+        m,
+        source_root,
+        source_rel,
+        target_rel,
+        size,
+        destinations,
+        pre.as_ref(),
+    )
+}
+
+/// 源在「快照 → 现在」之间没变的证明:快照要有、两侧的修改时间都要读得到、大小与修改时间
+/// 都相等。「不知道」不算「没变」(fail-closed)。等长原位改写并把修改时间改回旧值的对抗性
+/// 场景不在保护范围内——闭合它要把源再完整读一遍,拷卡时间翻倍,如实声明的边界。
+fn source_unchanged_since(pre: Option<&fs::Metadata>, src: &Path) -> bool {
+    let Some(pre) = pre else { return false };
+    let Ok(now) = fs::metadata(src) else {
+        return false;
+    };
+    let (Ok(t0), Ok(t1)) = (pre.modified(), now.modified()) else {
+        return false;
+    };
+    now.len() == pre.len() && t0 == t1
+}
+
+/// 同 [`file_done`],但用调用方在源哈希**之前**采集的快照判源稳定:源哈希与逐目的地
+/// 哈希要跑几分钟,期间源被改写(相机还在写这张卡)时,盘上既有目标仍与「刚才那份源」
+/// 一致,不加这一步就会把没备份的新内容当已完成(codex 终审 r15)。
+pub fn file_done_stable(
+    m: &CopyManifest,
+    source_root: &Path,
+    source_rel: &str,
+    target_rel: &str,
+    size: u64,
+    destinations: &[PathBuf],
+    pre_meta: Option<&fs::Metadata>,
+) -> bool {
     let Some(entry) = m
         .entries
         .iter()
@@ -1200,7 +1238,24 @@ pub fn file_done(
         hash::xxh3_file_uncached(&p)
             .map(|h| h == entry.xxh3)
             .unwrap_or(false)
-    })
+    }) && source_unchanged_since(pre_meta, &src)
+}
+
+/// 是不是 OCard 自己的探针残留:`.clock.<8 位十六进制>.ocardtmp`(NAS 时钟探针)或
+/// `.hlprobe.<8 位十六进制>[.l].ocardtmp`(硬链接探针)。**精确形状**:用户自己放的
+/// `.clock.notes.ocardtmp` 这种同前缀同后缀的文件不许当残留删(codex 终审 r15)。
+fn probe_residue_name(name: &str) -> bool {
+    let Some(rest) = name.strip_suffix(super::fsx::TMP_SUFFIX) else {
+        return false;
+    };
+    let tag = if let Some(t) = rest.strip_prefix(".clock.") {
+        t
+    } else if let Some(t) = rest.strip_prefix(".hlprobe.") {
+        t.strip_suffix(".l").unwrap_or(t)
+    } else {
+        return false;
+    };
+    tag.len() == 8 && tag.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// 持有租约的一方在开拷前清掉**别的 run 标签**留下的 `.ocardpart`。
@@ -1283,8 +1338,7 @@ pub fn sweep_stale_parts(
                 .strip_prefix('.')
                 .and_then(|n| n.strip_suffix(lock_suffix.as_str()))
                 .is_some_and(|n| names.contains(n));
-            let probe_residue = (name.starts_with(".clock.") || name.starts_with(".hlprobe."))
-                && name.ends_with(super::fsx::TMP_SUFFIX);
+            let probe_residue = probe_residue_name(&name);
             if lock_residue || probe_residue {
                 {
                     let path = e.path();
@@ -1295,7 +1349,8 @@ pub fn sweep_stale_parts(
                         (Ok(t), Some(now)) => now
                             .duration_since(t)
                             // 30 分钟(不是接管锁的两分钟):发布锁**不**在热路径回收,残留只由
-                            // 这里收;一个 rename 卡住半小时才迟到完成不是现实场景,两分钟是
+                            // 这里收;一个 rename 卡住半小时才迟到完成不是现实场景,两分钟则是
+                            // 慢 NAS 上一次正常发布可能真的还没结束
                             .is_ok_and(|age| age > std::time::Duration::from_secs(30 * 60)),
                         _ => false,
                     };
@@ -1545,7 +1600,15 @@ pub fn run_copy(
             // R5 三票 P1:时间戳快照在 file_done 的源哈希**之前**采集——
             // 修复目标场景里,验证读同样会刷新源 atime
             let pre_meta = fs::metadata(req.source_root.join(rel_to_native(src_rel))).ok();
-            if file_done(m, &req.source_root, src_rel, rel, size, &req.destinations) {
+            if file_done_stable(
+                m,
+                &req.source_root,
+                src_rel,
+                rel,
+                size,
+                &req.destinations,
+                pre_meta.as_ref(),
+            ) {
                 FileStatus::SkippedResume
             } else {
                 match copy_one(
@@ -1856,6 +1919,13 @@ fn copy_one(
                 )));
             }
         }
+        // 源哈希 + 逐目的地哈希跑了几分钟:此刻的源还是刚才哈希的那份吗?不是就不许
+        // 把既有目标当「已交付」——卡上的新内容没有备份(codex 终审 r15)
+        if !source_unchanged_since(src_meta.as_ref(), &src_path) {
+            return Err(super::CoreError::Invalid(format!(
+                "源文件在与既有目标比对期间被修改(大小或修改时间变了,或读不到修改时间),不能把既有目标当作这份源的备份: {source_rel}。请确认相机 / 录机已停止写这张卡后重试"
+            )));
+        }
         if pre_existing.len() == finals.len() {
             // 所有目的地都已有同内容文件:无需写入;顺带清理本任务可能的残留 part(终验 #4)。
             // 清之前查一次租约:同名 part 此刻可能是接管者正在写的
@@ -2030,7 +2100,8 @@ fn copy_one(
 /// 原子防覆盖落位(评审复核 P0:`rename` 会替换已存在目标,check→rename 有竞态窗口)。
 /// 优先 `hard_link`:目标已存在时原子失败,不可能覆盖;成功后删除 part 名。
 /// 文件系统不支持硬链接(部分 SMB/exFAT)时回退「存在性复查 + rename」,
-/// 该回退窗口为微秒级且长窗口已被入口 pre_existing 检查夹住。
+/// 最后一级回退是「目标路径上的发布锁 + 锁内复查 + rename」:两个发布者由锁串行,
+/// 崩溃残留的锁不在这里回收(开拷前清扫按 30 分钟收);回退被用到时有可见告警。
 fn finalize_no_replace(part: &Path, fin: &Path, retried: &mut ContentionTally) -> Result<()> {
     // 平台原生 no-replace 原子改名(renamex_np/renameat2/MoveFileEx),
     // 逐级回退见 fsx 模块(M2 技术债:替代此前的 hard_link 方案)。
@@ -2238,20 +2309,37 @@ mod tests {
         let plan = vec![planned("a.mp4"), planned("c.mp4")];
         let stale_lock = dest.join("sub/.a.mp4.publish.ocardtmp");
         let fresh_lock = dest.join("sub/.c.mp4.publish.ocardtmp");
-        let stale_probe = dest.join("sub/.clock.deadbeefdeadbeef.ocardtmp");
-        let fresh_probe = dest.join("sub/.clock.0123456789abcdef.ocardtmp");
+        let stale_probe = dest.join("sub/.clock.deadbeef.ocardtmp");
+        let stale_hlprobe = dest.join("sub/.hlprobe.0badf00d.ocardtmp");
+        let stale_hlprobe_l = dest.join("sub/.hlprobe.0badf00d.l.ocardtmp");
+        let fresh_probe = dest.join("sub/.clock.01234567.ocardtmp");
         let unplanned_lock = dest.join("sub/.z.mp4.publish.ocardtmp");
+        // 用户自己的文件,只是名字像:同前缀同后缀但不是 8 位十六进制标签
+        let lookalike = dest.join("sub/.clock.notes.ocardtmp");
+        let lookalike_long = dest.join("sub/.clock.deadbeefdeadbeef.ocardtmp");
         for f in [
             &stale_lock,
             &fresh_lock,
             &stale_probe,
+            &stale_hlprobe,
+            &stale_hlprobe_l,
             &fresh_probe,
             &unplanned_lock,
+            &lookalike,
+            &lookalike_long,
         ] {
             std::fs::write(f, b"").unwrap();
         }
         let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 60);
-        for f in [&stale_lock, &stale_probe, &unplanned_lock] {
+        for f in [
+            &stale_lock,
+            &stale_probe,
+            &stale_hlprobe,
+            &stale_hlprobe_l,
+            &unplanned_lock,
+            &lookalike,
+            &lookalike_long,
+        ] {
             std::fs::File::options()
                 .write(true)
                 .open(f)
@@ -2268,6 +2356,10 @@ mod tests {
             &|| false,
         );
         assert!(refused.removed.is_empty(), "{refused:?}");
+        assert!(
+            !refused.failed.is_empty(),
+            "租约丢了要记下来并停止,不许静默跳过: {refused:?}"
+        );
         assert!(stale_lock.exists() && stale_probe.exists());
         let swept = sweep_stale_parts(
             std::slice::from_ref(&dest),
@@ -2278,13 +2370,22 @@ mod tests {
         );
         let mut removed = swept.removed.clone();
         removed.sort();
-        let mut expected = vec![stale_lock.clone(), stale_probe.clone()];
+        let mut expected = vec![
+            stale_lock.clone(),
+            stale_probe.clone(),
+            stale_hlprobe.clone(),
+            stale_hlprobe_l.clone(),
+        ];
         expected.sort();
         assert_eq!(removed, expected, "只收超过 30 分钟的锁 / 探针残留");
         assert!(swept.failed.is_empty(), "{:?}", swept.failed);
         assert!(fresh_lock.exists(), "新鲜的发布锁是别人正在发布,不许碰");
         assert!(fresh_probe.exists(), "新鲜的探针不许碰");
         assert!(unplanned_lock.exists(), "不在计划里的锁不是本任务的,不许碰");
+        assert!(
+            lookalike.exists() && lookalike_long.exists(),
+            "用户自己的同形文件不许当残留删"
+        );
     }
 
     /// 清了什么、没清成什么都要回报。
@@ -2626,6 +2727,7 @@ mod tests {
         std::fs::write(src_root.join("DCIM/A.MP4"), b"hello").unwrap();
         let _ = super::super::fsx::take_times_preserve_failures();
         let mut tally = ContentionTally::default();
+        let mut chunks = 0u32;
         let r = copy_one(
             &src_root,
             "DCIM/A.MP4",
@@ -2633,9 +2735,13 @@ mod tests {
             None,
             std::slice::from_ref(&dest),
             "abcd1234-22222222",
-            &mut |_| true,
+            &mut |_| {
+                chunks += 1;
+                true
+            },
             &mut tally,
         );
+        assert_eq!(chunks, 0, "入口就该拒绝,一个块都不许拷");
         let msg = match r {
             Err(super::super::CoreError::Invalid(m)) => m,
             other => panic!("要 Invalid,得到 {other:?}"),
@@ -3461,6 +3567,75 @@ mod review_regression_tests {
             .iter()
             .any(|f| f.rel_path == "ALIAS.MP4" && matches!(f.status, FileStatus::Failed(_))));
         assert!(!req.destinations[0].join("ALIAS.MP4").exists());
+    }
+
+    /// codex 终审 r15:续传跳过要有「源在快照之后没变」的证明——源哈希与逐目的地哈希跑了
+    /// 几分钟,期间源被改写(相机还在写卡)时盘上目标仍与「刚才那份源」一致,不查快照就会
+    /// 把没备份的新内容当已完成。内容相同、只有修改时间前进也必须拒绝(不知道 ≠ 没变)。
+    #[test]
+    fn resume_skip_refuses_when_the_source_changed_since_the_snapshot() {
+        let (_t, req, mut m, project) = setup();
+        run_copy(
+            &req,
+            &plan_whole_volume(&scan_source(&req.source_root).unwrap()),
+            &mut m,
+            &project,
+            None,
+            |_| CopyControl::Continue,
+        )
+        .unwrap();
+        let src = req.source_root.join("CLIP0001.MP4");
+        let pre = fs::metadata(&src).ok();
+        assert!(file_done_stable(
+            &m,
+            &req.source_root,
+            "CLIP0001.MP4",
+            "CLIP0001.MP4",
+            9000,
+            &req.destinations,
+            pre.as_ref()
+        ));
+        // 快照之后源被「重写」:内容一样、修改时间前进了一秒(FAT / NTFS 粗粒度时钟下也确定)
+        let bumped = pre.as_ref().unwrap().modified().unwrap() + std::time::Duration::from_secs(1);
+        fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(bumped))
+            .unwrap();
+        assert!(
+            !file_done_stable(
+                &m,
+                &req.source_root,
+                "CLIP0001.MP4",
+                "CLIP0001.MP4",
+                9000,
+                &req.destinations,
+                pre.as_ref()
+            ),
+            "快照之后修改时间变了就不许当已完成"
+        );
+        assert!(
+            !file_done_stable(
+                &m,
+                &req.source_root,
+                "CLIP0001.MP4",
+                "CLIP0001.MP4",
+                9000,
+                &req.destinations,
+                None
+            ),
+            "没有快照 = 无法证明 = 不许当已完成"
+        );
+        // 重新采快照就又能证明了(内容确实没变)
+        assert!(file_done(
+            &m,
+            &req.source_root,
+            "CLIP0001.MP4",
+            "CLIP0001.MP4",
+            9000,
+            &req.destinations
+        ));
     }
 
     /// R4 终审 P0-1:目标被替换成**同大小不同内容**后,file_done 不许再判完成

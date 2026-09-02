@@ -304,7 +304,8 @@ pub fn mark_suspect(project_root: &Path, id: &str, why: &str) -> Result<()> {
     let path = suspect_path(project_root, id)?;
     let body = format!("{}\n{why}\n", chrono::Utc::now().to_rfc3339());
     super::fsx::write_atomic(&path, body.as_bytes())
-        .map(|_| ())
+        // 重试后成功也要说(系统替用户等了杀软 / 索引器):记到本线程,收尾聚合
+        .map(|r| super::fsx::note_retried_writes(r.retries as u64))
         .map_err(|f| super::CoreError::io_detail_retried("写入清单不可信标记", &path, &f))
 }
 

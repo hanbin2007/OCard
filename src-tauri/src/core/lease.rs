@@ -71,7 +71,10 @@
 //!
 //! - `rename_no_replace` 在既不支持原子原语、也建不了硬链接的文件系统上退到「发布锁 +
 //!   复查 + rename」(见 `fsx`,有可见告警):目标路径上先用 `create_new` 拿发布锁,两个
-//!   发布者互相覆盖的窗口由锁串行化;残余的边界是锁本身的陈旧回收(两分钟)。
+//!   发布者互相覆盖的窗口由锁串行化。发布锁**不**按年龄在热路径回收(两个回收者能互删
+//!   对方刚建的锁,回到互相覆盖):撞上就可见失败并点名锁文件;崩溃残留只由开拷前的清扫
+//!   按 30 分钟(NAS 时钟)收,清扫删锁本身没有认领——三台机器同一路径、残留恰好过期、
+//!   微秒级时序下理论上仍可双成功,如实声明。
 //! - 接管锁靠 mtime 年龄回收(两分钟):没有存储端的原子 CAS,这是唯一能收回崩溃
 //!   残留的办法,代价是**整机休眠 / 卡在一次 NAS 读写里超过两分钟**的持有者会被当成
 //!   残留。后果**有界**(指:判定与进程内排队有界;一次卡在 NAS 内核里的系统调用本身
@@ -366,6 +369,7 @@ fn disk_now_fresh(dir: &Path) -> Option<std::time::SystemTime> {
     if let Err(e) = std::fs::remove_file(&probe) {
         // 落在交付 / 清单目录里的探针残留:开拷前的清扫按 30 分钟收走;删不掉至少要说
         log::warn!("时钟探针没删掉 {}: {e}", probe.display());
+        super::fsx::note_leftover_temp(&probe);
     }
     if let Some(t) = t {
         lock_or_recover(disk_now_cache()).insert(dir.to_path_buf(), (std::time::Instant::now(), t));
@@ -1162,6 +1166,35 @@ struct Shared {
     /// 就是自己和自己抢——慢 NAS 上心跳一拍就能耗尽栅栏的耐心。
     io_busy: Mutex<bool>,
     io_free: std::sync::Condvar,
+    /// 心跳线程上发生的降级(线程局部的标记随线程消亡,没人取就丢了):线程退出前收进
+    /// 这里,释放路径连同释放判定一起报给用户(带任务 scope)。心跳卡死没退出的那种,
+    /// 这些也一起丢,与「心跳线程没退出」的告警同时发生。
+    hb_fallback: AtomicBool,
+    hb_leftovers: Mutex<Vec<PathBuf>>,
+    hb_retries: std::sync::atomic::AtomicU64,
+}
+
+/// 心跳线程上攒下的降级,随释放判定一起交给上层(见 [`Lease::release_reported`])。
+#[derive(Debug, Default)]
+pub struct HeartbeatDegradations {
+    pub fallback_used: bool,
+    pub leftovers: Vec<PathBuf>,
+    pub retried_writes: u64,
+}
+
+/// 把**本线程**的降级标记收进共享区(心跳线程退出前调用)。
+fn absorb_thread_degradations(shared: &Shared) {
+    if super::fsx::take_unsafe_fallback_flag() {
+        shared.hb_fallback.store(true, Ordering::Relaxed);
+    }
+    let left = super::fsx::take_leftover_sources();
+    if !left.is_empty() {
+        lock_or_recover(&shared.hb_leftovers).extend(left);
+    }
+    let r = super::fsx::take_retried_writes();
+    if r > 0 {
+        shared.hb_retries.fetch_add(r, Ordering::Relaxed);
+    }
 }
 
 impl Shared {
@@ -1298,6 +1331,9 @@ impl Held {
             last_ok_ms: std::sync::atomic::AtomicU64::new(0),
             io_busy: Mutex::new(false),
             io_free: std::sync::Condvar::new(),
+            hb_fallback: AtomicBool::new(false),
+            hb_leftovers: Mutex::new(Vec::new()),
+            hb_retries: std::sync::atomic::AtomicU64::new(0),
             lost: Mutex::new(None),
             last_err: Mutex::new(None),
         });
@@ -1305,7 +1341,10 @@ impl Held {
             let (path, me, shared) = (path.clone(), me.clone(), shared.clone());
             std::thread::Builder::new()
                 .name("ocard-lease-heartbeat".into())
-                .spawn(move || heartbeat_loop(&path, &me, timing, &shared))
+                .spawn(move || {
+                    heartbeat_loop(&path, &me, timing, &shared);
+                    absorb_thread_degradations(&shared);
+                })
         };
         match thread {
             Ok(t) => Ok(Self {
@@ -1458,6 +1497,19 @@ impl Held {
     }
 
     /// 显式释放并回报结果(`Drop` 也会释放,只是没人接结果)。
+    /// [`release`](Self::release) 加上心跳线程攒下的降级:释放路径(会 join 心跳线程)
+    /// 之后才读,读到的是完整的。上层用带任务 scope 的通知说出来。
+    pub fn release_reported(self) -> (Released, HeartbeatDegradations) {
+        let shared = self.shared.clone();
+        let released = self.release();
+        let degraded = HeartbeatDegradations {
+            fallback_used: shared.hb_fallback.swap(false, Ordering::Relaxed),
+            leftovers: std::mem::take(&mut *lock_or_recover(&shared.hb_leftovers)),
+            retried_writes: shared.hb_retries.swap(0, Ordering::Relaxed),
+        };
+        (released, degraded)
+    }
+
     pub fn release(mut self) -> Released {
         self.release_inner()
     }
@@ -1718,7 +1770,9 @@ fn heartbeat_loop(path: &Path, me: &Lease, timing: Timing, shared: &Arc<Shared>)
                     .map_err(|f| format!("{}{}", super::error::explain_io(&f.source), f.note()))
             });
         match written {
-            Ok(_) => {
+            Ok(report) => {
+                // 重试后成功也要说:记到心跳线程的线程局部,退出时收进共享区
+                super::fsx::note_retried_writes(report.retries as u64);
                 // 写完回读复核:取得现在一律在锁下,锁之外理论上没人能插进来;但复核只花一次小读,值得。历史上快路径的干净取得只在
                 // 文件不存在时成功——理论上到不了,但复核只花一次小读,值得。
                 // 回读不到自己的**不算成功**(fail-closed)

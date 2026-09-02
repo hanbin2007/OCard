@@ -101,27 +101,43 @@ pub(crate) fn notify_if_unsafe_fallback_for<R: tauri::Runtime>(
         );
     }
     let left = crate::core::fsx::take_leftover_sources();
-    if left > 0 {
-        notify::warn(
+    if !left.is_empty() {
+        notify::warn_scoped(
             app,
+            task,
             "fsx-leftover-temp",
-            format!("{left} 个文件已正确落位,但落位后的临时名没删掉(多半是杀毒软件 / 索引器还占着);它们不影响内容,下次开拷前的清扫或启动清理会收走"),
+            format!(
+                "{} 个文件没删掉(例如 {}):落位 / 改名已成功,但旧名(临时名、探针、发布锁,或分类移动的原文件)还留在原处,多半是杀毒软件 / 索引器还占着。新位置的内容不受影响;拷卡目录里的由下次开拷前的清扫收、清单目录里的由启动清理收,其它目录请按路径手动删除——残留的发布锁会挡住同名文件的落位",
+                left.len(),
+                left[0].display()
+            ),
         );
     }
     let n = crate::core::fsx::take_times_preserve_failures();
     if n > 0 {
-        notify::warn(
+        notify::warn_scoped(
             app,
+            task,
             "timestamps-not-preserved",
             format!("{n} 个文件的源时间戳未能保留(目标文件系统限制或权限);文件内容不受影响"),
         );
     }
     let u = crate::core::fsx::take_uncached_fallbacks();
     if u > 0 {
-        notify::info(
+        notify::info_scoped(
             app,
+            task,
             "verify-cache-fallback",
             format!("{u} 次校验回读未能绕过系统缓存(内核拒绝直读请求);校验仍执行,但覆盖介质错误的能力退化为普通读"),
+        );
+    }
+    let r = crate::core::fsx::take_retried_writes();
+    if r > 0 {
+        notify::info_scoped(
+            app,
+            task,
+            "fsx-write-retried",
+            format!("有写入被占用(多半是杀毒软件 / 索引器),系统重试了 {r} 轮后成功;内容无误。频繁出现请把工作目录加入杀毒软件排除项"),
         );
     }
 }

@@ -221,7 +221,7 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
             let lease_file = lease.path().to_path_buf();
             report_lease_release(
                 &app,
-                lease.release(),
+                lease.release_reported(),
                 &lease_file,
                 "重复的续传请求回滚",
                 false,
@@ -399,7 +399,7 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
             let lease_file = lease.path().to_path_buf();
             report_lease_release(
                 &app_for_spawn_error,
-                lease.release(),
+                lease.release_reported(),
                 &lease_file,
                 "拷卡线程启动失败、回滚",
                 false,
@@ -649,7 +649,7 @@ fn run_worker<R: tauri::Runtime>(
     let task_paused = handle.snap().state == "paused";
     report_lease_release(
         app,
-        lease.release(),
+        lease.release_reported(),
         &lease_file,
         "任务结束",
         task_paused,
@@ -704,7 +704,7 @@ impl<R: tauri::Runtime> Drop for LeaseKeeper<R> {
             let task_paused = self.handle.snap().state == "paused";
             report_lease_release(
                 &self.app,
-                lease.release(),
+                lease.release_reported(),
                 &path,
                 self.what,
                 task_paused,
@@ -720,7 +720,10 @@ impl<R: tauri::Runtime> Drop for LeaseKeeper<R> {
 /// 的 Drop 转到这里。
 pub(crate) fn report_lease_release<R: tauri::Runtime>(
     app: &AppHandle<R>,
-    released: crate::core::lease::Released,
+    released: (
+        crate::core::lease::Released,
+        crate::core::lease::HeartbeatDegradations,
+    ),
     lease_file: &Path,
     // 报文的口径:「任务结束」/「自动转代理状态写回」/「拷卡线程启动失败、回滚」——
     // 三处复用同一段判定,但只有 worker 那一路真的有任务被暂停
@@ -730,6 +733,39 @@ pub(crate) fn report_lease_release<R: tauri::Runtime>(
     // 残留租约时没有 scope 就只剩一条。代理写回那一路没有 project id,给空串即可
     task: Option<(&str, &str)>,
 ) {
+    let (released, degraded) = released;
+    // 心跳线程上的降级:线程局部的标记随线程消亡,由释放路径带任务 scope 说出来
+    if degraded.fallback_used {
+        super::notify::warn_scoped(
+            app,
+            task,
+            "fsx-fallback-window",
+            "租约心跳线程重建租约文件时,文件系统不支持原子防覆盖改名与硬链接,已降级为「发布锁 + 复查后改名」;建议确认 NAS 协议(SMB3/NFSv4)".into(),
+        );
+    }
+    if !degraded.leftovers.is_empty() {
+        super::notify::warn_scoped(
+            app,
+            task,
+            "fsx-leftover-temp",
+            format!(
+                "租约心跳线程有 {} 个临时文件没删掉(例如 {});清单目录里的由启动清理收,其它请按路径手动删除",
+                degraded.leftovers.len(),
+                degraded.leftovers[0].display()
+            ),
+        );
+    }
+    if degraded.retried_writes > 0 {
+        super::notify::info_scoped(
+            app,
+            task,
+            "fsx-write-retried",
+            format!(
+                "租约心跳写入被占用(多半是杀毒软件 / 索引器),系统重试了 {} 轮后成功;内容无误",
+                degraded.retried_writes
+            ),
+        );
+    }
     match released {
         crate::core::lease::Released::Removed => {}
         // 被接管:轮询阶段多半已经报过 task-lease-lost(同 code 同任务 30 秒内会合并,不会
@@ -951,7 +987,7 @@ fn run_worker_locked<R: tauri::Runtime>(
             "copy-stale-parts-swept",
             (&task_for_notices.0, &task_for_notices.1),
             format!(
-                "清理了上次运行留下的 {} 个残留,例如 {}。没写完的半个文件(.ocardpart)本次会重新拷;超过 30 分钟的发布锁 / 时钟探针残留(.ocardtmp)是上次崩溃留下的",
+                "清理了上次运行留下的 {} 个残留,例如 {}。没写完的半个文件(.ocardpart)本次会重新拷;超过 30 分钟的发布锁 / 时钟与硬链接探针残留(.ocardtmp)是上次崩溃留下的",
                 swept.removed.len(),
                 swept.removed[0].display()
             ),

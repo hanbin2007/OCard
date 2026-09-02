@@ -1964,7 +1964,10 @@ pub fn start_copy_task<R: tauri::Runtime>(
     // (字段名沿用 hidden_*:它同时是前端契约字段名,改名会打断并行开发的前端)
     m.hidden_skipped = hidden_skipped;
     m.hidden_samples = hidden_samples;
-    manifest::save(&stats.root, &m).map_err(err)?;
+    let first_save = manifest::save(&stats.root, &m).map_err(err)?;
+    // 重试后成功也要说;这条命令线程上的降级标记在这里带任务 scope 取走
+    crate::core::fsx::note_retried_writes(first_save.0.retries as u64);
+    sorting_cmds::notify_if_unsafe_fallback_for(&app, Some((&m.id, &stats.folder_name)));
 
     // 零静默,且必须在清单**落盘之后**才说(不然「已写入清单」是空头支票):
     // 系统替用户改了文件名,双确认屏之外再兜一次底
@@ -2075,8 +2078,14 @@ pub fn resume_copy_task<R: tauri::Runtime>(
             &handle.manifest_id,
             &handle.machine_id,
             &operator,
-        )
-        .map_err(|e| {
+        );
+        // 租约取得(原子建文件)在这条命令线程上完成,降级标记是线程局部的:在 `?` **之前**
+        // 取走、带 scope——Busy 早退时留在运行时线程上的标记会被下一条命令当成自己的
+        sorting_cmds::notify_if_unsafe_fallback_for(
+            &app,
+            Some((&task_id_for_lease, &project_id_for_lease)),
+        );
+        let lease = lease.map_err(|e| {
             let msg = e.to_string();
             if matches!(e, crate::core::CoreError::Busy(_)) {
                 // 先 clone 再放锁:notify 会写日志 + IPC,不该持着 snapshot 锁做
@@ -2101,11 +2110,6 @@ pub fn resume_copy_task<R: tauri::Runtime>(
             }
             msg
         })?;
-        // 租约取得(原子建文件)在这条命令线程上完成,降级标记是线程局部的:在这里取走、带 scope
-        sorting_cmds::notify_if_unsafe_fallback_for(
-            &app,
-            Some((&task_id_for_lease, &project_id_for_lease)),
-        );
         // 从这里到交给 worker 之间的任何早退(清单损坏、卷没插回……)都要有释放判定
         let mut keeper = tasks::LeaseKeeper::new(
             app.clone(),

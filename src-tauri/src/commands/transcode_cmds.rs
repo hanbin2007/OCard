@@ -1281,7 +1281,7 @@ fn save_proxy_state_inner<R: tauri::Runtime>(
     let lease_file = lease.path().to_path_buf();
     super::tasks::report_lease_release(
         app,
-        lease.release(),
+        lease.release_reported(),
         &lease_file,
         "自动转代理状态写回",
         false,

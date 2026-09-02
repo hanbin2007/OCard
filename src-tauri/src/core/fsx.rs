@@ -8,7 +8,7 @@
 
 use std::fs;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 thread_local! {
     /// 「最后回退(发布锁 + 复查 + rename)被真实使用」标记。**线程局部**:拷卡 worker、
@@ -16,9 +16,10 @@ thread_local! {
     /// 进程级的一个标记会被并发的别的任务先取走、归错任务(codex 终审)。
     /// 用了线程池的调用方(分析)要在池线程上取,再汇总到作业。
     static UNSAFE_FALLBACK_USED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// 落位成功但源(临时名)没删掉的次数:目标已经发布,这不是失败,但留下的临时文件
-    /// 是可见的降级,上层要说(启动清扫 / 下一轮 part 清扫会收走)。
-    static LEFTOVER_SOURCES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 没删掉的临时文件(落位后的临时名 / 探针 / 发布锁 / 原子写的临时文件)的**路径**:
+    /// 目标已经发布,这不是失败,但留下的文件是可见的降级,上层要点名说——只有拷卡目录和
+    /// 清单目录里的有清扫认得,其它目录里的要人按路径手删。
+    static LEFTOVER_SOURCES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// 取走**本线程**的「最后回退被使用」标记(取走即清零)。
@@ -30,9 +31,33 @@ fn mark_unsafe_fallback() {
     UNSAFE_FALLBACK_USED.with(|c| c.set(true));
 }
 
-/// 取走并清零**本线程**的「落位后源没删掉」计数(给上层告警用)。
-pub fn take_leftover_sources() -> usize {
-    LEFTOVER_SOURCES.with(|c| c.replace(0))
+/// 取走并清零**本线程**的「临时文件没删掉」计数(给上层告警用):落位后的临时名、探针、
+/// 发布锁、原子写的临时文件——删不掉的都算,日志不是出口。
+pub fn take_leftover_sources() -> Vec<PathBuf> {
+    LEFTOVER_SOURCES.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// 记一个本线程「临时文件没删掉」的路径(fsx 内外都用;租约的时钟探针也走这里)。
+pub fn note_leftover_temp(path: &Path) {
+    LEFTOVER_SOURCES.with(|c| c.borrow_mut().push(path.to_path_buf()));
+}
+
+thread_local! {
+    /// 系统替用户重试并**成功**的写入次数(占用重试):成功了也要说——它是「这台机器上有
+    /// 东西在抢文件」的信号,收尾聚合成一条 info。线程局部,同上。
+    static RETRIED_WRITES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 记本线程一次「重试后成功」的写入(带重试轮数)。
+pub fn note_retried_writes(retries: u64) {
+    if retries > 0 {
+        RETRIED_WRITES.with(|c| c.set(c.get() + retries));
+    }
+}
+
+/// 取走并清零本线程的「重试后成功」轮数。
+pub fn take_retried_writes() -> u64 {
+    RETRIED_WRITES.with(|c| c.replace(0))
 }
 
 /// 原语级(renamex_np / renameat2 / MoveFileExW)的「不支持」:只有这种才允许退到硬链接。
@@ -161,6 +186,7 @@ fn dir_supports_hard_links_with(
             r => r,
         }) {
             log::warn!("硬链接探针文件没删掉 {}: {}", p.display(), f.source);
+            note_leftover_temp(p);
         }
     }
     match r {
@@ -219,7 +245,7 @@ fn rename_no_replace_with(
                             "落位成功但临时名没删掉 {}: {ce}(目标已发布;临时文件留给清扫)",
                             src.display()
                         );
-                        LEFTOVER_SOURCES.with(|c| c.set(c.get() + 1));
+                        note_leftover_temp(src);
                     }
                 }
                 Ok(())
@@ -272,6 +298,7 @@ fn checked_rename_under_publish_lock(src: &Path, dst: &Path) -> io::Result<()> {
         // 交付目录里的锁残留没有启动清扫认得(只扫清单目录),开拷前的 part 清扫会顺手收;
         // 删不掉至少要说
         log::warn!("发布锁没删掉 {}: {}", lock.display(), f.source);
+        note_leftover_temp(&lock);
     }
     r
 }
@@ -295,7 +322,7 @@ fn publish_lock_busy(e: io::Error, lock: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
         format!(
-            "{PUBLISH_LOCK_HELD}:目标路径正被另一个发布者持有发布锁 {}(或是崩溃残留;发布锁不自动回收,开拷前的清扫只收超过 30 分钟的)。确认没有别的 OCard 在往这里写之后可手动删除该锁文件再重试:{e}",
+            "{PUBLISH_LOCK_HELD} {}(或是崩溃残留;发布锁不自动回收,开拷前的清扫只收超过 30 分钟的)。确认没有别的 OCard 在往这里写之后可手动删除该锁文件再重试:{e}",
             lock.display()
         ),
     )
@@ -378,17 +405,24 @@ fn platform_rename_no_replace(_src: &Path, _dst: &Path) -> io::Result<()> {
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
-/// 打开文件并尽量绕过页缓存(校验用:让回读尽量来自介质而非内存)。
-/// Windows 回退普通打开(如实标注的边界,见模块文档)。
-/// 绕缓存请求被内核拒绝的次数(R4 终审 P1:此前返回值被忽略,「介质回读」
-/// 保证会无提示退化成普通缓存读;计数由命令层聚合为可见提示)。
-static UNCACHED_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// 取走绕缓存退化计数(swap 清零)。
-pub fn take_uncached_fallbacks() -> u64 {
-    UNCACHED_FALLBACKS.swap(0, std::sync::atomic::Ordering::Relaxed)
+// 绕缓存请求被内核拒绝的次数(R4 终审 P1:此前返回值被忽略,「介质回读」
+// 保证会无提示退化成普通缓存读;计数由命令层聚合为可见提示)。
+thread_local! {
+    /// 线程局部(与其它降级计数同理:并行任务不许互相领走)。
+    static UNCACHED_FALLBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// 取走**本线程**的绕缓存退化计数(取走即清零)。
+pub fn take_uncached_fallbacks() -> u64 {
+    UNCACHED_FALLBACKS.with(|c| c.replace(0))
+}
+
+fn note_uncached_fallback() {
+    UNCACHED_FALLBACKS.with(|c| c.set(c.get() + 1));
+}
+
+/// 打开文件并尽量绕过页缓存(校验用:让回读尽量来自介质而非内存)。
+/// Windows 回退普通打开(如实标注的边界,见模块文档)。
 pub fn open_uncached(path: &Path) -> io::Result<fs::File> {
     let file = fs::File::open(path)?;
     #[cfg(target_os = "macos")]
@@ -396,7 +430,7 @@ pub fn open_uncached(path: &Path) -> io::Result<fs::File> {
         use std::os::fd::AsRawFd;
         let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
         if rc != 0 {
-            UNCACHED_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_uncached_fallback();
         }
     }
     #[cfg(target_os = "linux")]
@@ -404,13 +438,13 @@ pub fn open_uncached(path: &Path) -> io::Result<fs::File> {
         use std::os::fd::AsRawFd;
         let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
         if rc != 0 {
-            UNCACHED_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_uncached_fallback();
         }
     }
     #[cfg(windows)]
     {
         // Windows 无扇区对齐读实现,固定按退化计数(声明边界的可见化)
-        UNCACHED_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_uncached_fallback();
     }
     Ok(file)
 }
@@ -426,7 +460,7 @@ pub fn read_file_uncached(path: &Path) -> io::Result<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// UNSAFE_FALLBACK_USED 是进程级的一个标记:考它的用例必须串行,否则并行跑时一个
+    /// 降级标记如今是线程局部的;历史上是进程级的,考它的用例仍串行(无害),否则并行跑时一个
     /// 用例刚置位、另一个就把它取走(Windows CI 上真的撞过)
     fn flag_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1224,7 +1258,10 @@ fn cleanup_tmp(tmp: &Path) {
         Ok(()) => {}
         // 本来就不在(写都没成功)——正常
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => log::warn!("原子写的临时文件清不掉,已留在盘上: {} — {e}", tmp.display()),
+        Err(e) => {
+            log::warn!("原子写的临时文件清不掉,已留在盘上: {} — {e}", tmp.display());
+            note_leftover_temp(tmp);
+        }
     }
 }
 

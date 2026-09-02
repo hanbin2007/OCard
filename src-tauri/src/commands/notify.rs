@@ -195,6 +195,21 @@ pub fn error_scoped<R: tauri::Runtime>(
     }
 }
 
+/// [`warn_scoped`] 的 info 级(重试后成功、绕缓存退化这类「说一声就好」的事)。
+pub fn info_scoped<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    task: Option<(&str, &str)>,
+    code: &str,
+    message: String,
+) {
+    match task {
+        Some((task_id, project_id)) if !task_id.is_empty() => {
+            info_for_task(app, code, (task_id, project_id), message)
+        }
+        _ => info(app, code, message),
+    }
+}
+
 pub fn warn_for_task<R: tauri::Runtime>(
     app: &AppHandle<R>,
     code: &str,
