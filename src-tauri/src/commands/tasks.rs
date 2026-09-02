@@ -317,7 +317,7 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
                     "copy-task-aborted"
                 },
                 (&task_id, &proj_id),
-                if paused && e.to_string().starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) {
+                if paused && e.to_string().contains(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) {
                     // 锁目录不清理的话点「继续」也没用——最响最持久的这条不能给错指令
                     format!(
                         "拷卡任务「{folder}」已中断并转入暂停,已拷部分不会丢。这次的原因不会自己好:请先人工清理清单目录里的租约锁目录,再点「继续」。\n原因:{e}\n{DIAG_HINT}"
@@ -557,7 +557,7 @@ fn run_worker<R: tauri::Runtime>(
             // 锁目录异常(链接 / 异物)不会自己好:除了「已中断、可续传」那条,还要一条
             // 抬头就说「需人工清理」的,否则用户只会一遍遍点「继续」
             if e.to_string()
-                .starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX)
+                .contains(crate::core::lease::LOCK_DIR_BROKEN_PREFIX)
             {
                 super::notify::error_for_task(
                     app,
@@ -592,7 +592,7 @@ fn run_worker<R: tauri::Runtime>(
         // 运行中(落盘时)才发现锁目录异常:除了「已中断、可续传」那条,还要一条抬头就说
         // 「需人工清理」的,否则用户会白点一次「继续」才拿到这句话
         if e.to_string()
-            .starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX)
+            .contains(crate::core::lease::LOCK_DIR_BROKEN_PREFIX)
         {
             super::notify::error_for_task(
                 app,
@@ -692,8 +692,22 @@ pub(crate) fn report_lease_release<R: tauri::Runtime>(
 ) {
     match released {
         crate::core::lease::Released::Removed => {}
-        // 被接管:轮询阶段已经报过 task-lease-lost,这里不重复
-        crate::core::lease::Released::TakenOver => {}
+        // 被接管:轮询阶段多半已经报过 task-lease-lost(同 code 同任务 30 秒内会合并,不会
+        // 刷屏);但准备阶段就被接管、一次都没轮询过就早退的那条路此前是无声的
+        crate::core::lease::Released::TakenOver => {
+            super::notify::warn_scoped(
+                app,
+                task,
+                if task_paused {
+                    "task-lease-lost"
+                } else {
+                    "task-lease-lost-outside-run"
+                },
+                format!(
+                    "{what}时确认本任务的租约已由别的进程持有;请核对另一处的进度,再决定在哪边续传"
+                ),
+            );
+        }
         crate::core::lease::Released::RemoveFailed(why) => {
             // 留下的是**我们自己的**租约:别的机器要等 TTL;本机在本次运行期间也续不了
             // (pid 还活着,不算残留;重启 OCard 后 pid 不在了就能立刻接管)。得说清楚,
@@ -750,7 +764,7 @@ pub(crate) fn report_lease_release<R: tauri::Runtime>(
             );
         }
         crate::core::lease::Released::NoLock(why)
-            if why.starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) =>
+            if why.contains(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) =>
         {
             // 锁目录异常不会自己好:抬头要说「需人工清理」,而且是 error 级(不自动收起);
             // 后果那半句不能丢:租约留下了,别的机器要等 TTL、本机本次运行期间续不了,
@@ -875,7 +889,19 @@ fn run_worker_locked<R: tauri::Runtime>(
     };
     // 持有租约的一方清掉上一轮(别的 run 标签,含旧格式)留下的 .ocardpart。系统替用户
     // 删了东西,要说;没删成的也要说——它们不会与本轮撞名,只是占着空间
+    // 清扫在**栅栏内**:它专门删「别的 run」的 part,若本进程在拿到租约之后休眠、被接管,
+    // 醒来直接清扫就会删掉接管者正在写的 part(codex r9)。栅栏持锁核对 token,不是自己
+    // 的就不清、直接按中止处理
+    let sweep_fence = match lease.fence() {
+        Ok(f) => f,
+        Err(e) => {
+            return Err(crate::core::CoreError::Busy(format!(
+                "开拷前核对租约失败,没有清扫残留也没有开始拷贝:{e}"
+            )))
+        }
+    };
     let swept = copy::sweep_stale_parts(&handle.dest_targets, &plan, &task_prefix, &run_tag);
+    drop(sweep_fence);
     if !swept.removed.is_empty() {
         super::notify::info_for_task(
             app,
@@ -1009,7 +1035,7 @@ fn run_worker_locked<R: tauri::Runtime>(
                 if !lease_stop_reported {
                     lease_stop_reported = true;
                     lease_abort_why = Some(why.clone());
-                    if why.starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) {
+                    if why.contains(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) {
                         super::notify::error_for_task(
                             app,
                             "copy-resume-lease-lock-broken",
@@ -1059,6 +1085,17 @@ fn run_worker_locked<R: tauri::Runtime>(
         };
         if !outcome.paused {
             snap.finished_at = Some(Utc::now().to_rfc3339());
+        }
+        if snap.state == "done" {
+            // 全部按哈希确认并落盘了:这份清单此刻就是事实,不可信标记(若有)可以清掉
+            if let Err(e) = manifest::clear_suspect(&handle.project_root, &handle.manifest_id) {
+                super::notify::warn_for_task(
+                    app,
+                    "manifest-suspect",
+                    (&task_for_notices.0, &task_for_notices.1),
+                    format!("任务已完成,但清单旁的「不可信」标记没能删掉({e});下次启动它仍会被当作未完成展示,可手动删除该标记文件"),
+                );
+            }
         }
         let dest_state = match snap.state {
             "done" => "done",
@@ -1169,7 +1206,7 @@ fn run_worker_locked<R: tauri::Runtime>(
             Some(why) => crate::core::CoreError::Busy(why),
             // 心跳侧带前缀的原因(锁目录异常)原样上抛:上层据前缀换抬头、改「点继续」的提示
             None => match lease_abort_why.take() {
-                Some(why) if why.starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) => {
+                Some(why) if why.contains(crate::core::lease::LOCK_DIR_BROKEN_PREFIX) => {
                     crate::core::CoreError::Busy(why)
                 }
                 _ => copy::lease_abort(),

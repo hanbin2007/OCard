@@ -359,7 +359,9 @@ const LOCK_DIR_HAS_FOREIGN_ENTRIES: &str = "里有不认识的条目(不是 OCar
 
 /// 锁目录形状检查的两种「不合法」:读不出(让路、下次再看)与异物(拒绝、要说)。
 enum ShapeIssue {
-    Unreadable,
+    /// 枚举 / 读条目类型失败(带 IO 原因)。瞬时的让路;持续的要告诉用户是权限 / 存储问题,
+    /// 而不是「别的进程正在接管」
+    Unreadable(String),
     Foreign(&'static str),
 }
 
@@ -370,6 +372,8 @@ enum Take {
     Held,
     /// 锁目录不是我们能碰的东西,原因见 [`LOCK_DIR_NOT_A_DIR`] / [`LOCK_DIR_HAS_FOREIGN_ENTRIES`]。
     Refused(&'static str),
+    /// 锁目录读不出(权限 / 存储),带 IO 原因。可以稍后再试,但要如实说,不是「别人在接管」。
+    Unreadable(String),
 }
 
 /// 文件是不是「年轻」(最近才写的)。读不懂的年轻文件当作正在初始化。
@@ -478,6 +482,7 @@ impl TakeoverLock {
 
     /// 锁目录里有没有不是 OCard 写的条目。只读、不看年龄:一个刚落下的 `desktop.ini`
     /// 也该立刻被说出来,而不是先当「别人正在接管」等两分钟。
+    #[cfg(test)]
     fn foreign_shape(dir: &Path) -> Option<&'static str> {
         match Self::inspect_lock_shape(dir) {
             Err(ShapeIssue::Foreign(why)) => Some(why),
@@ -491,15 +496,18 @@ impl TakeoverLock {
     /// 真正的 nonce 已被删掉、异物还在、报文却说「别人正在接管」(codex r8)。
     /// 枚举出错(NAS 抖一下)不算异物,按「读不出」让路,下一次再看。
     fn inspect_lock_shape(dir: &Path) -> std::result::Result<Vec<PathBuf>, ShapeIssue> {
-        let rd = std::fs::read_dir(dir).map_err(|_| ShapeIssue::Unreadable)?;
+        let rd = std::fs::read_dir(dir)
+            .map_err(|e| ShapeIssue::Unreadable(super::error::explain_io(&e)))?;
         let mut nonces = Vec::new();
         for e in rd {
-            let e = e.map_err(|_| ShapeIssue::Unreadable)?;
+            let e = e.map_err(|e| ShapeIssue::Unreadable(super::error::explain_io(&e)))?;
             let name = e.file_name();
             let name = name.to_string_lossy();
             let shaped = name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit());
             // DirEntry::file_type 不跟链接:链接就是链接,不是文件
-            let kind = e.file_type().map_err(|_| ShapeIssue::Unreadable)?;
+            let kind = e
+                .file_type()
+                .map_err(|e| ShapeIssue::Unreadable(super::error::explain_io(&e)))?;
             if !shaped || !kind.is_file() {
                 return Err(ShapeIssue::Foreign(LOCK_DIR_HAS_FOREIGN_ENTRIES));
             }
@@ -560,7 +568,7 @@ impl TakeoverLock {
                 log::warn!("租约接管锁目录里有不认识的条目,不回收: {}", dir.display());
                 return Err(why);
             }
-            Err(ShapeIssue::Unreadable) => return Ok(false),
+            Err(ShapeIssue::Unreadable(_)) => return Ok(false),
         };
         // 破坏性判定**强制写一个新探针**(不吃 5 秒缓存:缓存建立后 NAS 时钟若跳了两分钟
         // 以上,按缓存算刚建的锁会立刻「可回收」),但一次 reclaim 只写这一个——锁目录
@@ -621,9 +629,12 @@ impl TakeoverLock {
                             return Ok(Take::Refused(LOCK_DIR_NOT_A_DIR));
                         }
                     }
-                    // 异物同样先于年龄判:否则新鲜的异物要先当「别人正在接管」等两分钟
-                    if let Some(why) = Self::foreign_shape(&dir) {
-                        return Ok(Take::Refused(why));
+                    // 异物同样先于年龄判:否则新鲜的异物要先当「别人正在接管」等两分钟。
+                    // 读不出的也单独说:持续读不出(权限 / 存储)不是「别的进程正在接管」
+                    match Self::inspect_lock_shape(&dir) {
+                        Err(ShapeIssue::Foreign(why)) => return Ok(Take::Refused(why)),
+                        Err(ShapeIssue::Unreadable(e)) => return Ok(Take::Unreadable(e)),
+                        Ok(_) => {}
                     }
                     if !Self::is_reclaimable(&dir) {
                         return Ok(Take::Held);
@@ -643,16 +654,19 @@ impl TakeoverLock {
     /// 等一小会儿再试(给心跳/释放用:对面接管只需几十毫秒)。被**拒绝**的不等:
     /// 那种锁目录不会自己好。
     fn take_with_patience(lease: &Path, tries: u32) -> Result<Take> {
+        let mut last = Take::Held;
         for i in 0..tries {
             match Self::try_take(lease)? {
-                Take::Held => {}
+                Take::Held => last = Take::Held,
+                // 读不出多半是瞬时的:再等等;等到最后还是读不出,把原因带回去
+                u @ Take::Unreadable(_) => last = u,
                 decided => return Ok(decided),
             }
             if i + 1 < tries {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
-        Ok(Take::Held)
+        Ok(last)
     }
 
     /// 锁还是不是我的(nonce 还在)。每个破坏性动作之前问一句。
@@ -773,6 +787,12 @@ pub fn acquire_with(
         Take::Held => {
             return Err(super::CoreError::Busy(format!(
                 "另一个进程正在接管这个拷卡任务的租约,本次不重复接管;请在那边操作,或稍后再试(若确认没有别的进程在跑,可删除锁目录解锁:{})",
+                TakeoverLock::path_for(&path).display()
+            )));
+        }
+        Take::Unreadable(e) => {
+            return Err(super::CoreError::Busy(format!(
+                "这个拷卡任务的租约锁目录读不出({e}),本次不接管;稍后再试,持续出现请检查该目录的权限与存储:{}",
                 TakeoverLock::path_for(&path).display()
             )));
         }
@@ -1136,6 +1156,12 @@ impl Held {
                     )),
                 });
             }
+            Take::Unreadable(e) => {
+                return Err(super::CoreError::Busy(format!(
+                    "落盘前租约锁目录读不出({e}),本次不写;为安全起见已停下,可续传;持续出现请检查该目录的权限与存储:{}",
+                    TakeoverLock::path_for(&self.path).display()
+                )));
+            }
             Take::Refused(why) => {
                 return Err(super::CoreError::Busy(format!(
                     "{LOCK_DIR_BROKEN_PREFIX}:落盘前发现租约接管锁目录{why},已拒绝回收,本次不写;这种情况不会自己好,请人工检查该目录:{}",
@@ -1222,6 +1248,12 @@ impl Held {
                 return Released::NoLock(
                     "释放时没能拿到接管锁(别的进程正在接管,或锁目录残留)".into(),
                 )
+            }
+            Ok(Take::Unreadable(e)) => {
+                return Released::NoLock(format!(
+                    "释放时租约锁目录读不出({e});持续出现请检查该目录的权限与存储:{}",
+                    TakeoverLock::path_for(&self.path).display()
+                ))
             }
             Ok(Take::Refused(why)) => {
                 return Released::NoLock(format!(
@@ -1313,6 +1345,13 @@ fn heartbeat_loop(path: &Path, me: &Lease, timing: Timing, shared: &Arc<Shared>)
                 fail("接管锁被别的进程持有,本拍跳过".into());
                 continue;
             }
+            Ok(Take::Unreadable(e)) => {
+                fail(format!(
+                    "租约锁目录读不出({e}),本拍跳过;持续出现请检查该目录的权限与存储:{}",
+                    TakeoverLock::path_for(path).display()
+                ));
+                continue;
+            }
             Ok(Take::Refused(why)) => {
                 // 不会自己好:每拍都失败,at_risk_after 之后上层会停下并把这句话说出来
                 fail(format!(
@@ -1368,6 +1407,17 @@ fn heartbeat_loop(path: &Path, me: &Lease, timing: Timing, shared: &Arc<Shared>)
                             }
                             return;
                         }
+                        // 同上:重建期间锁被回收 = 不可逆 Lost,并撤回
+                        if !guard.still_mine() {
+                            *lock_or_recover(&shared.lost) = Some(
+                                "别的进程(接管锁在本机重建租约期间已被回收,本机建出的那份已撤回)"
+                                    .into(),
+                            );
+                            if matches!(read_lease(path), Some(l) if l.token == me.token) {
+                                let _ = std::fs::remove_file(path);
+                            }
+                            return;
+                        }
                         shared.last_ok_ms.store(shared.now_ms(), Ordering::Relaxed);
                         *lock_or_recover(&shared.last_err) = None;
                     }
@@ -1414,6 +1464,17 @@ fn heartbeat_loop(path: &Path, me: &Lease, timing: Timing, shared: &Arc<Shared>)
                         // 我的就删。锁可能已被回收(两分钟门槛),这一删是尽力而为;
                         // 万一删掉的是接管者刚换上的,它的心跳下一拍会按「文件没了」重建
                         if shared.stop.load(Ordering::SeqCst) {
+                            let _ = std::fs::remove_file(path);
+                            return;
+                        }
+                        // 锁在这一拍期间被回收(整机休眠超过两分钟才醒)= 这一拍可能盖掉了
+                        // 接管者刚写的租约。**不可逆**地判 Lost、不刷新 last_ok_ms——否则
+                        // 旧持有者读回自己的 token 会以为一切正常,继续写清单(codex r9);
+                        // 回读还是我的就撤回
+                        if !guard.still_mine() {
+                            *lock_or_recover(&shared.lost) = Some(
+                                "别的进程(接管锁在本机写心跳期间已被回收,本机这一拍可能盖掉了它的租约,已撤回)".into(),
+                            );
                             let _ = std::fs::remove_file(path);
                             return;
                         }
@@ -2185,6 +2246,26 @@ mod tests {
             msg.contains("人工检查") && msg.contains("不认识的条目"),
             "{msg}"
         );
+        assert!(!msg.contains("另一个进程正在接管"), "{msg}");
+    }
+
+    /// 读不出的锁目录(权限)要如实说「读不出」,不能说「另一个进程正在接管」——
+    /// 后者会让人去别的机器上白找,而这个目录只要权限不改就永远读不出。
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_lock_dir_is_reported_as_unreadable_not_as_a_takeover_in_progress() {
+        use std::os::unix::fs::PermissionsExt;
+        // root 无视权限位,这条测试在 root 下考不到东西:硬断言,不许静默跳过
+        assert_ne!(unsafe { libc::geteuid() }, 0, "前置:不能以 root 跑这条测试");
+        let (_t, root, id) = setup();
+        write_lease(&root, &id, &stale(live("MACHINE-B", 4242, "李四")));
+        let dir = TakeoverLock::path_for(&lease_path(&root, &id).unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = acquire_with(&root, &id, "MACHINE-A", "张三", FAST).unwrap_err();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("读不出") && msg.contains("权限"), "{msg}");
         assert!(!msg.contains("另一个进程正在接管"), "{msg}");
     }
 

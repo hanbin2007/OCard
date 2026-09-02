@@ -287,6 +287,41 @@ pub fn save_guarded(
     }
 }
 
+/// 「这份清单可能被迟到的写入顶掉」的**持久化**标记(`<id>.suspect`,与清单同目录)。
+///
+/// 旧持有者在写完复核时发现栅栏已丢——那一刻它已经把自己那份(可能带着过时的
+/// `completed=true`)盖到了接管者刚写的清单上。本机的通知只在本机存在;别的机器、
+/// 下一次启动都会静默采信盘上那份。所以要在 NAS 上留一个不可信标记:任务重建时把它
+/// 当未完成展示、自动转代理不按它派发、续传按哈希重新确认并跑完之后才清掉。
+pub fn suspect_path(project_root: &Path, id: &str) -> Result<PathBuf> {
+    manifest_child(project_root, id, "suspect")
+}
+
+/// 写下不可信标记(尽力而为:写不成由调用方说出来)。
+pub fn mark_suspect(project_root: &Path, id: &str, why: &str) -> Result<()> {
+    let path = suspect_path(project_root, id)?;
+    let body = format!("{}\n{why}\n", chrono::Utc::now().to_rfc3339());
+    super::fsx::write_atomic(&path, body.as_bytes())
+        .map(|_| ())
+        .map_err(|f| super::CoreError::io_detail_retried("写入清单不可信标记", &path, &f))
+}
+
+/// 这份清单是否带着不可信标记;有则返回标记正文。
+pub fn suspect(project_root: &Path, id: &str) -> Option<String> {
+    let path = suspect_path(project_root, id).ok()?;
+    std::fs::read_to_string(&path).ok()
+}
+
+/// 清掉不可信标记(不存在也算成功)。
+pub fn clear_suspect(project_root: &Path, id: &str) -> Result<()> {
+    let path = suspect_path(project_root, id)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(super::CoreError::io_detail("删除清单不可信标记", &path, &e)),
+    }
+}
+
 /// 由清单 id 拼出落点,并把 id 当**不可信输入**过闸。
 ///
 /// `CopyManifest.id` 来自 NAS 上的 JSON——那是一份别人能改、也可能损坏的文件。
@@ -389,6 +424,29 @@ pub fn list(project_root: &Path) -> Result<ManifestList> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// 不可信标记:写得下、读得回、清得掉;而且它**不是**清单——`list` 不许把它算成
+    /// 「读不懂的清单」而计入 skipped。
+    #[test]
+    fn a_suspect_marker_round_trips_and_is_invisible_to_list() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("proj");
+        std::fs::create_dir_all(manifest_dir(&root)).unwrap();
+        let m = CopyManifest::new("1. 待分类/x", "CARD", "A_B_C", "张三", "");
+        save(&root, &m).unwrap();
+        assert!(suspect(&root, &m.id).is_none());
+        mark_suspect(&root, &m.id, "写完后发现租约锁已丢").unwrap();
+        let why = suspect(&root, &m.id).expect("标记要读得回");
+        assert!(why.contains("租约锁已丢"), "{why}");
+        let listed = list(&root).unwrap();
+        assert_eq!(listed.manifests.len(), 1);
+        assert_eq!(listed.skipped, 0, "标记文件不是清单,不许算成读不懂的清单");
+        clear_suspect(&root, &m.id).unwrap();
+        assert!(suspect(&root, &m.id).is_none());
+        clear_suspect(&root, &m.id).expect("不存在也算清掉");
+    }
+
     /// 0.4.3 现场:Windows 上这里失败,用户看到的全部信息是
     /// 「IO 错误: 拒绝访问。 (os error 5)」——哪个文件、该做什么,一个字都没有。
     /// `save` 退回裸 `fs::write` + `fs::rename`(即 `CoreError::Io`)时本测试红。
@@ -542,7 +600,6 @@ mod tests {
         assert!(junk.is_empty(), "清单目录里有残留: {junk:?}");
     }
 
-    use super::*;
     use tempfile::tempdir;
 
     /// R3:save 的 `.ocard` 落地闸接线回归——中间段被换成指向项目外的

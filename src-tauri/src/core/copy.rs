@@ -1215,36 +1215,79 @@ pub fn sweep_stale_parts(
     task_prefix: &str,
     keep_run_tag: &str,
 ) -> SweptParts {
+    use std::collections::{BTreeMap, BTreeSet};
     let mut swept = SweptParts::default();
-    let mut dirs: Vec<PathBuf> = Vec::new();
+    // 目录 → 计划里落在该目录下的**文件名**:part 名必须精确等于
+    // `<计划文件名>.<标签>.ocardpart`,不用 contains——别的任务的原文件名里含 `.<前缀>-`
+    // 也会被 contains 认领(codex r9)
+    let mut dirs: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
     for dest in destinations {
         for p in plan {
-            let parent = Path::new(&rel_to_native(&p.target_rel))
+            let native = rel_to_native(&p.target_rel);
+            let rel = Path::new(&native);
+            let parent = rel
                 .parent()
                 .map(|d| dest.join(d))
                 .unwrap_or_else(|| dest.clone());
-            if !dirs.contains(&parent) {
-                dirs.push(parent);
+            if let Some(name) = rel.file_name() {
+                dirs.entry(parent)
+                    .or_default()
+                    .insert(name.to_string_lossy().into_owned());
             }
         }
     }
-    // 不带横杠:升级前(≤0.4.3)的 part 名是 `<文件名>.<前缀>.ocardpart`,没有 run 标签,
-    // 那些几十 GB 的半个文件也要认领并清掉;别的任务的前缀不同,`contains` 隔得开
-    let ours = format!(".{task_prefix}");
-    let keep = format!(".{task_prefix}-{keep_run_tag}{PART_SUFFIX}");
-    for dir in dirs {
-        let Ok(rd) = fs::read_dir(&dir) else {
-            continue; // 目录还不存在(首次拷)或读不出:没有残留可清
+    let ours_dash = format!("{task_prefix}-");
+    let keep = format!("{task_prefix}-{keep_run_tag}");
+    let is_ours_stale_tag = |tag: &str| -> bool {
+        // 旧格式(≤0.4.3):正好等于前缀;新格式:`<前缀>-<8 位 run>`,且不是本轮的
+        tag == task_prefix
+            || (tag.len() == task_prefix.len() + 9
+                && tag.starts_with(&ours_dash)
+                && tag != keep
+                && tag[ours_dash.len()..]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit()))
+    };
+    for (dir, names) in dirs {
+        let rd = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // 首次拷:目录还没有
+            Err(e) => {
+                swept
+                    .failed
+                    .push((dir.clone(), super::error::explain_io(&e)));
+                continue;
+            }
         };
-        for e in rd.flatten() {
+        for e in rd {
+            let e = match e {
+                Ok(e) => e,
+                Err(err) => {
+                    swept
+                        .failed
+                        .push((dir.clone(), super::error::explain_io(&err)));
+                    continue;
+                }
+            };
             let name = e.file_name();
             let name = name.to_string_lossy();
-            if !name.ends_with(PART_SUFFIX) || !name.contains(&ours) || name.ends_with(&keep) {
+            let Some(stem_and_tag) = name.strip_suffix(PART_SUFFIX) else {
+                continue;
+            };
+            let Some((stem, tag)) = stem_and_tag.rsplit_once('.') else {
+                continue;
+            };
+            if !names.contains(stem) || !is_ours_stale_tag(tag) {
                 continue;
             }
             let path = e.path();
-            if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                continue; // 链接 / 目录不碰
+            match e.file_type() {
+                Ok(t) if t.is_file() => {}
+                Ok(_) => continue, // 链接 / 目录不碰
+                Err(err) => {
+                    swept.failed.push((path, super::error::explain_io(&err)));
+                    continue;
+                }
             }
             match fs::remove_file(&path) {
                 Ok(()) => swept.removed.push(path),
@@ -1290,10 +1333,20 @@ fn save_within_fence(
     let saved = manifest::save_guarded(project_root, m, &still_mine).map_err(|e| e.to_string())?;
     if !still_mine() {
         // 改名之后才读不到锁标记:这份已经发布了,可能盖掉了接管者刚写的——停下并说明。
-        // 原因分不出来(存储抖动 / 被外部回收),就不点名
-        return Err(
-            "落盘之后读不到本任务的租约锁标记(可能是存储抖了一下,也可能是锁被外部回收;这里分不出来),这次落盘不可信,已停下;请核对是否有别的进程在跑这个任务,再决定在哪边续传".into(),
+        // 原因分不出来(存储抖动 / 被外部回收),就不点名。并且在 NAS 上留下**持久化**的
+        // 不可信标记:本机的通知别的机器看不见,下一次启动会静默采信盘上这份
+        let mut why = String::from(
+            "落盘之后读不到本任务的租约锁标记(可能是存储抖了一下,也可能是锁被外部回收;这里分不出来),这次落盘不可信,已停下;请核对是否有别的进程在跑这个任务,再决定在哪边续传",
         );
+        match manifest::mark_suspect(project_root, &m.id, &why) {
+            Ok(()) => why.push_str(
+                "。已在清单旁写下「不可信」标记:任务重建会按未完成处理,续传按哈希重新确认后才清掉",
+            ),
+            Err(e) => why.push_str(&format!(
+                "。而且没能在清单旁写下「不可信」标记({e}):下一次启动会采信盘上这份,请人工核对"
+            )),
+        }
+        return Err(why);
     }
     Ok(saved)
 }
@@ -2044,7 +2097,11 @@ mod tests {
         let mine = dest.join("sub/a.mp4.abcd1234-22222222.ocardpart");
         let other_task = dest.join("sub/a.mp4.zzzz9999-11111111.ocardpart");
         let dir_lookalike = dest.join("sub/b.mp4.abcd1234-33333333.ocardpart");
-        for f in [&old, &legacy, &mine, &other_task] {
+        // 别的任务的**原文件名**里含 `.abcd1234-`:按 contains 会被误删,精确解析不会
+        let trap = dest.join("sub/x.abcd1234-y.mp4.zzzz9999-11111111.ocardpart");
+        // 不在计划里的文件名:不是本任务的 part,不碰
+        let unplanned = dest.join("sub/z.mp4.abcd1234-11111111.ocardpart");
+        for f in [&old, &legacy, &mine, &other_task, &trap, &unplanned] {
             std::fs::write(f, b"x").unwrap();
         }
         std::fs::create_dir(&dir_lookalike).unwrap();
@@ -2053,7 +2110,7 @@ mod tests {
         let link = {
             let target = dest.join("sub/REAL.MP4");
             std::fs::write(&target, b"real").unwrap();
-            let link = dest.join("sub/c.mp4.abcd1234-44444444.ocardpart");
+            let link = dest.join("sub/a.mp4.abcd1234-44444444.ocardpart");
             std::os::unix::fs::symlink(&target, &link).unwrap();
             (link, target)
         };
@@ -2067,6 +2124,8 @@ mod tests {
         assert!(!old.exists() && !legacy.exists());
         assert!(mine.exists(), "本轮的 part 被清了");
         assert!(other_task.exists(), "别的任务的 part 被清了");
+        assert!(trap.exists(), "别的任务原文件名含本任务前缀的 part 被误删");
+        assert!(unplanned.exists(), "不在计划里的文件名不该被碰");
         assert!(dir_lookalike.is_dir(), "名字像 part 的目录被动了");
         #[cfg(unix)]
         {

@@ -107,6 +107,8 @@ export const NOTICE_TITLES: Record<string, string> = {
   "copy-stale-parts-swept": "清理了上次运行留下的临时文件",
   "copy-stale-parts-sweep-failed": "上次运行的临时文件没清干净",
   "auto-proxy-state-unverified": "自动转代理状态写回后无法确认",
+  "manifest-suspect": "清单可能被迟到的写入顶掉，已按未完成处理",
+  "auto-proxy-skipped-suspect": "清单不可信，暂不派发自动转代理",
   "copy-resume-lease-lock-broken": "租约锁目录异常，需人工清理",
   "copy-resume-lease-held": "任务正被别的进程执行，拒绝续传",
   "copy-resume-already-running": "上一次运行还没退出，本次「继续」未生效",
@@ -133,6 +135,8 @@ const DIAGNOSTIC_CODES = new Set([
   "task-lease-lost-outside-run",
   "task-lease-left-behind",
   "copy-stale-parts-sweep-failed",
+  "manifest-suspect",
+  "auto-proxy-skipped-suspect",
   "copy-resume-lease-held",
   "copy-resume-lease-lock-broken",
 ]);

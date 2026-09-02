@@ -2488,9 +2488,14 @@ fn persist_refreshed_plan<R: tauri::Runtime>(
         // 落盘后复核栅栏:被外部回收 = 这次落盘期间可能有人接管,接管者的清单可能刚被
         // 这次整份重写顶掉——按写失败处理并说出来,不能一声不吭(第九轮评审)
         if !fence.still_mine() {
-            return Err(crate::core::CoreError::Busy(
-                "落盘之后读不到本任务的租约锁标记(可能是存储抖了一下,也可能是锁被外部回收;这里分不出来),这次写回不可信;请确认没有别的 OCard 在跑这个任务".into(),
-            ));
+            let mut why = String::from(
+                "落盘之后读不到本任务的租约锁标记(可能是存储抖了一下,也可能是锁被外部回收;这里分不出来),这次写回不可信;请确认没有别的 OCard 在跑这个任务",
+            );
+            // NAS 上留持久化的不可信标记(本机通知别的机器看不见)
+            if let Err(e) = manifest::mark_suspect(project_root, &m.id, &why) {
+                why.push_str(&format!("。而且没能写下「不可信」标记({e})"));
+            }
+            return Err(crate::core::CoreError::Busy(why));
         }
         drop(fence);
         Ok(r)
@@ -2691,7 +2696,34 @@ pub fn rebuild_tasks<R: tauri::Runtime>(app: &AppHandle<R>, state: &AppState) {
                 ),
             );
         }
-        for m in list.manifests.into_iter().filter(|m| !m.completed) {
+        // 带「不可信」标记的清单(被迟到的写入顶掉过)即使写着 completed 也按未完成展示:
+        // 续传会按哈希重新确认,跑完才清标记。系统替用户改了判断,要说
+        let suspects: Vec<(String, String)> = list
+            .manifests
+            .iter()
+            .filter(|m| m.completed)
+            .filter_map(|m| manifest::suspect(&p.root, &m.id).map(|why| (m.id.clone(), why)))
+            .collect();
+        for (mid, why) in &suspects {
+            notify::warn_for_task(
+                app,
+                "manifest-suspect",
+                (mid, &p.folder_name),
+                format!(
+                    "「{}」下清单 {}… 写着已完成,但它旁边有「不可信」标记(上一次运行写完后发现租约锁已丢,这份内容可能盖掉了接管方的进度):已按未完成任务展示,续传会按哈希重新确认。标记内容:{}",
+                    p.folder_name,
+                    &mid[..8.min(mid.len())],
+                    why.trim()
+                ),
+            );
+        }
+        let suspect_ids: std::collections::HashSet<String> =
+            suspects.into_iter().map(|(id, _)| id).collect();
+        for m in list
+            .manifests
+            .into_iter()
+            .filter(|m| !m.completed || suspect_ids.contains(&m.id))
+        {
             // 归一后再用:旧 manifest 可能携带 `..` 等病态目的地字符串(codex 终验 #6);
             // 续传时还会经 validate_dest_layout 与重绑后的源做嵌套复核
             let dest_targets: Vec<PathBuf> = m

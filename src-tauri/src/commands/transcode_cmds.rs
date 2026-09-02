@@ -1090,6 +1090,14 @@ fn save_proxy_state<R: tauri::Runtime>(
         // 写完再复核:此时改名**已经发生**,栅栏没了只能说「发布了但不能确认」,不能说
         // 「没有写回」——放弃标记若已落盘,下次启动就不会再重投,却没人告诉用户已放弃
         let unverified = !fence.still_mine();
+        if unverified {
+            // NAS 上留持久化的不可信标记;写不成在下面的通知里说
+            let _ = crate::core::manifest::mark_suspect(
+                project_root,
+                id,
+                "自动转代理状态写回后发现租约锁已丢,这份清单可能盖掉了接管方的进度",
+            );
+        }
         drop(fence);
         Ok((wr, path, unverified))
     });
@@ -1185,6 +1193,20 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
     if !m.auto_proxy || m.proxy_completed || !m.completed {
         return;
     }
+    // 带「不可信」标记的清单:completed 可能是迟到的写入顶回来的,不按它派发
+    if let Some(why) = crate::core::manifest::suspect(project_root, &m.id) {
+        notify::warn_for_task(
+            app,
+            "auto-proxy-skipped-suspect",
+            (&m.id, ""),
+            format!(
+                "「{}」的清单旁有「不可信」标记({}),它写着已完成但可能是被迟到的写入顶回来的:本次不派发自动转代理;续传跑完、标记清掉后会再派发",
+                m.target_rel,
+                why.trim()
+            ),
+        );
+        return;
+    }
     // 永久失败不许无限重投(评审 P1-8):三次仍未整批成功即放弃,可见告知
     if m.proxy_attempts >= 3 {
         let persisted = save_proxy_state(
@@ -1199,15 +1221,27 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
         // 放弃标记写成了才能说「停止自动重试」;没写成就不是停止,是「这次没派发」。
         // 「写回了但不能确认」也要说停止:盘上多半已是放弃态,下次启动不会再重投,
         // 不说就是一次无声的放弃
-        if persisted != Persist::NotPublished {
-            notify::warn(
+        match persisted {
+            Persist::Confirmed => notify::warn_for_task(
                 app,
                 "auto-proxy-abandoned",
+                (&m.id, ""),
                 format!(
                     "「{}」的自动转代理已连续 {} 次未能整批完成,停止自动重试;可在转码页手动执行(已转文件会安全跳过)",
                     m.target_rel, m.proxy_attempts
                 ),
-            );
+            ),
+            // 改名已经发生但不能确认盘上是不是这份:不许确定地说「已停止」,也不派发
+            Persist::PublishedUnverified => notify::warn_for_task(
+                app,
+                "auto-proxy-abandoned",
+                (&m.id, ""),
+                format!(
+                    "「{}」的自动转代理已连续 {} 次未能整批完成;放弃标记可能已写回但不能确认,本次不派发,下次启动会重读确认。可在转码页手动执行(已转文件会安全跳过)",
+                    m.target_rel, m.proxy_attempts
+                ),
+            ),
+            Persist::NotPublished => {}
         }
         return;
     }
