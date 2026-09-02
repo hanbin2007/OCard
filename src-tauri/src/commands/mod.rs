@@ -2076,12 +2076,19 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         .map_err(|e| {
             let msg = e.to_string();
             if matches!(e, crate::core::CoreError::Busy(_)) {
-                notify::warn(&app, "copy-resume-lease-held", msg.clone());
+                let s = handle.snapshot.lock().unwrap();
+                notify::warn_for_task(
+                    &app,
+                    "copy-resume-lease-held",
+                    (&s.id, &s.project_id),
+                    msg.clone(),
+                );
             }
             msg
         })?;
         if let Some(note) = lease.took_over_stale.take() {
-            notify::warn(&app, "task-lease-taken-over", note);
+            let s = handle.snapshot.lock().unwrap();
+            notify::warn_for_task(&app, "task-lease-taken-over", (&s.id, &s.project_id), note);
         }
         // 续传身份核对(评审 M10/P0-1)+ 按卷名重解析挂载点(复核必修 A:
         // 卡后插/换挂载口场景,插回原卡即可续传,无需重启应用)

@@ -104,7 +104,10 @@ export async function createProjectViaWizard(name, scenario) {
     // 超时时把「到底是什么压在按钮上」带出来。CI 上这条自 v0.4.2 起就红,
     // 日志里只有几十行 element click intercepted,却没有一行说是被谁拦的;
     // 不把现场拍下来就只能猜。
-    const scene = await browser.execute(() => {
+    // 取证本身不许把原始错误吃掉:超时时会话/窗口常常已经不可用,execute 会抛
+    let scene;
+    try {
+      scene = await browser.execute(() => {
       const describe = (el) => {
         const chain = [];
         for (let n = el; n && n !== document.body && chain.length < 6; n = n.parentElement) {
@@ -136,7 +139,10 @@ export async function createProjectViaWizard(name, scenario) {
       );
       const step = document.querySelector('[data-testid^="npw-step"]')?.getAttribute("data-testid") ?? "?";
       return { step, hasSubmit: Boolean(submit), rect, atPoint, toasts, overlays, vw: innerWidth, vh: innerHeight };
-    });
+      });
+    } catch (probeErr) {
+      scene = { probeFailed: probeErr?.message ?? String(probeErr) };
+    }
     const detail = JSON.stringify(scene);
     const last = lastClickError ? ` 最后一次点击错误: ${lastClickError.message}` : "";
     throw new Error(`${err.message}${last}\n现场: ${detail}`);

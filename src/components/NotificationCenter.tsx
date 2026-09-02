@@ -94,7 +94,7 @@ const NOTICE_TITLES: Record<string, string> = {
   /* 任务租约:这几条说的都是「别的进程可能/正在写你的清单」,顶着通用的
      「降级提示」会被一扫而过 */
   "task-lease-taken-over": "接管了上次留下的任务租约",
-  "task-lease-at-risk": "任务租约心跳持续失败，已暂停",
+  "task-lease-at-risk": "任务租约心跳异常，已暂停",
   "task-lease-lost": "任务已被别的进程接管，已暂停",
   "task-lease-left-behind": "任务租约没能清掉",
   "copy-resume-lease-held": "任务正被别的进程执行，拒绝续传",

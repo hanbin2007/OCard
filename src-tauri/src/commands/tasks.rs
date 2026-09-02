@@ -184,7 +184,23 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
         return;
     }
     std::thread::spawn(move || {
-        let outcome = run_worker(&app, &handle);
+        // panic 也要有终态:否则 running 永远是 true、任务卡在「运行中」、
+        // 没有一条通知——用户只能重启应用
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_worker(&app, &handle)
+        })) {
+            Ok(r) => r,
+            Err(payload) => {
+                let what = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "(无说明)".into());
+                Err(crate::core::CoreError::Invalid(format!(
+                    "拷卡线程异常终止(程序内部错误:{what})。已拷部分与清单不受影响,可点「继续」续传;请导出诊断报告"
+                )))
+            }
+        };
         // 拷卡写了 manifest/素材:目录统计缓存立即失效(M3 W3)
         if let Some(nas) = handle.project_root.parent() {
             crate::core::catalog::invalidate_cache(nas);
@@ -443,8 +459,13 @@ fn run_worker<R: tauri::Runtime>(
         )?,
     };
     if let Some(note) = lease.took_over_stale.take() {
-        // 接管别人/自己残留的租约是「系统替用户做了决定」,零静默要求说出来
-        super::notify::warn(app, "task-lease-taken-over", note);
+        // 接管别人/自己残留的租约是「系统替用户做了决定」,零静默要求说出来;
+        // 带任务:并行拷卡时同 code 的通知会按任务分桶,不会互相顶掉正文
+        let (id, pid) = {
+            let s = handle.snapshot.lock().unwrap();
+            (s.id.clone(), s.project_id.clone())
+        };
+        super::notify::warn_for_task(app, "task-lease-taken-over", (&id, &pid), note);
     }
     let mut m = manifest::load(&handle.project_root, &handle.manifest_id)?;
 
@@ -456,15 +477,16 @@ fn run_worker<R: tauri::Runtime>(
         crate::core::lease::Released::Removed => {}
         // 被接管:轮询阶段已经报过 task-lease-lost,这里不重复
         crate::core::lease::Released::TakenOver => {}
-        crate::core::lease::Released::RemoveFailed(why) => {
-            // 删不掉的是**我们自己的**租约:本机(pid 还活着,不算残留)与别的机器
-            // 都要等 TTL 才能再续这个任务。得说清楚,否则用户点「继续」会撞上
-            // 「本进程内的另一次续传」然后一头雾水
+        crate::core::lease::Released::RemoveFailed(why)
+        | crate::core::lease::Released::NoLock(why) => {
+            // 留下的是**我们自己的**租约:别的机器要等 TTL;本机在本次运行期间也续不了
+            // (pid 还活着,不算残留;重启 OCard 后 pid 不在了就能立刻接管)。得说清楚,
+            // 否则用户点「继续」会撞上「本进程内的另一次续传」然后一头雾水
             super::notify::warn(
                 app,
                 "task-lease-left-behind",
                 format!(
-                    "任务结束后没能删掉自己的租约文件({why}):{}。在此后 {} 分钟内,本机与别的机器续这个任务都会被它挡住;可手动删除该文件解锁",
+                    "任务结束后没能清掉自己的租约文件({why}):{}。别的机器在 {} 分钟内、本机在本次运行期间续这个任务都会被它挡住;重启 OCard 或手动删除该文件可立刻解锁",
                     lease_file.display(),
                     crate::core::lease::LEASE_TTL.num_minutes()
                 ),
@@ -771,6 +793,10 @@ fn run_worker_locked<R: tauri::Runtime>(
                 }),
             ),
         );
+    }
+    if outcome.aborted {
+        // 审计与总账已经写完,现在才把「租约没了」抛上去让任务落到暂停
+        return Err(copy::lease_abort());
     }
     Ok(())
 }

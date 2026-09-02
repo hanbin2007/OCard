@@ -55,6 +55,10 @@ pub struct CopyOutcome {
     pub all_verified: bool,
     /// 因暂停请求提前停止(文件边界处停,manifest 可续传)。
     pub paused: bool,
+    /// 因租约原因(被接管 / 心跳久未成功)在文件边界停下,并**跳过了随后的落盘**。
+    /// 用 outcome 而不是 Err 承载:收尾(已失败文件的审计、占用总账)必须照跑,
+    /// 否则那几条「哪个文件为什么失败」的记录就跟着 Err 一起消失了。
+    pub aborted: bool,
     /// 写清单时为躲开「目标被占用」而重试的总轮数(见 [`Progress::Contention`])。
     pub write_retries: u32,
     /// **素材文件**落位改名时同样原因的重试总轮数。分开记是因为两者的分量不同:
@@ -1247,10 +1251,15 @@ pub fn run_copy(
     let mut material_retries = 0u32;
     // 租约丢了(或马上要丢):从此一个字节都不许再写进清单
     let mut abort_writes = false;
+    let mut aborted = false;
     let total = plan.len();
 
     for (index, item) in plan.iter().enumerate() {
         let (src_rel, rel, size) = (&item.source_rel, &item.target_rel, item.size);
+        if control == CopyControl::Abort {
+            aborted = true;
+            break;
+        }
         if control == CopyControl::Pause {
             paused = true;
             break;
@@ -1288,15 +1297,18 @@ pub fn run_copy(
                     &req.destinations,
                     &req.task_tag,
                     &mut |delta| {
-                        // 块级进度只上报,不在文件中途暂停;但「不许再写清单」这一条
-                        // 在文件中途就得记下来,否则拷完这个文件就会落一次盘
+                        // 块级进度只上报,普通暂停不在文件中途停;但租约 Abort 要在
+                        // 块边界就停——接管方已经在拷同一份计划,把手上这个几十 GB
+                        // 的文件拷完只会和它互删 part、刷一串假失败
                         if progress(Progress::BytesCopied {
                             rel_path: rel,
                             delta,
                         }) == CopyControl::Abort
                         {
                             abort_writes = true;
+                            return false;
                         }
+                        true
                     },
                     &mut file_tally,
                 ) {
@@ -1343,7 +1355,15 @@ pub fn run_copy(
             || control == CopyControl::Abort
             || progress(Progress::AboutToSave { rel_path: rel }) == CopyControl::Abort
         {
-            return Err(lease_abort());
+            // 这个文件的结果仍要进 reports(它已经拷完/失败了,审计要记),只是不落盘
+            reports.push(FileReport {
+                rel_path: rel.clone(),
+                source_rel: src_rel.clone(),
+                size,
+                status,
+            });
+            aborted = true;
+            break;
         }
         // 逐文件落盘,任意时刻中断都可续传
         let (wr, mpath) = manifest::save(project_root, m)?;
@@ -1360,9 +1380,6 @@ pub fn run_copy(
             rel_path: rel,
             status: &status,
         });
-        if control == CopyControl::Abort {
-            return Err(lease_abort());
-        }
         reports.push(FileReport {
             rel_path: rel.clone(),
             source_rel: src_rel.clone(),
@@ -1376,14 +1393,26 @@ pub fn run_copy(
     }
 
     let all_verified = !paused
+        && !aborted
         && reports.len() == total
         && !reports.is_empty()
         && reports
             .iter()
             .all(|r| !matches!(r.status, FileStatus::Failed(_)));
     m.completed = all_verified;
-    if abort_writes || progress(Progress::AboutToSave { rel_path: "" }) == CopyControl::Abort {
-        return Err(lease_abort());
+    if aborted
+        || abort_writes
+        || progress(Progress::AboutToSave { rel_path: "" }) == CopyControl::Abort
+    {
+        return Ok(CopyOutcome {
+            files: reports,
+            bytes_copied,
+            all_verified: false,
+            paused: true,
+            aborted: true,
+            write_retries,
+            material_retries,
+        });
     }
     let (wr, mpath) = manifest::save(project_root, m)?;
     if wr.retries > 0 {
@@ -1400,13 +1429,16 @@ pub fn run_copy(
         bytes_copied,
         all_verified,
         paused,
+        aborted: false,
         write_retries,
         material_retries,
     })
 }
 
-/// 因租约原因停机时返回的错误:`Busy` → 任务落「暂停」,可续传。
-fn lease_abort() -> super::CoreError {
+/// 因租约原因停机时的错误:`Busy` → 任务落「暂停」,可续传。
+/// `copy_one` 在块边界用它中止当前文件;`run_worker` 在收尾(审计、总账)跑完之后
+/// 用它把任务落到「暂停」——中途不用它掀桌子,不然已失败文件的记录就没了。
+pub fn lease_abort() -> super::CoreError {
     super::CoreError::Busy(
         "本任务的租约已不再由本进程持有(或心跳久未成功、随时会被接管),已在文件边界停下并放弃写回清单——继续写会把接管方记下的进度整份顶掉。请确认另一处的进度后再决定在哪边续传".into(),
     )
@@ -1428,7 +1460,8 @@ fn copy_one(
     src_meta: Option<fs::Metadata>,
     destinations: &[PathBuf],
     task_tag: &str,
-    on_chunk: &mut dyn FnMut(u64),
+    // 每写完一块调一次;返回 false = 立刻停(租约 Abort),part 由失败清理路径删掉
+    on_chunk: &mut dyn FnMut(u64) -> bool,
     // 素材落位时为躲开占用而重试的记录,累加进来(零静默:上层要报给用户看)
     retried: &mut ContentionTally,
 ) -> Result<String> {
@@ -1567,7 +1600,9 @@ fn copy_one(
             for w in &mut writers {
                 w.write_all(&buf[..n])?;
             }
-            on_chunk(n as u64);
+            if !on_chunk(n as u64) {
+                return Err(lease_abort());
+            }
         }
         for mut w in writers {
             w.flush()?;
@@ -1645,10 +1680,10 @@ fn finalize_no_replace(part: &Path, fin: &Path, retried: &mut ContentionTally) -
         Err(f) => {
             // 天书报文的另一半:此前这里抛的是裸 Io,逐文件失败原因就是
             // 那句「IO 错误: 拒绝访问。 (os error 5)」
-            // 最终失败的轮数**不**进成功总账:那条总账的正文说的是「重试后成功、
-            // 结果不受影响」,把失败混进去等于把失败报成成功。失败自己带着轮数
-            // 走 FileStatus::Failed 的报文(io_detail_retried)
-            retried.last_path = Some(fin.to_path_buf());
+            // 最终失败的轮数**不**进成功总账,路径也**不**记进 last_path:那条总账
+            // 的正文说的是「重试后成功、结果不受影响」,多目标时前一个目标成功、
+            // 后一个失败,把失败的路径挂在成功的轮数上等于把失败报成成功。
+            // 失败自己带着轮数和路径走 FileStatus::Failed 的报文(io_detail_retried)
             Err(super::CoreError::io_detail_retried(
                 "把临时文件改名为最终文件",
                 fin,
@@ -1805,7 +1840,7 @@ mod tests {
         let manifest_file = manifest::manifest_dir(&project).join(format!("{}.json", m.id));
 
         let mut saves_asked = 0usize;
-        let err = run_copy(&req, &plan, &mut m, &project, |p| match p {
+        let out = run_copy(&req, &plan, &mut m, &project, |p| match p {
             // 第一次要写清单的那一刻说「租约没了」
             Progress::AboutToSave { .. } => {
                 saves_asked += 1;
@@ -1813,11 +1848,13 @@ mod tests {
             }
             _ => CopyControl::Continue,
         })
-        .unwrap_err();
-
-        assert!(
-            matches!(err, super::super::CoreError::Busy(_)),
-            "租约原因停机要落「暂停」口径(Busy),不是失败: {err}"
+        .expect("Abort 用 outcome 承载,收尾要照跑,不是 Err");
+        assert!(out.aborted && out.paused, "要标成 aborted + paused");
+        assert!(!out.all_verified, "中途停下不许报全部通过");
+        assert_eq!(
+            out.files.len(),
+            1,
+            "已拷完的那个文件的结果要进 reports(审计靠它)"
         );
         assert_eq!(saves_asked, 1, "必须停在第一次落盘之前");
         assert!(
@@ -1844,7 +1881,7 @@ mod tests {
         let (_t, req, mut m, project) = setup();
         let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
         let mut saves = 0usize;
-        let err = run_copy(&req, &plan, &mut m, &project, |p| match p {
+        let out = run_copy(&req, &plan, &mut m, &project, |p| match p {
             Progress::AboutToSave { .. } => {
                 saves += 1;
                 CopyControl::Continue
@@ -1852,8 +1889,8 @@ mod tests {
             Progress::FileFinished { .. } => CopyControl::Abort,
             _ => CopyControl::Continue,
         })
-        .unwrap_err();
-        assert!(matches!(err, super::super::CoreError::Busy(_)), "{err}");
+        .unwrap();
+        assert!(out.aborted);
         assert_eq!(saves, 1, "FileFinished 上的 Abort 只允许它之前那一次落盘");
     }
 
@@ -1863,16 +1900,58 @@ mod tests {
         let (_t, req, mut m, project) = setup();
         let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
         let manifest_file = manifest::manifest_dir(&project).join(format!("{}.json", m.id));
-        let err = run_copy(&req, &plan, &mut m, &project, |p| match p {
+        let out = run_copy(&req, &plan, &mut m, &project, |p| match p {
             Progress::BytesCopied { .. } => CopyControl::Abort,
             _ => CopyControl::Continue,
         })
-        .unwrap_err();
-        assert!(matches!(err, super::super::CoreError::Busy(_)), "{err}");
+        .unwrap();
+        assert!(out.aborted);
         assert!(
             !manifest_file.exists(),
             "文件中途收到 Abort,拷完后仍写了清单"
         );
+        // 块边界就停:当前文件按失败记(part 已清),不是拷完
+        assert!(
+            matches!(
+                out.files.first().map(|f| &f.status),
+                Some(FileStatus::Failed(_))
+            ),
+            "中途 Abort 的文件应记为失败并停在块边界: {:?}",
+            out.files.first().map(|f| &f.status)
+        );
+        let part_left = std::fs::read_dir(&req.destinations[0])
+            .map(|rd| {
+                rd.flatten()
+                    .any(|e| e.file_name().to_string_lossy().contains(".ocardpart"))
+            })
+            .unwrap_or(false);
+        assert!(!part_left, "中途停下要清掉自己的 .ocardpart");
+    }
+
+    /// 素材落位最终失败时,失败的路径**不许**记进「重试后成功」的总账:多目标时
+    /// 前一个目标成功、后一个失败,把失败的路径挂在成功的轮数上等于把失败报成成功。
+    #[test]
+    #[cfg(unix)]
+    fn a_final_finalize_failure_does_not_enter_the_success_tally() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            panic!("本测试要求非 root(root 无视权限位,造不出这个场景)");
+        }
+        let tmp = tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        let dst_dir = tmp.path().join("dst");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dst_dir).unwrap();
+        let part = src_dir.join("a.ocardpart");
+        fs::write(&part, b"x").unwrap();
+        // 目标目录不可写:改名进不去,一路重试到底还是失败
+        fs::set_permissions(&dst_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let mut tally = ContentionTally::default();
+        let r = finalize_no_replace(&part, &dst_dir.join("a.bin"), &mut tally);
+        fs::set_permissions(&dst_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(r.is_err());
+        assert_eq!(tally.retries, 0, "最终失败的轮数不进成功总账");
+        assert!(tally.last_path.is_none(), "失败的路径不许挂在成功总账上");
     }
 
     #[test]

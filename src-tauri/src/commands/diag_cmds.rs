@@ -47,7 +47,13 @@ pub async fn export_diagnostics<R: tauri::Runtime>(
     // 同步目录、只读配置)时,此前直接报失败,后面的候选一个都不试。
     // 落点不是「下载」时必须说:换个位置本身是降级,用户按经验去下载夹找
     // 会一无所获,然后以为导出没成功
-    let (path, skipped) = write_to_first_writable(&report_dirs(&app), &name, &report)?;
+    let (dirs, unresolved) = report_dirs(&app);
+    let (path, mut skipped) = write_to_first_writable(&dirs, &name, &report)?;
+    // 「下载」连路径都解析不出来时,前面 skipped 是空的,但落点已经不是下载了——
+    // 一样要说,否则用户按经验去下载夹找,一无所获
+    if let Some(why) = unresolved {
+        skipped.insert(0, why);
+    }
     if !skipped.is_empty() {
         notify::warn(
             &app,
@@ -137,19 +143,22 @@ fn write_to_first_writable(
 
 /// 报告的候选落点,按优先级:「下载」→「桌面」→ 日志目录 → 临时目录。
 /// 全部列出来由调用方逐个真写——「能解析出路径」不等于「写得进去」。
-fn report_dirs<R: tauri::Runtime>(app: &AppHandle<R>) -> Vec<PathBuf> {
+/// 第二个返回值:「下载」目录**解析不出来**的原因(有的话)——它不会出现在
+/// 写失败列表里,但同样意味着落点不是下载,必须告知。
+fn report_dirs<R: tauri::Runtime>(app: &AppHandle<R>) -> (Vec<PathBuf>, Option<String>) {
     let p = app.path();
-    let mut out: Vec<PathBuf> = [
-        p.download_dir().ok(),
-        p.desktop_dir().ok(),
-        p.app_log_dir().ok(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let download = p.download_dir();
+    let unresolved = download
+        .as_ref()
+        .err()
+        .map(|e| format!("下载目录解析失败:{e}"));
+    let mut out: Vec<PathBuf> = [download.ok(), p.desktop_dir().ok(), p.app_log_dir().ok()]
+        .into_iter()
+        .flatten()
+        .collect();
     out.push(std::env::temp_dir());
     out.dedup();
-    out
+    (out, unresolved)
 }
 
 /// 从 `AppState` 里拷一份报告要用的数据。

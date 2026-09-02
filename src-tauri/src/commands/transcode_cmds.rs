@@ -960,7 +960,8 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                     // 与放弃标记/重试计数同一条路:重读 + 看活租约 + 写回,写失败可见。
                     // 此前这里 `if let Ok(..)` 读不出清单就一声不吭——任务显示完成、
                     // 意图却没落盘,下次启动会重投一次,用户不知道为什么
-                    save_proxy_state(&body_app, &root, &machine_id, mid, "完成标记", |fresh| {
+                    save_proxy_state(&body_app, &root, &machine_id, mid, "完成标记",
+                        "下次启动会重投一次(已转文件会安全跳过)", |fresh| {
                         fresh.proxy_completed = true
                     });
                 }
@@ -1044,26 +1045,32 @@ fn save_proxy_state<R: tauri::Runtime>(
     machine_id: &str,
     id: &str,
     what: &str,
+    // 写不成的**后果**,各调用点各说各的:完成标记写不成 ≠ 计数写不成
+    consequence: &str,
     mutate: impl FnOnce(&mut crate::core::manifest::CopyManifest),
-) {
+) -> bool {
     if let Some(who) = crate::core::lease::live_holder(project_root, id, machine_id) {
         notify::warn(
             app,
             "auto-proxy-state-unsaved",
-            format!("自动转代理{what}没有写回:这个任务正被 {who} 执行中,等它结束后下次启动会补"),
+            format!("自动转代理{what}没有写回:这个任务正被 {who} 执行中。{consequence}"),
         );
-        return;
+        return false;
     }
     let result = crate::core::manifest::load(project_root, id).and_then(|mut fresh| {
         mutate(&mut fresh);
         crate::core::manifest::save(project_root, &fresh).map(|_| ())
     });
-    if let Err(e) = result {
-        notify::warn(
-            app,
-            "auto-proxy-state-unsaved",
-            format!("自动转代理{what}写入失败({e}),放弃上限可能失效,下次启动会重试"),
-        );
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            notify::warn(
+                app,
+                "auto-proxy-state-unsaved",
+                format!("自动转代理{what}写入失败({e})。{consequence}"),
+            );
+            false
+        }
     }
 }
 
@@ -1086,6 +1093,7 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
             machine_id,
             &m.id,
             "放弃标记",
+            "下次启动会重复本条放弃提示",
             |fresh| fresh.proxy_completed = true,
         );
         notify::warn(
@@ -1099,14 +1107,19 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
         return;
     }
     // 计数写不进去=放弃上限失效,存在无限重投风险,必须可见(R2 P2)
-    save_proxy_state(
+    // 计数写不进去 = 放弃上限失效 = 无限重投的风险:那就**不派发**这一次。
+    // 通知已在 save_proxy_state 里发过,这里只中止(R2 P2 + 评审)
+    if !save_proxy_state(
         app,
         project_root,
         machine_id,
         &m.id,
         "重试计数",
+        "放弃上限会失效,本次不派发,下次启动再试",
         |fresh| fresh.proxy_attempts += 1,
-    );
+    ) {
+        return;
+    }
     let meta = match project::load_meta(project_root) {
         Ok(m) => m,
         Err(e) => {
