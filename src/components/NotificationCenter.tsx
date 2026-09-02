@@ -112,6 +112,8 @@ export const NOTICE_TITLES: Record<string, string> = {
   "copy-resume-revoked-pause": "已撤销暂停请求，上一次运行接着跑",
   "copy-worker-spawn-failed": "拷卡线程没能启动",
   "auto-proxy-skipped-suspect": "清单不可信，暂不派发自动转代理",
+  "auto-proxy-skipped-stale": "清单已变，本次不派发自动转代理",
+  "fsx-leftover-temp": "落位成功，但临时文件没删掉",
   "copy-resume-lease-lock-broken": "租约锁目录异常，需人工清理",
   "copy-resume-lease-held": "任务正被别的进程执行，拒绝续传",
   "copy-resume-already-running": "上一次运行还没退出，本次「继续」未生效",

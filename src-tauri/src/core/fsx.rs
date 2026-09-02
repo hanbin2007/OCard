@@ -21,18 +21,81 @@ pub fn take_unsafe_fallback_flag() -> bool {
     UNSAFE_FALLBACK_USED.swap(false, Ordering::Relaxed)
 }
 
+/// 落位成功但源(临时名)没删掉的次数:目标已经发布,这不是失败,但留下的临时文件
+/// 是可见的降级,上层要说(启动清扫 / 下一轮 part 清扫会收走)。
+static LEFTOVER_SOURCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 取走并清零「落位后源没删掉」的计数(给上层告警用)。
+pub fn take_leftover_sources() -> usize {
+    LEFTOVER_SOURCES.swap(0, Ordering::Relaxed)
+}
+
+/// 这个错误是不是「文件系统 / 内核不支持这个原语」——只有这种才允许回退到下一级。
+/// 占用(5/32/33)、权限、瞬断一律**不**回退:回退到「复查+rename」是可覆盖的竞态,
+/// 一次瞬时的 AccessDenied 就把安全关键路径推进去,而调用方的占用重试本来会处理它
+/// (codex 终审 P0)。
+fn is_unsupported(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP | libc::EOPNOTSUPP | libc::EPERM)
+        )
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_INVALID_FUNCTION(1) / ERROR_NOT_SUPPORTED(50) / ERROR_INVALID_PARAMETER(87)
+        // / ERROR_CALL_NOT_IMPLEMENTED(120):SMB / exFAT 上硬链接与 no-replace 原语的典型回答
+        matches!(e.raw_os_error(), Some(1) | Some(50) | Some(87) | Some(120))
+    }
+}
+
 /// 原子防覆盖改名:目标已存在时失败(`AlreadyExists`),绝不替换。
+///
+/// 契约:返回 `Ok` 当且仅当目标已发布;返回 `Err(AlreadyExists)` 当且仅当目标本来就在;
+/// 其余 `Err` 表示目标**没有**发布、可按原因重试。hard_link 成功之后源删不掉不算失败
+/// (目标已经在了),只记一笔留给上层告警——否则调用方重试一次撞上 AlreadyExists,会把
+/// 自己刚发布的文件误报成「别的任务写的」。
 pub fn rename_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
-    platform_rename_no_replace(src, dst).or_else(|e| {
-        if e.kind() == io::ErrorKind::AlreadyExists {
-            return Err(e);
-        }
+    rename_no_replace_with(src, dst, platform_rename_no_replace, |s, d| {
+        fs::hard_link(s, d)
+    })
+}
+
+/// [`rename_no_replace`] 的本体,两级原语可注入——好直接考「瞬时 AccessDenied 不许回退」。
+fn rename_no_replace_with(
+    src: &Path,
+    dst: &Path,
+    native: impl Fn(&Path, &Path) -> io::Result<()>,
+    link: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match native(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+        Err(e) if !is_unsupported(&e) => Err(e),
         // 平台原语不可用(旧内核/异构文件系统):hard_link 仍是原子防覆盖
-        match fs::hard_link(src, dst) {
-            Ok(()) => fs::remove_file(src),
+        Err(_) => match link(src, dst) {
+            Ok(()) => {
+                match fs::remove_file(src) {
+                    Ok(()) => {}
+                    Err(ce) if ce.kind() == io::ErrorKind::NotFound => {}
+                    Err(ce) => {
+                        log::warn!(
+                            "落位成功但临时名没删掉 {}: {ce}(目标已发布;临时文件留给清扫)",
+                            src.display()
+                        );
+                        LEFTOVER_SOURCES.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
+            }
             Err(le) if le.kind() == io::ErrorKind::AlreadyExists => {
                 Err(io::Error::new(io::ErrorKind::AlreadyExists, le))
             }
+            Err(le) if !is_unsupported(&le) => Err(le),
             Err(_) => {
                 // 最后回退:复查+rename。窗口在本地盘是微秒级,在不支持
                 // 原语/硬链接的网络盘上可达网络往返量级——置标记让上层告警
@@ -42,8 +105,8 @@ pub fn rename_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
                 }
                 fs::rename(src, dst)
             }
-        }
-    })
+        },
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -170,6 +233,78 @@ pub fn read_file_uncached(path: &Path) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 原语报的是**占用 / 权限**(不是「不支持」):不许回退到硬链接或复查+rename——
+    /// 那条尾路是可覆盖的竞态,一次瞬时的 AccessDenied 不该把安全关键路径推进去。
+    #[test]
+    fn a_transient_access_denied_never_falls_back_to_the_overwriting_path() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("a.tmp");
+        let dst = t.path().join("a");
+        std::fs::write(&src, b"x").unwrap();
+        let _ = take_unsafe_fallback_flag();
+        let linked = std::cell::Cell::new(false);
+        let r = rename_no_replace_with(
+            &src,
+            &dst,
+            |_, _| Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            |_, _| {
+                linked.set(true);
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(&r, Err(e) if e.kind() == io::ErrorKind::PermissionDenied),
+            "占用 / 权限要原样上抛: {r:?}"
+        );
+        assert!(!linked.get(), "不许回退到硬链接");
+        assert!(!dst.exists() && src.exists(), "什么都不许动");
+        assert!(!take_unsafe_fallback_flag(), "更不许走到复查+rename");
+    }
+
+    /// 原语「不支持」→ 硬链接;硬链接也「不支持」→ 复查+rename(置可见标记);
+    /// 硬链接说目标已在 → AlreadyExists。
+    #[test]
+    fn only_unsupported_errors_walk_down_the_fallback_ladder() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("b.tmp");
+        let dst = t.path().join("b");
+        std::fs::write(&src, b"x").unwrap();
+        let _ = take_unsafe_fallback_flag();
+        let unsupported = || io::Error::from(io::ErrorKind::Unsupported);
+        rename_no_replace_with(
+            &src,
+            &dst,
+            |_, _| Err(unsupported()),
+            |_, _| Err(unsupported()),
+        )
+        .unwrap();
+        assert!(
+            dst.exists() && !src.exists(),
+            "最后一级要真的把文件发布出去"
+        );
+        assert!(
+            take_unsafe_fallback_flag(),
+            "走到复查+rename 必须置可见标记"
+        );
+
+        std::fs::write(&src, b"y").unwrap();
+        let r = rename_no_replace_with(
+            &src,
+            &dst,
+            |_, _| Err(unsupported()),
+            |_, _| Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+        );
+        assert!(
+            matches!(&r, Err(e) if e.kind() == io::ErrorKind::AlreadyExists),
+            "{r:?}"
+        );
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"x",
+            "已存在的目标一个字节都不许动"
+        );
+    }
 
     /// 守门人说不:临时文件写了但不发布——目标不许出现,临时文件也不许留下。
     #[test]

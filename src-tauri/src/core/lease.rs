@@ -1825,7 +1825,7 @@ mod tests {
     }
 
     /// 同一个进程里第二次取得(两次并发续传):token 不同、pid 活着 → 拒绝。
-    /// 这条堵的是「准备阶段没有 CAS」那个已知未修——两次 resume 不能都通过。
+    /// 这条堵的是「准备阶段没有 CAS」(0.4.4 前的已知未修)——两次 resume 不能都通过。
     #[test]
     fn a_second_acquire_from_the_same_process_is_refused_not_silently_shared() {
         let (_t, root, id) = setup();

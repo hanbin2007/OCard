@@ -1214,6 +1214,9 @@ pub fn sweep_stale_parts(
     plan: &[PlannedFile],
     task_prefix: &str,
     keep_run_tag: &str,
+    // 每一次破坏性删除之前再问一句租约锁还是不是自己的:整个清扫在栅栏内,但扫描 /
+    // NAS 调用期间休眠到可被接管的旧进程醒来时,栅栏标记已经没了(codex 终审)
+    still_mine: &dyn Fn() -> bool,
 ) -> SweptParts {
     use std::collections::{BTreeMap, BTreeSet};
     let mut swept = SweptParts::default();
@@ -1289,6 +1292,12 @@ pub fn sweep_stale_parts(
                     continue;
                 }
             }
+            if !still_mine() {
+                swept
+                    .failed
+                    .push((path, "租约锁已不是本进程的,停止清扫".into()));
+                return swept;
+            }
             match fs::remove_file(&path) {
                 Ok(()) => swept.removed.push(path),
                 Err(err) => swept.failed.push((path, super::error::explain_io(&err))),
@@ -1331,15 +1340,38 @@ fn save_within_fence(
         Some(Ok(g)) => Some(g),
         Some(Err(e)) => return Err(e.to_string()),
     };
+    // 清标记与写清单在同一栅栏内,而且清了之后写失败要**恢复**标记:否则盘上还是那份旧的
+    // completed=true 清单、标记却没了,下一次启动静默采信(codex 终审 P0)
+    let mut cleared: Option<String> = None;
     if clear_suspect_first {
-        if let Err(e) = manifest::clear_suspect(project_root, &m.id) {
-            log::warn!("清单不可信标记删不掉(收尾会再查一次并通知): {e}");
+        match manifest::suspect(project_root, &m.id) {
+            Ok(Some(why)) => match manifest::clear_suspect(project_root, &m.id) {
+                Ok(()) => cleared = Some(why),
+                Err(e) => log::warn!("清单不可信标记删不掉(收尾会再查一次并通知): {e}"),
+            },
+            Ok(None) => {}
+            Err(e) => log::warn!("清单不可信标记读不出(收尾会再查一次并通知): {e}"),
         }
     }
     let still_mine = || guard.as_ref().is_none_or(|g| g.still_mine());
     // 真正的写失败(IO)也用 Err(原因) 承载而不是 `?`:否则 reports 跟着丢,已拷完 /
     // 已失败文件一条审计都不写。任务落到暂停,清单还是上一次落盘的那份,可续传
-    let saved = manifest::save_guarded(project_root, m, &still_mine).map_err(|e| e.to_string())?;
+    let saved = match manifest::save_guarded(project_root, m, &still_mine) {
+        Ok(v) => v,
+        Err(e) => {
+            let mut why = e.to_string();
+            if let Some(reason) = cleared {
+                if let Err(re) = manifest::mark_suspect(project_root, &m.id, &reason) {
+                    why.push_str(&format!(
+                        "。而且收尾前清掉的「不可信」标记没能恢复({re}):盘上那份旧清单会被当作可信,请人工核对"
+                    ));
+                } else {
+                    why.push_str("。收尾前清掉的「不可信」标记已恢复");
+                }
+            }
+            return Err(why);
+        }
+    };
     if !still_mine() {
         // 改名之后才读不到锁标记:这份已经发布了,可能盖掉了接管者刚写的——停下并说明。
         // 原因分不出来(存储抖动 / 被外部回收),就不点名。并且在 NAS 上留下**持久化**的
@@ -2131,7 +2163,26 @@ mod tests {
             std::os::unix::fs::symlink(&target, &link).unwrap();
             (link, target)
         };
-        let swept = sweep_stale_parts(std::slice::from_ref(&dest), &plan, "abcd1234", "22222222");
+        // 租约丢了就一个都不许删
+        let refused = sweep_stale_parts(
+            std::slice::from_ref(&dest),
+            &plan,
+            "abcd1234",
+            "22222222",
+            &|| false,
+        );
+        assert!(
+            refused.removed.is_empty() && !refused.failed.is_empty(),
+            "{refused:?}"
+        );
+        assert!(old.exists() && legacy.exists());
+        let swept = sweep_stale_parts(
+            std::slice::from_ref(&dest),
+            &plan,
+            "abcd1234",
+            "22222222",
+            &|| true,
+        );
         let mut removed = swept.removed.clone();
         removed.sort();
         let mut expected = vec![old.clone(), legacy.clone()];
@@ -2302,6 +2353,41 @@ mod tests {
         assert!(
             manifest::suspect(&project, &m.id).unwrap().is_none(),
             "跑完之后不可信标记必须清掉"
+        );
+    }
+
+    /// 清掉标记之后收尾落盘失败:标记必须恢复——盘上还是那份旧清单,没了标记下一次启动
+    /// 就静默采信。
+    #[test]
+    fn a_suspect_marker_is_restored_when_the_final_save_fails() {
+        let (_t, req, mut m, project) = setup();
+        let plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
+        manifest::mark_suspect(&project, &m.id, "上一次运行写完发现栅栏已丢").unwrap();
+        // 把清单文件的落点占成目录:收尾那一次改名必然失败
+        let manifest_file = manifest::manifest_dir(&project).join(format!("{}.json", m.id));
+        std::fs::remove_file(&manifest_file).unwrap();
+        std::fs::create_dir(&manifest_file).unwrap();
+        let out = run_copy(&req, &plan, &mut m, &project, None, |_| {
+            CopyControl::Continue
+        })
+        .unwrap();
+        assert!(
+            out.aborted && !out.all_verified,
+            "收尾写失败必须中止: {:?}",
+            out.abort_reason
+        );
+        assert!(
+            manifest::suspect(&project, &m.id).unwrap().is_some(),
+            "写失败之后不可信标记必须还在(已恢复)"
+        );
+        assert!(
+            out.abort_reason.as_deref().unwrap_or("").contains("已恢复"),
+            "{:?}",
+            out.abort_reason
         );
     }
 

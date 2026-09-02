@@ -338,9 +338,13 @@ pub fn run() {
                         let listing = match core::manifest::list(&p.root) {
                             Ok(l) => l,
                             Err(e) => {
-                                commands::notify::warn(
+                                // 按项目分桶(伪任务 id、空 project id → 不渲染「查看任务」):
+                                // 多个项目同时读失败时不能被 30 秒合并折成只剩最后一个
+                                let bucket = format!("project:{}", p.meta.name);
+                                commands::notify::warn_for_task(
                                     &app_handle,
                                     "auto-proxy-deferred",
+                                    (&bucket, ""),
                                     format!("「{}」的拷卡清单读取失败({e}),该项目的自动转代理本次未检查", p.meta.name),
                                 );
                                 continue;

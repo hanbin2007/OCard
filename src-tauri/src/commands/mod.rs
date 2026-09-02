@@ -2583,7 +2583,15 @@ pub(crate) fn sweep_stale_temp_files(dir: &std::path::Path, tally: &mut SweepTal
     // 年龄用 NAS 自己的时钟量(与租约模块同一把尺子):本机比 NAS 快一小时以上时,
     // 别的工作站此刻正在「写临时文件 → 改名」窗口里的那份会被当孤儿删掉。探针写不成
     // 就退回本机时钟(与此前行为相同)
-    let now = crate::core::lease::nas_now(dir).unwrap_or_else(std::time::SystemTime::now);
+    let Some(now) = crate::core::lease::nas_now(dir) else {
+        // fail-closed:探针写不进就不删——退回本机时钟的话,本机快一小时以上时会把别的
+        // 工作站此刻正在改名窗口里的临时文件当孤儿删掉。算作「扫不动」并点名目录
+        tally.stuck += 1;
+        tally
+            .trouble
+            .push(format!("{}(时钟探针写不进,本次跳过清扫)", dir.display()));
+        return;
+    };
     let (mut removed, mut stuck) = (0usize, 0usize);
     for e in rd {
         // 逐项枚举失败(NAS 半死时常见)不能 flatten 掉:那一项到底是什么、

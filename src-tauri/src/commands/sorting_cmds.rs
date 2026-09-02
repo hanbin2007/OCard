@@ -91,6 +91,14 @@ pub(crate) fn notify_if_unsafe_fallback<R: tauri::Runtime>(app: &AppHandle<R>) {
             "当前文件系统不支持原子防覆盖改名与硬链接,零覆盖保障退化为「复查后改名」,并发写入存在极小竞态窗口;建议确认 NAS 协议(SMB3/NFSv4)".into(),
         );
     }
+    let left = crate::core::fsx::take_leftover_sources();
+    if left > 0 {
+        notify::warn(
+            app,
+            "fsx-leftover-temp",
+            format!("{left} 个文件已正确落位,但落位后的临时名没删掉(多半是杀毒软件 / 索引器还占着);它们不影响内容,下次开拷前的清扫或启动清理会收走"),
+        );
+    }
     let n = crate::core::fsx::take_times_preserve_failures();
     if n > 0 {
         notify::warn(

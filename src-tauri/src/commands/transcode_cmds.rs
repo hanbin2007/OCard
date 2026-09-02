@@ -963,7 +963,13 @@ pub(crate) fn spawn_proxy_job<R: tauri::Runtime>(
                     // 三种结局都已在里面各自通知;完成标记写不写得进不改变本次作业的结果
                     let _ = save_proxy_state(&body_app, &root, &machine_id, mid, "完成标记",
                         "下次启动会重投一次(已转文件会安全跳过)", |fresh| {
-                        fresh.proxy_completed = true
+                        // 盘上那份已经不是「已完成」(另一台机器续传把它打回了):不许标代理完成,
+                        // 否则以后补拷的新文件永远不会再自动转代理
+                        if !fresh.completed || !fresh.auto_proxy {
+                            return false;
+                        }
+                        fresh.proxy_completed = true;
+                        true
                     });
                 }
             }
@@ -1046,7 +1052,10 @@ fn save_proxy_state<R: tauri::Runtime>(
     what: &str,
     // 写不成的**后果**,各调用点各说各的:完成标记写不成 ≠ 计数写不成
     consequence: &str,
-    mutate: impl FnOnce(&mut crate::core::manifest::CopyManifest),
+    // 在租约下**重读**的那份清单上再判一次资格:返回 false = 盘上那份已经不满足(另一台
+    // 机器续传把 completed 打回了 false、或别的进程已经放弃/完成),不改、不写、不派发。
+    // 此前只盲目执行 closure,资格全按调用方手里的陈旧快照(codex 终审 P0)
+    mutate: impl FnOnce(&mut crate::core::manifest::CopyManifest) -> bool,
 ) -> Persist {
     // 短期持有真正的租约,而不是 live_holder 这种「检查后写」:worker 收尾那次
     // save 写的正是 completed=true,续传刷新又会把 completed 打回 false——写集合
@@ -1091,90 +1100,123 @@ fn save_proxy_state<R: tauri::Runtime>(
             return Persist::NotPublished;
         }
     };
-    let result = crate::core::manifest::load(project_root, id).and_then(|mut fresh| {
-        mutate(&mut fresh);
-        // 写在栅栏内:持有 Held 本身挡不住「进程休眠超过 TTL 后被接管」,栅栏在落盘前
-        // 持锁核对 token,不是自己的就不写(codex r6);改名之前再问一句(守门版 save)
-        let fence = lease.fence()?;
-        let (wr, path) =
-            crate::core::manifest::save_guarded(project_root, &fresh, &|| fence.still_mine())?;
-        // 写完再复核:此时改名**已经发生**,栅栏没了只能说「发布了但不能确认」,不能说
-        // 「没有写回」——放弃标记若已落盘,下次启动就不会再重投,却没人告诉用户已放弃
-        let unverified = !fence.still_mine();
-        // NAS 上留持久化的不可信标记;写不成在下面的通知里如实说,不能谎称已留下
-        let marker = if unverified {
-            Some(crate::core::manifest::mark_suspect(
-                project_root,
-                id,
-                "自动转代理状态写回后发现租约锁已丢,这份清单可能盖掉了接管方的进度",
-            ))
-        } else {
-            None
-        };
-        drop(fence);
-        Ok((wr, path, unverified, marker))
-    });
-    let outcome = match result {
-        Ok((wr, path, unverified, marker)) => {
-            // 被占用后重试成功的轮数在拷卡那条路上是可见的(fs-write-contention),口径一致
-            if wr.retries > 0 {
-                notify::warn_for_task(
-                app,
-                "fs-write-contention",
-                (id, &project_id),
-                    format!(
-                        "写入拷卡清单时被别的程序占着,重试 {} 轮后成功:{}。多半是杀毒软件或 NAS 索引正在扫这个目录;若反复出现,把该目录加入杀毒软件排除项",
-                        wr.retries,
-                        path.display()
-                    ),
-                );
+    // 租约下先看不可信标记:有(或读不出)就什么都不写、不派发(fail-closed)
+    let suspect = match crate::core::manifest::suspect(project_root, id) {
+        Ok(None) => None,
+        Ok(Some(why)) => Some(why),
+        Err(e) => Some(format!("(标记读不出:{e};按不可信处理)")),
+    };
+    let outcome = if let Some(why) = suspect {
+        notify::warn_for_task(
+            app,
+            "auto-proxy-skipped-suspect",
+            (id, &project_id),
+            format!(
+                "清单 {which}… 旁有「不可信」标记、或标记读不出({}):{what}本次不写回也不派发",
+                why.trim()
+            ),
+        );
+        Persist::Skipped
+    } else {
+        // 在租约下重读的那份上再判资格;不满足就不改不写
+        let result = crate::core::manifest::load(project_root, id).and_then(|mut fresh| {
+            if !mutate(&mut fresh) {
+                return Ok(None);
             }
-            if unverified {
-                notify::warn_for_task(
-                app,
-                "auto-proxy-state-unverified",
-                (id, &project_id),
-                    format!(
-                        "清单 {which}… 的自动转代理{what}已写回,但写完后读不到本任务的租约锁标记(可能是存储抖动,也可能是锁被外部回收),不能确认这份清单没有被别处顶掉;本次按已写回处理{}。请确认没有别的 OCard 在跑这个任务",
-                        match &marker {
-                            Some(Ok(())) => ",并已在清单旁留下「不可信」标记".to_string(),
-                            Some(Err(e)) => format!(",而且没能在清单旁写下「不可信」标记({e}):下次启动会采信盘上这份,请人工核对"),
-                            None => String::new(),
-                        }
-                    ),
-                );
-                Persist::PublishedUnverified
+            // 写在栅栏内:持有 Held 本身挡不住「进程休眠超过 TTL 后被接管」,栅栏在落盘前
+            // 持锁核对 token,不是自己的就不写(codex r6);改名之前再问一句(守门版 save)
+            let fence = lease.fence()?;
+            let (wr, path) =
+                crate::core::manifest::save_guarded(project_root, &fresh, &|| fence.still_mine())?;
+            // 写完再复核:此时改名**已经发生**,栅栏没了只能说「发布了但不能确认」,不能说
+            // 「没有写回」——放弃标记若已落盘,下次启动就不会再重投,却没人告诉用户已放弃
+            let unverified = !fence.still_mine();
+            // NAS 上留持久化的不可信标记;写不成在下面的通知里如实说,不能谎称已留下
+            let marker = if unverified {
+                Some(crate::core::manifest::mark_suspect(
+                    project_root,
+                    id,
+                    "自动转代理状态写回后发现租约锁已丢,这份清单可能盖掉了接管方的进度",
+                ))
             } else {
-                Persist::Confirmed
+                None
+            };
+            drop(fence);
+            Ok(Some((wr, path, unverified, marker)))
+        });
+        match result {
+            Ok(None) => {
+                // 系统替用户做了「不做」的决定,要说:盘上那份已经不满足派发条件(多半是另一台
+                // 机器续传把它打回了未完成,或别处已经放弃 / 完成)
+                notify::info_for_task(
+                    app,
+                    "auto-proxy-skipped-stale",
+                    (id, &project_id),
+                    format!("清单 {which}… 在租约下重读后已不满足{what}的条件(可能另一台机器正在续传、或别处已处理),本次不写回也不派发"),
+                );
+                Persist::Skipped
             }
-        }
-        Err(e) => {
-            // 栅栏拒绝(含锁目录异常)时根本没写,不能说「写入失败」
-            if e.to_string()
-                .starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX)
-            {
-                notify::error_for_task(
-                    app,
-                    "copy-resume-lease-lock-broken",
-                    (id, &project_id),
-                    format!("清单 {which}… 的自动转代理{what}没有写回:{e}。{consequence}"),
-                );
-            } else if matches!(e, crate::core::CoreError::Busy(_)) {
-                notify::warn_for_task(
-                    app,
-                    "auto-proxy-state-unsaved",
-                    (id, &project_id),
-                    format!("清单 {which}… 的自动转代理{what}没有写回:{e}。{consequence}"),
-                );
-            } else {
-                notify::warn_for_task(
-                    app,
-                    "auto-proxy-state-unsaved",
-                    (id, &project_id),
-                    format!("清单 {which}… 的自动转代理{what}写入失败({e})。{consequence}"),
-                );
+            Ok(Some((wr, path, unverified, marker))) => {
+                // 被占用后重试成功的轮数在拷卡那条路上是可见的(fs-write-contention),口径一致
+                if wr.retries > 0 {
+                    notify::warn_for_task(
+                        app,
+                        "fs-write-contention",
+                        (id, &project_id),
+                        format!(
+                            "写入拷卡清单时被别的程序占着,重试 {} 轮后成功:{}。多半是杀毒软件或 NAS 索引正在扫这个目录;若反复出现,把该目录加入杀毒软件排除项",
+                            wr.retries,
+                            path.display()
+                        ),
+                    );
+                }
+                if unverified {
+                    notify::warn_for_task(
+                        app,
+                        "auto-proxy-state-unverified",
+                        (id, &project_id),
+                        format!(
+                            "清单 {which}… 的自动转代理{what}已写回,但写完后读不到本任务的租约锁标记(可能是存储抖动,也可能是锁被外部回收),不能确认这份清单没有被别处顶掉;本次按已写回处理{}。请确认没有别的 OCard 在跑这个任务",
+                            match &marker {
+                                Some(Ok(())) => ",并已在清单旁留下「不可信」标记".to_string(),
+                                Some(Err(e)) => format!(",而且没能在清单旁写下「不可信」标记({e}):下次启动会采信盘上这份,请人工核对"),
+                                None => String::new(),
+                            }
+                        ),
+                    );
+                    Persist::PublishedUnverified
+                } else {
+                    Persist::Confirmed
+                }
             }
-            Persist::NotPublished
+            Err(e) => {
+                // 栅栏拒绝(含锁目录异常)时根本没写,不能说「写入失败」
+                if e.to_string()
+                    .starts_with(crate::core::lease::LOCK_DIR_BROKEN_PREFIX)
+                {
+                    notify::error_for_task(
+                        app,
+                        "copy-resume-lease-lock-broken",
+                        (id, &project_id),
+                        format!("清单 {which}… 的自动转代理{what}没有写回:{e}。{consequence}"),
+                    );
+                } else if matches!(e, crate::core::CoreError::Busy(_)) {
+                    notify::warn_for_task(
+                        app,
+                        "auto-proxy-state-unsaved",
+                        (id, &project_id),
+                        format!("清单 {which}… 的自动转代理{what}没有写回:{e}。{consequence}"),
+                    );
+                } else {
+                    notify::warn_for_task(
+                        app,
+                        "auto-proxy-state-unsaved",
+                        (id, &project_id),
+                        format!("清单 {which}… 的自动转代理{what}写入失败({e})。{consequence}"),
+                    );
+                }
+                Persist::NotPublished
+            }
         }
     };
     // 释放要有判定:只靠 Drop 的话「没删掉 / 被接管」就成了无声
@@ -1198,6 +1240,8 @@ pub enum Persist {
     Confirmed,
     PublishedUnverified,
     NotPublished,
+    /// 租约下重读后已不满足条件(或清单不可信):没改、没写、不派发,已通知。
+    Skipped,
 }
 
 pub fn dispatch_auto_proxy<R: tauri::Runtime>(
@@ -1244,7 +1288,17 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
             &m.id,
             "放弃标记",
             "本次不派发;放弃状态没有持久化,下次启动会再试一次写回",
-            |fresh| fresh.proxy_completed = true,
+            |fresh| {
+                if !(fresh.auto_proxy
+                    && fresh.completed
+                    && !fresh.proxy_completed
+                    && fresh.proxy_attempts >= 3)
+                {
+                    return false;
+                }
+                fresh.proxy_completed = true;
+                true
+            },
         );
         // 放弃标记写成了才能说「停止自动重试」;没写成就不是停止,是「这次没派发」。
         // 「写回了但不能确认」也要说停止:盘上多半已是放弃态,下次启动不会再重投,
@@ -1253,7 +1307,7 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
             Persist::Confirmed => notify::warn_for_task(
                 app,
                 "auto-proxy-abandoned",
-                (&m.id, ""),
+                (&m.id, &project_id),
                 format!(
                     "「{}」的自动转代理已连续 {} 次未能整批完成,停止自动重试;可在转码页手动执行(已转文件会安全跳过)",
                     m.target_rel, m.proxy_attempts
@@ -1263,13 +1317,13 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
             Persist::PublishedUnverified => notify::warn_for_task(
                 app,
                 "auto-proxy-abandoned",
-                (&m.id, ""),
+                (&m.id, &project_id),
                 format!(
                     "「{}」的自动转代理已连续 {} 次未能整批完成;放弃标记可能已写回但不能确认,本次不派发,下次启动会重读确认。可在转码页手动执行(已转文件会安全跳过)",
                     m.target_rel, m.proxy_attempts
                 ),
             ),
-            Persist::NotPublished => {}
+            Persist::NotPublished | Persist::Skipped => {}
         }
         return;
     }
@@ -1280,17 +1334,26 @@ pub fn dispatch_auto_proxy<R: tauri::Runtime>(
     // 计数多半在盘上、放弃上限仍然有效;若当没写回,每一次 unverified 都会烧掉一次
     // 重投额度却一个作业都不派,三次之后弹出「已连续 3 次未能整批完成」的假话
     // (opus r14)
-    if Persist::NotPublished
-        == save_proxy_state(
-            app,
-            project_root,
-            machine_id,
-            &m.id,
-            "重试计数",
-            "放弃上限会失效,本次不派发,下次启动再试",
-            |fresh| fresh.proxy_attempts += 1,
-        )
-    {
+    let reserved = save_proxy_state(
+        app,
+        project_root,
+        machine_id,
+        &m.id,
+        "重试计数",
+        "放弃上限会失效,本次不派发,下次启动再试",
+        |fresh| {
+            if !(fresh.auto_proxy
+                && fresh.completed
+                && !fresh.proxy_completed
+                && fresh.proxy_attempts < 3)
+            {
+                return false;
+            }
+            fresh.proxy_attempts += 1;
+            true
+        },
+    );
+    if matches!(reserved, Persist::NotPublished | Persist::Skipped) {
         return;
     }
     let meta = match project::load_meta(project_root) {

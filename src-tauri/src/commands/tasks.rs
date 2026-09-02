@@ -934,7 +934,10 @@ fn run_worker_locked<R: tauri::Runtime>(
             )))
         }
     };
-    let swept = copy::sweep_stale_parts(&handle.dest_targets, &plan, &task_prefix, &run_tag);
+    let swept =
+        copy::sweep_stale_parts(&handle.dest_targets, &plan, &task_prefix, &run_tag, &|| {
+            sweep_fence.still_mine()
+        });
     drop(sweep_fence);
     if !swept.removed.is_empty() {
         super::notify::info_for_task(
