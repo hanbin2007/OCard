@@ -2856,22 +2856,41 @@ mod tests {
             if let Progress::BytesCopied { delta, .. } = p {
                 if delta > 0 && !rewritten.get() {
                     rewritten.set(true);
-                    // 等长、内容不同的原位改写;mtime 显式拨到 +1s,不押文件系统的时间粒度
-                    // (Windows NTFS 15.6ms 节拍、FAT 2 秒)
-                    std::fs::write(&src, vec![b'B'; BUF_SIZE + 1024 * 1024]).unwrap();
-                    let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
-                    std::fs::File::options()
-                        .write(true)
-                        .open(&src)
-                        .unwrap()
-                        .set_times(std::fs::FileTimes::new().set_modified(bumped))
-                        .unwrap();
+                    if cfg!(windows) {
+                        // Windows:引擎持着 FILE_SHARE_READ 的句柄,写者根本打不开——这正是
+                        // Windows 上「拷贝期间没人在写」的保证(修改时间在那里靠不住)
+                        let r = std::fs::OpenOptions::new().write(true).open(&src);
+                        assert!(
+                            matches!(&r, Err(e) if e.raw_os_error() == Some(32)),
+                            "Windows 上拷贝期间写者必须打不开源文件: {r:?}"
+                        );
+                    } else {
+                        // 等长、内容不同的原位改写;mtime 显式拨到 +1s,不押文件系统的时间粒度
+                        std::fs::write(&src, vec![b'B'; BUF_SIZE + 1024 * 1024]).unwrap();
+                        let bumped =
+                            std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+                        std::fs::File::options()
+                            .write(true)
+                            .open(&src)
+                            .unwrap()
+                            .set_times(std::fs::FileTimes::new().set_modified(bumped))
+                            .unwrap();
+                    }
                 }
             }
             CopyControl::Continue
         })
         .unwrap();
-        assert!(rewritten.get(), "前置:改写要真的发生在拷贝期间");
+        assert!(rewritten.get(), "前置:改写(或改写尝试)要真的发生在拷贝期间");
+        if cfg!(windows) {
+            // 写者被挡在门外,拷贝照常完成、照常验证
+            assert!(
+                out.all_verified,
+                "写者打不开源,拷贝该照常通过: {:?}",
+                out.files
+            );
+            return;
+        }
         assert!(!out.all_verified, "源不稳定不许报全部通过");
         let status = &out.files[0].status;
         assert!(
