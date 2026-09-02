@@ -2101,6 +2101,11 @@ pub fn resume_copy_task<R: tauri::Runtime>(
             }
             msg
         })?;
+        // 租约取得(原子建文件)在这条命令线程上完成,降级标记是线程局部的:在这里取走、带 scope
+        sorting_cmds::notify_if_unsafe_fallback_for(
+            &app,
+            Some((&task_id_for_lease, &project_id_for_lease)),
+        );
         // 从这里到交给 worker 之间的任何早退(清单损坏、卷没插回……)都要有释放判定
         let mut keeper = tasks::LeaseKeeper::new(
             app.clone(),

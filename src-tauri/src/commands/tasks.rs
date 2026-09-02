@@ -951,7 +951,7 @@ fn run_worker_locked<R: tauri::Runtime>(
             "copy-stale-parts-swept",
             (&task_for_notices.0, &task_for_notices.1),
             format!(
-                "清理了上次运行留下的 {} 个临时文件(.ocardpart),例如 {}。这些是上次中断时没写完的半个文件,本次会重新拷",
+                "清理了上次运行留下的 {} 个残留,例如 {}。没写完的半个文件(.ocardpart)本次会重新拷;超过 30 分钟的发布锁 / 时钟探针残留(.ocardtmp)是上次崩溃留下的",
                 swept.removed.len(),
                 swept.removed[0].display()
             ),
@@ -963,7 +963,7 @@ fn run_worker_locked<R: tauri::Runtime>(
             "copy-stale-parts-sweep-failed",
             (&task_for_notices.0, &task_for_notices.1),
             format!(
-                "上次运行留下的 {} 个临时文件(.ocardpart)没能清掉,例如 {}({})。它们不影响本次拷贝,但会一直占着空间;可手动删除",
+                "上次运行留下的 {} 个残留(.ocardpart 半个文件 / .ocardtmp 锁与探针)没能清掉,例如 {}({})。半个文件不影响本次拷贝但会一直占着空间;残留的发布锁会挡住同名文件的落位。可手动删除",
                 swept.failed.len(),
                 swept.failed[0].0.display(),
                 swept.failed[0].1

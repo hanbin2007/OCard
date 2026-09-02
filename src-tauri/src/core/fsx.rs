@@ -241,8 +241,8 @@ fn rename_no_replace_with(
 /// 与文件名都相同)都看到目标不在、后一个普通 rename 会替换前一个,而两边的 part 都已各自
 /// 校验通过——两份清单都报成功,盘上却只剩一份(codex 终审 P0)。所以在目标路径上先用
 /// `create_new` 建一个**发布锁**(O_EXCL 在 FAT / SMB2+ 上都是原子的),锁内再复查 + rename;
-/// 别的发布者撞上锁 = 按占用重试,重试完还在 = 报 AlreadyExists 让上层核对内容。
-/// 崩溃残留的锁按年龄(两分钟)回收。
+/// 别的发布者撞上锁 = 按占用重试,重试完还在 = 可见失败并点名锁文件让人核对。
+/// 崩溃残留的锁**不在这里回收**(年龄回收有 ABA),由开拷前的清扫按 30 分钟收。
 fn checked_rename_under_publish_lock(src: &Path, dst: &Path) -> io::Result<()> {
     let lock = publish_lock_path(dst);
     // 锁在就是在:**不在热路径上回收**。按年龄回收有 ABA(两个回收者 / 时钟快的机器偷走
@@ -255,7 +255,9 @@ fn checked_rename_under_publish_lock(src: &Path, dst: &Path) -> io::Result<()> {
         .open(&lock)
     {
         Ok(f) => drop(f),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(publish_lock_busy(e)),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(publish_lock_busy(e, &lock))
+        }
         Err(e) => return Err(e),
     }
     let r = if dst.exists() {
@@ -288,10 +290,14 @@ pub const PUBLISH_LOCK_HELD: &str = "目标路径正被另一个发布者持有�
 
 /// 别的发布者正持着这个目标路径的发布锁:按「占用」上抛(PermissionDenied 在 is_contention
 /// 名单里),调用方的占用重试会再来几轮;重试完还在就是 AlreadyExists 级别的冲突。
-fn publish_lock_busy(e: io::Error) -> io::Error {
+fn publish_lock_busy(e: io::Error, lock: &Path) -> io::Error {
+    // 点名锁文件 + 补救写在这里:分类 / 转码 / 交付把这段原文带进逐项失败,一处修全部
     io::Error::new(
         io::ErrorKind::PermissionDenied,
-        format!("{PUBLISH_LOCK_HELD}:{e}"),
+        format!(
+            "{PUBLISH_LOCK_HELD}:目标路径正被另一个发布者持有发布锁 {}(或是崩溃残留;发布锁不自动回收,开拷前的清扫只收超过 30 分钟的)。确认没有别的 OCard 在往这里写之后可手动删除该锁文件再重试:{e}",
+            lock.display()
+        ),
     )
 }
 
@@ -519,7 +525,8 @@ mod tests {
     }
 
     /// 最后一级回退在目标路径上先拿发布锁:别的发布者持着锁时不许复查+rename(那正是
-    /// 两个任务互相覆盖的窗口),按占用上抛;锁陈旧(崩溃残留)则回收后继续。
+    /// 两个任务互相覆盖的窗口),按占用上抛;锁陈旧(崩溃残留)也照样按占用上抛(不在热路径
+    /// 回收),锁没了才发布、发布完自己的锁清掉。
     #[test]
     fn the_checked_rename_fallback_respects_a_publish_lock_on_the_final_path() {
         let _serial = flag_lock();
@@ -760,17 +767,20 @@ mod tests {
     }
 }
 
-/// 拷贝后时间戳保留失败计数(零静默:命令层取走后聚合告警)。
-static TIMES_PRESERVE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// 拷贝后时间戳保留失败计数(零静默:命令层取走后聚合告警)。
+thread_local! {
+    /// 时间戳保留失败计数,**线程局部**(与降级标记同理:并行拷卡时不许被先收尾的任务领走)。
+    static TIMES_PRESERVE_FAILURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// 取走时间戳保留失败数(swap 清零)。
 pub fn take_times_preserve_failures() -> u64 {
-    TIMES_PRESERVE_FAILURES.swap(0, std::sync::atomic::Ordering::Relaxed)
+    TIMES_PRESERVE_FAILURES.with(|c| c.replace(0))
 }
 
 /// 外部记入 N 次保留失败(如:源元数据在读取前就拿不到,时间戳注定无法保留)。
 pub fn note_times_preserve_failures(n: u64) {
-    TIMES_PRESERVE_FAILURES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    TIMES_PRESERVE_FAILURES.with(|c| c.set(c.get() + n));
 }
 
 /// 把源文件的时间戳复制到目标(拷卡/交付/精选的复制路径都要调):
@@ -816,7 +826,7 @@ pub fn preserve_times(src_meta: &fs::Metadata, dst: &Path) -> io::Result<bool> {
 pub fn preserve_times_counted(src_meta: &fs::Metadata, dst: &Path) {
     // Err(含 mtime 缺失)与部分退化(Ok(false))都计入聚合告警,零静默
     if !matches!(preserve_times(src_meta, dst), Ok(true)) {
-        TIMES_PRESERVE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_times_preserve_failures(1);
     }
 }
 

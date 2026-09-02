@@ -97,7 +97,7 @@ pub(crate) fn notify_if_unsafe_fallback_for<R: tauri::Runtime>(
             app,
             task,
             "fsx-fallback-window",
-            "当前文件系统不支持原子防覆盖改名与硬链接,零覆盖保障退化为「发布锁 + 复查后改名」:两个任务同时往同一路径写由发布锁串行,残余边界是崩溃残留锁的两分钟回收;建议确认 NAS 协议(SMB3/NFSv4)".into(),
+            "当前文件系统不支持原子防覆盖改名与硬链接,零覆盖保障退化为「发布锁 + 复查后改名」:两个任务同时往同一路径写由发布锁串行;崩溃残留的锁不自动回收(开拷前清扫只收超过 30 分钟的),撞上会可见失败并点名锁文件。建议确认 NAS 协议(SMB3/NFSv4)".into(),
         );
     }
     let left = crate::core::fsx::take_leftover_sources();

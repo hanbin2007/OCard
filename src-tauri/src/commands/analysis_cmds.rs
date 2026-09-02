@@ -142,6 +142,7 @@ pub fn start_analysis<R: tauri::Runtime>(
             // 降级标记是线程局部的:池线程上写缩略图走了回退,要在**池线程**上取走、汇总到
             // 作业,作业结束时一次性告知(此前只在 500ms 节流分支里取,且取的是作业线程的)
             let fallback_seen = std::sync::atomic::AtomicBool::new(false);
+            let leftover_seen = std::sync::atomic::AtomicUsize::new(0);
 
             // rayon 并行(物理核-1);每项 catch_unwind 隔离(计划 C2/W7)
             let workers = std::thread::available_parallelism()
@@ -171,6 +172,10 @@ pub fn start_analysis<R: tauri::Runtime>(
                     }));
                     if crate::core::fsx::take_unsafe_fallback_flag() {
                         fallback_seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let left = crate::core::fsx::take_leftover_sources();
+                    if left > 0 {
+                        leftover_seen.fetch_add(left, std::sync::atomic::Ordering::Relaxed);
                     }
                     match outcome {
                         Ok(AnalyzeOne::Cached) => {
@@ -262,6 +267,14 @@ pub fn start_analysis<R: tauri::Runtime>(
                     &body_app,
                     "fsx-fallback-window",
                     "分析写缩略图时文件系统不支持原子防覆盖改名与硬链接,已降级为「发布锁 + 复查后改名」;建议确认 NAS 协议(SMB3/NFSv4)".into(),
+                );
+            }
+            let left = leftover_seen.load(std::sync::atomic::Ordering::Relaxed);
+            if left > 0 {
+                notify::warn(
+                    &body_app,
+                    "fsx-leftover-temp",
+                    format!("{left} 个缩略图已正确落位,但落位后的临时名没删掉(多半是杀毒软件 / 索引器还占着);不影响内容,启动清理会收走"),
                 );
             }
             if !result.failed.is_empty() {

@@ -1283,8 +1283,8 @@ pub fn sweep_stale_parts(
                 .strip_prefix('.')
                 .and_then(|n| n.strip_suffix(lock_suffix.as_str()))
                 .is_some_and(|n| names.contains(n));
-            let probe_residue =
-                name.starts_with(".clock.") && name.ends_with(super::fsx::TMP_SUFFIX);
+            let probe_residue = (name.starts_with(".clock.") || name.starts_with(".hlprobe."))
+                && name.ends_with(super::fsx::TMP_SUFFIX);
             if lock_residue || probe_residue {
                 {
                     let path = e.path();
@@ -1299,9 +1299,22 @@ pub fn sweep_stale_parts(
                             .is_ok_and(|age| age > std::time::Duration::from_secs(30 * 60)),
                         _ => false,
                     };
-                    if age_ok && still_mine() {
-                        match fs::remove_file(&path) {
-                            Ok(()) => swept.removed.push(path),
+                    if age_ok {
+                        // 与 part 分支同口径:租约丢了就记下来并停止,不静默跳过
+                        if !still_mine() {
+                            swept
+                                .failed
+                                .push((path, "租约锁已不是本进程的,停止清扫".into()));
+                            return swept;
+                        }
+                        match e.file_type() {
+                            Ok(t) if t.is_file() => match fs::remove_file(&path) {
+                                Ok(()) => swept.removed.push(path),
+                                Err(err) => {
+                                    swept.failed.push((path, super::error::explain_io(&err)))
+                                }
+                            },
+                            Ok(_) => {} // 链接 / 目录不碰
                             Err(err) => swept.failed.push((path, super::error::explain_io(&err))),
                         }
                     }
@@ -1794,10 +1807,13 @@ fn copy_one(
     // planned 项经 resume 并回后仍会读到卡外)——canonical 断言真实位置在源根内
     super::paths::assert_within_core(source_root, &src_path)?;
 
-    // 时间戳快照由调用方在 file_done 源哈希之前采集传入(R5 三票 P1);
-    // 获取失败计入保留失败聚合告警
+    // 时间戳快照由调用方在 file_done 源哈希之前采集传入(R5 三票 P1)。取不到就**在这里**
+    // fail-closed:它同时是「源在拷贝期间没被改写」的基准,没有基准就无法证明,不该先拷几十 GB
+    // 再判失败,也不该给根本没落位的文件计一笔「时间戳未保留」
     if src_meta.is_none() {
-        super::fsx::note_times_preserve_failures(destinations.len() as u64);
+        return Err(super::CoreError::Invalid(format!(
+            "开拷前读不到源文件的元数据,无法确认它在拷贝期间没有被改写,这份拷贝不落位: {source_rel}。请重试;持续出现请检查卡的读取"
+        )));
     }
 
     // 落点用**目标** rel:扁平化后它与源路径不同(通常只是文件名)
@@ -2598,6 +2614,47 @@ mod tests {
 
     /// 源在拷贝期间被改写(相机还在写这张卡):目标是一半旧一半新,回读校验照样过——
     /// 必须按「源不稳定」判失败、不落位、不标 verified。
+    /// 开拷前读不到源的元数据 → 没有「源在拷贝期间没被改写」的基准 → 直接失败、不落位、
+    /// 不给这个根本没落位的文件计「时间戳未保留」。
+    #[test]
+    fn a_source_without_metadata_fails_closed_before_copying_anything() {
+        let t = tempfile::tempdir().unwrap();
+        let src_root = t.path().join("card");
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(src_root.join("DCIM")).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(src_root.join("DCIM/A.MP4"), b"hello").unwrap();
+        let _ = super::super::fsx::take_times_preserve_failures();
+        let mut tally = ContentionTally::default();
+        let r = copy_one(
+            &src_root,
+            "DCIM/A.MP4",
+            "DCIM/A.MP4",
+            None,
+            std::slice::from_ref(&dest),
+            "abcd1234-22222222",
+            &mut |_| true,
+            &mut tally,
+        );
+        let msg = match r {
+            Err(super::super::CoreError::Invalid(m)) => m,
+            other => panic!("要 Invalid,得到 {other:?}"),
+        };
+        assert!(msg.contains("读不到源文件的元数据"), "{msg}");
+        assert!(!dest.join("DCIM/A.MP4").exists(), "不许落位");
+        assert!(
+            std::fs::read_dir(dest.join("DCIM"))
+                .map(|d| d.count() == 0)
+                .unwrap_or(true),
+            "不许留下 part"
+        );
+        assert_eq!(
+            super::super::fsx::take_times_preserve_failures(),
+            0,
+            "没落位的文件不许计「时间戳未保留」"
+        );
+    }
+
     #[test]
     fn a_source_rewritten_during_the_copy_fails_instead_of_landing_a_mixed_file() {
         let t = tempfile::tempdir().unwrap();

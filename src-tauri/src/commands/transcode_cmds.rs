@@ -1085,6 +1085,26 @@ fn save_proxy_state<R: tauri::Runtime>(
     machine_id: &str,
     id: &str,
     what: &str,
+    consequence: &str,
+    mutate: impl FnOnce(&mut crate::core::manifest::CopyManifest) -> bool,
+) -> Persist {
+    let r = save_proxy_state_inner(app, project_root, machine_id, id, what, consequence, mutate);
+    // 租约取得(原子建文件)在调用线程上完成,降级标记是线程局部的:在这里取走、带 scope。
+    // 调用方(拷卡 worker / 转码作业)自己的收尾取走发生在派发**之前**,这里不取就丢了
+    let project_id = project_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    super::sorting_cmds::notify_if_unsafe_fallback_for(app, Some((id, &project_id)));
+    r
+}
+
+fn save_proxy_state_inner<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    project_root: &Path,
+    machine_id: &str,
+    id: &str,
+    what: &str,
     // 写不成的**后果**,各调用点各说各的:完成标记写不成 ≠ 计数写不成
     consequence: &str,
     // 在租约下**重读**的那份清单上再判一次资格:返回 false = 盘上那份已经不满足(另一台
