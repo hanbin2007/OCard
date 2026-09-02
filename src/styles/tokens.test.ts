@@ -236,6 +236,22 @@ describe("主题令牌", () => {
     }
   });
 
+  /**
+   * 欢迎窗口里的 toast 必须靠上贴。那个窗口没有铃铛,warning 不会自动收起,
+   * 而新建项目向导的主按钮在右下角——默认的右下 toast 会把它整个盖住
+   * (E2E 自 v0.4.2 起就是这么红的,取证抓到的就是一条 index-failures 提示)。
+   */
+  it("欢迎窗口的 toast 不许压在向导右下角的主按钮上", async () => {
+    const { RULES, where } = await import("./_css-contract");
+    const rule = RULES.find(
+      (r) => r.selector.includes("welcome-shell") && r.subjectClasses.has("toasts"),
+    );
+    expect(rule ? where(rule) : null, "缺 .welcome-shell .toasts 规则").not.toBeNull();
+    const decl = (prop: string) => rule!.decls.find((d) => d.prop === prop)?.value.trim();
+    expect(decl("bottom"), "必须把默认的 bottom 让开").toBe("auto");
+    expect(decl("top"), "必须给一个 top").toBeTruthy();
+  });
+
   it("字体栈全部是系统字体，不引 webfont", () => {
     expect(css).not.toContain("@font-face");
     expect(css).not.toContain("fonts.googleapis");

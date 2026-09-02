@@ -21,6 +21,16 @@
   height: 36px;
 }
 
+/* 欢迎窗口里的 toast 靠**上**贴,不靠下。
+   这个窗口没有铃铛,warning 不会自动收起(收起就等于消失);而新建项目向导的
+   「下一步 / 创建项目」正好在右下角——一条「1 个文件无法生成预览」的提示落在
+   右下,就把向导的主按钮整个盖住了,点不动也看不见为什么。CI 的 E2E 自 v0.4.2
+   起一直红,取证抓到的就是这一幕。 */
+.welcome-shell .toasts {
+  top: calc(36px + var(--space-3)); /* 让开顶部拖动条 */
+  bottom: auto;
+}
+
 .welcome-shell__body {
   flex: 1;
   min-height: 0;

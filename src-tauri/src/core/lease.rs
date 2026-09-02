@@ -953,11 +953,17 @@ mod tests {
     /// ACCESS_DENIED,得带 FILE_FLAG_BACKUP_SEMANTICS(CI 实测)。
     fn open_dir_for_times(dir: &Path) -> std::fs::File {
         let mut o = std::fs::OpenOptions::new();
-        o.read(true);
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            o.custom_flags(0x0200_0000); // FILE_FLAG_BACKUP_SEMANTICS
+            // 改时间戳要 FILE_WRITE_ATTRIBUTES;只 read 打开会 ACCESS_DENIED(CI 实测)。
+            // access_mode 会覆盖 read/write 标志,所以这里不再 .read(true)
+            o.access_mode(0x0100); // FILE_WRITE_ATTRIBUTES
+            o.custom_flags(0x0200_0000); // FILE_FLAG_BACKUP_SEMANTICS:允许打开目录
+        }
+        #[cfg(not(windows))]
+        {
+            o.read(true);
         }
         o.open(dir).expect("打开目录改时间戳")
     }
