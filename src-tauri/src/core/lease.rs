@@ -47,6 +47,13 @@
 //! 一定是自己上次的残留(single-instance 保证同机没有第二个 OCard),直接接管;
 //! ③ 心跳时间戳在**未来**也当过期(对方机器时钟快,否则那份租约永不过期)。
 //!
+//! # 契约:进程名
+//!
+//! 「同机残留」的判定看 pid 对应的进程名是否含 `ocard`(`pid_is_ocard`)。这依赖
+//! `tauri.conf.json` 的 `productName = "OCard"`(三平台可执行名 OCard / OCard.exe)。
+//! 改产品名、或 IT 改名分发,会让同机**活着**的持有者被判成残留而被抢——改名时
+//! 必须同步改这里。
+//!
 //! # 边界(如实声明)
 //!
 //! - `rename_no_replace` 在不支持原子原语的文件系统上会退到「复查+rename」
@@ -78,6 +85,9 @@ pub struct Timing {
     /// 超过这么久没有一次成功的心跳,拷贝就该停:再往前 TTL/2 就可能被别人接管,
     /// 而我们还在写清单。
     pub at_risk_after: std::time::Duration,
+    /// 心跳多久不更新就算过期(生产 = [`LEASE_TTL`];测试用短的,好造出
+    /// 「看起来过期但其实活着」的持有者)。
+    pub ttl: chrono::Duration,
 }
 
 impl Timing {
@@ -88,6 +98,7 @@ impl Timing {
         heartbeat_every: std::time::Duration::from_secs(10),
         // TTL 的一半:留足余量,在被接管**之前**停下
         at_risk_after: std::time::Duration::from_secs(15 * 60),
+        ttl: LEASE_TTL,
     };
 }
 
@@ -129,10 +140,14 @@ impl Lease {
     /// 时间戳在**未来**超过 TTL 也当过期——对方机器时钟快时写下的租约,
     /// 否则在别的机器眼里永不过期,而报文还在承诺「等 30 分钟再试」。
     pub fn is_stale(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.is_stale_by(now, LEASE_TTL)
+    }
+
+    fn is_stale_by(&self, now: chrono::DateTime<chrono::Utc>, ttl: chrono::Duration) -> bool {
         match chrono::DateTime::parse_from_rfc3339(&self.heartbeat_at) {
             Ok(t) => {
                 let age = now - t.to_utc();
-                age > LEASE_TTL || age < -LEASE_TTL
+                age > ttl || age < -ttl
             }
             Err(_) => true,
         }
@@ -316,7 +331,20 @@ impl TakeoverLock {
     fn make(dir: PathBuf) -> Result<Option<Self>> {
         let nonce = dir.join(uuid::Uuid::new_v4().simple().to_string());
         match std::fs::write(&nonce, b"") {
-            Ok(()) => Ok(Some(Self { dir, nonce })),
+            Ok(()) => {
+                // 复核:目录里只该有我这一个 nonce。慢 NAS 上 mkdir 与写 nonce 之间
+                // 可能超过回收门槛,目录被别人收走重建——我的 nonce 就落进了别人的
+                // 目录,两边 still_mine 都为真。那就撤回自己的,按没拿到处理
+                let alone = std::fs::read_dir(&dir)
+                    .map(|rd| rd.flatten().count() == 1)
+                    .unwrap_or(false);
+                if alone {
+                    Ok(Some(Self { dir, nonce }))
+                } else {
+                    let _ = std::fs::remove_file(&nonce);
+                    Ok(None)
+                }
+            }
             Err(_) if !dir.exists() => Ok(None),
             Err(e) => Err(super::CoreError::io_detail(
                 "写入租约接管锁标记",
@@ -341,6 +369,12 @@ impl TakeoverLock {
                 return false;
             }
             return std::fs::remove_dir(dir).is_ok();
+        }
+        // 判据下沉到 nonce **自己**的年龄:调用方看到的「老目录」可能在它判断之后
+        // 已经被别人回收重建——那个新目录里的 nonce 一定是新鲜的。真实的崩溃残留
+        // nonce 一定是老的(它在取锁那一刻创建)。看到任何一个新鲜 nonce 就让路
+        if nonces.iter().any(|n| !Self::is_reclaimable(n)) {
+            return false;
         }
         let mut removed_any = false;
         for n in &nonces {
@@ -396,7 +430,11 @@ impl TakeoverLock {
 
     /// 锁还是不是我的(nonce 还在)。每个破坏性动作之前问一句。
     fn still_mine(&self) -> bool {
-        self.nonce.exists()
+        // 只有「确实不在了」才算被收走;NAS 抖一下的瞬时错误不该让我们让路
+        !matches!(
+            std::fs::symlink_metadata(&self.nonce),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        )
     }
 }
 
@@ -460,27 +498,15 @@ pub fn acquire_with(
         }
     }
 
-    // 已存在:能不能接管,要在**接管锁**下重读再判——锁之前读到的那份可能
-    // 在我们判断的这一瞬间已经被别的接管者换成了新鲜的
-    let guard = match TakeoverLock::try_take(&path)? {
-        Some(g) => g,
-        None => {
-            return Err(super::CoreError::Busy(format!(
-                "另一个进程正在接管这个拷卡任务的租约,本次不重复接管;请在那边操作,或稍后再试(若确认没有别的进程在跑,可删除锁目录解锁:{})",
-                TakeoverLock::path_for(&path).display()
-            )));
-        }
-    };
-    let note = match classify_existing(&path, machine_id, chrono::Utc::now()) {
-        Existing::Busy(msg) => return Err(super::CoreError::Busy(msg)),
-        Existing::TakeOver(note) => Some(note),
-        Existing::Fresh => None,
-    };
     // 「按时钟过期」不能单独定罪:对方机器时钟偏差超过 TTL 时,一份**活着**的租约
-    // 在我们眼里也是过期的。所以再用本机的单调时间观察一个心跳周期:心跳还在
+    // 在我们眼里也是过期的。所以先用本机的单调时间观察一个心跳周期:心跳还在
     // 变,那就是活的,退 Busy;真死了才接管。本机残留(pid 不在)不用等。
+    //
+    // **必须在取接管锁之前观察**:对方的心跳每一拍都要先拿这把锁,我们持锁睡
+    // 一个周期等于把它的心跳一起锁死——盘上的时间戳一个字节都不会变,于是永远
+    // 判成「死了」。评审抓到这条时,守卫是 100% 不生效的死代码。
     if let Some(l0) = read_lease(&path) {
-        if l0.is_stale(chrono::Utc::now()) && !l0.is_dead_local(machine_id) {
+        if l0.is_stale_by(chrono::Utc::now(), timing.ttl) && !l0.is_dead_local(machine_id) {
             let margin = std::time::Duration::from_secs(5).min(timing.heartbeat_every);
             std::thread::sleep(timing.heartbeat_every + margin);
             if let Some(l1) = read_lease(&path) {
@@ -494,6 +520,22 @@ pub fn acquire_with(
         }
     }
 
+    // 已存在:能不能接管,要在**接管锁**下重读再判——锁之前读到的那份可能
+    // 在我们判断的这一瞬间已经被别的接管者换成了新鲜的
+    let guard = match TakeoverLock::try_take(&path)? {
+        Some(g) => g,
+        None => {
+            return Err(super::CoreError::Busy(format!(
+                "另一个进程正在接管这个拷卡任务的租约,本次不重复接管;请在那边操作,或稍后再试(若确认没有别的进程在跑,可删除锁目录解锁:{})",
+                TakeoverLock::path_for(&path).display()
+            )));
+        }
+    };
+    let note = match classify_existing(&path, machine_id, chrono::Utc::now(), timing.ttl) {
+        Existing::Busy(msg) => return Err(super::CoreError::Busy(msg)),
+        Existing::TakeOver(note) => Some(note),
+        Existing::Fresh => None,
+    };
     // 持锁期间接管者只有我们;快路径的 try_create 仍可能抢在 remove 与 create
     // 之间落一份新的——那就让它赢,我们退回 Busy(它是干净取得,不需要接管)
     // 删之前再确认锁还是我的:被回收了就等于没锁
@@ -502,12 +544,7 @@ pub fn acquire_with(
             "接管锁在判断期间被别的进程回收,本次让路;请稍后再试".into(),
         ));
     }
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(super::CoreError::io_detail("移除过期的任务租约", &path, &e)),
-    }
-    if try_create(&path, &me)? {
+    if publish(&path, &me, note.is_some())? {
         Held::start(path, me, timing, note)
     } else {
         Err(super::CoreError::Busy(
@@ -515,6 +552,22 @@ pub fn acquire_with(
                 .into(),
         ))
     }
+}
+
+/// 在锁下把自己的租约放上去。`evict` = 先把盘上那份(已判定为可接管的)删掉。
+///
+/// Fresh(文件已不在)时必须 `evict = false`:此刻可能有人正走快路径(不拿锁)
+/// 刚原子建好自己的租约,删了等于把一份合法的干净取得抹掉。直接去建,建不成
+/// 就是它赢——这条语义单独成函数,好被直接考。
+fn publish(path: &Path, me: &Lease, evict: bool) -> Result<bool> {
+    if evict {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(super::CoreError::io_detail("移除过期的任务租约", path, &e)),
+        }
+    }
+    try_create(path, me)
 }
 
 /// 对已存在的租约的裁决。
@@ -533,6 +586,7 @@ fn classify_existing(
     path: &Path,
     machine_id: &str,
     now: chrono::DateTime<chrono::Utc>,
+    ttl: chrono::Duration,
 ) -> Existing {
     match read_lease(path) {
         // 上一个持有者在我们等锁期间干净释放了——正常竞态,不是接管,不发告警
@@ -543,7 +597,7 @@ fn classify_existing(
         None => Existing::TakeOver(
             "上一份任务租约读不懂且已陈旧(可能是异常退出写了一半),已接管".to_string(),
         ),
-        Some(l) if l.is_stale(now) => Existing::TakeOver(format!(
+        Some(l) if l.is_stale_by(now, ttl) => Existing::TakeOver(format!(
             "接管了一份过期的任务租约:{} 上次心跳 {},已超过 {} 分钟没有动静(多半是上次异常退出;若那台机器时钟不准也会这样)",
             l.who(machine_id),
             l.heartbeat_at,
@@ -675,9 +729,20 @@ impl Held {
             }),
             Err(e) => {
                 // 没有心跳的租约 30 分钟后就是别人的了,却还在装作持有:
-                // 不如现在就把文件收回、如实报错
-                let _ = std::fs::remove_file(&path);
-                Err(super::CoreError::io_detail("启动租约心跳线程", &path, &e))
+                // 不如现在就把文件收回、如实报错。收不回也要说——盘上会留一份
+                // 永远不心跳的租约,别人要等 TTL
+                let leftover = match std::fs::remove_file(&path) {
+                    Ok(()) => String::new(),
+                    Err(re) => format!(
+                        "(且租约文件没能收回:{re},别的机器续这个任务要等 {} 分钟)",
+                        LEASE_TTL.num_minutes()
+                    ),
+                };
+                Err(super::CoreError::IoDetail(format!(
+                    "启动租约心跳线程失败: {} —— {}{leftover}",
+                    path.display(),
+                    super::error::explain_io(&e)
+                )))
             }
         }
     }
@@ -902,6 +967,15 @@ mod tests {
     const FAST: Timing = Timing {
         heartbeat_every: std::time::Duration::from_millis(120),
         at_risk_after: std::time::Duration::from_secs(1),
+        ttl: LEASE_TTL,
+    };
+    /// 观察者视角的「短 TTL」:让一个每 120ms 心跳的**真实**持有者看起来像过期。
+    /// 取 1 微秒:任何一次读到的心跳都「过期」,观察分支必然被走到——否则读得
+    /// 正巧撞上刚打完的一拍时,会走普通的「活着 → Busy」分支,考不到观察期。
+    const SUSPICIOUS: Timing = Timing {
+        heartbeat_every: std::time::Duration::from_millis(120),
+        at_risk_after: std::time::Duration::from_secs(1),
+        ttl: chrono::Duration::microseconds(1),
     };
 
     fn setup() -> (tempfile::TempDir, PathBuf, String) {
@@ -1074,37 +1148,21 @@ mod tests {
     #[test]
     fn a_live_lease_that_merely_looks_stale_by_clock_is_not_stolen() {
         let (_t, root, id) = setup();
-        let p = lease_path(&root, &id).unwrap();
-        let mut skewed = live("MACHINE-B", 4242, "李四");
-        let base = chrono::Utc::now() - LEASE_TTL - chrono::Duration::hours(2);
-        skewed.heartbeat_at = base.to_rfc3339();
-        write_lease(&root, &id, &skewed);
-        // 模拟对方的心跳线程:按它那套慢时钟**持续**推进 heartbeat_at(原子写,
-        // 免得观察者读到半截文件),直到我们这边的 acquire 返回
-        let stop = Arc::new(AtomicBool::new(false));
-        let pusher = {
-            let (p, mut beat, stop) = (p.clone(), skewed.clone(), stop.clone());
-            std::thread::spawn(move || {
-                let mut n = 0i64;
-                while !stop.load(Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    n += 1;
-                    beat.heartbeat_at = (base + chrono::Duration::seconds(n)).to_rfc3339();
-                    let _ =
-                        super::super::fsx::write_atomic(&p, &serde_json::to_vec(&beat).unwrap());
-                }
-            })
-        };
-        let err = acquire_with(&root, &id, "MACHINE-A", "张三", FAST).unwrap_err();
-        stop.store(true, Ordering::SeqCst);
-        pusher.join().unwrap();
+        // 一个**真实**的持有者:它的心跳线程每拍都要拿接管锁——这正是评审抓到的
+        // 那条:观察期若在锁内跑,对方一拍都打不出来,永远判成「死了」。
+        // 用假 pusher 绕开锁写文件的测试,绿得毫无意义
+        let holder = acquire_with(&root, &id, "MACHINE-B", "李四", FAST).unwrap();
+        let holder_token = holder.me.token.clone();
+        // 观察者的 TTL 极短:持有者的心跳在它眼里永远「过期」——正是时钟偏差的形状
+        let err = acquire_with(&root, &id, "MACHINE-A", "张三", SUSPICIOUS).unwrap_err();
         assert!(matches!(err, super::super::CoreError::Busy(_)), "{err}");
         assert!(err.to_string().contains("时钟"), "{err}");
         assert_eq!(
             on_disk(&root, &id).token,
-            skewed.token,
+            holder_token,
             "活着的租约被偷走了"
         );
+        assert_eq!(holder.poll(), LeaseStatus::Ok, "持有者不该被这次尝试打扰");
     }
 
     /// 对方机器时钟快:心跳在未来。只用 `now - t > TTL` 判的话它永不过期,
@@ -1287,7 +1345,17 @@ mod tests {
         let dir = TakeoverLock::path_for(&lease);
         for round in 0..30 {
             std::fs::create_dir(&dir).unwrap();
-            std::fs::write(dir.join("stale-nonce"), b"").unwrap();
+            let stale_nonce = dir.join("stale-nonce");
+            std::fs::write(&stale_nonce, b"").unwrap();
+            // 真实残留:nonce 本身也是老的(它在取锁那一刻创建)
+            std::fs::File::options()
+                .write(true)
+                .open(&stale_nonce)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() - YOUNG_LEASE - std::time::Duration::from_secs(60),
+                ))
+                .unwrap();
             set_dir_mtime(
                 &dir,
                 std::time::SystemTime::now() - YOUNG_LEASE - std::time::Duration::from_secs(60),
@@ -1340,6 +1408,44 @@ mod tests {
         assert!(!dir.exists());
     }
 
+    /// Fresh 路径绝不删文件:文件在我们判断之后又出现了 = 有人走快路径刚干净取得,
+    /// 那份必须留着,我们让路。
+    #[test]
+    fn publishing_without_evict_never_removes_a_lease_that_appeared_meanwhile() {
+        let (_t, root, id) = setup();
+        let p = lease_path(&root, &id).unwrap();
+        let theirs = live("MACHINE-B", 4242, "李四");
+        write_lease(&root, &id, &theirs);
+        let me = Lease::fresh("MACHINE-A", "张三", &uuid::Uuid::new_v4().to_string());
+        assert!(
+            !publish(&p, &me, false).unwrap(),
+            "文件已在,不 evict 就不许赢"
+        );
+        assert_eq!(on_disk(&root, &id), theirs, "别人刚建好的租约被删了");
+        // 对照:判定为可接管(evict)时才允许顶掉
+        assert!(publish(&p, &me, true).unwrap());
+        assert_eq!(on_disk(&root, &id).token, me.token);
+    }
+
+    /// 老目录里躺着一个**新鲜**的 nonce = 别人刚回收重建、正在持有:不许再回收。
+    /// 只按目录年龄判的话,回收者会删掉别人刚写的 nonce 然后 rmdir——双持有者。
+    #[test]
+    fn reclaim_backs_off_when_the_nonce_inside_is_fresh() {
+        let t = tempdir().unwrap();
+        let dir = t.path().join("x.lease.takeover");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("fresh-nonce"), b"").unwrap();
+        set_dir_mtime(
+            &dir,
+            std::time::SystemTime::now() - YOUNG_LEASE - std::time::Duration::from_secs(60),
+        );
+        assert!(
+            !TakeoverLock::reclaim(&dir),
+            "nonce 是新鲜的,目录再老也不许回收"
+        );
+        assert!(dir.join("fresh-nonce").exists(), "别人的 nonce 被删了");
+    }
+
     /// 等锁期间上一个持有者干净释放、文件已经不在:那不是接管,不许标成接管。
     /// (快路径拿不到这一支——文件不在时快路径直接成功——所以直接考分类函数。)
     #[test]
@@ -1347,7 +1453,7 @@ mod tests {
         let t = tempdir().unwrap();
         let gone = t.path().join("gone.lease");
         assert!(matches!(
-            classify_existing(&gone, "MACHINE-A", chrono::Utc::now()),
+            classify_existing(&gone, "MACHINE-A", chrono::Utc::now(), LEASE_TTL),
             Existing::Fresh
         ));
     }

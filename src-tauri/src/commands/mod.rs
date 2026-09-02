@@ -2076,19 +2076,21 @@ pub fn resume_copy_task<R: tauri::Runtime>(
         .map_err(|e| {
             let msg = e.to_string();
             if matches!(e, crate::core::CoreError::Busy(_)) {
-                let s = handle.snapshot.lock().unwrap();
-                notify::warn_for_task(
-                    &app,
-                    "copy-resume-lease-held",
-                    (&s.id, &s.project_id),
-                    msg.clone(),
-                );
+                // 先 clone 再放锁:notify 会写日志 + IPC,不该持着 snapshot 锁做
+                let (id, pid) = {
+                    let s = handle.snapshot.lock().unwrap();
+                    (s.id.clone(), s.project_id.clone())
+                };
+                notify::warn_for_task(&app, "copy-resume-lease-held", (&id, &pid), msg.clone());
             }
             msg
         })?;
         if let Some(note) = lease.took_over_stale.take() {
-            let s = handle.snapshot.lock().unwrap();
-            notify::warn_for_task(&app, "task-lease-taken-over", (&s.id, &s.project_id), note);
+            let (id, pid) = {
+                let s = handle.snapshot.lock().unwrap();
+                (s.id.clone(), s.project_id.clone())
+            };
+            notify::warn_for_task(&app, "task-lease-taken-over", (&id, &pid), note);
         }
         // 续传身份核对(评审 M10/P0-1)+ 按卷名重解析挂载点(复核必修 A:
         // 卡后插/换挂载口场景,插回原卡即可续传,无需重启应用)

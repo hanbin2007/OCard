@@ -35,6 +35,9 @@ pub enum FileStatus {
     /// manifest 中已验证,断点续传跳过。
     SkippedResume,
     Failed(String),
+    /// 因租约原因在**数据块边界**主动中止:临时文件已清理,续传会重拷。
+    /// 这不是失败——不进 COPY_FILE_FAILED 审计,快照里回到 pending。
+    AbortedMidFile,
 }
 
 #[derive(Debug, Clone)]
@@ -1323,6 +1326,11 @@ pub fn run_copy(
                         bytes_copied += size;
                         FileStatus::Copied
                     }
+                    // 租约原因在块边界主动停下的,不是这个文件的失败:不记 Failed、
+                    // 不往清单里塞未验证项(反正随后也不落盘)
+                    Err(e) if abort_writes && matches!(e, super::CoreError::Busy(_)) => {
+                        FileStatus::AbortedMidFile
+                    }
                     Err(e) => {
                         if e.is_io() {
                             consecutive_io += 1;
@@ -1440,7 +1448,7 @@ pub fn run_copy(
 /// 用它把任务落到「暂停」——中途不用它掀桌子,不然已失败文件的记录就没了。
 pub fn lease_abort() -> super::CoreError {
     super::CoreError::Busy(
-        "本任务的租约已不再由本进程持有(或心跳久未成功、随时会被接管),已在文件边界停下并放弃写回清单——继续写会把接管方记下的进度整份顶掉。请确认另一处的进度后再决定在哪边续传".into(),
+        "本任务的租约已不再由本进程持有(或心跳久未成功、随时会被接管),已停下并放弃写回清单——正在拷的那个文件在数据块边界中止、临时文件已清理,续传会重拷它;继续写清单会把接管方记下的进度整份顶掉。请确认另一处的进度后再决定在哪边续传".into(),
     )
 }
 
@@ -1914,9 +1922,9 @@ mod tests {
         assert!(
             matches!(
                 out.files.first().map(|f| &f.status),
-                Some(FileStatus::Failed(_))
+                Some(FileStatus::AbortedMidFile)
             ),
-            "中途 Abort 的文件应记为失败并停在块边界: {:?}",
+            "中途 Abort 的文件是主动中止,不是失败(不许进失败审计): {:?}",
             out.files.first().map(|f| &f.status)
         );
         let part_left = std::fs::read_dir(&req.destinations[0])

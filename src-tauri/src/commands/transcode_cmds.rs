@@ -1036,9 +1036,7 @@ pub(crate) fn intent_release_by_job(job_id: &str) {
 /// 顶掉;反过来 worker 的下一次落盘又会把这里加的计数顶回去——「三次放弃」
 /// 上限就这么静默失效。所以:写之前**重读**,再看有没有活着的 worker 在写。
 ///
-/// 边界:`live_holder` 检查与 `save` 之间仍是「检查后写」。但这里只对
-/// `completed == true` 的清单写(`dispatch_auto_proxy` 入口就挡了未完成的),
-/// 而 worker 只写未完成的清单——两边的写集合不相交,窗口里没有对手。
+/// 现在写之前短期取得任务租约(与 worker 同一把),不再是「检查后写」。
 fn save_proxy_state<R: tauri::Runtime>(
     app: &AppHandle<R>,
     project_root: &Path,
@@ -1049,14 +1047,20 @@ fn save_proxy_state<R: tauri::Runtime>(
     consequence: &str,
     mutate: impl FnOnce(&mut crate::core::manifest::CopyManifest),
 ) -> bool {
-    if let Some(who) = crate::core::lease::live_holder(project_root, id, machine_id) {
-        notify::warn(
-            app,
-            "auto-proxy-state-unsaved",
-            format!("自动转代理{what}没有写回:这个任务正被 {who} 执行中。{consequence}"),
-        );
-        return false;
-    }
+    // 短期持有真正的租约,而不是 live_holder 这种「检查后写」:worker 收尾那次
+    // save 写的正是 completed=true,续传刷新又会把 completed 打回 false——写集合
+    // 并不像此前注释说的那样不相交。Busy 就是可见出口;写完 Held 一 drop 就释放
+    let _lease = match crate::core::lease::acquire(project_root, id, machine_id, "") {
+        Ok(h) => h,
+        Err(e) => {
+            notify::warn(
+                app,
+                "auto-proxy-state-unsaved",
+                format!("自动转代理{what}没有写回:{e}。{consequence}"),
+            );
+            return false;
+        }
+    };
     let result = crate::core::manifest::load(project_root, id).and_then(|mut fresh| {
         mutate(&mut fresh);
         crate::core::manifest::save(project_root, &fresh).map(|_| ())

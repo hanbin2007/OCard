@@ -145,6 +145,8 @@ pub fn file_status_str(status: &copy::FileStatus) -> &'static str {
     match status {
         copy::FileStatus::Copied | copy::FileStatus::SkippedResume => "verified",
         copy::FileStatus::Failed(_) => "failed",
+        // 主动中止的不是失败:续传会重拷,快照里回到待处理
+        copy::FileStatus::AbortedMidFile => "pending",
     }
 }
 
@@ -184,6 +186,15 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
         return;
     }
     std::thread::spawn(move || {
+        // running 的复位放进 guard:下面任何路径(含二次 panic)都会清,否则任务
+        // 永远卡在「运行中」
+        struct RunningGuard<'a>(&'a AtomicBool);
+        impl Drop for RunningGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _running = RunningGuard(&handle.running);
         // panic 也要有终态:否则 running 永远是 true、任务卡在「运行中」、
         // 没有一条通知——用户只能重启应用
         let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -208,7 +219,14 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
         // 拷贝路径也消费 fsx 回退标记(终审:告警不能只挂在分类命令上)
         super::sorting_cmds::notify_if_unsafe_fallback(&app);
         // 拷完自动转代理(M3 T1.5):任务 done 且 manifest 带意图 → 派发作业
-        if outcome.is_ok() && handle.snapshot.lock().unwrap().state == "done" {
+        if outcome.is_ok()
+            && handle
+                .snapshot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .state
+                == "done"
+        {
             // 读不出清单就派不了自动转代理。此前是 `if let Ok(..)` 一声不吭:
             // 任务显示完成、代理却始终不出现,用户没有任何解释可循
             match manifest::load(&handle.project_root, &handle.manifest_id) {
@@ -233,7 +251,7 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
             }
         }
         if let Err(e) = &outcome {
-            let mut snap = handle.snapshot.lock().unwrap();
+            let mut snap = handle.snapshot.lock().unwrap_or_else(|p| p.into_inner());
             snap.state = state_after_error(e);
             if snap.state == "failed" {
                 snap.finished_at = Some(Utc::now().to_rfc3339());
@@ -283,8 +301,8 @@ pub fn spawn_worker<R: tauri::Runtime>(app: AppHandle<R>, handle: Arc<TaskHandle
         }
         // 终态事件在 running=false 之后发(复核 P1-9):此刻点「继续」已能启动新 worker;
         // 事件读的是实时快照,若新 worker 已接手则发出的就是其当前状态,不会回退 UI
-        handle.running.store(false, Ordering::SeqCst);
-        let mut snap = handle.snapshot.lock().unwrap();
+        drop(_running); // running=false 之后再发终态事件(此刻点「继续」已能起新 worker)
+        let mut snap = handle.snapshot.lock().unwrap_or_else(|p| p.into_inner());
         let ev = final_event(&mut snap, Vec::new());
         drop(snap);
         let _ = app.emit(PROGRESS_EVENT, &ev);
@@ -477,8 +495,7 @@ fn run_worker<R: tauri::Runtime>(
         crate::core::lease::Released::Removed => {}
         // 被接管:轮询阶段已经报过 task-lease-lost,这里不重复
         crate::core::lease::Released::TakenOver => {}
-        crate::core::lease::Released::RemoveFailed(why)
-        | crate::core::lease::Released::NoLock(why) => {
+        crate::core::lease::Released::RemoveFailed(why) => {
             // 留下的是**我们自己的**租约:别的机器要等 TTL;本机在本次运行期间也续不了
             // (pid 还活着,不算残留;重启 OCard 后 pid 不在了就能立刻接管)。得说清楚,
             // 否则用户点「继续」会撞上「本进程内的另一次续传」然后一头雾水
@@ -486,7 +503,20 @@ fn run_worker<R: tauri::Runtime>(
                 app,
                 "task-lease-left-behind",
                 format!(
-                    "任务结束后没能清掉自己的租约文件({why}):{}。别的机器在 {} 分钟内、本机在本次运行期间续这个任务都会被它挡住;重启 OCard 或手动删除该文件可立刻解锁",
+                    "任务结束后没能删掉自己的租约文件({why}):{}。别的机器在 {} 分钟内、本机在本次运行期间续这个任务都会被它挡住;重启 OCard 或手动删除该文件可立刻解锁",
+                    lease_file.display(),
+                    crate::core::lease::LEASE_TTL.num_minutes()
+                ),
+            );
+        }
+        crate::core::lease::Released::NoLock(why) => {
+            // 没拿到接管锁就没敢删——盘上那份**可能已经是接管方的**。这里绝不能
+            // 建议「手动删除」:照做就是删掉一个正在拷卡的进程的租约
+            super::notify::warn(
+                app,
+                "task-lease-left-behind",
+                format!(
+                    "任务结束时没能确认租约文件的归属({why}),没有删除:{}。它可能仍是本进程的(别的机器要等 {} 分钟、本机重启 OCard 后可续),也可能已被别的进程接管——删除前请先确认没有别的 OCard 在跑这个任务",
                     lease_file.display(),
                     crate::core::lease::LEASE_TTL.num_minutes()
                 ),
@@ -704,6 +734,11 @@ fn run_worker_locked<R: tauri::Runtime>(
             "paused" => "idle",
             _ => "error",
         };
+        // 主动中止时,快照的 copied_bytes 吃进了当前文件的部分 delta,而那个 part
+        // 已被清掉;按引擎的 bytes_copied(只算落位的)回填,别让界面虚高
+        if outcome.aborted {
+            snap.copied_bytes = outcome.bytes_copied;
+        }
         let written = snap.copied_bytes;
         for d in snap.destinations.iter_mut() {
             d.state = dest_state;
@@ -748,6 +783,7 @@ fn run_worker_locked<R: tauri::Runtime>(
     }
 
     for f in &outcome.files {
+        // AbortedMidFile 不进失败审计:那是主动中止,续传会重拷,不是这个文件失败
         if let copy::FileStatus::Failed(e) = &f.status {
             append_audit(
                 app,
