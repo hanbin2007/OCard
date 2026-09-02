@@ -837,7 +837,7 @@ pub(crate) fn report_lease_release<R: tauri::Runtime>(
             task,
             "task-lease-heartbeat-stuck",
             format!(
-                "{what}:租约心跳线程 5 秒内没有退出(可能卡在 NAS 读写上),释放没有再等它。它醒来后会先查停止标记再动手,不会复活租约;但它在那之后攒下的降级会由下一次收尾补报"
+                "{what}:租约心跳线程 5 秒内没有退出(可能卡在 NAS 读写上),释放没有再等它。它醒来后会先查停止标记再动手,不会复活租约;它在那之后攒下的降级会直接补报出来"
             ),
         );
     }
@@ -1290,6 +1290,15 @@ fn run_worker_locked<R: tauri::Runtime>(
     // 零静默中的最高危一条:部分拷贝完成时,`all_verified` 只代表**所选文件夹**
     // 全过了,卡上其余内容一个字节都没拷。UI 那句「本卡可格式化」在这种任务上
     // 是错的,会直接导致用户格式化掉没备份的素材——后端必须自己喊一嗓子。
+    // 连续 IO 失败的自动暂停:任务变成「已暂停」不算说了——原因要进通知中心(codex 终审 r18)
+    if let Some(why) = &outcome.pause_reason {
+        super::notify::error_for_task(
+            app,
+            "copy-task-paused",
+            (&task_for_notices.0, &task_for_notices.1),
+            format!("拷卡任务已自动暂停(可续传):{why}"),
+        );
+    }
     if outcome.baseline_degraded > 0 {
         super::notify::warn_for_task(
             app,

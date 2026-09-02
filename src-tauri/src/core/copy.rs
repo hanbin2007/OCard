@@ -62,6 +62,9 @@ pub struct CopyOutcome {
     /// 用 outcome 而不是 Err 承载:收尾(已失败文件的审计、占用总账)必须照跑,
     /// 否则那几条「哪个文件为什么失败」的记录就跟着 Err 一起消失了。
     pub aborted: bool,
+    /// 因连续 IO 失败**自动**暂停时的原因(用户主动暂停为 `None`):上层要发通知——
+    /// 任务无声变成「已暂停」、通知中心没有原因,就是零静默的洞(codex 终审 r18)。
+    pub pause_reason: Option<String>,
     /// 计划里没有修改时间基准(旧版本清单 / 扫描时读不到)的文件数:这些文件的「拷贝期间
     /// 源没被改写」只按开拷快照判,同一时间戳槽内的等长改写挡不住——上层要说。
     pub baseline_degraded: usize,
@@ -1572,6 +1575,9 @@ pub fn run_copy(
     let mut paused = false;
     // 连续 IO 失败视为基础设施故障(NAS 断连),转入暂停而非全部标失败(评审复核 P1)
     let mut consecutive_io = 0usize;
+    // 自动暂停(连续 IO 失败)的原因:上层要发通知,不能只让任务无声变成「已暂停」
+    let mut pause_reason: Option<String> = None;
+    let mut last_io_failure: Option<String> = None;
     // 写清单被占用后重试成功的总轮数(结果是对的,但要报给用户看,见 CopyOutcome)
     let mut write_retries = 0u32;
     // 素材文件落位改名被占用后重试的总轮数(同上,但这条是素材,更要紧)
@@ -1718,6 +1724,7 @@ pub fn run_copy(
                     Err(e) => {
                         if e.is_io() {
                             consecutive_io += 1;
+                            last_io_failure = Some(format!("{rel}: {e}"));
                         } else {
                             consecutive_io = 0;
                         }
@@ -1813,6 +1820,10 @@ pub fn run_copy(
         });
         if consecutive_io >= 3 {
             paused = true;
+            pause_reason = Some(format!(
+                "连续 {consecutive_io} 个文件 IO 失败(最近一个:{}),按基础设施故障(NAS 断连 / 目的地不可写 / 源被别的程序占着)自动暂停;已拷完的文件不受影响,排除后点「继续」续传",
+                last_io_failure.as_deref().unwrap_or("?")
+            ));
             break;
         }
     }
@@ -1832,7 +1843,8 @@ pub fn run_copy(
         || progress(Progress::AboutToSave { rel_path: "" }) == CopyControl::Abort
     {
         return Ok(CopyOutcome {
-            baseline_degraded: 0,
+            baseline_degraded,
+            pause_reason: None,
             files: reports,
             bytes_copied,
             all_verified: false,
@@ -1851,7 +1863,8 @@ pub fn run_copy(
     match save_within_fence(fence, project_root, m, all_verified) {
         Err(why) => {
             return Ok(CopyOutcome {
-                baseline_degraded: 0,
+                baseline_degraded,
+                pause_reason: None,
                 files: reports,
                 bytes_copied,
                 all_verified: false,
@@ -1875,6 +1888,7 @@ pub fn run_copy(
     }
     Ok(CopyOutcome {
         baseline_degraded,
+        pause_reason,
         files: reports,
         bytes_copied,
         all_verified,
@@ -2907,6 +2921,29 @@ mod tests {
         );
     }
 
+    /// 旧清单(没有修改时间基准)的退化计数在租约中止路径上也要如实带回:此前两处中止返回
+    /// 硬编码 0,上层收不到 copy-baseline-degraded(codex 终审 r18)。
+    #[test]
+    fn an_abort_at_save_keeps_the_legacy_baseline_count() {
+        let (_t, req, mut m, project) = setup();
+        let mut plan = plan_whole_volume(&scan_source(&req.source_root).unwrap());
+        for p in &mut plan {
+            p.source_mtime_ns = 0; // 旧版本清单:没记修改时间
+        }
+        let out = run_copy(&req, &plan, &mut m, &project, None, |p| match p {
+            Progress::AboutToSave { .. } => CopyControl::Abort,
+            _ => CopyControl::Continue,
+        })
+        .unwrap();
+        assert!(out.aborted, "落盘前被租约中止");
+        assert_eq!(
+            out.baseline_degraded,
+            plan.len(),
+            "中止路径也要带回退化计数"
+        );
+        assert!(out.pause_reason.is_none(), "不是自动暂停");
+    }
+
     /// 写 part 之前、回读校验之前、落位之前各有一个 delta 为 0 的租约检查点。只在
     /// **第三个**(落位前)说 Abort:文件必须停在落位之前——目的地不许出现正式名的
     /// 文件,part 也要清掉;并断言确实数到了三个,少任何一个检查点这里都红
@@ -3505,6 +3542,13 @@ mod review_regression_tests {
         )
         .unwrap();
         assert!(out.paused, "连续 IO 失败应转入可续传的暂停,而非终态 failed");
+        assert!(
+            out.pause_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("自动暂停")),
+            "自动暂停要带原因给上层发通知: {:?}",
+            out.pause_reason
+        );
         assert!(!out.all_verified);
         let saved = manifest::load(&project, &m.id).unwrap();
         assert!(!saved.completed);
